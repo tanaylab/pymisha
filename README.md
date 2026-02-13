@@ -1,5 +1,8 @@
 # PyMisha
 
+[![PyPI](https://img.shields.io/pypi/v/pymisha.svg)](https://pypi.org/project/pymisha/)
+[![CI](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml/badge.svg)](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml)
+
 Python interface for [misha](https://github.com/tanaylab/misha) genomic databases. PyMisha provides full read/write access to misha track databases with C++ streaming backends for genome-scale operations.
 
 ## Features
@@ -14,16 +17,13 @@ Python interface for [misha](https://github.com/tanaylab/misha) genomic database
 
 ## Installation
 
-Prerequisites:
-- Python 3.10+
-- C++17 compiler (GCC 8+, Clang 7+, or Apple Clang 11+)
-- `numpy`, `pandas`
-
 ```bash
-pip install .
+pip install pymisha
 ```
 
-For development:
+Pre-built wheels are available for Linux (x86_64) and macOS (x86_64 and arm64), Python 3.10-3.12.
+
+To install from source (requires a C++17 compiler and numpy):
 
 ```bash
 pip install -e ".[dev]"
