@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-push hook: prevent pushing branches to wrong remotes.
+#
+# Guardrails:
+#   - dev → only private (aviezerl/pymisha)
+#   - main → only origin (tanaylab/pymisha)
+#
+set -euo pipefail
+
+REMOTE="$1"
+BRANCH="$(git branch --show-current 2>/dev/null || true)"
+
+if [[ "$BRANCH" == "dev" && "$REMOTE" == "origin" ]]; then
+    echo "ERROR: Cannot push 'dev' to 'origin' (tanaylab/pymisha)." >&2
+    echo "       Use: git push private dev" >&2
+    exit 1
+fi
+
+if [[ "$BRANCH" == "main" && "$REMOTE" == "private" ]]; then
+    echo "ERROR: Cannot push 'main' to 'private' (aviezerl/pymisha)." >&2
+    echo "       Use: git push origin main" >&2
+    exit 1
+fi
+
+exit 0
