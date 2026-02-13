@@ -1589,7 +1589,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             verror("percentiles must be a sequence of numbers");
         }
 
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(percentiles_seq);
+        Py_ssize_t n = PySequence_Fast_GET_SIZE((PyObject *)percentiles_seq);
         if (n <= 0) {
             verror("percentiles must contain at least one value");
         }
@@ -1931,7 +1931,7 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
             verror("percentiles must be a sequence of numbers");
         }
 
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(percentiles_seq);
+        Py_ssize_t n = PySequence_Fast_GET_SIZE((PyObject *)percentiles_seq);
         if (n <= 0) {
             verror("percentiles must contain at least one value");
         }
