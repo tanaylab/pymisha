@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "numpy>=1.20"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymisha"
+version = "0.1.0"
+description = "Python interface for misha genomic databases with C++ streaming backends"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Aviezer Lifshitz", email = "aviezerl@weizmann.ac.il"}
+]
+maintainers = [
+    {name = "Aviezer Lifshitz", email = "aviezerl@weizmann.ac.il"}
+]
+keywords = ["genomics", "bioinformatics", "misha", "tracks"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff>=0.6",
+    "mypy",
+]
+docs = [
+    "sphinx>=7.0",
+    "myst-parser>=2.0",
+    "furo>=2024.8.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/tanaylab/pymisha"
+Documentation = "https://tanaylab.github.io/pymisha/"
+Repository = "https://github.com/tanaylab/pymisha.git"
+Issues = "https://github.com/tanaylab/pymisha/issues"
+
+[tool.setuptools]
+packages = ["pymisha"]
+
+[tool.setuptools.package-data]
+pymisha = ["py.typed"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W", "B", "SIM", "PIE", "RET", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "B017", "B023"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pymisha"]
+
+[tool.ruff.format]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "pymisha"]
+addopts = "--doctest-modules"
+doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "benchmark: mark test as a benchmark",
+]

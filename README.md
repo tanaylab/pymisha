@@ -1,0 +1,76 @@
+# PyMisha
+
+Python interface for [misha](https://github.com/tanaylab/misha) genomic databases. PyMisha provides full read/write access to misha track databases with C++ streaming backends for genome-scale operations.
+
+## Features
+
+- **1D and 2D track support:** Dense, sparse, and 2D (rectangle/point) tracks with full CRUD operations.
+- **C++ streaming backends:** Extraction, summary, quantiles, distribution, lookup, segmentation, Wilcoxon tests, correlation, and sampling all stream through C++ for performance.
+- **Virtual tracks:** Computed-on-the-fly track views with filtering, shifting, and 30+ aggregation functions.
+- **Interval operations:** Union, intersection, difference, canonicalization, neighbors, annotation, normalization, random generation, and liftover.
+- **Sequence analysis:** Extraction, k-mer counting, PWM/PSSM scoring, and Markov-chain synthesis (`gsynth`).
+- **Database management:** Create, link, convert, and manage misha-compatible genomic databases.
+- **R misha compatibility:** Reads and writes the same on-disk formats as R misha (123/145 R exports covered).
+
+## Installation
+
+Prerequisites:
+- Python 3.10+
+- C++17 compiler (GCC 8+, Clang 7+, or Apple Clang 11+)
+- `numpy`, `pandas`
+
+```bash
+pip install .
+```
+
+For development:
+
+```bash
+pip install -e ".[dev]"
+```
+
+## Quick start
+
+```python
+import pymisha as pm
+
+# Initialize the database
+pm.gdb_init("/path/to/misha_db")
+
+# Create intervals and extract data
+intervals = pm.gintervals_from_strings(["chr1:0-1000", "chr1:2000-2600"])
+out = pm.gextract("track1", intervals, iterator=100)
+
+# Filter and summarize
+filtered = pm.gscreen("track1 > 0.5", intervals)
+stats = pm.gsummary("track1", intervals)
+```
+
+## Examples
+
+Using the built-in example database:
+
+```python
+import pymisha as pm
+
+pm.gdb_init_examples()
+print(pm.gtrack_ls())
+print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
+```
+
+## Optional dependencies
+
+- `pyBigWig`: For BigWig import in `gtrack_import`.
+- `pyreadr` + `Rscript`: For loading R-serialized big interval sets.
+- `PyYAML`: For richer `gdataset_info` metadata parsing.
+
+## Missing features
+
+Compared to R misha, the following are not yet implemented:
+
+- **Track Arrays:** `gtrack.array.*` and `gvtrack.array.slice`.
+- **Legacy Conversion:** `gtrack.convert` (for migrating old 2D formats).
+
+## License
+
+MIT. See [LICENSE](LICENSE) for details.
