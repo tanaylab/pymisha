@@ -98,7 +98,9 @@ private:
 };
 
 
-// Iterator that returns sparse track intervals overlapping the scope
+// Iterator that returns sparse track intervals overlapping the scope.
+// Streams overlaps lazily: loads one chromosome at a time and computes
+// overlaps on-the-fly during next(), avoiding upfront materialization.
 class PMSparseIterator : public PMTrackExpressionIterator {
 public:
     PMSparseIterator(const std::vector<GInterval> &intervals, const std::string &track_dir);
@@ -108,19 +110,46 @@ public:
     virtual void next() override;
     virtual bool isend() const override { return m_isend; }
 
-    virtual const GInterval &last_interval() const override { return m_out_intervals[m_idx]; }
+    virtual const GInterval &last_interval() const override { return m_cur_overlap; }
 
-    virtual uint64_t size() const override { return m_out_intervals.size(); }
-    virtual uint64_t idx() const override { return m_idx; }
-    virtual uint64_t original_interval_idx() const override { return m_out_interval_ids[m_idx]; }
+    virtual uint64_t size() const override { return 0; }  // unknown for streaming
+    virtual uint64_t idx() const override { return m_total_emitted; }
+    virtual uint64_t original_interval_idx() const override { return m_cur_scope_id; }
 
 private:
-    std::vector<GInterval> m_scope;
+    struct ScopeEntry {
+        GInterval interval;
+        uint64_t scope_id;  // 1-based original interval index
+    };
+
     std::string m_track_dir;
-    std::vector<GInterval> m_out_intervals;
-    std::vector<uint64_t> m_out_interval_ids;
-    size_t m_idx{0};
+    // Scope intervals grouped by chromosome; only chroms with scope intervals are stored
+    std::vector<int> m_chrom_order;  // chromids in order
+    std::vector<std::vector<ScopeEntry>> m_scope_by_chrom;
+
+    // Current chromosome state
+    size_t m_cur_chrom_order_idx{0};
+    GenomeTrackSparse m_cur_track;
+    const std::vector<GInterval> *m_cur_track_intervals{nullptr};
+
+    // Current iteration state within a chromosome
+    size_t m_cur_scope_idx{0};   // index into scope intervals for current chrom
+    size_t m_cur_track_idx{0};   // index into track intervals for current overlap scan
+
+    // Current output
+    GInterval m_cur_overlap;
+    uint64_t m_cur_scope_id{0};
+    uint64_t m_total_emitted{0};
     bool m_isend{true};
+
+    // Load sparse track data for the given chrom_order_idx
+    bool load_chrom(size_t chrom_order_idx);
+
+    // Advance to the next valid overlap; return true if found
+    bool find_next_overlap();
+
+    // Binary search for first track interval that could overlap pos
+    size_t find_first_overlap(const std::vector<GInterval> &intervals, int64_t pos) const;
 };
 
 #endif /* PMTRACKEXPRESSIONITERATOR_H_ */

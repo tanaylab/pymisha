@@ -11,6 +11,7 @@
 #include <string>
 #include <memory>
 #include <cmath>
+#include <unordered_map>
 
 #include "pymisha.h"
 #include "PMTrackExpressionIterator.h"
@@ -127,6 +128,15 @@ private:
     // State
     bool m_isend;
     bool m_use_python;
+
+    // Per-chromosome CHROM string cache to avoid per-row PyUnicode_FromString
+    std::unordered_map<int, PyObject*> m_chrom_str_cache;
+    PyObject *m_empty_chrom_str{nullptr};
+
+    // Lazy population flags: only fill CHROM/START/END when expressions reference them
+    bool m_need_chrom{false};
+    bool m_need_start{false};
+    bool m_need_end{false};
 
     // Constants
     static const int INIT_REPORT_STEP;

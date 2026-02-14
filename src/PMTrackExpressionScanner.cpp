@@ -42,6 +42,11 @@ PMTrackExprScanner::PMTrackExprScanner()
 
 PMTrackExprScanner::~PMTrackExprScanner()
 {
+    for (auto &pair : m_chrom_str_cache) {
+        Py_XDECREF(pair.second);
+    }
+    m_chrom_str_cache.clear();
+    Py_XDECREF(m_empty_chrom_str);
 }
 
 std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_iterator(
@@ -176,6 +181,14 @@ void PMTrackExprScanner::define_py_vars(unsigned eval_buf_limit)
         PyDict_SetItemString(m_py_ldict, "CHROM", m_py_chrom_array);
         PyDict_SetItemString(m_py_ldict, "START", m_py_start_array);
         PyDict_SetItemString(m_py_ldict, "END", m_py_end_array);
+
+        // Scan expressions to determine which coordinate arrays are actually referenced
+        m_need_chrom = m_need_start = m_need_end = false;
+        for (const auto &expr : m_track_exprs) {
+            if (expr.find("CHROM") != std::string::npos) m_need_chrom = true;
+            if (expr.find("START") != std::string::npos) m_need_start = true;
+            if (expr.find("END") != std::string::npos) m_need_end = true;
+        }
     }
 
     // For expressions that are just track variable references, point directly to the array
@@ -263,10 +276,12 @@ bool PMTrackExprScanner::eval_next()
                 // Pad remainder with NaN/sentinel values to prevent stale data
                 // from affecting non-elementwise expressions (np.mean, np.sort, etc.)
                 if (m_use_python) {
+                    if (!m_empty_chrom_str)
+                        m_empty_chrom_str = PyUnicode_FromString("");
                     for (unsigned i = m_eval_buf_size; i < m_eval_buf_limit; ++i) {
-                        // Set CHROM to empty string (PyUnicode_FromString returns new ref)
                         Py_DECREF(m_chrom_array[i]);
-                        m_chrom_array[i] = PyUnicode_FromString("");
+                        Py_INCREF(m_empty_chrom_str);
+                        m_chrom_array[i] = m_empty_chrom_str;
                         m_start_array[i] = -1;
                         m_end_array[i] = -1;
                     }
@@ -280,13 +295,23 @@ bool PMTrackExprScanner::eval_next()
             m_expr_itr_intervals[m_eval_buf_size] = interval;
             m_expr_itr_interval_ids[m_eval_buf_size] = m_itr->original_interval_idx();
 
-            if (m_use_python) {
-                // Update CHROM array
-                Py_DECREF(m_chrom_array[m_eval_buf_size]);
-                const std::string &chrom = g_pmdb->chromkey().id2chrom(interval.chromid);
-                m_chrom_array[m_eval_buf_size] = PyUnicode_FromString(chrom.c_str());
-                m_start_array[m_eval_buf_size] = interval.start;
-                m_end_array[m_eval_buf_size] = interval.end;
+            if (m_use_python && (m_need_chrom || m_need_start || m_need_end)) {
+                if (m_need_chrom) {
+                    Py_DECREF(m_chrom_array[m_eval_buf_size]);
+                    auto it = m_chrom_str_cache.find(interval.chromid);
+                    if (it == m_chrom_str_cache.end()) {
+                        const std::string &chrom = g_pmdb->chromkey().id2chrom(interval.chromid);
+                        PyObject *chrom_str = PyUnicode_FromString(chrom.c_str());
+                        m_chrom_str_cache[interval.chromid] = chrom_str;
+                        it = m_chrom_str_cache.find(interval.chromid);
+                    }
+                    Py_INCREF(it->second);
+                    m_chrom_array[m_eval_buf_size] = it->second;
+                }
+                if (m_need_start)
+                    m_start_array[m_eval_buf_size] = interval.start;
+                if (m_need_end)
+                    m_end_array[m_eval_buf_size] = interval.end;
             }
 
             // Set track variable values

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.1 (2026-02-14)
+
+### Performance
+
+- **Phase 1 optimizations:** Reduce BufferedFile default buffer (2MB → 128KB) for multitask workloads, cache per-chromosome CHROM strings to avoid per-row `PyUnicode_FromString`, skip `fseek` for sequential fixed-bin reads, add reducer fast-path in fixed-bin to skip unused function bookkeeping, stream sparse overlaps lazily instead of materializing all upfront.
+- **Phase 2 optimizations:** Add basic-only sparse fast path in `calc_vals` (tight loop for avg/sum/min/max when no position/stddev/sample needed), replace `dynamic_cast` with `static_cast` in per-row hot loop, skip CHROM/START/END array population when expressions don't reference them, reuse scratch buffers in fixed-bin multi-bin path, eliminate extra copy in sparse track loading.
+- Combined effect: 13–21% speedup across extraction workloads.
+
+### Documentation
+
+- Migrate docs from Sphinx/Furo to MkDocs Material.
+- Port R misha vignettes to pymisha docs.
+- Add pymisha logo and favicon.
+
 ## v0.1.0 (2026-02-13)
 
 Initial public release.

@@ -52,6 +52,11 @@ protected:
 	float     m_cached_bin_val{numeric_limits<float>::quiet_NaN()};
 	bool      m_cache_valid{false};
 
+	// Reusable scratch buffers for multi-bin path (avoids per-call allocation)
+	std::vector<float> m_scratch_bin_vals;
+	std::vector<float> m_scratch_all_values;
+	std::vector<double> m_scratch_all_positions;
+
 	// State for indexed "smart handle"
 	std::string m_dat_path;
 	std::string m_dat_mode;

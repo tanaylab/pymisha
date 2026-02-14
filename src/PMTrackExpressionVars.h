@@ -32,6 +32,7 @@ public:
         std::unique_ptr<GenomeTrack> track;  // Track reader
         GenomeTrack::Type track_type;        // Track type
         int64_t bin_size;           // Bin size (for fixed bin tracks)
+        int64_t last_bin{-1};       // Last bin read (for sequential seek skip)
         int cur_chromid;            // Currently loaded chromosome
         bool cur_chromid_valid;     // Whether current chromosome data is valid
     };
