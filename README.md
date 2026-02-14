@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="docs/assets/logo.png" alt="PyMisha" width="200">
-</p>
-
-# PyMisha
+<h1><img src="docs/assets/logo.png" alt="" width="60" style="vertical-align: middle;"> PyMisha</h1>
 
 [![PyPI](https://img.shields.io/pypi/v/pymisha.svg)](https://pypi.org/project/pymisha/)
 [![CI](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml/badge.svg)](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml)

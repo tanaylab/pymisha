@@ -1,8 +1,4 @@
-<div style="text-align: center; margin-bottom: 1em;">
-  <img src="assets/logo.png" alt="PyMisha" width="200">
-</div>
-
-# PyMisha
+# ![PyMisha](assets/logo.png){ width="60" style="vertical-align: middle" } PyMisha
 
 Python interface for [misha](https://github.com/tanaylab/misha) genomic databases with C++ streaming backends.
 
