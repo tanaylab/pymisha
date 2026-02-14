@@ -15,10 +15,24 @@ Python interface for [misha](https://github.com/tanaylab/misha) genomic database
 
 ## Quick Start
 
+Get started instantly with the bundled examples database:
+
 ```python
 import pymisha as pm
 
-pm.gdb_init("/path/to/misha_db")
+pm.gdb_init_examples()
+# or equivalently: pm.gsetroot(pm.gdb_examples_path())
+
+print(pm.gtrack_ls())
+print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
+```
+
+To connect to your own misha database:
+
+```python
+import pymisha as pm
+
+pm.gsetroot("/path/to/misha_db")
 intervals = pm.gintervals_from_strings(["chr1:0-1000", "chr1:2000-2600"])
 out = pm.gextract("track1", intervals, iterator=100)
 ```

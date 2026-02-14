@@ -31,11 +31,29 @@ pip install -e ".[dev]"
 
 ## Quick start
 
+PyMisha ships with a built-in examples database so you can start exploring immediately -- no external data needed:
+
+```python
+import pymisha as pm
+
+# Option 1: one-liner to load the bundled examples database
+pm.gdb_init_examples()
+
+# Option 2: equivalent explicit form
+pm.gsetroot(pm.gdb_examples_path())
+
+# List available tracks and extract data
+print(pm.gtrack_ls())
+print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
+```
+
+To connect to your own misha database, use `gsetroot`:
+
 ```python
 import pymisha as pm
 
 # Initialize the database
-pm.gdb_init("/path/to/misha_db")
+pm.gsetroot("/path/to/misha_db")
 
 # Create intervals and extract data
 intervals = pm.gintervals_from_strings(["chr1:0-1000", "chr1:2000-2600"])
@@ -53,7 +71,12 @@ Using the built-in example database:
 ```python
 import pymisha as pm
 
+# Quickest way to get started
 pm.gdb_init_examples()
+
+# Or equivalently, using gsetroot with the examples path
+pm.gsetroot(pm.gdb_examples_path())
+
 print(pm.gtrack_ls())
 print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
 ```
