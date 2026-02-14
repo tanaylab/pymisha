@@ -19,7 +19,7 @@
 
 class BufferedFile {
 public:
-	BufferedFile() { init(2097152); }  // 2MB default buffer for genomic data
+	BufferedFile() { init(131072); }  // 128KB buffer — reduced from 2MB to cut per-worker memory for multi-track extraction
 	BufferedFile(unsigned bufsize) { init(bufsize); }
 	~BufferedFile();
 

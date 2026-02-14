@@ -205,11 +205,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
 {
     for (auto &var : m_track_vars) {
         if (var.track_type == GenomeTrack::SPARSE) {
-            GenomeTrackSparse *sparse = dynamic_cast<GenomeTrackSparse *>(var.track.get());
-            if (!sparse) {
-                var.values[idx] = std::nan("");
-                continue;
-            }
+            GenomeTrackSparse *sparse = static_cast<GenomeTrackSparse *>(var.track.get());
 
             if (var.cur_chromid != interval.chromid) {
                 std::string chrom_file = GenomeTrack::find_existing_1d_filename(
@@ -236,11 +232,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             continue;
         }
 
-        GenomeTrackFixedBin *fixed_bin = dynamic_cast<GenomeTrackFixedBin *>(var.track.get());
-        if (!fixed_bin) {
-            var.values[idx] = std::nan("");
-            continue;
-        }
+        GenomeTrackFixedBin *fixed_bin = static_cast<GenomeTrackFixedBin *>(var.track.get());
 
         // Load chromosome if needed
         if (var.cur_chromid != interval.chromid) {
@@ -269,6 +261,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
                              var.name.c_str(), var.bin_size, m_bin_size);
                 }
             }
+            var.last_bin = -1;  // Reset sequential tracking on chrom change
         }
 
         if (!var.cur_chromid_valid) {
@@ -280,13 +273,17 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
         int64_t pos = (interval.start + interval.end) / 2;
         int64_t bin = pos / var.bin_size;
 
-        fixed_bin->goto_bin(bin);
+        // Only seek when bin is not sequential — avoids fseek overhead for common scan patterns
+        if (bin != var.last_bin + 1) {
+            fixed_bin->goto_bin(bin);
+        }
         float val;
         if (fixed_bin->read_next_bin(val)) {
             var.values[idx] = val;
         } else {
             var.values[idx] = std::nan("");
         }
+        var.last_bin = bin;
     }
 }
 

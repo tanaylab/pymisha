@@ -69,6 +69,44 @@ inline bool GenomeTrackSparse::check_first_overlap(size_t idx, const GInterval &
 
 inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 {
+    // Fast path: when only basic reducers (avg/sum/min/max/nearest) are needed
+    // (no position tracking, stddev, quantile, sample, exists, first/last, size)
+    const bool basic_only =
+        !m_functions[MIN_POS] && !m_functions[MAX_POS] &&
+        !m_functions[STDDEV] && !m_use_quantile &&
+        !m_functions[EXISTS] && !m_functions[FIRST] && !m_functions[FIRST_POS] &&
+        !m_functions[LAST] && !m_functions[LAST_POS] &&
+        !m_functions[SAMPLE] && !m_functions[SAMPLE_POS] && !m_functions[SIZE];
+
+    if (basic_only) {
+        float num_vs = 0;
+        double sum = 0;
+        float mn = std::numeric_limits<float>::max();
+        float mx = -std::numeric_limits<float>::max();
+        for (size_t i = m_cur_idx; i < m_intervals.size(); ++i) {
+            const GInterval &cur = m_intervals[i];
+            if (!cur.do_overlap(interval))
+                break;
+            float v = m_vals[i];
+            if (!std::isnan(v)) {
+                sum += v;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                ++num_vs;
+            }
+        }
+        if (num_vs > 0) {
+            m_last_sum = sum;
+            m_last_avg = m_last_nearest = sum / num_vs;
+            m_last_min = mn;
+            m_last_max = mx;
+        } else {
+            m_last_avg = m_last_nearest = m_last_min = m_last_max = m_last_sum = std::numeric_limits<float>::quiet_NaN();
+        }
+        return;
+    }
+
+    // Generic path: full function bookkeeping
     float num_vs = 0;
     double mean_square_sum = 0;
 

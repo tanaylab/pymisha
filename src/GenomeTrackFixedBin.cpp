@@ -142,13 +142,9 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		double stddev_mean = 0;
 		double stddev_m2 = 0;
 
-		// For sampling, collect all values/positions
-		vector<float> all_values;
-		vector<double> all_positions;
-		if (m_functions[SAMPLE] || m_functions[SAMPLE_POS])
-			all_values.reserve(100);
-		if (m_functions[SAMPLE_POS])
-			all_positions.reserve(100);
+		// Reuse scratch buffers for sampling (avoids per-call allocation)
+		m_scratch_all_values.clear();
+		m_scratch_all_positions.clear();
 
 		m_last_sum = 0;
 		m_last_min = numeric_limits<float>::max();
@@ -158,13 +154,20 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		if (m_functions[MIN_POS])
 			m_last_min_pos = numeric_limits<double>::quiet_NaN();
 
-		// Bulk read all bins at once instead of one-by-one
-		vector<float> bin_vals;
-		int64_t bins_read = read_bins_bulk(sbin, ebin - sbin, bin_vals);
+		// Bulk read all bins at once into reusable scratch buffer
+		m_scratch_bin_vals.clear();
+		int64_t bins_read = read_bins_bulk(sbin, ebin - sbin, m_scratch_bin_vals);
+
+		// Precompute which optional reducer groups are active to avoid per-bin work
+		const bool need_pos = m_functions[MIN_POS] || m_functions[MAX_POS] ||
+		                      m_functions[FIRST_POS] || m_functions[LAST_POS] || m_functions[SAMPLE_POS];
+		const bool need_vtrack = m_functions[EXISTS] || m_functions[FIRST] || m_functions[FIRST_POS] ||
+		                         m_functions[LAST] || m_functions[LAST_POS] ||
+		                         m_functions[SAMPLE] || m_functions[SAMPLE_POS];
 
 		for (int64_t i = 0; i < bins_read; ++i) {
 			int64_t bin = sbin + i;
-			float v = bin_vals[i];
+			float v = m_scratch_bin_vals[i];
 
 			m_cached_bin_idx = bin;
 			m_cached_bin_val = v;
@@ -172,46 +175,59 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 
 			if (!std::isnan(v)) {
 				m_last_sum += v;
-				double bin_start = static_cast<double>(bin * m_bin_size);
-				double overlap_start = std::max(bin_start, static_cast<double>(interval.start));
+
+				// Min/max are always tracked (callers read them unconditionally)
+				// Only position bookkeeping is conditional
 				if (v < m_last_min) {
 					m_last_min = v;
-					if (m_functions[MIN_POS])
-						m_last_min_pos = overlap_start;
+					if (m_functions[MIN_POS]) {
+						double bin_start = static_cast<double>(bin * m_bin_size);
+						m_last_min_pos = std::max(bin_start, static_cast<double>(interval.start));
+					}
 				} else if (m_functions[MIN_POS] && v == m_last_min) {
-					double candidate_pos = overlap_start;
+					double bin_start = static_cast<double>(bin * m_bin_size);
+					double candidate_pos = std::max(bin_start, static_cast<double>(interval.start));
 					if (std::isnan(m_last_min_pos) || candidate_pos < m_last_min_pos)
 						m_last_min_pos = candidate_pos;
 				}
 				if (v > m_last_max) {
 					m_last_max = v;
-					if (m_functions[MAX_POS])
-						m_last_max_pos = overlap_start;
+					if (m_functions[MAX_POS]) {
+						double bin_start = static_cast<double>(bin * m_bin_size);
+						m_last_max_pos = std::max(bin_start, static_cast<double>(interval.start));
+					}
 				}
 
-				if (m_use_quantile && !std::isnan(v))
+				if (m_use_quantile)
 					m_sp.add(v, s_rnd_func);
 
-				// New virtual track computations
-				if (m_functions[EXISTS])
-					m_last_exists = 1;
+				if (need_vtrack) {
+					double overlap_start = 0;
+					if (need_pos) {
+						double bin_start = static_cast<double>(bin * m_bin_size);
+						overlap_start = std::max(bin_start, static_cast<double>(interval.start));
+					}
 
-				if (m_functions[FIRST] && std::isnan(m_last_first))
-					m_last_first = v;
+					if (m_functions[EXISTS])
+						m_last_exists = 1;
 
-				if (m_functions[FIRST_POS] && std::isnan(m_last_first_pos))
-					m_last_first_pos = overlap_start;
+					if (m_functions[FIRST] && std::isnan(m_last_first))
+						m_last_first = v;
 
-				if (m_functions[LAST])
-					m_last_last = v;
+					if (m_functions[FIRST_POS] && std::isnan(m_last_first_pos))
+						m_last_first_pos = overlap_start;
 
-				if (m_functions[LAST_POS])
-					m_last_last_pos = overlap_start;
+					if (m_functions[LAST])
+						m_last_last = v;
 
-				if (m_functions[SAMPLE])
-					all_values.push_back(v);
-				if (m_functions[SAMPLE_POS])
-					all_positions.push_back(overlap_start);
+					if (m_functions[LAST_POS])
+						m_last_last_pos = overlap_start;
+
+					if (m_functions[SAMPLE])
+						m_scratch_all_values.push_back(v);
+					if (m_functions[SAMPLE_POS])
+						m_scratch_all_positions.push_back(overlap_start);
+				}
 
 				++num_vs;
 				if (m_functions[STDDEV]) {
@@ -228,22 +244,22 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 			m_last_size = num_vs;
 
 			// Sample from collected values
-			if (m_functions[SAMPLE] && !all_values.empty()) {
-				int idx = (int)(s_rnd_func() * all_values.size());
-				if (idx >= (int)all_values.size())
-					idx = (int)all_values.size() - 1;
+			if (m_functions[SAMPLE] && !m_scratch_all_values.empty()) {
+				int idx = (int)(s_rnd_func() * m_scratch_all_values.size());
+				if (idx >= (int)m_scratch_all_values.size())
+					idx = (int)m_scratch_all_values.size() - 1;
 				if (idx < 0)
 					idx = 0;
-				m_last_sample = all_values[idx];
+				m_last_sample = m_scratch_all_values[idx];
 			}
 
-			if (m_functions[SAMPLE_POS] && !all_positions.empty()) {
-				int idx = (int)(s_rnd_func() * all_positions.size());
-				if (idx >= (int)all_positions.size())
-					idx = (int)all_positions.size() - 1;
+			if (m_functions[SAMPLE_POS] && !m_scratch_all_positions.empty()) {
+				int idx = (int)(s_rnd_func() * m_scratch_all_positions.size());
+				if (idx >= (int)m_scratch_all_positions.size())
+					idx = (int)m_scratch_all_positions.size() - 1;
 				if (idx < 0)
 					idx = 0;
-				m_last_sample_pos = all_positions[idx];
+				m_last_sample_pos = m_scratch_all_positions[idx];
 			}
 
 		if (num_vs > 0)

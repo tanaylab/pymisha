@@ -109,27 +109,21 @@ void GenomeTrackSparse::read_file_into_mem()
         return;
     }
 
-    const size_t total_bytes = m_num_records * kSparseRecBytes;
-    std::vector<char> buffer(total_bytes);
-
-    uint64_t bytes_read = m_bfile.read(buffer.data(), total_bytes);
-    if (bytes_read != total_bytes) {
-        if (m_bfile.error())
-            TGLError<GenomeTrackSparse>("Failed to read sparse track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
-        TGLError<GenomeTrackSparse>("Truncated sparse track file %s: expected %zu bytes of data, but only read %llu bytes",
-                                    m_bfile.file_name().c_str(), total_bytes, (unsigned long long)bytes_read);
-    }
-
-    const char *ptr = buffer.data();
+    // Read records directly into target arrays, one at a time, avoiding bulk buffer allocation
+    char rec[kSparseRecBytes];
     for (int64_t i = 0; i < m_num_records; ++i) {
-        GInterval &interval = m_intervals[i];
+        uint64_t bytes_read = m_bfile.read(rec, kSparseRecBytes);
+        if (bytes_read != kSparseRecBytes) {
+            if (m_bfile.error())
+                TGLError<GenomeTrackSparse>("Failed to read sparse track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
+            TGLError<GenomeTrackSparse>("Truncated sparse track file %s at record %lld",
+                                        m_bfile.file_name().c_str(), (long long)i);
+        }
 
-        memcpy(&interval.start, ptr, sizeof(int64_t));
-        ptr += sizeof(int64_t);
-        memcpy(&interval.end, ptr, sizeof(int64_t));
-        ptr += sizeof(int64_t);
-        memcpy(&m_vals[i], ptr, sizeof(float));
-        ptr += sizeof(float);
+        GInterval &interval = m_intervals[i];
+        memcpy(&interval.start, rec, sizeof(int64_t));
+        memcpy(&interval.end, rec + sizeof(int64_t), sizeof(int64_t));
+        memcpy(&m_vals[i], rec + 2 * sizeof(int64_t), sizeof(float));
 
         if (isinf(m_vals[i]))
             m_vals[i] = std::numeric_limits<float>::quiet_NaN();
