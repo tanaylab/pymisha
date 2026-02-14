@@ -5,6 +5,8 @@ repo_name: tanaylab/pymisha
 
 theme:
   name: material
+  logo: assets/logo.png
+  favicon: assets/logo.png
   palette:
     - scheme: default
       primary: indigo

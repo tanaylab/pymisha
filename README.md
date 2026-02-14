@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="PyMisha" width="200">
+</p>
+
 # PyMisha
 
 [![PyPI](https://img.shields.io/pypi/v/pymisha.svg)](https://pypi.org/project/pymisha/)
