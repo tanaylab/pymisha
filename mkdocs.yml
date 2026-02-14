@@ -1,0 +1,75 @@
+site_name: PyMisha
+site_url: https://tanaylab.github.io/pymisha/
+repo_url: https://github.com/tanaylab/pymisha
+repo_name: tanaylab/pymisha
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+hooks:
+  - hooks/autorefs_filter.py
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: guides/quickstart.md
+  - Tutorials:
+      - User Manual: tutorials/manual.md
+      - Database Formats: tutorials/database-formats.md
+      - Creating Genome Databases: tutorials/genomes.md
+  - Reference:
+      - R Parity: guides/parity.md
+      - Roadmap: roadmap.md
+  - API Reference: api/pymisha.md

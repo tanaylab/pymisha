@@ -29,6 +29,7 @@ env/
 test.ipynb
 .ipynb_checkpoints/
 docs/_build/
+site/
 .nfs*
 
 .a5c/
