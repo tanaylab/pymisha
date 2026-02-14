@@ -1,9 +1,18 @@
-<h1><img src="docs/assets/logo.png" alt="" width="60" style="vertical-align: middle;"> PyMisha</h1>
+<table><tr>
+<td>
+
+# PyMisha
 
 [![PyPI](https://img.shields.io/pypi/v/pymisha.svg)](https://pypi.org/project/pymisha/)
 [![CI](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml/badge.svg)](https://github.com/tanaylab/pymisha/actions/workflows/ci.yml)
 
 Python interface for [misha](https://github.com/tanaylab/misha) genomic databases. PyMisha provides full read/write access to misha track databases with C++ streaming backends for genome-scale operations.
+
+</td>
+<td>
+<img src="docs/assets/logo.png" alt="PyMisha" width="300">
+</td>
+</tr></table>
 
 ## Features
 
