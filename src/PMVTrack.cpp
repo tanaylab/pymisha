@@ -964,6 +964,11 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         if (func == "max.pos.abs" || func == "max.pos.relative") track1d->register_function(GenomeTrack1D::MAX_POS);
         if (func == "min.pos.abs" || func == "min.pos.relative") track1d->register_function(GenomeTrack1D::MIN_POS);
 
+        const bool sparse_fast_reduce =
+            sparse &&
+            (func == "avg" || func == "mean" || func == "sum" ||
+             func == "min" || func == "max" || func == "size" || func == "exists");
+
         // LSE (log-sum-exp) for physical tracks: read raw values and compute directly
         if (func == "lse") {
             int cur_chromid = -1;
@@ -1040,6 +1045,11 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
         int cur_chromid = -1;
         bool cur_chromid_valid = false;
+        const std::vector<GInterval> *sp_intervals_ptr = nullptr;
+        const std::vector<float> *sp_vals_ptr = nullptr;
+        size_t sp_scan_idx = 0;
+        int64_t sp_last_start = std::numeric_limits<int64_t>::min();
+        bool sp_scan_ready = false;
 
         for (size_t i = 0; i < intervals.size(); ++i) {
             GInterval eval;
@@ -1059,6 +1069,13 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                         fixed_bin->init_read(full_path.c_str(), eval.chromid);
                     } else if (sparse) {
                         sparse->init_read(full_path.c_str(), eval.chromid);
+                        if (sparse_fast_reduce) {
+                            sp_intervals_ptr = &sparse->get_intervals();
+                            sp_vals_ptr = &sparse->get_vals();
+                            sp_scan_idx = 0;
+                            sp_last_start = std::numeric_limits<int64_t>::min();
+                            sp_scan_ready = false;
+                        }
                     }
                     cur_chromid = eval.chromid;
                     cur_chromid_valid = true;
@@ -1067,6 +1084,78 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
             if (!cur_chromid_valid) {
                 set_nan(i);
+                continue;
+            }
+
+            if (sparse_fast_reduce) {
+                const auto &sp_intervals = *sp_intervals_ptr;
+                const auto &sp_vals = *sp_vals_ptr;
+                if (sp_intervals.empty()) {
+                    if (func == "size" || func == "exists")
+                        out[i] = 0.0;
+                    else
+                        set_nan(i);
+                    continue;
+                }
+
+                if (!sp_scan_ready || eval.start < sp_last_start) {
+                    size_t lo = 0;
+                    size_t hi = sp_intervals.size();
+                    while (lo < hi) {
+                        size_t mid = lo + (hi - lo) / 2;
+                        if (sp_intervals[mid].end <= eval.start)
+                            lo = mid + 1;
+                        else
+                            hi = mid;
+                    }
+                    sp_scan_idx = lo;
+                    sp_scan_ready = true;
+                } else {
+                    while (sp_scan_idx < sp_intervals.size() &&
+                           sp_intervals[sp_scan_idx].end <= eval.start) {
+                        ++sp_scan_idx;
+                    }
+                }
+                sp_last_start = eval.start;
+
+                double sum = 0.0;
+                double mn = std::numeric_limits<double>::infinity();
+                double mx = -std::numeric_limits<double>::infinity();
+                size_t n_valid = 0;
+
+                for (size_t j = sp_scan_idx; j < sp_intervals.size(); ++j) {
+                    const GInterval &cur = sp_intervals[j];
+                    if (cur.start >= eval.end)
+                        break;
+                    if (cur.end <= eval.start)
+                        continue;
+                    float v = sp_vals[j];
+                    if (std::isnan(v))
+                        continue;
+                    const double dv = static_cast<double>(v);
+                    sum += dv;
+                    if (dv < mn) mn = dv;
+                    if (dv > mx) mx = dv;
+                    ++n_valid;
+                }
+
+                if (func == "exists") {
+                    out[i] = n_valid > 0 ? 1.0 : 0.0;
+                } else if (func == "size") {
+                    out[i] = static_cast<double>(n_valid);
+                } else if (n_valid == 0) {
+                    set_nan(i);
+                } else if (func == "avg" || func == "mean") {
+                    out[i] = sum / static_cast<double>(n_valid);
+                } else if (func == "sum") {
+                    out[i] = sum;
+                } else if (func == "min") {
+                    out[i] = mn;
+                } else if (func == "max") {
+                    out[i] = mx;
+                } else {
+                    set_nan(i);
+                }
                 continue;
             }
 

@@ -1664,14 +1664,17 @@ class TestCoreVtracks:
         assert "v_q5" in res.columns
         assert "v_q9" in res.columns
 
-    @pytest.mark.skip(reason="global.percentile not yet supported in pymisha C++ backend")
     def test_vtrack_global_percentile(self):
         """global.percentile function (R line 348-354)."""
         pm.gvtrack_create("v_gp", "dense_track", func="global.percentile")
-        res = pm.gextract("v_gp", pm.gintervals(["1", "2"]), iterator=233)
+        pm.gvtrack_create("v_gp_min", "dense_track", func="global.percentile.min")
+        pm.gvtrack_create("v_gp_max", "dense_track", func="global.percentile.max")
+
+        res = pm.gextract(["v_gp", "v_gp_min", "v_gp_max"], pm.gintervals(["1", "2"]), iterator=233)
         assert len(res) > 0
-        vals = res["v_gp"].dropna()
-        assert (vals >= 0).all() and (vals <= 1).all()
+        for col in ["v_gp", "v_gp_min", "v_gp_max"]:
+            vals = res[col].dropna()
+            assert (vals >= 0).all() and (vals <= 1).all()
 
     def test_vtrack_nearest(self):
         """nearest function (R line 182-188)."""
