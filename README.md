@@ -90,6 +90,29 @@ print(pm.gtrack_ls())
 print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
 ```
 
+## Creating a genome database
+
+PyMisha ships prebuilt genome databases for common assemblies. Download and set up with a single call:
+
+```python
+import pymisha as pm
+
+# Download a prebuilt genome (mm9, mm10, mm39, hg19, hg38)
+pm.gdb_create_genome("hg38", path="/data/genomes")   # creates /data/genomes/hg38/
+pm.gsetroot("/data/genomes/hg38")
+
+pm.gchrom_sizes()  # verify it worked
+```
+
+To build a database from your own FASTA files (e.g. a custom assembly):
+
+```python
+pm.gdb_create("/data/my_genome", "genome.fa.gz", verbose=True)
+pm.gsetroot("/data/my_genome")
+```
+
+See the [Creating Genome Databases](https://tanaylab.github.io/pymisha/tutorials/genomes/) tutorial for UCSC download workflows and advanced options.
+
 ## Optional dependencies
 
 - `pyBigWig`: For BigWig import in `gtrack_import`.
