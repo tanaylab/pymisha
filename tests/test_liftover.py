@@ -1422,10 +1422,8 @@ class TestLiftoverMappingParity:
 # During loading these policies behave like "keep" -- all chains are retained.
 # The cluster resolution must be applied on the liftover result.
 #
-# NOTE: As of this writing, cluster resolution is accepted by
-# gintervals_load_chain / gintervals_liftover but not yet applied
-# after liftover.  Tests that depend on cluster resolution are marked
-# xfail so they serve as a specification for when the feature lands.
+# Cluster resolution is applied after liftover mapping. These tests verify
+# the behavior for the alias and variant policies.
 
 
 class TestBestSourceCluster:
@@ -1485,7 +1483,6 @@ class TestBestSourceCluster:
         assert 0 in result["start"].values
         assert 200 in result["start"].values
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_disjoint_selects_larger_mass(self, tmp_path):
         """Disjoint source chains select cluster with largest target mass.
 
@@ -1519,7 +1516,6 @@ class TestBestSourceCluster:
         assert result.iloc[0]["start"] == 200
         assert result.iloc[0]["end"] == 300
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_overlapping_cluster_beats_disjoint(self, tmp_path):
         """Cluster with overlapping sources (mass 200) beats single disjoint chain (mass 50).
 
@@ -1582,7 +1578,6 @@ class TestBestSourceCluster:
         assert result.iloc[0]["start"] == 0
         assert result.iloc[0]["end"] == 100
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_adjacent_non_overlapping_separate_clusters(self, tmp_path):
         """Adjacent (touching) source chains are separate clusters, not merged.
 
@@ -1614,7 +1609,6 @@ class TestBestSourceCluster:
         result = pm.gintervals_liftover(intervals, chain)
         assert len(result) == 1
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_mass_tiebreaker_first_wins(self, tmp_path):
         """Equal mass: first cluster by source position wins.
 
@@ -1647,7 +1641,6 @@ class TestBestSourceCluster:
         assert len(result) == 1
         assert result.iloc[0]["start"] == 0
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_partial_overlap_larger_mass_wins(self, tmp_path):
         """Partially overlapping intervals: cluster with larger mapped mass wins.
 
@@ -1715,7 +1708,6 @@ class TestBestSourceCluster:
         assert "1" in chroms
         assert "X" in chroms
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_adjacent_disjoint_higher_mass_wins(self, tmp_path):
         """Adjacent disjoint chains: higher mass cluster wins.
 
@@ -1783,7 +1775,6 @@ class TestBestSourceCluster:
         assert any(result["chrom"] == "1")
         assert any(result["chrom"] == "X")
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_transitive_overlap_bridge(self, tmp_path):
         """Transitive overlap: A-B-C (bridge) outweighs disjoint D.
 
@@ -1832,7 +1823,6 @@ class TestBestSourceCluster:
         assert result_ids == [1, 2, 3]
         assert 4 not in result["chain_id"].values
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_tie_first_source_position_wins(self, tmp_path):
         """Tie-breaking: first source position wins.
 
@@ -1865,7 +1855,6 @@ class TestBestSourceCluster:
         assert len(result) == 1
         assert result.iloc[0]["chain_id"] == 1
 
-    @pytest.mark.xfail(reason="best_source_cluster resolution not yet applied after liftover")
     def test_disjoint_cluster_outweighs_overlapping_pair(self, tmp_path):
         """Larger disjoint cluster beats smaller overlapping pair.
 
@@ -1965,7 +1954,6 @@ class TestBestClusterVariants:
         )
         assert chain.attrs.get("tgt_overlap_policy") == "best_cluster_max"
 
-    @pytest.mark.xfail(reason="best_cluster_sum resolution not yet applied after liftover")
     def test_sum_rewards_duplications(self, tmp_path):
         """SUM strategy: sum of member lengths rewards duplications.
 
@@ -2005,7 +1993,6 @@ class TestBestClusterVariants:
         assert len(result) == 2
         assert set(result["chain_id"].tolist()) == {1, 2}
 
-    @pytest.mark.xfail(reason="best_cluster_union resolution not yet applied after liftover")
     def test_union_vs_sum_different_winners(self, tmp_path):
         """UNION and SUM strategies produce different winners.
 
@@ -2042,7 +2029,6 @@ class TestBestClusterVariants:
         assert len(result_union) == 1
         assert result_union.iloc[0]["chain_id"] == 3
 
-    @pytest.mark.xfail(reason="best_cluster_max resolution not yet applied after liftover")
     def test_max_single_large_beats_overlapping_cluster(self, tmp_path):
         """MAX strategy: single large chain beats overlapping cluster.
 
