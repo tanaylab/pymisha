@@ -151,7 +151,6 @@ class TestGtrackLiftover:
         finally:
             pm.gdb_init(str(TEST_DB))
 
-    @pytest.mark.xfail(reason="indexed-only liftover source not yet supported")
     def test_liftover_indexed_only_source_track(self, tmp_path):
         """Indexed-only source track (track.idx/track.dat) must be read correctly."""
         root = _copy_db(tmp_path)
@@ -962,7 +961,6 @@ class TestGtrackLiftoverSparseOverlapMerge:
     where different source intervals map to overlapping target regions.
     """
 
-    @pytest.mark.xfail(reason="gtrack_liftover does not yet merge overlapping lifted intervals before track creation")
     def test_overlapping_target_intervals_merged(self, tmp_path):
         """Overlapping target intervals from multiple chains are merged.
 
@@ -1176,7 +1174,6 @@ class TestGtrackLiftoverSparseOverlapMerge:
         finally:
             pm.gdb_init(str(TEST_DB))
 
-    @pytest.mark.xfail(reason="gtrack_liftover does not yet merge overlapping lifted intervals before track creation")
     def test_output_track_format_valid(self, tmp_path):
         """Lifted sparse track has valid format (can be read by gextract/gsummary).
 
@@ -1262,7 +1259,6 @@ class TestGtrackLiftoverSparseOverlapMerge:
         finally:
             pm.gdb_init(str(TEST_DB))
 
-    @pytest.mark.xfail(reason="gtrack_liftover does not yet merge overlapping lifted intervals before track creation")
     def test_sum_aggregation_overlapping(self, tmp_path):
         """Sum aggregation correctly sums overlapping values.
 

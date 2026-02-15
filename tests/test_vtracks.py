@@ -1234,7 +1234,6 @@ class TestValueBasedVtracks:
         res = pm.gextract("vb_q", q, iterator=-1)
         np.testing.assert_allclose(res["vb_q"].values, [20.0])
 
-    @pytest.mark.skip(reason="pymisha does not raise on overlapping value-based intervals (R does)")
     def test_value_based_overlapping_intervals_error(self):
         """Overlapping intervals should raise error (R line 144-158)."""
         src = pd.DataFrame({
@@ -1344,7 +1343,6 @@ class TestValueBasedVtracks:
         np.testing.assert_allclose(res_first["vb_first"].values, [10.0])
         np.testing.assert_allclose(res_last["vb_last"].values, [30.0])
 
-    @pytest.mark.skip(reason="Position functions not supported for value-based vtracks in C++ backend")
     def test_value_based_position_functions(self):
         """Value-based vtrack position functions (R line 336-381)."""
         src = pd.DataFrame({
@@ -1372,7 +1370,6 @@ class TestValueBasedVtracks:
             pm.gextract("vb_lpa", q, iterator=-1)["vb_lpa"].values, [500.0]
         )
 
-    @pytest.mark.skip(reason="Position functions not supported for value-based vtracks in C++ backend")
     def test_value_based_relative_position_functions(self):
         """Value-based vtrack relative position functions (R line 363-371)."""
         src = pd.DataFrame({
@@ -1802,10 +1799,6 @@ class TestValueBasedVtracksPartialGaps:
         expected_avg = (2.0 * 50 + 8.0 * 200) / (50 + 200)
         np.testing.assert_allclose(avg_res["vb_favg"].values, [expected_avg], rtol=1e-6)
 
-    @pytest.mark.skip(
-        reason="Filtered stddev for value-based vtracks not yet supported "
-               "(DataFrame source in _extract_raw_unmasked_values)"
-    )
     def test_value_based_filter_preserves_count_based_stddev(self):
         """Filter preserves count-based stddev for value-based vtrack (R line 98-123).
 
@@ -1852,9 +1845,6 @@ class TestValueBasedVtracksPartialGaps:
         # Second window [100,200): covers [100,150] with val=2 -> avg = 2
         np.testing.assert_allclose(vals[1], 2.0)
 
-    @pytest.mark.skip(
-        reason="'nearest' not supported for value-based vtracks in C++ backend"
-    )
     def test_value_based_nearest(self):
         """Value-based vtrack nearest function (R line 318-334).
 
@@ -1874,7 +1864,6 @@ class TestValueBasedVtracksPartialGaps:
         # Average of 10 and 20 = 15
         np.testing.assert_allclose(result["vb_near"].values, [15.0])
 
-    @pytest.mark.skip(reason="Position functions not supported for value-based vtracks in C++ backend")
     def test_value_based_relative_pos_under_filter(self):
         """Relative positions stay iterator-relative under filters (R line 383-403).
 
@@ -1917,10 +1906,6 @@ class TestValueBasedVtracksPartialGaps:
         # [100-200] and [150-250] unified to [100-250] = 150/150 = 1.0
         np.testing.assert_allclose(result["vb_covign"].values, [1.0], atol=1e-6)
 
-    @pytest.mark.skip(
-        reason="pymisha does not reject overlapping intervals for distance.center "
-               "at creation time (R does)"
-    )
     def test_value_based_distance_center_rejects_overlapping(self):
         """distance.center rejects overlapping intervals (R line 441-449)."""
         src = pd.DataFrame({
@@ -2146,10 +2131,6 @@ class TestValueBasedEquivalencePartialGaps:
                 track_screen["end"].values, vtrack_screen["end"].values
             )
 
-    @pytest.mark.skip(
-        reason="nearest, min/max.pos.abs, first/last.pos.abs not supported "
-               "for value-based vtracks in C++ backend"
-    )
     def test_equivalence_position_functions_extended(self):
         """Position functions: nearest, pos.abs match between track/value (R line 133-175).
 
@@ -2178,10 +2159,6 @@ class TestValueBasedEquivalencePartialGaps:
                 err_msg=f"Function {func} mismatch",
             )
 
-    @pytest.mark.skip(
-        reason="Value-based vtracks with multi-chrom DataFrame source only "
-               "match data on the first chromosome (C++ backend bug)"
-    )
     def test_equivalence_multi_chrom(self):
         """Multi-chrom equivalence between track-based and value-based (R line 212-249).
 

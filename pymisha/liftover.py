@@ -595,6 +595,114 @@ def _handle_tgt_overlaps_agg(df):
     return pd.DataFrame(result_rows)[_EMPTY_CHAIN_COLS].reset_index(drop=True)
 
 
+def _interval_union_length(starts, ends):
+    """Return total union length of half-open intervals."""
+    if len(starts) == 0:
+        return 0.0
+
+    starts = np.asarray(starts, dtype=np.int64)
+    ends = np.asarray(ends, dtype=np.int64)
+    order = np.argsort(starts, kind="mergesort")
+    starts = starts[order]
+    ends = ends[order]
+
+    cur_start = int(starts[0])
+    cur_end = int(ends[0])
+    total = 0
+
+    for i in range(1, len(starts)):
+        s = int(starts[i])
+        e = int(ends[i])
+        if s < cur_end:
+            cur_end = max(cur_end, e)
+        else:
+            total += cur_end - cur_start
+            cur_start = s
+            cur_end = e
+
+    total += cur_end - cur_start
+    return float(total)
+
+
+def _resolve_cluster_policy(df, policy):
+    """Apply best_cluster_* policy on mapped rows per intervalID."""
+    if df.empty:
+        return df
+
+    if "__src_start" not in df.columns or "__src_end" not in df.columns:
+        return df
+
+    if policy == "best_source_cluster":
+        policy = "best_cluster_union"
+
+    if policy not in ("best_cluster_union", "best_cluster_sum", "best_cluster_max"):
+        return df
+
+    kept = []
+    for _interval_id, group in df.groupby("intervalID", sort=False):
+        if len(group) <= 1:
+            kept.append(group)
+            continue
+
+        ordered = group.sort_values(
+            ["__src_start", "__src_end", "chain_id", "start", "end"],
+            kind="mergesort",
+        ).reset_index()
+
+        starts = ordered["__src_start"].to_numpy(dtype=np.int64, copy=False)
+        ends = ordered["__src_end"].to_numpy(dtype=np.int64, copy=False)
+
+        # Connected components in 1D interval graphs can be found by scanline.
+        # Touching intervals (start == previous_end) are separate clusters.
+        cluster_ids = np.zeros(len(ordered), dtype=np.int64)
+        cluster_id = 0
+        max_end = int(ends[0])
+        for i in range(1, len(ordered)):
+            s = int(starts[i])
+            e = int(ends[i])
+            if s < max_end:
+                max_end = max(max_end, e)
+            else:
+                cluster_id += 1
+                max_end = e
+            cluster_ids[i] = cluster_id
+        ordered["__cluster_id"] = cluster_ids
+
+        best_cluster = None
+        best_score = None
+        best_min_start = None
+
+        for cid, cgrp in ordered.groupby("__cluster_id", sort=False):
+            cstarts = cgrp["__src_start"].to_numpy(dtype=np.int64, copy=False)
+            cends = cgrp["__src_end"].to_numpy(dtype=np.int64, copy=False)
+            lens = cends - cstarts
+
+            if policy == "best_cluster_union":
+                score = _interval_union_length(cstarts, cends)
+            elif policy == "best_cluster_sum":
+                score = float(np.sum(lens))
+            else:  # best_cluster_max
+                score = float(np.max(lens))
+
+            min_start = int(np.min(cstarts))
+            if (
+                best_score is None
+                or score > best_score
+                or (score == best_score and min_start < best_min_start)
+            ):
+                best_score = score
+                best_min_start = min_start
+                best_cluster = cid
+
+        chosen_idx = ordered.loc[ordered["__cluster_id"] == best_cluster, "index"].to_numpy()
+        kept.append(group.loc[chosen_idx])
+
+    if not kept:
+        return df.iloc[0:0].copy()
+
+    return pd.concat(kept, axis=0).sort_index().reset_index(drop=True)
+
+
 # ===================================================================
 # Public API: gintervals_load_chain
 # ===================================================================
@@ -1022,6 +1130,10 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
         for chrom, rows in chain_by_src_chrom.items()
     }
 
+    effective_tgt_policy = chain_df.attrs.get("tgt_overlap_policy", tgt_overlap_policy)
+    if effective_tgt_policy == "auto":
+        effective_tgt_policy = "auto_score"
+
     # Map each source interval
     result_rows = []
     for interval_id, (_, src_row) in enumerate(intervals.iterrows()):
@@ -1065,6 +1177,8 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
                 "end": int(tgt_end),
                 "intervalID": interval_id,
                 "chain_id": int(cb["chain_id"]),
+                "__src_start": int(common_start),
+                "__src_end": int(common_end),
             }
 
             if include_metadata:
@@ -1091,9 +1205,19 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
 
     result = pd.DataFrame(result_rows)
 
+    if effective_tgt_policy in (
+        "best_source_cluster", "best_cluster_union",
+        "best_cluster_sum", "best_cluster_max",
+    ):
+        result = _resolve_cluster_policy(result, effective_tgt_policy)
+
     # Canonic merging: merge adjacent target blocks from same intervalID + chain_id
     if canonic:
         result = _canonic_merge(result, include_metadata, value_col)
+
+    helper_cols = [c for c in ("__src_start", "__src_end") if c in result.columns]
+    if helper_cols:
+        result = result.drop(columns=helper_cols)
 
     # Sort by target coordinates
     return result.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
@@ -1424,15 +1548,15 @@ def _read_source_track(src_track_dir):
 def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
     """Aggregate values for overlapping target intervals.
 
-    Groups intervals by (chrom, start, end) and applies the aggregation
-    function to the values in each group. Returns a DataFrame with unique
-    (chrom, start, end, value) rows sorted by coordinates.
+    Segments each chromosome into disjoint regions using interval breakpoints,
+    applies the aggregation function to values covering each segment, and
+    merges adjacent segments with identical aggregated values.
     """
     if len(intervals_df) == 0:
         return intervals_df
 
-    def _agg(group):
-        vals = group["value"].to_numpy()
+    def _agg_vals(vals):
+        vals = np.asarray(vals, dtype=np.float64)
         if not na_rm and np.any(np.isnan(vals)):
             return np.nan
         vals_clean = vals[~np.isnan(vals)]
@@ -1442,11 +1566,66 @@ def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
             return np.nan
         return agg_func(vals_clean if na_rm else vals)
 
-    grouped = intervals_df.groupby(["chrom", "start", "end"], sort=False)
-    result = grouped.apply(_agg, include_groups=False).reset_index()
-    result.columns = ["chrom", "start", "end", "value"]
-    result = result.dropna(subset=["value"])
-    return result.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    out_rows = []
+    data = intervals_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
+
+    for chrom, group in data.groupby("chrom", sort=False):
+        starts = group["start"].to_numpy(dtype=np.int64, copy=False)
+        ends = group["end"].to_numpy(dtype=np.int64, copy=False)
+        vals = group["value"].to_numpy(dtype=np.float64, copy=False)
+
+        if len(group) == 0:
+            continue
+
+        points = np.unique(np.concatenate((starts, ends)))
+        if points.size < 2:
+            continue
+
+        starts_at = defaultdict(list)
+        ends_at = defaultdict(list)
+        for i in range(len(group)):
+            starts_at[int(starts[i])].append(i)
+            ends_at[int(ends[i])].append(i)
+
+        active = set()
+        merged = []
+
+        for i in range(len(points) - 1):
+            coord = int(points[i])
+            next_coord = int(points[i + 1])
+
+            for idx in ends_at.get(coord, ()):
+                active.discard(idx)
+            for idx in starts_at.get(coord, ()):
+                active.add(idx)
+
+            if next_coord <= coord or not active:
+                continue
+
+            seg_val = _agg_vals(vals[list(active)])
+            if np.isnan(seg_val):
+                continue
+
+            if (
+                merged
+                and merged[-1]["end"] == coord
+                and np.isclose(merged[-1]["value"], seg_val, rtol=1e-12, atol=0.0)
+            ):
+                merged[-1]["end"] = next_coord
+            else:
+                merged.append({
+                    "chrom": chrom,
+                    "start": coord,
+                    "end": next_coord,
+                    "value": float(seg_val),
+                })
+
+        out_rows.extend(merged)
+
+    if not out_rows:
+        return intervals_df.iloc[0:0][["chrom", "start", "end", "value"]].copy()
+
+    return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"]).reset_index(drop=True)
 
 
 def gtrack_liftover(track, description, src_track_dir, chain,
