@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.2 (2026-02-15)
+
+### Features
+
+- **global.percentile vtracks:** Python-side support for `global.percentile`, `global.percentile.min`, and `global.percentile.max` virtual track functions.
+- **Sparse vtrack C++ fast path:** Forward-scan cursor for `avg`/`sum`/`min`/`max`/`size`/`exists` reducers on sparse tracks, replacing per-interval generic reducer flow.
+
+### Infrastructure
+
+- **Conda packaging:** Automated conda package builds on release (Python 3.10–3.12 × NumPy 1.26/2.0/2.1 × Linux/macOS). Install via `conda install -c aviezerl pymisha`.
+
+### Bug fixes
+
+- Fix vtrack cache key to include DB root, avoiding cross-DB cache collisions.
+
 ## v0.1.1 (2026-02-14)
 
 ### Performance

@@ -597,7 +597,7 @@ def _compute_filtered_pwm_max_pos(intervals, payload_eval, filter_df):
 
 
 def _global_percentile_reference_values(src, bin_size):
-    key = (str(src), int(bin_size))
+    key = (str(_shared._GROOT), str(src), int(bin_size))
     cached = _GLOBAL_PERCENTILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -663,6 +663,41 @@ def _compute_filtered_global_percentile(intervals, payload_eval, filter_df, func
     return _percentile_from_reference(stats, ref)
 
 
+def _compute_global_percentile_unfiltered(intervals, payload_eval, func):
+    """global.percentile* without filter using C++ per-interval stats + Python reference CDF."""
+    from .tracks import gtrack_info
+
+    src = payload_eval.get("src")
+    if not isinstance(src, str):
+        raise NotImplementedError("global.percentile* requires a dense track source")
+
+    info = gtrack_info(src)
+    track_type = str(info.get("type", "")).lower()
+    bin_size = info.get("bin_size") or info.get("bin.size")
+    if track_type != "dense" or bin_size is None:
+        raise NotImplementedError("global.percentile* requires a dense track source")
+
+    stat_payload = dict(payload_eval)
+    if func == "global.percentile":
+        stat_payload["func"] = "avg"
+    elif func == "global.percentile.min":
+        stat_payload["func"] = "min"
+    else:
+        stat_payload["func"] = "max"
+
+    stats = _numpy.asarray(
+        _pymisha.pm_vtrack_compute(
+            stat_payload,
+            _df2pymisha(intervals),
+            CONFIG,
+        ),
+        dtype=float,
+    )
+
+    ref = _global_percentile_reference_values(src, int(bin_size))
+    return _percentile_from_reference(stats, ref)
+
+
 def _compute_vtrack_values(vtrack_name, intervals):
     """
     Compute values for a virtual track.
@@ -688,15 +723,23 @@ def _compute_vtrack_values(vtrack_name, intervals):
     if 'pssm' in payload and isinstance(payload['pssm'], _pandas.DataFrame):
         payload['pssm'] = payload['pssm'].to_numpy(dtype=float, copy=True)
 
+    func = str(payload.get("func", "avg")).lower()
+
     filter_df = payload.get("filter")
     if filter_df is None or (isinstance(filter_df, _pandas.DataFrame) and len(filter_df) == 0):
+        # C++ backend does not support global.percentile* yet.
+        if func in _FILTER_GLOBAL_PERCENTILE_FUNCS:
+            payload_eval = dict(payload)
+            payload_eval.pop("filter", None)
+            payload_eval.pop("filter_key", None)
+            payload_eval.pop("filter_stats", None)
+            return _compute_global_percentile_unfiltered(intervals, payload_eval, func)
         return _pymisha.pm_vtrack_compute(
             payload,
             _df2pymisha(intervals),
             CONFIG
         )
 
-    func = str(payload.get("func", "avg")).lower()
     payload_eval = dict(payload)
     payload_eval.pop("filter", None)
     payload_eval.pop("filter_key", None)
