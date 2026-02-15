@@ -1,0 +1,51 @@
+{% set name = "pymisha" %}
+{% set version = environ.get("PACKAGE_VERSION", "0.1.1") %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  sha256: SET_ON_RELEASE
+
+build:
+  number: 0
+  skip: true  # [win]
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  build:
+    - {{ compiler("cxx") }}
+  host:
+    - python
+    - pip
+    - setuptools >=45
+    - wheel
+    - numpy
+  run:
+    - python
+    - {{ pin_compatible("numpy") }}
+    - pandas >=1.3
+
+test:
+  imports:
+    - pymisha
+    - _pymisha
+
+about:
+  home: https://github.com/tanaylab/pymisha
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Python interface for misha genomic databases with C++ streaming backends
+  description: |
+    PyMisha provides a Python interface for working with misha genomic
+    track databases. It includes high-performance C++ streaming backends
+    for extraction, iteration, and summarization of genomic interval data.
+  dev_url: https://github.com/tanaylab/pymisha
+  doc_url: https://tanaylab.github.io/pymisha/
+
+extra:
+  recipe-maintainers:
+    - aviezerl
