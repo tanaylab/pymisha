@@ -1,18 +1,11 @@
 # Changelog
 
-## v0.1.3 (2026-02-15)
+## v0.1.3 (2026-02-16)
 
-### Features
+### Documentation
 
-- **2D extraction parity:** Added 2D support for arithmetic expressions, virtual-track expressions, named 2D interval-set scopes in extraction/screening, and 2D iterator intervals from track-name iterators.
-- **Intervals utilities:** Added `gintervals_is_bigset` API and exported it from the public package namespace.
-
-### Bug fixes
-
-- **Value-based virtual tracks:** Fixed DataFrame-source handling for interval-only functions, multi-chrom behavior, overlap validation by function class, and Python fallback parity for `nearest` and position reducers.
-- **Filtered value semantics:** Fixed filtered value-based `avg` to use overlap-length weighting and aligned empty-bin behavior for reductions.
-- **PWM spatial validation:** Enforced positive finite `spat_factor` and positive integer `spat_bin` at vtrack creation.
-- **2D range clipping:** Added 2D support in `gintervals_force_range`.
+- Add a concise "Misha Basics (Short Guide)" tutorial focused on core concepts: tracks, intervals, iterator policies, virtual tracks (including `sshift`/`eshift`), and PWM basics with examples from the bundled example DB.
+- Add the new basics tutorial to MkDocs navigation under Tutorials.
 
 ## v0.1.2 (2026-02-15)
 
