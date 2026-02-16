@@ -68,6 +68,7 @@ nav:
   - Home: index.md
   - Getting Started: guides/quickstart.md
   - Tutorials:
+      - Misha Basics (Short Guide): tutorials/misha-basics.md
       - User Manual: tutorials/manual.md
       - Database Formats: tutorials/database-formats.md
       - Creating Genome Databases: tutorials/genomes.md

@@ -121,71 +121,6 @@ def _gextract_2d_single(track, col_name, intervals, band):
     ).reset_index(drop=True)
 
 
-def _resolve_2d_vtrack_source(vtrack_name):
-    """Resolve a 2D-capable virtual track to its backing 2D physical track."""
-    from .tracks import gtrack_info
-
-    cfg = _shared._VTRACKS.get(vtrack_name)
-    if cfg is None:
-        raise ValueError(f"Unknown virtual track '{vtrack_name}'")
-
-    src = cfg.get("src")
-    if not isinstance(src, str):
-        raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' requires a physical 2D track source"
-        )
-
-    info = gtrack_info(src)
-    if int(info.get("dimensions", 1) or 1) != 2:
-        raise ValueError(
-            f"Virtual track '{vtrack_name}' does not reference a 2D track source"
-        )
-
-    func = str(cfg.get("func", "avg")).lower()
-    params = cfg.get("params")
-    if func not in {"avg", "mean"} or params is not None:
-        raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' supports only direct aliases"
-        )
-    if int(cfg.get("sshift", 0) or 0) != 0 or int(cfg.get("eshift", 0) or 0) != 0:
-        raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' does not support iterator shifts"
-        )
-    if cfg.get("filter") is not None:
-        raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' does not support filters"
-        )
-
-    return src
-
-
-def _maybe_load_2d_intervals_set(intervals, exprs, iterator, band):
-    """Load named interval sets only when we likely need a 2D scope."""
-    if not isinstance(intervals, str):
-        return intervals
-
-    should_try = band is not None
-    if not should_try and isinstance(iterator, str):
-        from .tracks import gtrack_exists, gtrack_info
-
-        if gtrack_exists(iterator):
-            info = gtrack_info(iterator)
-            should_try = int(info.get("dimensions", 1) or 1) == 2
-
-    if not should_try:
-        return intervals
-
-    from .intervals import gintervals_load
-
-    try:
-        loaded = gintervals_load(intervals)
-    except Exception:
-        return intervals
-    if _is_2d_intervals(loaded):
-        return loaded
-    return intervals
-
-
 def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
     """
     Extract values from 2D tracks for 2D intervals.
@@ -204,124 +139,67 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
     from .tracks import gtrack_info
 
     band = _validate_band(band)
-    track_names = set(_pymisha.pm_track_names())
-    vtrack_names = set(_shared._VTRACKS.keys())
 
-    parsed = []
-    used_tracks = set()
-    used_vtracks = set()
+    # Validate: 2D extraction only supports simple track names
+    track_names_set = set(_pymisha.pm_track_names())
     for e in exprs:
-        new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(
-            e, track_names, vtrack_names
-        )
-        parsed.append((e, new_expr, expr_tracks, expr_vtracks))
-        used_tracks.update(expr_tracks)
-        used_vtracks.update(expr_vtracks)
-
-    if not used_tracks and not used_vtracks:
-        if len(exprs) == 1:
+        if e not in track_names_set:
             raise ValueError(
-                "Cannot implicitly determine iterator policy:\n"
-                f"track expression \"{exprs[0]}\" does not contain any tracks."
+                f"2D extraction only supports simple track names, "
+                f"not expressions: '{e}'"
             )
-        raise ValueError(
-            "Cannot implicitly determine iterator policy: "
-            "track expressions do not contain any tracks."
-        )
-
-    for tname in used_tracks:
-        info = gtrack_info(tname)
-        if int(info.get("dimensions", 1) or 1) != 2:
+        info = gtrack_info(e)
+        if info.get("dimensions") != 2:
             raise ValueError(
-                f"Track '{tname}' is not a 2D track (type: {info.get('type')})"
+                f"Track '{e}' is not a 2D track (type: {info.get('type')})"
             )
 
-    vtrack_to_track = {}
-    for vt_name in used_vtracks:
-        vtrack_to_track[vt_name] = _resolve_2d_vtrack_source(vt_name)
+    col_names = colnames if colnames is not None else exprs
 
-    required_tracks = []
+    if len(exprs) == 1:
+        return _gextract_2d_single(exprs[0], col_names[0], intervals, band)
 
-    def _add_required(track_name):
-        if track_name not in required_tracks:
-            required_tracks.append(track_name)
-
-    for _orig_expr, _expr_eval, expr_tracks, expr_vtracks in parsed:
-        for tname in expr_tracks:
-            _add_required(tname)
-        for vt_name in expr_vtracks:
-            _add_required(vtrack_to_track[vt_name])
-
-    if len(required_tracks) > 1 and iterator is None:
+    if iterator is None:
         raise ValueError(
             "Cannot implicitly determine iterator policy: "
             "track expressions contain more than one 2D track."
         )
 
-    anchor_track = required_tracks[0]
+    anchor_expr_idx = 0
     if isinstance(iterator, str):
-        if iterator in required_tracks:
-            anchor_track = iterator
-        elif iterator in vtrack_to_track:
-            anchor_track = vtrack_to_track[iterator]
+        for idx, expr in enumerate(exprs):
+            if expr == iterator:
+                anchor_expr_idx = idx
+                break
 
-    key_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
+    key_cols = [
+        "chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"
+    ]
     coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
 
-    track_cols = {tname: _expr_safe_name(tname) for tname in required_tracks}
-    result = _gextract_2d_single(anchor_track, track_cols[anchor_track], intervals, band)
+    result = _gextract_2d_single(
+        exprs[anchor_expr_idx], col_names[anchor_expr_idx], intervals, band
+    )
     if result is None:
         return None
 
-    for tname in required_tracks:
-        if tname == anchor_track:
+    for idx, (expr, col_name) in enumerate(zip(exprs, col_names, strict=False)):
+        if idx == anchor_expr_idx:
             continue
-        cur = _gextract_2d_single(tname, track_cols[tname], intervals, band)
+
+        cur = _gextract_2d_single(expr, col_name, intervals, band)
         if cur is None:
-            result[track_cols[tname]] = _numpy.nan
+            result[col_name] = _numpy.nan
             continue
-        cur = cur[key_cols + [track_cols[tname]]]
+
+        cur = cur[key_cols + [col_name]]
         if cur.duplicated(key_cols).any():
             cur = cur.drop_duplicates(key_cols, keep="first")
         result = result.merge(cur, on=key_cols, how="left")
 
-    out_cols = colnames if colnames is not None else exprs
-    out_data = {}
-    for out_col, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in zip(
-        out_cols, parsed, strict=False
-    ):
-        allowed_names = {
-            "np",
-            "numpy",
-            *(_expr_safe_name(t) for t in expr_tracks),
-            *(_expr_safe_name(vt) for vt in expr_vtracks),
-        }
-        try:
-            code_obj = compile_safe_expression(expr_eval, allowed_names)
-        except UnsafeExpressionError as exc:
-            raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
-
-        local_ns = {"np": _numpy, "numpy": _numpy}
-        for tname in expr_tracks:
-            local_ns[_expr_safe_name(tname)] = result[track_cols[tname]].to_numpy(
-                dtype=float, copy=False
-            )
-        for vt_name in expr_vtracks:
-            src_track = vtrack_to_track[vt_name]
-            local_ns[_expr_safe_name(vt_name)] = result[track_cols[src_track]].to_numpy(
-                dtype=float, copy=False
-            )
-
-        vals = eval(code_obj, {"__builtins__": {}}, local_ns)
-        if _numpy.isscalar(vals):
-            vals = _numpy.full(len(result), vals, dtype=float)
-        out_data[out_col] = _numpy.asarray(vals, dtype=float)
-
-    out_df = result[coord_cols].copy()
-    for out_col in out_cols:
-        out_df[out_col] = out_data[out_col]
-    out_df["intervalID"] = result["intervalID"].to_numpy(dtype=int, copy=False)
-    return out_df.sort_values(
+    # Keep expression columns in caller order, regardless of anchor choice.
+    result = result[coord_cols + col_names + ["intervalID"]]
+    return result.sort_values(
         ["chrom1", "start1", "chrom2", "start2", "intervalID"]
     ).reset_index(drop=True)
 
@@ -389,17 +267,14 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     5
     """
     _checkroot()
-    exprs = [expr] if isinstance(expr, str) else list(expr)
-
     if intervals is None:
         from .intervals import gintervals_all
 
         intervals = gintervals_all()
 
-    intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
-
     # Route to 2D extraction if intervals are 2D
     if _is_2d_intervals(intervals):
+        exprs = [expr] if isinstance(expr, str) else list(expr)
         if colnames is not None and len(colnames) != len(exprs):
             raise ValueError(
                 f"colnames length ({len(colnames)}) must match number of "
@@ -414,6 +289,8 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
 
     progress = kwargs.get('progress')
     progress_desc = kwargs.get('progress_desc', 'gextract')
+
+    exprs = [expr] if isinstance(expr, str) else list(expr)
 
     if colnames is not None and len(colnames) != len(exprs):
         raise ValueError(
@@ -634,36 +511,6 @@ def gscreen(expr, intervals=None, **kwargs):
 
     progress = kwargs.get('progress')
     progress_desc = kwargs.get('progress_desc', 'gscreen')
-    iterator = kwargs.get("iterator")
-    band = kwargs.get("band")
-
-    intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
-    if _is_2d_intervals(intervals):
-        extracted = gextract(
-            expr,
-            intervals=intervals,
-            iterator=iterator,
-            band=band,
-            progress=progress,
-            progress_desc=progress_desc,
-        )
-        if extracted is None or len(extracted) == 0:
-            return None
-        data_cols = [
-            c
-            for c in extracted.columns
-            if c not in {"chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"}
-        ]
-        if not data_cols:
-            return None
-        vals = extracted[data_cols[0]].to_numpy(dtype=float, copy=False)
-        mask = (~_numpy.isnan(vals)) & (vals != 0.0)
-        if not mask.any():
-            return None
-        return (
-            extracted.loc[mask, ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]]
-            .reset_index(drop=True)
-        )
 
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
