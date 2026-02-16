@@ -265,7 +265,6 @@ class TestPwmSpatialErrorHandling:
         yield
         _remove_all_vtracks()
 
-    @pytest.mark.skip(reason="pymisha does not reject negative spatial weights at vtrack creation time")
     def test_negative_spatial_factor_rejected(self):
         """Negative spatial factors should be rejected."""
         pssm = _create_test_pssm()
@@ -276,7 +275,6 @@ class TestPwmSpatialErrorHandling:
                 spat_factor=[-1, 1, 1], spat_bin=10,
             )
 
-    @pytest.mark.skip(reason="pymisha does not reject non-positive bin size at vtrack creation time")
     def test_non_positive_bin_size_rejected(self):
         """Non-positive bin size should be rejected."""
         pssm = _create_test_pssm()
@@ -287,7 +285,6 @@ class TestPwmSpatialErrorHandling:
                 spat_factor=[1, 1, 1], spat_bin=0,
             )
 
-    @pytest.mark.skip(reason="pymisha does not reject zero spatial weights at vtrack creation time")
     def test_zero_spatial_factor_rejected(self):
         """Zero spatial factors should be rejected."""
         pssm = _create_test_pssm()

@@ -839,7 +839,6 @@ class TestPwmCountVtrack:
         )
         assert res["count_spatial"].iloc[0] >= res["count_nospatial"].iloc[0]
 
-    @pytest.mark.skip(reason="pymisha does not reject zero spatial weights at vtrack creation time")
     def test_count_rejects_non_positive_spatial_weights(self):
         """spat_factor with zero value should be rejected."""
         pssm = _create_test_pssm()

@@ -934,40 +934,90 @@ def gintervals_force_range(intervals):
         )
     )
 
-    result_chroms = []
-    result_starts = []
-    result_ends = []
+    def _force_axis(chrom_vals, starts, ends):
+        out_chrom = []
+        out_start = []
+        out_end = []
+        with _contextlib.suppress(Exception):
+            chrom_vals = _normalize_chroms(chrom_vals)
 
-    chrom_vals = intervals["chrom"].astype(str).tolist()
-    with _contextlib.suppress(Exception):
-        chrom_vals = _normalize_chroms(chrom_vals)
+        for chrom, start, end in zip(chrom_vals, starts, ends, strict=False):
+            if chrom not in chrom_sizes:
+                out_chrom.append(None)
+                out_start.append(None)
+                out_end.append(None)
+                continue
+            chrom_size = chrom_sizes[chrom]
+            start = max(0, int(start))
+            end = min(chrom_size, int(end))
+            if start < end:
+                out_chrom.append(chrom)
+                out_start.append(start)
+                out_end.append(end)
+            else:
+                out_chrom.append(None)
+                out_start.append(None)
+                out_end.append(None)
+        return out_chrom, out_start, out_end
 
-    for chrom, start, end in zip(
-        chrom_vals,
+    # 2D intervals
+    if {"chrom1", "start1", "end1", "chrom2", "start2", "end2"}.issubset(intervals.columns):
+        c1, s1, e1 = _force_axis(
+            intervals["chrom1"].astype(str).tolist(),
+            intervals["start1"].tolist(),
+            intervals["end1"].tolist(),
+        )
+        c2, s2, e2 = _force_axis(
+            intervals["chrom2"].astype(str).tolist(),
+            intervals["start2"].tolist(),
+            intervals["end2"].tolist(),
+        )
+
+        keep = [
+            i for i in range(len(c1))
+            if c1[i] is not None and c2[i] is not None
+        ]
+        if not keep:
+            return None
+        return _pandas.DataFrame({
+            "chrom1": [c1[i] for i in keep],
+            "start1": [s1[i] for i in keep],
+            "end1": [e1[i] for i in keep],
+            "chrom2": [c2[i] for i in keep],
+            "start2": [s2[i] for i in keep],
+            "end2": [e2[i] for i in keep],
+        })
+
+    # 1D intervals
+    chrom_vals, starts, ends = _force_axis(
+        intervals["chrom"].astype(str).tolist(),
         intervals["start"].tolist(),
-        intervals["end"].tolist(), strict=False,
-    ):
-
-        if chrom not in chrom_sizes:
-            continue
-
-        chrom_size = chrom_sizes[chrom]
-        start = max(0, start)
-        end = min(chrom_size, end)
-
-        if start < end:
-            result_chroms.append(chrom)
-            result_starts.append(start)
-            result_ends.append(end)
-
-    if not result_chroms:
+        intervals["end"].tolist(),
+    )
+    keep = [i for i in range(len(chrom_vals)) if chrom_vals[i] is not None]
+    if not keep:
         return None
-
     return _pandas.DataFrame({
-        'chrom': result_chroms,
-        'start': result_starts,
-        'end': result_ends
+        "chrom": [chrom_vals[i] for i in keep],
+        "start": [starts[i] for i in keep],
+        "end": [ends[i] for i in keep],
     })
+
+
+def gintervals_is_bigset(intervals_set):
+    """Return whether a saved interval set uses directory ("bigset") storage."""
+    _checkroot()
+    if not isinstance(intervals_set, str) or not intervals_set.strip():
+        raise ValueError("intervals_set must be a non-empty string")
+    dataset = gintervals_dataset(intervals_set)
+    if dataset is None:
+        return False
+    path_part = intervals_set.replace(".", "/")
+    for suffix in (".interv", ".interv2d"):
+        p = Path(dataset) / "tracks" / f"{path_part}{suffix}"
+        if p.exists():
+            return p.is_dir()
+    return False
 
 
 def _sort_intervals(intervals):
@@ -3009,12 +3059,6 @@ def giterator_intervals(expr=None, intervals=None, iterator=None,
         )
     _checkroot()
 
-    if intervals is None:
-        intervals = gintervals_all()
-
-    if len(intervals) == 0:
-        return None
-
     # Determine iterator policy
     itr = iterator
     if itr is None and expr is not None:
@@ -3030,6 +3074,47 @@ def giterator_intervals(expr=None, intervals=None, iterator=None,
                 "Could not determine iterator from expression. "
                 "Pass an explicit numeric iterator."
             )
+
+    if interval_relative and isinstance(itr, str):
+        raise ValueError("interval_relative=True requires a numeric iterator.")
+
+    # Support string iterators for tracks.
+    if isinstance(itr, str):
+        from .tracks import gtrack_exists, gtrack_info
+
+        if gtrack_exists(itr):
+            info = gtrack_info(itr)
+            dims = int(info.get("dimensions", 1) or 1)
+            if dims == 2:
+                from .extract import gextract
+
+                if intervals is None:
+                    intervals = gintervals_2d_all()
+                elif isinstance(intervals, str):
+                    intervals = gintervals_load(intervals)
+
+                if intervals is None or len(intervals) == 0:
+                    return None
+                if not isinstance(intervals, _pandas.DataFrame) or "chrom1" not in intervals.columns:
+                    raise ValueError("2D track iterator requires 2D intervals")
+
+                res = gextract(itr, intervals=intervals, iterator=itr)
+                if res is None or len(res) == 0:
+                    return None
+                cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
+                return res[cols].drop_duplicates().reset_index(drop=True)
+
+            bin_size = info.get("bin_size") or info.get("bin.size")
+            if bin_size is not None:
+                itr = int(float(bin_size))
+
+    if intervals is None:
+        intervals = gintervals_all()
+    elif isinstance(intervals, str):
+        intervals = gintervals_load(intervals)
+
+    if len(intervals) == 0:
+        return None
 
     if interval_relative:
         if isinstance(itr, bool) or not isinstance(itr, (int, float)):
@@ -4199,4 +4284,3 @@ def gintervals_import_genes(genes_file, annots_file=None, annots_names=None):
         "utr3": _unify_intervals(utr3_records, effective_annots),
         "utr5": _unify_intervals(utr5_records, effective_annots),
     }
-

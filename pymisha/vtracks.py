@@ -42,6 +42,15 @@ _FILTER_GLOBAL_PERCENTILE_FUNCS = {
     "global.percentile.max",
 }
 _FILTER_PWM_MAX_POS_FUNCS = {"pwm.max.pos"}
+_DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
+_VALUE_DF_PY_FUNCS = {
+    "avg", "mean", "sum", "min", "max", "first", "last", "size", "exists",
+    "stddev", "std", "quantile", "nearest",
+    "first.pos.abs", "first.pos.relative",
+    "last.pos.abs", "last.pos.relative",
+    "min.pos.abs", "min.pos.relative",
+    "max.pos.abs", "max.pos.relative",
+}
 _FILTER_SUPPORTED_FUNCS = (
     _FILTER_PASSTHROUGH_FUNCS
     | _FILTER_WEIGHTED_FUNCS
@@ -231,6 +240,172 @@ def _build_unmasked_segments(intervals, payload, filter_df):
         seg_rows,
         columns=["chrom", "start", "end", "orig_idx", "seg_len", "base_start"],
     )
+
+
+def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
+    """Python fallback evaluator for value-based virtual tracks."""
+    func = str(payload_eval.get("func", "avg")).lower()
+    has_filter = filter_df is not None and len(filter_df) > 0
+    src_df = payload_eval.get("src_df")
+    out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
+    if src_df is None or len(src_df) == 0:
+        if func == "exists":
+            return _numpy.zeros(len(intervals), dtype=float)
+        return out
+
+    seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
+    if seg_df is None or len(seg_df) == 0:
+        if func == "exists":
+            return _numpy.zeros(len(intervals), dtype=float)
+        return out
+
+    src_by_chrom = {
+        chrom: grp.reset_index(drop=True)
+        for chrom, grp in src_df.groupby("chrom", sort=False)
+    }
+
+    for orig_idx, seg_group in seg_df.groupby("orig_idx", sort=False):
+        oi = int(orig_idx)
+        chrom = str(seg_group.iloc[0]["chrom"])
+        sgrp = src_by_chrom.get(chrom)
+        if sgrp is None or len(sgrp) == 0:
+            if func == "exists":
+                out[oi] = 0.0
+            continue
+
+        segments = [
+            (int(r.start), int(r.end), int(r.base_start), int(r.seg_len))
+            for r in seg_group.itertuples(index=False)
+        ]
+        base_start = segments[0][2]
+        unmasked_len = int(seg_group["seg_len"].sum())
+
+        if has_filter and func == "nearest":
+            # nearest under filter uses only the first unmasked segment.
+            segments = [segments[0]]
+
+        matched = []
+        overlaps_for_cov = []
+        for ridx, row in sgrp.iterrows():
+            rs = int(row["start"])
+            re = int(row["end"])
+            total_ov = 0
+            for ss, se, _bs, _sl in segments:
+                ov_s = max(rs, ss)
+                ov_e = min(re, se)
+                if ov_e > ov_s:
+                    total_ov += ov_e - ov_s
+                    overlaps_for_cov.append((ov_s, ov_e))
+            if total_ov > 0 and not _numpy.isnan(float(row["value"])):
+                matched.append((int(ridx), rs, re, float(row["value"]), total_ov))
+
+        if func == "exists":
+            out[oi] = 1.0 if matched else 0.0
+            continue
+        if func == "coverage":
+            if unmasked_len <= 0:
+                continue
+            if not overlaps_for_cov:
+                out[oi] = 0.0
+                continue
+            overlaps_for_cov.sort()
+            cov = 0
+            cs, ce = overlaps_for_cov[0]
+            for s, e in overlaps_for_cov[1:]:
+                if s < ce:
+                    ce = max(ce, e)
+                else:
+                    cov += ce - cs
+                    cs, ce = s, e
+            cov += ce - cs
+            out[oi] = float(cov) / float(unmasked_len)
+            continue
+
+        vals = _numpy.asarray([m[3] for m in matched], dtype=float)
+
+        if vals.size == 0:
+            if func == "size":
+                out[oi] = 0.0
+            continue
+
+        if func in {"avg", "mean"}:
+            if has_filter:
+                weights = _numpy.asarray([m[4] for m in matched], dtype=float)
+                wsum = float(weights.sum())
+                if wsum > 0:
+                    out[oi] = float((vals * weights).sum() / wsum)
+            else:
+                out[oi] = float(vals.mean())
+        elif func == "nearest":
+            # If no overlap, nearest falls back to minimum distance.
+            out[oi] = float(vals.mean())
+        elif func == "sum":
+            out[oi] = float(vals.sum())
+        elif func == "min":
+            out[oi] = float(vals.min())
+        elif func == "max":
+            out[oi] = float(vals.max())
+        elif func == "size":
+            out[oi] = float(vals.size)
+        elif func in {"stddev", "std"}:
+            if vals.size >= 2:
+                out[oi] = float(_numpy.std(vals, ddof=1))
+        elif func == "quantile":
+            q = float(payload_eval.get("params", 0.5) or 0.5)
+            out[oi] = float(_numpy.quantile(vals, q))
+        elif func == "first":
+            first_row = min(matched, key=lambda m: (m[1], m[0]))
+            out[oi] = float(first_row[3])
+        elif func == "last":
+            last_row = max(matched, key=lambda m: (m[1], m[0]))
+            out[oi] = float(last_row[3])
+        elif func in {"first.pos.abs", "first.pos.relative"}:
+            pos = float(min(matched, key=lambda m: (m[1], m[0]))[1])
+            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
+        elif func in {"last.pos.abs", "last.pos.relative"}:
+            pos = float(max(matched, key=lambda m: (m[1], m[0]))[1])
+            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
+        elif func in {"min.pos.abs", "min.pos.relative"}:
+            pos = float(min(matched, key=lambda m: (m[3], m[1], m[0]))[1])
+            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
+        elif func in {"max.pos.abs", "max.pos.relative"}:
+            pos = float(max(matched, key=lambda m: (m[3], -m[1], -m[0]))[1])
+            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
+
+    # nearest fallback for non-overlap cases
+    if func == "nearest":
+        for orig_idx, seg_group in seg_df.groupby("orig_idx", sort=False):
+            oi = int(orig_idx)
+            if not _numpy.isnan(out[oi]):
+                continue
+            chrom = str(seg_group.iloc[0]["chrom"])
+            sgrp = src_by_chrom.get(chrom)
+            if sgrp is None or len(sgrp) == 0:
+                continue
+            ss = int(seg_group.iloc[0]["start"])
+            se = int(seg_group.iloc[0]["end"])
+            dists = []
+            vals = []
+            for row in sgrp.itertuples(index=False):
+                rs = int(row.start)
+                re = int(row.end)
+                if re <= ss:
+                    d = ss - re
+                elif rs >= se:
+                    d = rs - se
+                else:
+                    d = 0
+                if _numpy.isnan(float(row.value)):
+                    continue
+                dists.append(d)
+                vals.append(float(row.value))
+            if dists:
+                dmin = min(dists)
+                cand = [v for d, v in zip(dists, vals, strict=False) if d == dmin]
+                if cand:
+                    out[oi] = float(_numpy.mean(_numpy.asarray(cand, dtype=float)))
+
+    return out
 
 
 def _compute_filtered_nearest(intervals, payload_eval, filter_df):
@@ -717,6 +892,7 @@ def _compute_vtrack_values(vtrack_name, intervals):
     payload = dict(vtrack_config)
     src = payload.get('src')
     if isinstance(src, _pandas.DataFrame):
+        payload['src_df'] = src.copy()
         payload['src'] = _df2pymisha(src)
 
     # Ensure pssm is passed as a numpy array with correct ordering
@@ -727,6 +903,12 @@ def _compute_vtrack_values(vtrack_name, intervals):
 
     filter_df = payload.get("filter")
     if filter_df is None or (isinstance(filter_df, _pandas.DataFrame) and len(filter_df) == 0):
+        if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS:
+            return _compute_value_df_vtrack(
+                intervals,
+                payload,
+                _pandas.DataFrame(columns=["chrom", "start", "end"]),
+            )
         # C++ backend does not support global.percentile* yet.
         if func in _FILTER_GLOBAL_PERCENTILE_FUNCS:
             payload_eval = dict(payload)
@@ -744,6 +926,9 @@ def _compute_vtrack_values(vtrack_name, intervals):
     payload_eval.pop("filter", None)
     payload_eval.pop("filter_key", None)
     payload_eval.pop("filter_stats", None)
+
+    if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS:
+        return _compute_value_df_vtrack(intervals, payload_eval, filter_df)
 
     if func in _FILTER_PASSTHROUGH_FUNCS:
         return _pymisha.pm_vtrack_compute(payload_eval, _df2pymisha(intervals), CONFIG)
@@ -1024,6 +1209,50 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
     ...                   kmer="CG", strand=1)
     """
     _checkroot()
+    func_lc = str(func).lower()
+
+    if isinstance(src, _pandas.DataFrame):
+        from .intervals import _normalize_chroms
+
+        req = {"chrom", "start", "end"}
+        if not req.issubset(src.columns):
+            raise ValueError("DataFrame source must include columns: chrom, start, end")
+
+        is_interval_func = func_lc in _DF_INTERVAL_FUNCS
+        value_cols = [
+            c
+            for c in src.columns
+            if c not in {"chrom", "start", "end", "intervalID", "intervalID1", "intervalID2"}
+        ]
+        if not is_interval_func and not value_cols:
+            raise ValueError("DataFrame source must include one value column")
+
+        if is_interval_func:
+            src_df = src.copy()
+        else:
+            value_col = value_cols[0]
+            src_df = src[["chrom", "start", "end", value_col]].copy()
+            src_df.columns = ["chrom", "start", "end", "value"]
+
+        src_df["chrom"] = _normalize_chroms(src_df["chrom"].astype(str).tolist())
+        src_df["start"] = _pandas.to_numeric(src_df["start"], errors="coerce").astype("Int64")
+        src_df["end"] = _pandas.to_numeric(src_df["end"], errors="coerce").astype("Int64")
+        if not is_interval_func:
+            src_df["value"] = _pandas.to_numeric(src_df["value"], errors="coerce")
+            src_df = src_df.dropna(subset=["start", "end", "value"]).copy()
+        else:
+            src_df = src_df.dropna(subset=["start", "end"]).copy()
+        src_df["start"] = src_df["start"].astype(int)
+        src_df["end"] = src_df["end"].astype(int)
+        src_df = src_df[src_df["end"] > src_df["start"]]
+        src_df = src_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
+
+        prev_end = src_df.groupby("chrom")["end"].shift(1)
+        has_overlaps = bool((src_df["start"] < prev_end).fillna(False).any())
+        if has_overlaps and (func_lc == "distance.center" or not is_interval_func):
+            raise ValueError("overlapping intervals in DataFrame source are not allowed for this function")
+
+        src = src_df
 
     config = {
         'src': src,
@@ -1033,6 +1262,30 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
         'eshift': eshift,
     }
     config.update(kwargs)
+
+    if str(config.get("func", "")).startswith("pwm"):
+        spat_factor = config.get("spat_factor")
+        if spat_factor is not None:
+            try:
+                spat_vals = _numpy.asarray(spat_factor, dtype=float).ravel()
+            except Exception as exc:
+                raise ValueError("spat_factor must be a numeric array-like") from exc
+            if spat_vals.size == 0:
+                raise ValueError("spat_factor must be non-empty")
+            if not _numpy.isfinite(spat_vals).all():
+                raise ValueError("spat_factor must contain only finite values")
+            if _numpy.any(spat_vals <= 0):
+                raise ValueError("spat_factor must contain only positive values")
+            config["spat_factor"] = spat_vals.tolist()
+
+        if "spat_bin" in config and config.get("spat_bin") is not None:
+            try:
+                spat_bin = int(config["spat_bin"])
+            except Exception as exc:
+                raise ValueError("spat_bin must be a positive integer") from exc
+            if spat_bin <= 0:
+                raise ValueError("spat_bin must be a positive integer")
+            config["spat_bin"] = spat_bin
 
     # For PWM virtual tracks, if pssm is a DataFrame, ensure column order A, C, G, T
     if config.get('func', '').startswith('pwm'):
