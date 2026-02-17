@@ -2,7 +2,7 @@
 PyMisha - Python wrapper for the misha Genomic Data Analysis Toolkit
 """
 
-__version__ = '0.1.0'
+__version__ = '0.1.5'
 
 # Make numpy available for expressions
 import numpy as np  # noqa: F401
@@ -30,6 +30,7 @@ from .dataset import (
     gdataset_unload,
 )
 from .db import (
+    gdb_export_fasta,
     gdb_examples_path,
     gdb_info,
     gdb_init,
@@ -188,6 +189,7 @@ __all__ = [
     'gdb_reload',
     'gdb_unload',
     'gdb_info',
+    'gdb_export_fasta',
     'gdb_examples_path',
     'gdb_init_examples',
     'gsetroot',

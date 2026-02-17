@@ -1,9 +1,11 @@
 """Database initialization and example DB helpers."""
 
 import atexit
+import copy
 import contextlib
 import os
 import shutil
+import struct
 import tempfile
 from pathlib import Path
 
@@ -412,3 +414,297 @@ def gdb_info(groot: str = None):
         "genome_size": int(chrom_sizes["size"].sum()),
         "chromosomes": chrom_sizes,
     }
+
+
+def _read_chrom_sizes_rows(chrom_sizes_path):
+    rows = []
+    with open(chrom_sizes_path, encoding="utf-8") as fh:
+        for line_num, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid chrom_sizes.txt format at line {line_num}: expected 2 columns"
+                )
+            chrom = parts[0].strip()
+            if not chrom:
+                raise ValueError(
+                    f"Invalid chrom_sizes.txt format at line {line_num}: empty chromosome name"
+                )
+            try:
+                size = int(parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid chrom_sizes.txt format at line {line_num}: invalid size"
+                ) from exc
+            if size < 0:
+                raise ValueError(
+                    f"Invalid chrom_sizes.txt format at line {line_num}: size must be non-negative"
+                )
+            rows.append((chrom, size))
+    return rows
+
+
+def _resolve_seq_file(seq_dir, chrom):
+    candidates = [chrom]
+    if chrom.startswith("chr"):
+        candidates.append(chrom[3:])
+    else:
+        candidates.append(f"chr{chrom}")
+
+    for name in candidates:
+        path = seq_dir / f"{name}.seq"
+        if path.exists():
+            return path
+
+    tried = ", ".join(f"{candidate}.seq" for candidate in candidates)
+    raise FileNotFoundError(
+        f"Missing sequence file for chromosome '{chrom}' (tried: {tried})"
+    )
+
+
+def _iter_genome_idx_entries(index_path):
+    with open(index_path, "rb") as fh:
+        header = fh.read(24)
+        if len(header) != 24:
+            raise ValueError("Invalid genome.idx header")
+        magic, version, num_entries, _checksum = struct.unpack("<8sIIQ", header)
+        if magic != b"MISHAIDX":
+            raise ValueError("Invalid genome.idx magic")
+        if version != 1:
+            raise ValueError(f"Unsupported genome.idx version {version}")
+        if num_entries > 20000000:
+            raise ValueError("Invalid genome.idx entry count")
+
+        entries = []
+        for _ in range(num_entries):
+            id_and_len = fh.read(6)
+            if len(id_and_len) != 6:
+                raise ValueError("Truncated genome.idx entry table")
+            chrom_id, name_len = struct.unpack("<IH", id_and_len)
+
+            name_bytes = fh.read(name_len)
+            if len(name_bytes) != name_len:
+                raise ValueError("Truncated genome.idx contig name")
+
+            tail = fh.read(24)
+            if len(tail) != 24:
+                raise ValueError("Truncated genome.idx entry table")
+            offset, length, _reserved = struct.unpack("<QQQ", tail)
+
+            try:
+                name = name_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Invalid UTF-8 contig name in genome.idx") from exc
+            entries.append((chrom_id, name, offset, length))
+
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def _stream_wrapped_sequence(out_fh, seq_fh, chrom, length, line_width, chunk_size):
+    pending = b""
+    remaining = int(length)
+
+    while remaining > 0:
+        to_read = min(chunk_size, remaining)
+        chunk = seq_fh.read(to_read)
+        if len(chunk) != to_read:
+            raise IOError(
+                f"Failed reading sequence for chromosome {chrom}: "
+                f"expected {to_read} bytes, got {len(chunk)}"
+            )
+
+        merged = pending + chunk
+        full_len = (len(merged) // line_width) * line_width
+        if full_len:
+            block = merged[:full_len]
+            out_fh.write(
+                b"\n".join(
+                    block[i: i + line_width] for i in range(0, full_len, line_width)
+                )
+            )
+            out_fh.write(b"\n")
+        pending = merged[full_len:]
+        remaining -= to_read
+
+    if pending:
+        out_fh.write(pending)
+        out_fh.write(b"\n")
+
+
+@contextlib.contextmanager
+def _temporary_db_root(groot):
+    if groot is None:
+        _checkroot()
+        yield
+        return
+
+    root_path = Path(groot).expanduser()
+    if not root_path.exists():
+        raise FileNotFoundError(f"Database directory does not exist: {groot}")
+    target_root = str(root_path.resolve(strict=False))
+
+    old_root = _shared._GROOT
+    old_user = _shared._UROOT
+    old_gwd = _shared._GWD
+    old_datasets = list(_shared._GDATASETS)
+    old_vtracks = copy.deepcopy(_shared._VTRACKS)
+
+    old_root_resolved = (
+        str(Path(old_root).expanduser().resolve(strict=False))
+        if old_root is not None
+        else None
+    )
+    if old_root_resolved == target_root:
+        yield
+        return
+
+    gdb_init(target_root)
+    try:
+        yield
+    finally:
+        if old_root is None:
+            gdb_unload()
+        else:
+            gdb_init(old_root, old_user)
+            _shared._GDATASETS = list(old_datasets)
+            _shared._pymisha.pm_dbsetdatasets(old_datasets)
+            _shared._VTRACKS = old_vtracks
+            _shared._GWD = old_gwd
+
+
+def gdb_export_fasta(
+    file=None,
+    groot=None,
+    line_width=80,
+    chunk_size=1000000,
+    overwrite=False,
+    verbose=False,
+):
+    """
+    Export database genome sequence to a multi-FASTA file.
+
+    Parameters
+    ----------
+    file : str or os.PathLike
+        Output FASTA file path.
+    groot : str, optional
+        Database root to export. If None, exports the currently active DB.
+    line_width : int, default 80
+        Number of bases per FASTA line.
+    chunk_size : int, default 1000000
+        Number of bases to read per I/O chunk.
+    overwrite : bool, default False
+        If True, replace an existing output file.
+    verbose : bool, default False
+        If True, print per-chromosome progress.
+
+    Returns
+    -------
+    str
+        Output FASTA path.
+    """
+    usage = (
+        "Usage: gdb_export_fasta(file, groot=None, line_width=80, "
+        "chunk_size=1000000, overwrite=False, verbose=False)"
+    )
+    if file is None or not isinstance(file, (str, os.PathLike)):
+        raise ValueError(usage)
+    file_str = os.fspath(file)
+    if file_str == "":
+        raise ValueError(usage)
+
+    try:
+        line_width = int(line_width)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("line_width must be a positive integer") from exc
+    if line_width < 1:
+        raise ValueError("line_width must be a positive integer")
+
+    try:
+        chunk_size = int(chunk_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("chunk_size must be a positive integer") from exc
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+
+    out_path = Path(file_str).expanduser()
+    out_dir = out_path.parent
+    if not out_dir.exists():
+        raise FileNotFoundError(f"Output directory does not exist: {out_dir}")
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output file already exists: {out_path}. Use overwrite=True to replace it."
+        )
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix="pymisha_export_",
+        suffix=".fasta",
+        dir=str(out_dir),
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        with _temporary_db_root(groot):
+            db_root = Path(_shared._GROOT).expanduser().resolve(strict=False)
+            seq_dir = db_root / "seq"
+            if not seq_dir.is_dir():
+                raise FileNotFoundError(f"seq directory does not exist: {seq_dir}")
+
+            genome_idx = seq_dir / "genome.idx"
+            genome_seq = seq_dir / "genome.seq"
+            chrom_sizes_path = db_root / "chrom_sizes.txt"
+            if not chrom_sizes_path.exists():
+                raise FileNotFoundError(
+                    f"chrom_sizes.txt not found: {chrom_sizes_path}"
+                )
+
+            with open(tmp_path, "wb") as out_fh:
+                if genome_idx.exists() and genome_seq.exists():
+                    entries = _iter_genome_idx_entries(genome_idx)
+                    if not entries:
+                        raise ValueError("No chromosomes found in the database")
+                    with open(genome_seq, "rb") as seq_fh:
+                        for _chrom_id, chrom, offset, length in entries:
+                            if verbose:
+                                print(f"Exporting {chrom} ({length} bp)")
+                            out_fh.write(f">{chrom}\n".encode("utf-8"))
+                            seq_fh.seek(offset)
+                            _stream_wrapped_sequence(
+                                out_fh,
+                                seq_fh,
+                                chrom,
+                                length,
+                                line_width,
+                                chunk_size,
+                            )
+                else:
+                    chrom_rows = _read_chrom_sizes_rows(chrom_sizes_path)
+                    if not chrom_rows:
+                        raise ValueError("No chromosomes found in the database")
+                    for chrom, length in chrom_rows:
+                        seq_path = _resolve_seq_file(seq_dir, chrom)
+                        if verbose:
+                            print(f"Exporting {chrom} ({length} bp)")
+                        out_fh.write(f">{chrom}\n".encode("utf-8"))
+                        with open(seq_path, "rb") as seq_fh:
+                            _stream_wrapped_sequence(
+                                out_fh,
+                                seq_fh,
+                                chrom,
+                                length,
+                                line_width,
+                                chunk_size,
+                            )
+
+        os.replace(tmp_path, out_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
+
+    return str(out_path)

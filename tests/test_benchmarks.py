@@ -89,6 +89,7 @@ def time_r_code(code: str, n_reps: int = N_REPS, n_warmup: int = N_WARMUP, testd
     timed_code = f'''
 library(misha)
 gdb.init("{testdb}")
+options(gmax.processes = 1)
 
 # Warmup runs
 for (i in 1:{n_warmup}) {{
@@ -775,6 +776,33 @@ result <- gscreen("{LARGEDB_TRACK} > 0", intervals)
             speedup = py_single / py_multi
             print(f"  Speedup: {speedup:.2f}x")
 
+    def test_benchmark_large_gsummary_multitask(self):
+        """Benchmark gsummary with single vs multiprocess execution."""
+        intervals = pm.gintervals_all()
+
+        # Single-process
+        pm.CONFIG['multitasking'] = False
+        py_single, py_single_std = time_python_code(
+            lambda: pm.gsummary(LARGEDB_TRACK, intervals),
+            n_reps=5, n_warmup=1
+        )
+
+        # Multiprocess
+        pm.CONFIG['multitasking'] = True
+        py_multi, py_multi_std = time_python_code(
+            lambda: pm.gsummary(LARGEDB_TRACK, intervals),
+            n_reps=5, n_warmup=1
+        )
+
+        pm.CONFIG['multitasking'] = False
+
+        print("\ngsummary large multitask comparison:")
+        print(f"  Single: {py_single:.4f}s (±{py_single_std:.4f})")
+        print(f"  Multi:  {py_multi:.4f}s (±{py_multi_std:.4f})")
+        if py_multi > 0:
+            speedup = py_single / py_multi
+            print(f"  Speedup: {speedup:.2f}x")
+
 
 class TestBenchmarkSummary:
     """Print summary of all benchmarks."""
@@ -834,4 +862,3 @@ class TestBenchmarkSummary:
             print(f"Overall geometric mean speedup: {geomean:.2f}x")
 
         print("=" * 80)
-
