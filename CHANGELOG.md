@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.6 (2026-02-17)
+
+### Documentation
+
+- Replace the docs favicon with an icon-only transparent asset (no `pymisha` wordmark text) and configure MkDocs to use it.
+- Re-export the docs logo with transparent background and cleaner edges while reducing file size from 5.2MB to ~3.6MB.
+
 ## v0.1.5 (2026-02-17)
 
 ### Features
