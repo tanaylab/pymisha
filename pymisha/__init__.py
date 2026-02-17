@@ -30,8 +30,8 @@ from .dataset import (
     gdataset_unload,
 )
 from .db import (
-    gdb_export_fasta,
     gdb_examples_path,
+    gdb_export_fasta,
     gdb_info,
     gdb_init,
     gdb_init_examples,
