@@ -1,8 +1,8 @@
 """Database initialization and example DB helpers."""
 
 import atexit
-import copy
 import contextlib
+import copy
 import os
 import shutil
 import struct
@@ -512,7 +512,7 @@ def _stream_wrapped_sequence(out_fh, seq_fh, chrom, length, line_width, chunk_si
         to_read = min(chunk_size, remaining)
         chunk = seq_fh.read(to_read)
         if len(chunk) != to_read:
-            raise IOError(
+            raise OSError(
                 f"Failed reading sequence for chromosome {chrom}: "
                 f"expected {to_read} bytes, got {len(chunk)}"
             )
@@ -672,7 +672,7 @@ def gdb_export_fasta(
                         for _chrom_id, chrom, offset, length in entries:
                             if verbose:
                                 print(f"Exporting {chrom} ({length} bp)")
-                            out_fh.write(f">{chrom}\n".encode("utf-8"))
+                            out_fh.write(f">{chrom}\n".encode())
                             seq_fh.seek(offset)
                             _stream_wrapped_sequence(
                                 out_fh,
@@ -690,7 +690,7 @@ def gdb_export_fasta(
                         seq_path = _resolve_seq_file(seq_dir, chrom)
                         if verbose:
                             print(f"Exporting {chrom} ({length} bp)")
-                        out_fh.write(f">{chrom}\n".encode("utf-8"))
+                        out_fh.write(f">{chrom}\n".encode())
                         with open(seq_path, "rb") as seq_fh:
                             _stream_wrapped_sequence(
                                 out_fh,
