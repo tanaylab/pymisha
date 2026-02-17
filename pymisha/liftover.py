@@ -1502,7 +1502,10 @@ def _read_source_track(src_track_dir):
 
     data_files = [
         fname for fname in sorted(os.listdir(src_track_dir))
-        if not fname.startswith(".")
+        if (
+            not fname.startswith(".")
+            and os.path.isfile(os.path.join(src_track_dir, fname))
+        )
     ]
     per_chrom_files = [f for f in data_files if f not in ("track.idx", "track.dat")]
     has_indexed_files = "track.idx" in data_files and "track.dat" in data_files
