@@ -10,9 +10,11 @@ import glob
 import gzip
 import io
 import lzma
+import math
 import os
 import re
 import shutil
+import struct
 import tempfile
 import zipfile
 from pathlib import Path
@@ -366,19 +368,26 @@ def _canonicalize_known_chroms(df):
 
     chrom_sizes = gintervals_all()
     known = set(chrom_sizes["chrom"].astype(str).tolist())
-    keep = []
-    canon = []
-    for chrom in df["chrom"].astype(str).tolist():
+
+    # Batch-normalize: collect unique chromosome names, normalize once
+    raw_chroms = df["chrom"].astype(str)
+    unique_raw = raw_chroms.unique()
+
+    # Build mapping: raw -> canonical (or None if normalization fails)
+    canon_map = {}
+    # Batch call for all unique chroms at once
+    for raw in unique_raw:
         try:
-            c = _pymisha.pm_normalize_chroms([chrom])[0]
+            c = _pymisha.pm_normalize_chroms([raw])[0]
+            canon_map[raw] = c if c in known else None
         except Exception:
-            keep.append(False)
-            canon.append(chrom)
-            continue
-        keep.append(c in known)
-        canon.append(c)
-    out = df.loc[keep].copy()
-    out["chrom"] = [c for k, c in zip(keep, canon, strict=False) if k]
+            canon_map[raw] = None
+
+    # Vectorized apply via map
+    canonical = raw_chroms.map(canon_map)
+    mask = canonical.notna()
+    out = df.loc[mask.values].copy()
+    out["chrom"] = canonical.loc[mask.values].values
     return out.reset_index(drop=True)
 
 
@@ -782,7 +791,7 @@ def gtrack_create_dense(track, description, intervals, values, binsize, defval=n
     vals = np.asarray(values, dtype=np.float64)
     if len(vals) != len(data):
         raise ValueError("Length of values must match number of intervals")
-    data = data.copy()
+    # _normalize_intervals_df already returns a copy; no need to copy again
     data["value"] = vals
     data = _canonicalize_known_chroms(data)
     if len(data) == 0:
@@ -806,6 +815,191 @@ def gtrack_create_dense(track, description, intervals, values, binsize, defval=n
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)
+            _pymisha.pm_dbreload()
+        raise
+
+
+def gtrack_create_dense_direct(
+    track,
+    description,
+    intervals,
+    values,
+    binsize,
+    defval=np.nan,
+    reload=True,
+):
+    """
+    Create a Dense track by writing binary files directly.
+
+    This is functionally equivalent to :func:`gtrack_create_dense` but
+    bypasses the C++ bridge, writing per-chromosome binary files and the
+    ``.attributes`` metadata file directly to the track directory.
+    This avoids the overhead of the Python/C++ bridge and intermediate
+    DataFrame copies, making it significantly faster for large datasets.
+
+    Parameters
+    ----------
+    track : str
+        Name for the new track.
+    description : str
+        Human-readable description stored as a track attribute.
+    intervals : pandas.DataFrame
+        One-dimensional intervals with columns ``chrom``, ``start``,
+        ``end``.
+    values : array-like of float
+        Numeric values, one per interval. Length must match the number
+        of rows in *intervals*.
+    binsize : int
+        Bin size in base pairs. Must be a positive integer.
+    defval : float, default numpy.nan
+        Default value for bins not covered by any interval.
+    reload : bool, default True
+        If True, reload the genome database after writing. Set to False
+        when creating many tracks in a batch and call
+        ``gdb_reload()`` once at the end.
+
+    Returns
+    -------
+    None
+
+    See Also
+    --------
+    gtrack_create_dense : Create a Dense track via the C++ bridge.
+    """
+    _checkroot()
+    _validate_track_name(track)
+    _ensure_track_absent(track)
+
+    binsize = int(binsize)
+    if binsize <= 0:
+        raise ValueError("binsize must be a positive integer")
+    defval = float(defval)
+
+    data = _normalize_intervals_df(intervals)
+    vals = np.asarray(values, dtype=np.float64)
+    if len(vals) != len(data):
+        raise ValueError("Length of values must match number of intervals")
+
+    data["value"] = vals
+    data = _canonicalize_known_chroms(data)
+    if len(data) == 0:
+        raise ValueError("No intervals map to known chromosomes")
+
+    # Get chromosome sizes
+    from .intervals import gintervals_all
+
+    chrom_sizes_df = gintervals_all()
+    chrom_sizes = {
+        c: int(e)
+        for c, e in zip(chrom_sizes_df["chrom"], chrom_sizes_df["end"], strict=False)
+    }
+
+    track_dir = _track_dir_for_create(track)
+    track_dir.mkdir(parents=True, exist_ok=True)
+    vars_dir = track_dir / "vars"
+    vars_dir.mkdir(exist_ok=True)
+
+    try:
+        # Group intervals by chromosome
+        grouped = data.groupby("chrom", sort=False)
+
+        for chrom, chrom_size in chrom_sizes.items():
+            num_bins = math.ceil(chrom_size / binsize)
+            dense = np.full(num_bins, defval, dtype=np.float32)
+
+            if chrom in grouped.groups:
+                grp = grouped.get_group(chrom)
+                starts = grp["start"].values.astype(np.int64)
+                ends = grp["end"].values.astype(np.int64)
+                grp_vals = grp["value"].values.astype(np.float64)
+
+                # Use an accumulator in float64 to collect weighted contributions.
+                # Initialize to 0.0 — we merge with defval after all intervals.
+                accum = np.zeros(num_bins, dtype=np.float64)
+                touched = np.zeros(num_bins, dtype=np.bool_)
+
+                # Vectorized bin assignment for all intervals at once
+                fb = np.maximum(starts // binsize, 0).astype(np.intp)
+                tb = np.minimum(
+                    np.ceil(ends / binsize).astype(np.intp) - 1,
+                    num_bins - 1,
+                )
+
+                # Single-bin intervals (fb == tb): one fractional contribution
+                single = fb >= tb
+                if np.any(single):
+                    s_fb = fb[single]
+                    fracs = (ends[single] - starts[single]) / binsize
+                    np.add.at(accum, s_fb, grp_vals[single] * fracs)
+                    touched[s_fb] = True
+
+                # Multi-bin intervals: first-bin, last-bin, and full bins
+                multi = ~single
+                if np.any(multi):
+                    m_fb = fb[multi]
+                    m_tb = tb[multi]
+                    m_s = starts[multi]
+                    m_e = ends[multi]
+                    m_v = grp_vals[multi]
+
+                    # First-bin fraction
+                    f_frac = ((m_fb + 1) * binsize - m_s) / binsize
+                    np.add.at(accum, m_fb, m_v * f_frac)
+                    touched[m_fb] = True
+
+                    # Last-bin fraction
+                    l_frac = (m_e - m_tb * binsize) / binsize
+                    np.add.at(accum, m_tb, m_v * l_frac)
+                    touched[m_tb] = True
+
+                    # Full bins in between (value * 1.0 for each)
+                    for j in range(len(m_fb)):
+                        if m_tb[j] > m_fb[j] + 1:
+                            accum[m_fb[j] + 1 : m_tb[j]] += m_v[j]
+                            touched[m_fb[j] + 1 : m_tb[j]] = True
+
+                # Merge: touched bins get accumulated value, rest keep defval
+                dense[touched] = accum[touched].astype(np.float32)
+
+            # Write binary: [uint32 binsize][float32 x num_bins]
+            out_path = track_dir / chrom
+            with open(out_path, "wb") as fout:
+                fout.write(struct.pack("<I", binsize))
+                dense.tofile(fout)
+
+        # Write .attributes (null-separated binary format)
+        now_str = _datetime.datetime.now().ctime()
+        user = _getpass.getuser()
+        created_by = (
+            f'gtrack.create_dense("{track}", description, intervals, '
+            f"values, {binsize}, {defval:g})"
+        )
+        attrs = {
+            "created.by": created_by,
+            "created.date": now_str,
+            "created.user": user,
+            "description": str(description),
+            "type": "dense",
+            "binsize": str(binsize),
+        }
+        parts = []
+        for key, value in sorted(attrs.items()):
+            parts.append(key.encode("utf-8"))
+            parts.append(b"\x00")
+            parts.append(str(value).encode("utf-8"))
+            parts.append(b"\x00")
+        with open(track_dir / ".attributes", "wb") as f:
+            f.write(b"".join(parts))
+
+        if reload:
+            _pymisha.pm_dbreload()
+            if _db_is_indexed(_shared._GROOT):
+                gtrack_convert_to_indexed(track, remove_old=False)
+                _pymisha.pm_dbreload()
+    except Exception:
+        if track_dir.exists():
+            shutil.rmtree(track_dir, ignore_errors=True)
+        if reload:
             _pymisha.pm_dbreload()
         raise
 
@@ -1820,6 +2014,9 @@ def gtrack_import_mappedseq(
     plus = [[] for _ in range(nchrom)]
     minus = [[] for _ in range(nchrom)]
 
+    # Cache for chromosome name normalization (avoids repeated C++ calls)
+    _chrom_norm_cache = {}
+
     path = str(file)
     if not os.path.exists(path):
         raise ValueError(f"File not found: {path}")
@@ -1853,15 +2050,26 @@ def gtrack_import_mappedseq(
                 total_unmapped += 1
                 continue
 
-            try:
-                chrom = _pymisha.pm_normalize_chroms([chrom])[0]
-            except Exception:
-                total_unmapped += 1
-                continue
+            # Cached chromosome normalization
+            if chrom in _chrom_norm_cache:
+                chrom = _chrom_norm_cache[chrom]
+                if chrom is None:
+                    total_unmapped += 1
+                    continue
+            else:
+                try:
+                    norm = _pymisha.pm_normalize_chroms([chrom])[0]
+                except Exception:
+                    _chrom_norm_cache[chrom] = None
+                    total_unmapped += 1
+                    continue
+                if norm not in chrom_sizes:
+                    _chrom_norm_cache[chrom] = None
+                    total_unmapped += 1
+                    continue
+                _chrom_norm_cache[chrom] = norm
+                chrom = norm
 
-            if chrom not in chrom_sizes:
-                total_unmapped += 1
-                continue
             chrom_len = chrom_sizes[chrom]
             if coord < 0 or coord >= chrom_len:
                 total_unmapped += 1
@@ -1881,48 +2089,108 @@ def gtrack_import_mappedseq(
         _close_text_auto(stream)
 
     if pileup > 0:
-        dense_rows = {"chrom": [], "start": [], "end": [], "value": []}
+        # --- Vectorized dense pileup ---
+        all_chroms = []
+        all_starts = []
+        all_ends = []
+        all_values = []
+
         for ci, chrom in enumerate(chroms):
             chrom_len = chrom_sizes[chrom]
             nbins = int(np.ceil(chrom_len / binsize))
             vals = np.zeros(nbins, dtype=np.float64)
 
-            for strand_idx, coords in enumerate((plus[ci], minus[ci])):
-                coords.sort()
-                prev = None
-                for c in coords:
-                    if remove_dups and prev is not None and c == prev:
-                        dups[ci] += 1
-                        continue
-                    prev = c
-                    if strand_idx == 0:
-                        from_coord = max(c, 0)
-                        to_coord = min(c + pileup, chrom_len)
-                    else:
-                        from_coord = max(c - pileup, 0)
-                        to_coord = min(c, chrom_len)
-                    if to_coord <= from_coord:
-                        continue
+            for strand_idx, coords_list in enumerate((plus[ci], minus[ci])):
+                if not coords_list:
+                    continue
+                coords_arr = np.array(coords_list, dtype=np.int64)
+                coords_arr.sort()
 
-                    fb = int(from_coord // binsize)
-                    tb = int(np.ceil(to_coord / binsize) - 1)
-                    if fb >= tb:
-                        vals[fb] += (to_coord - from_coord) / binsize
-                    else:
-                        vals[fb] += (fb + 1) - (from_coord / binsize)
-                        vals[tb] += (to_coord / binsize) - tb
-                        if tb > fb + 1:
-                            vals[fb + 1:tb] += 1.0
+                # Vectorized duplicate detection
+                if remove_dups:
+                    if len(coords_arr) > 1:
+                        is_unique = np.empty(len(coords_arr), dtype=np.bool_)
+                        is_unique[0] = True
+                        is_unique[1:] = coords_arr[1:] != coords_arr[:-1]
+                        n_dups = int(np.count_nonzero(~is_unique))
+                        dups[ci] += n_dups
+                        coords_arr = coords_arr[is_unique]
+                else:
+                    pass  # keep all coordinates
 
-            for b in range(nbins):
-                start = b * binsize
-                end = min((b + 1) * binsize, chrom_len)
-                dense_rows["chrom"].append(chrom)
-                dense_rows["start"].append(start)
-                dense_rows["end"].append(end)
-                dense_rows["value"].append(float(vals[b]))
+                if len(coords_arr) == 0:
+                    continue
 
-        ddf = pd.DataFrame(dense_rows)
+                # Vectorized from/to coordinate computation
+                if strand_idx == 0:
+                    from_coords = np.maximum(coords_arr, 0)
+                    to_coords = np.minimum(coords_arr + pileup, chrom_len)
+                else:
+                    from_coords = np.maximum(coords_arr - pileup, 0)
+                    to_coords = np.minimum(coords_arr, chrom_len)
+
+                # Filter out invalid intervals
+                valid = to_coords > from_coords
+                from_coords = from_coords[valid]
+                to_coords = to_coords[valid]
+
+                if len(from_coords) == 0:
+                    continue
+
+                # Vectorized bin assignment
+                fb = (from_coords // binsize).astype(np.intp)
+                tb = (np.ceil(to_coords / binsize) - 1).astype(np.intp)
+
+                # Separate single-bin and multi-bin intervals
+                single = fb >= tb
+                multi = ~single
+
+                # Single-bin: add fractional coverage
+                if np.any(single):
+                    s_fb = fb[single]
+                    s_from = from_coords[single]
+                    s_to = to_coords[single]
+                    contributions = (s_to - s_from) / binsize
+                    np.add.at(vals, s_fb, contributions)
+
+                # Multi-bin: first bin, last bin, and full bins in between
+                if np.any(multi):
+                    m_fb = fb[multi]
+                    m_tb = tb[multi]
+                    m_from = from_coords[multi]
+                    m_to = to_coords[multi]
+
+                    # First-bin fractional coverage
+                    first_frac = (m_fb + 1) - (m_from / binsize)
+                    np.add.at(vals, m_fb, first_frac)
+
+                    # Last-bin fractional coverage
+                    last_frac = (m_to / binsize) - m_tb
+                    np.add.at(vals, m_tb, last_frac)
+
+                    # Full bins in between (loop only over multi-bin reads)
+                    for j in range(len(m_fb)):
+                        if m_tb[j] > m_fb[j] + 1:
+                            vals[m_fb[j] + 1 : m_tb[j]] += 1.0
+
+            # Vectorized row building (replaces per-bin append loop)
+            bin_indices = np.arange(nbins, dtype=np.int64)
+            starts = bin_indices * binsize
+            ends = np.minimum((bin_indices + 1) * binsize, chrom_len)
+            chrom_arr = np.full(nbins, chrom, dtype=object)
+
+            all_chroms.append(chrom_arr)
+            all_starts.append(starts)
+            all_ends.append(ends)
+            all_values.append(vals)
+
+        # Build DataFrame in one shot from concatenated arrays
+        ddf = pd.DataFrame({
+            "chrom": np.concatenate(all_chroms) if all_chroms else np.array([], dtype=object),
+            "start": np.concatenate(all_starts) if all_starts else np.array([], dtype=np.int64),
+            "end": np.concatenate(all_ends) if all_ends else np.array([], dtype=np.int64),
+            "value": np.concatenate(all_values) if all_values else np.array([], dtype=np.float64),
+        })
         gtrack_create_dense(track, description, ddf[["chrom", "start", "end"]], ddf["value"], binsize, np.nan)
     else:
         sparse_rows = {"chrom": [], "start": [], "end": [], "value": []}
