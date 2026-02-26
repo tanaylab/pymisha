@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.8 (2026-02-26)
+
+### Bug fixes
+
+- Fixed `GInterval::dist2coord` treating `coord == end` as inside the interval, inconsistent with the half-open `[start, end)` convention used throughout the codebase. This could affect distance calculations for coordinates that fall exactly on an interval boundary.
+
 ## v0.1.7 (2026-02-23)
 
 ### Performance
