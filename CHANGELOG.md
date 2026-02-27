@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.10 (2026-02-27)
+
+### Documentation
+
+- Fixed API reference: added `docstring_style: numpy` to mkdocstrings config so Parameters, Returns, Examples, and See Also sections render correctly instead of as plain text.
+- Split monolithic API page (856KB, 136 functions) into 10 per-section pages: Database, Datasets, Tracks, Virtual Tracks, Intervals, Data Operations, Liftover, Sequence Analysis, Genome Synthesis.
+- Disabled inline source code display (`show_source: false`) to reduce page bloat.
+- Added signature annotations and separate signature rendering for better readability.
+- Limited TOC depth to prevent sub-sections (Parameters, Returns) from cluttering the sidebar.
+
 ## v0.1.9 (2026-02-27)
 
 ### Bug fixes

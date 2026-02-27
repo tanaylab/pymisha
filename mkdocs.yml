@@ -44,8 +44,12 @@ plugins:
       handlers:
         python:
           options:
-            show_source: true
+            docstring_style: numpy
+            docstring_section_style: spacy
+            show_source: false
             show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
             members_order: source
 
 markdown_extensions:
@@ -63,6 +67,7 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
+      toc_depth: 3
 
 nav:
   - Home: index.md
@@ -75,4 +80,14 @@ nav:
   - Reference:
       - R Parity: guides/parity.md
       - Roadmap: roadmap.md
-  - API Reference: api/pymisha.md
+  - API Reference:
+      - Overview: api/index.md
+      - Database: api/database.md
+      - Datasets: api/datasets.md
+      - Tracks: api/tracks.md
+      - Virtual Tracks: api/vtracks.md
+      - Intervals: api/intervals.md
+      - Data Operations: api/data-operations.md
+      - Liftover: api/liftover.md
+      - Sequence Analysis: api/sequence.md
+      - Genome Synthesis: api/synthesis.md
