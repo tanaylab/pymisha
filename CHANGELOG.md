@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.9 (2026-02-27)
+
+### Bug fixes
+
+- Fixed multi-chunk quad-tree reader: cross-chunk references (negative kid offsets) now correctly read the target chunk header instead of treating the file position as a node offset.
+- Fixed `gintervals_summary` and `gintervals_quantiles` for 2D intervals: replaced hardcoded 1D column names with dynamic coordinate column selection.
+- Added `_maybe_load_2d_intervals_set` calls to `gsummary`, `gquantiles`, `gdist` so string-named 2D interval sets are auto-detected.
+
+### Features
+
+- **2D vtrack iterator shifts:** `gvtrack_iterator_2d` shifts (`sshift1`/`eshift1`/`sshift2`/`eshift2`) are now applied during 2D extraction.
+
+### Performance
+
+- Cache file mmap per chrom pair in 2D extraction — opens each file once instead of per-interval.
+- Replace `iterrows()` with vectorized numpy extraction in `gtrack_2d_create` and `gtrack_2d_import_contacts`.
+
 ## v0.1.8 (2026-02-26)
 
 ### Bug fixes

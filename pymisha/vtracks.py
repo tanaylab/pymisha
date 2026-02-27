@@ -901,9 +901,15 @@ def _compute_vtrack_values(vtrack_name, intervals):
 
     func = str(payload.get("func", "avg")).lower()
 
+    # Functions that the C++ value-based vtrack path handles efficiently
+    _VALUE_CPP_FUNCS = {
+        "avg", "mean", "sum", "min", "max", "first", "last", "size",
+        "exists", "stddev", "std", "quantile", "sample", "lse",
+    }
+
     filter_df = payload.get("filter")
     if filter_df is None or (isinstance(filter_df, _pandas.DataFrame) and len(filter_df) == 0):
-        if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS:
+        if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS and func not in _VALUE_CPP_FUNCS:
             return _compute_value_df_vtrack(
                 intervals,
                 payload,

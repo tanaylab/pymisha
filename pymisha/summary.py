@@ -15,9 +15,16 @@ from ._shared import (
     _pymisha2df,
 )
 from .expr import _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars
-from .extract import _is_2d_intervals, gextract
+from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, gextract
 from .intervals import gintervals_all
 from .vtracks import _compute_vtrack_values
+
+
+def _interval_coord_cols(intervals):
+    """Return the coordinate column names for 1D or 2D intervals."""
+    if _is_2d_intervals(intervals):
+        return ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    return ["chrom", "start", "end"]
 
 
 def _validate_expr_security(expr, track_names=None, vtrack_names=None):
@@ -149,6 +156,8 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
     # Calculate number of bins for each dimension
     n_bins = [len(b) - 1 for b in breaks_list]
+
+    intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
     # Band or 2D intervals require extract-then-bin path
     if band is not None or _is_2d_intervals(intervals):
@@ -820,6 +829,8 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
+
     try:
         _validate_expr_security(expr)
     except UnsafeExpressionError as exc:
@@ -910,6 +921,8 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
     _checkroot()
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
     try:
         _validate_expr_security(expr)
@@ -1008,7 +1021,7 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
         with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             out["Total intervals"] = 0.0
             out["NaN intervals"] = 0.0
             out["Min"] = _numpy.nan
@@ -1023,7 +1036,7 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
         result = gextract(expr, intervals, iterator=iterator, band=band,
                           progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             out["Total intervals"] = 0.0
             out["NaN intervals"] = 0.0
             out["Min"] = _numpy.nan
@@ -1033,12 +1046,12 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
             out["Std dev"] = _numpy.nan
             out = out.reset_index(drop=True)
         else:
-            data_cols = [c for c in result.columns if c not in {"chrom", "start", "end", "intervalID"}]
+            data_cols = [c for c in result.columns if c not in _INTERVAL_META_COLS]
             if len(data_cols) != 1:
                 raise ValueError("Expected a single expression column for gintervals_summary")
 
             col = data_cols[0]
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             n = len(out)
             out["Total intervals"] = 0.0
             out["NaN intervals"] = 0.0
@@ -1132,7 +1145,7 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
         with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             for p in pct:
                 out[_format_percentile(p)] = _numpy.nan
             out = out.reset_index(drop=True)
@@ -1142,12 +1155,12 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
         result = gextract(expr, intervals, iterator=iterator, band=band,
                           progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             for p in pct:
                 out[_format_percentile(p)] = _numpy.nan
             out = out.reset_index(drop=True)
         else:
-            data_cols = [c for c in result.columns if c not in {"chrom", "start", "end", "intervalID"}]
+            data_cols = [c for c in result.columns if c not in _INTERVAL_META_COLS]
             if len(data_cols) != 1:
                 raise ValueError("Expected a single expression column for gintervals_quantiles")
 
@@ -1177,7 +1190,7 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
 
             q_df = q_df.reindex(all_ids)
 
-            out = intervals[["chrom", "start", "end"]].copy()
+            out = intervals[_interval_coord_cols(intervals)].copy()
             for p in pct:
                 if p in q_df.columns:
                     out[_format_percentile(p)] = q_df[p].values

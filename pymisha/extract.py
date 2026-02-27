@@ -69,36 +69,58 @@ def _obj_in_band(obj, is_points, band):
 
 def _gextract_2d_single(track, col_name, intervals, band):
     """Extract a single 2D track over 2D intervals."""
-    from ._quadtree import query_2d_track_objects
+    import struct
+
+    from ._quadtree import _read_file_header, query_2d_track_opened
     from .tracks import gtrack_info
 
     track_path = _pymisha.pm_track_path(track)
     info = gtrack_info(track)
     is_points = info.get("type") == "points"
 
-    rows = []
+    # Group intervals by (chrom1, chrom2) to open each file only once.
+    chrom_pair_intervals = {}  # (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...]
     for interval_idx, qrow in enumerate(intervals.itertuples(index=False)):
         c1 = str(qrow.chrom1)
+        c2 = str(qrow.chrom2)
         s1 = int(qrow.start1)
         e1 = int(qrow.end1)
-        c2 = str(qrow.chrom2)
         s2 = int(qrow.start2)
         e2 = int(qrow.end2)
+        key = (c1, c2)
+        if key not in chrom_pair_intervals:
+            chrom_pair_intervals[key] = []
+        chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
 
+    rows = []
+    for (c1, c2), interval_list in chrom_pair_intervals.items():
         filepath = _find_2d_track_file(track_path, c1, c2)
         if filepath is None:
             continue
 
-        objs = query_2d_track_objects(filepath, s1, s2, e1, e2)
-        for obj in objs:
-            if band is not None and not _obj_in_band(obj, is_points, band):
+        # Open/mmap the file once for all intervals on this chrom pair
+        file_is_points, num_objs, data = _read_file_header(filepath)
+        try:
+            if num_objs == 0:
                 continue
-            if is_points:
-                ox, oy, val = obj
-                rows.append((c1, ox, ox + 1, c2, oy, oy + 1, float(val), interval_idx))
-            else:
-                ox1, oy1, ox2, oy2, val = obj
-                rows.append((c1, ox1, ox2, c2, oy1, oy2, float(val), interval_idx))
+            root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
+
+            for interval_idx, s1, e1, s2, e2 in interval_list:
+                objs = query_2d_track_opened(
+                    data, file_is_points, num_objs, root_chunk_fpos,
+                    s1, s2, e1, e2,
+                )
+                for obj in objs:
+                    if band is not None and not _obj_in_band(obj, is_points, band):
+                        continue
+                    if is_points:
+                        ox, oy, val = obj
+                        rows.append((c1, ox, ox + 1, c2, oy, oy + 1, float(val), interval_idx))
+                    else:
+                        ox1, oy1, ox2, oy2, val = obj
+                        rows.append((c1, ox1, ox2, c2, oy1, oy2, float(val), interval_idx))
+        finally:
+            data.close()
 
     if not rows:
         return None
@@ -122,7 +144,14 @@ def _gextract_2d_single(track, col_name, intervals, band):
 
 
 def _resolve_2d_vtrack_source(vtrack_name):
-    """Resolve a 2D-capable virtual track to its backing 2D physical track."""
+    """Resolve a 2D-capable virtual track to its backing 2D physical track.
+
+    Returns
+    -------
+    tuple of (str, dict)
+        The physical track name and a dict with 2D shift values
+        ``{"sshift1": int, "eshift1": int, "sshift2": int, "eshift2": int}``.
+    """
     from .tracks import gtrack_info
 
     cfg = _shared._VTRACKS.get(vtrack_name)
@@ -149,14 +178,20 @@ def _resolve_2d_vtrack_source(vtrack_name):
         )
     if int(cfg.get("sshift", 0) or 0) != 0 or int(cfg.get("eshift", 0) or 0) != 0:
         raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' does not support iterator shifts"
+            f"2D extraction for virtual track '{vtrack_name}' does not support 1D iterator shifts"
         )
     if cfg.get("filter") is not None:
         raise ValueError(
             f"2D extraction for virtual track '{vtrack_name}' does not support filters"
         )
 
-    return src
+    shifts = {
+        "sshift1": int(cfg.get("sshift1", 0) or 0),
+        "eshift1": int(cfg.get("eshift1", 0) or 0),
+        "sshift2": int(cfg.get("sshift2", 0) or 0),
+        "eshift2": int(cfg.get("eshift2", 0) or 0),
+    }
+    return src, shifts
 
 
 def _maybe_load_2d_intervals_set(intervals, exprs, iterator, band):
@@ -184,6 +219,18 @@ def _maybe_load_2d_intervals_set(intervals, exprs, iterator, band):
     if _is_2d_intervals(loaded):
         return loaded
     return intervals
+
+
+def _apply_2d_shifts(intervals, sshift1, eshift1, sshift2, eshift2):
+    """Apply 2D iterator shifts to interval coordinates."""
+    if sshift1 == 0 and eshift1 == 0 and sshift2 == 0 and eshift2 == 0:
+        return intervals
+    shifted = intervals.copy()
+    shifted["start1"] = shifted["start1"] + sshift1
+    shifted["end1"] = shifted["end1"] + eshift1
+    shifted["start2"] = shifted["start2"] + sshift2
+    shifted["end2"] = shifted["end2"] + eshift2
+    return shifted
 
 
 def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
@@ -237,8 +284,11 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
             )
 
     vtrack_to_track = {}
+    vtrack_shifts = {}
     for vt_name in used_vtracks:
-        vtrack_to_track[vt_name] = _resolve_2d_vtrack_source(vt_name)
+        src, shifts = _resolve_2d_vtrack_source(vt_name)
+        vtrack_to_track[vt_name] = src
+        vtrack_shifts[vt_name] = shifts
 
     required_tracks = []
 
@@ -269,14 +319,27 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
     coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
 
     track_cols = {tname: _expr_safe_name(tname) for tname in required_tracks}
-    result = _gextract_2d_single(anchor_track, track_cols[anchor_track], intervals, band)
+
+    def _get_shifted_intervals(track_name):
+        """Return intervals with shifts applied if track is accessed via a shifted vtrack."""
+        for vt_name, src in vtrack_to_track.items():
+            if src == track_name:
+                s = vtrack_shifts[vt_name]
+                return _apply_2d_shifts(
+                    intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"]
+                )
+        return intervals
+
+    result = _gextract_2d_single(
+        anchor_track, track_cols[anchor_track], _get_shifted_intervals(anchor_track), band
+    )
     if result is None:
         return None
 
     for tname in required_tracks:
         if tname == anchor_track:
             continue
-        cur = _gextract_2d_single(tname, track_cols[tname], intervals, band)
+        cur = _gextract_2d_single(tname, track_cols[tname], _get_shifted_intervals(tname), band)
         if cur is None:
             result[track_cols[tname]] = _numpy.nan
             continue

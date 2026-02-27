@@ -671,6 +671,71 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
             double dist_margin = (func == "distance") ? (dist_param * 0.5) : 0.0;
 
+            // Hybrid sequential/binary scan state for start-sorted source intervals
+            size_t s_scan_idx = 0;
+            int64_t s_last_key = std::numeric_limits<int64_t>::min();
+            int s_last_chrom = -1;
+            // Hybrid scan state for end-sorted source intervals
+            size_t e_scan_idx = 0;
+            int64_t e_last_key = std::numeric_limits<int64_t>::min();
+            int e_last_chrom = -1;
+            // Hybrid scan state for neighbor.count expanded intervals (start-sorted)
+            size_t nc_scan_idx = 0;
+            int64_t nc_last_key = std::numeric_limits<int64_t>::min();
+            int nc_last_chrom = -1;
+
+            // Adaptive lower_bound on start-sorted sintervs array: sequential when
+            // queries advance monotonically, binary search on backward jump.
+            auto adaptive_lb_start = [&](const GInterval &eval) -> size_t {
+                if (eval.chromid == s_last_chrom && eval.start >= s_last_key) {
+                    while (s_scan_idx < sintervs.size() &&
+                           interval_cmp_start(sintervs[s_scan_idx], eval)) {
+                        ++s_scan_idx;
+                    }
+                } else {
+                    s_scan_idx = (size_t)(std::lower_bound(
+                        sintervs.begin(), sintervs.end(), eval,
+                        interval_cmp_start) - sintervs.begin());
+                }
+                s_last_key = eval.start;
+                s_last_chrom = eval.chromid;
+                return s_scan_idx;
+            };
+
+            // Adaptive lower_bound on end-sorted eintervs array
+            auto adaptive_lb_end = [&](const GInterval &eval) -> size_t {
+                if (eval.chromid == e_last_chrom && eval.end >= e_last_key) {
+                    while (e_scan_idx < eintervs.size() &&
+                           interval_cmp_end(eintervs[e_scan_idx], eval)) {
+                        ++e_scan_idx;
+                    }
+                } else {
+                    e_scan_idx = (size_t)(std::lower_bound(
+                        eintervs.begin(), eintervs.end(), eval,
+                        interval_cmp_end) - eintervs.begin());
+                }
+                e_last_key = eval.end;
+                e_last_chrom = eval.chromid;
+                return e_scan_idx;
+            };
+
+            // Adaptive lower_bound on neighbor.count's start-sorted expanded eintervs
+            auto adaptive_lb_nc = [&](const GInterval &eval) -> size_t {
+                if (eval.chromid == nc_last_chrom && eval.start >= nc_last_key) {
+                    while (nc_scan_idx < eintervs.size() &&
+                           interval_cmp_start(eintervs[nc_scan_idx], eval)) {
+                        ++nc_scan_idx;
+                    }
+                } else {
+                    nc_scan_idx = (size_t)(std::lower_bound(
+                        eintervs.begin(), eintervs.end(), eval,
+                        interval_cmp_start) - eintervs.begin());
+                }
+                nc_last_key = eval.start;
+                nc_last_chrom = eval.chromid;
+                return nc_scan_idx;
+            };
+
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
@@ -685,7 +750,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 if (func == "distance") {
                     int64_t coord = (eval.start + eval.end) / 2;
                     double min_dist = std::numeric_limits<double>::max();
-                    auto it = std::lower_bound(sintervs.begin(), sintervs.end(), eval, interval_cmp_start);
+                    size_t idx = adaptive_lb_start(eval);
+                    auto it = sintervs.begin() + idx;
                     if (it != sintervs.end() && it->chromid == eval.chromid) {
                         min_dist = it->dist2coord(coord, dist_margin);
                     }
@@ -697,7 +763,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     if (min_dist == std::numeric_limits<double>::max()) {
                         set_nan(i);
                     } else {
-                        auto it2 = std::lower_bound(eintervs.begin(), eintervs.end(), eval, interval_cmp_end);
+                        size_t idx2 = adaptive_lb_end(eval);
+                        auto it2 = eintervs.begin() + idx2;
                         if (it2 != eintervs.end() && it2->chromid == eval.chromid) {
                             double d = it2->dist2coord(coord, dist_margin);
                             if (std::fabs(d) < std::fabs(min_dist)) min_dist = d;
@@ -713,7 +780,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                 if (func == "distance.center") {
                     int64_t coord = (eval.start + eval.end) / 2;
-                    auto it = std::lower_bound(sintervs.begin(), sintervs.end(), eval, interval_cmp_start);
+                    size_t idx = adaptive_lb_start(eval);
+                    auto it = sintervs.begin() + idx;
                     double dist = std::numeric_limits<double>::quiet_NaN();
                     if (it != sintervs.begin()) {
                         auto prev = it - 1;
@@ -732,7 +800,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                 if (func == "distance.edge") {
                     int64_t best = std::numeric_limits<int64_t>::max();
-                    auto it = std::lower_bound(sintervs.begin(), sintervs.end(), eval, interval_cmp_start);
+                    size_t idx = adaptive_lb_start(eval);
+                    auto it = sintervs.begin() + idx;
                     if (it != sintervs.end() && it->chromid == eval.chromid) {
                         int64_t d = eval.dist2interv(*it);
                         if (llabs(d) < llabs(best) || best == std::numeric_limits<int64_t>::max())
@@ -742,7 +811,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                         int64_t d = eval.dist2interv(*(it - 1));
                         if (llabs(d) < llabs(best)) best = d;
                     }
-                    auto it2 = std::lower_bound(eintervs.begin(), eintervs.end(), eval, interval_cmp_end);
+                    size_t idx2 = adaptive_lb_end(eval);
+                    auto it2 = eintervs.begin() + idx2;
                     if (it2 != eintervs.end() && it2->chromid == eval.chromid) {
                         int64_t d = eval.dist2interv(*it2);
                         if (llabs(d) < llabs(best)) best = d;
@@ -765,7 +835,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                         continue;
                     }
                     int64_t total_overlap = 0;
-                    auto it = std::lower_bound(sintervs.begin(), sintervs.end(), eval, interval_cmp_start);
+                    size_t idx = adaptive_lb_start(eval);
+                    auto it = sintervs.begin() + idx;
                     if (it != sintervs.begin()) {
                         auto prev = it - 1;
                         if (prev->chromid == eval.chromid && prev->end > eval.start) {
@@ -791,7 +862,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                         continue;
                     }
                     size_t count = 0;
-                    auto it = std::lower_bound(eintervs.begin(), eintervs.end(), eval, interval_cmp_start);
+                    size_t idx = adaptive_lb_nc(eval);
+                    auto it = eintervs.begin() + idx;
                     if (it != eintervs.begin()) {
                         auto prev = it - 1;
                         while (true) {
@@ -843,19 +915,20 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             }
             double percentile = obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
 
+            std::vector<double> vals;
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
                     set_nan(i);
                     continue;
                 }
-                std::vector<double> vals;
+                vals.clear();
                 auto it = std::lower_bound(entries.begin(), entries.end(), eval, [](const IntervalValue &a, const GInterval &b) {
                     if (a.interval.chromid != b.chromid) return a.interval.chromid < b.chromid;
                     if (a.interval.start != b.start) return a.interval.start < b.start;
                     return a.interval.end < b.end;
                 });
-                if (it != entries.begin()) --it;
+                if (it != entries.begin() && (it - 1)->interval.chromid == eval.chromid) --it;
                 for (; it != entries.end() && it->interval.chromid == eval.chromid && it->interval.start < eval.end; ++it) {
                     if (it->interval.end > eval.start) {
                         if (!std::isnan(it->value)) vals.push_back(it->value);
@@ -973,6 +1046,14 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         if (func == "lse") {
             int cur_chromid = -1;
             bool cur_chromid_valid = false;
+            // Hybrid scan state for sparse LSE
+            size_t lse_sp_scan_idx = 0;
+            int64_t lse_sp_last_start = std::numeric_limits<int64_t>::min();
+            bool lse_sp_scan_ready = false;
+            const std::vector<GInterval> *lse_sp_intervals_ptr = nullptr;
+            const std::vector<float> *lse_sp_vals_ptr = nullptr;
+            std::vector<double> vals;
+            std::vector<float> bin_vals;
 
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
@@ -992,6 +1073,11 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                             fixed_bin->init_read(full_path.c_str(), eval.chromid);
                         } else if (sparse) {
                             sparse->init_read(full_path.c_str(), eval.chromid);
+                            lse_sp_intervals_ptr = &sparse->get_intervals();
+                            lse_sp_vals_ptr = &sparse->get_vals();
+                            lse_sp_scan_idx = 0;
+                            lse_sp_last_start = std::numeric_limits<int64_t>::min();
+                            lse_sp_scan_ready = false;
                         }
                         cur_chromid = eval.chromid;
                         cur_chromid_valid = true;
@@ -1004,21 +1090,42 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 }
 
                 // Collect non-NaN values from the interval
-                std::vector<double> vals;
+                vals.clear();
                 if (fixed_bin) {
                     unsigned bin_size = fixed_bin->get_bin_size();
                     int64_t sbin = (int64_t)(eval.start / bin_size);
                     int64_t ebin = (int64_t)std::ceil(eval.end / (double)bin_size);
-                    std::vector<float> bin_vals;
+                    bin_vals.clear();
                     int64_t bins_read = fixed_bin->read_bins_bulk(sbin, ebin - sbin, bin_vals);
                     vals.reserve(bins_read);
                     for (int64_t j = 0; j < bins_read; ++j) {
                         if (!std::isnan(bin_vals[j])) vals.push_back((double)bin_vals[j]);
                     }
-                } else if (sparse) {
-                    const std::vector<GInterval> &sp_intervals = sparse->get_intervals();
-                    const std::vector<float> &sp_vals = sparse->get_vals();
-                    for (size_t j = 0; j < sp_intervals.size(); ++j) {
+                } else if (sparse && lse_sp_intervals_ptr) {
+                    const std::vector<GInterval> &sp_intervals = *lse_sp_intervals_ptr;
+                    const std::vector<float> &sp_vals = *lse_sp_vals_ptr;
+
+                    // Hybrid sequential/binary scan
+                    if (!lse_sp_scan_ready || eval.start < lse_sp_last_start) {
+                        size_t lo = 0, hi = sp_intervals.size();
+                        while (lo < hi) {
+                            size_t mid = lo + (hi - lo) / 2;
+                            if (sp_intervals[mid].end <= eval.start)
+                                lo = mid + 1;
+                            else
+                                hi = mid;
+                        }
+                        lse_sp_scan_idx = lo;
+                        lse_sp_scan_ready = true;
+                    } else {
+                        while (lse_sp_scan_idx < sp_intervals.size() &&
+                               sp_intervals[lse_sp_scan_idx].end <= eval.start) {
+                            ++lse_sp_scan_idx;
+                        }
+                    }
+                    lse_sp_last_start = eval.start;
+
+                    for (size_t j = lse_sp_scan_idx; j < sp_intervals.size(); ++j) {
                         if (sp_intervals[j].start >= eval.end) break;
                         if (sp_intervals[j].end > eval.start && !std::isnan(sp_vals[j])) {
                             vals.push_back((double)sp_vals[j]);

@@ -3055,23 +3055,21 @@ def gtrack_2d_create(track, description, intervals, values):
 
             # Collect objects and check overlaps
             if is_points:
-                objs = []
-                for _, row in group.iterrows():
-                    oi = row.name  # position in sorted df
-                    objs.append((int(row["start1"]), int(row["start2"]),
-                                 float(values_arr[orig_idx[oi]])))
+                group_indices = group.index.to_numpy()
+                s1 = group["start1"].to_numpy(dtype=int)
+                s2 = group["start2"].to_numpy(dtype=int)
+                vals = values_arr[orig_idx[group_indices]].astype(float)
+                objs = list(zip(s1, s2, vals, strict=False))
                 # Points can't overlap (they're 1x1)
             else:
-                rects_for_check = []
-                objs = []
-                for _, row in group.iterrows():
-                    oi = row.name
-                    r = (int(row["start1"]), int(row["start2"]),
-                         int(row["end1"]), int(row["end2"]))
-                    rects_for_check.append(r)
-                    objs.append((int(row["start1"]), int(row["start2"]),
-                                 int(row["end1"]), int(row["end2"]),
-                                 float(values_arr[orig_idx[oi]])))
+                group_indices = group.index.to_numpy()
+                s1 = group["start1"].to_numpy(dtype=int)
+                s2 = group["start2"].to_numpy(dtype=int)
+                e1 = group["end1"].to_numpy(dtype=int)
+                e2 = group["end2"].to_numpy(dtype=int)
+                vals = values_arr[orig_idx[group_indices]].astype(float)
+                rects_for_check = list(zip(s1, s2, e1, e2, strict=False))
+                objs = list(zip(s1, s2, e1, e2, vals, strict=False))
                 verify_no_overlaps_2d(rects_for_check)
 
             filename = os.path.join(str(track_dir), f"{c1}-{c2}")
@@ -3234,10 +3232,14 @@ def gtrack_2d_import_contacts(
             raise ValueError(
                 "Fends file must contain columns: fend, chr, coord"
             )
-        fend_map = {}
         fdf["chr"] = fdf["chr"].astype(str).str.replace(r'\.0$', '', regex=True)
-        for _, row in fdf.iterrows():
-            fend_map[int(row["fend"])] = (str(row["chr"]), int(row["coord"]))
+        fend_ids = fdf["fend"].to_numpy(dtype=int)
+        fend_chrs = fdf["chr"].to_numpy(dtype=str)
+        fend_coords = fdf["coord"].to_numpy(dtype=int)
+        fend_map = {
+            int(fid): (ch, int(co))
+            for fid, ch, co in zip(fend_ids, fend_chrs, fend_coords, strict=False)
+        }
 
     # ------------------------------------------------------------------
     # 2. Read contact files and build a list of (chrom1, mid1, chrom2, mid2, value)
@@ -3257,16 +3259,19 @@ def gtrack_2d_import_contacts(
                     "Contacts file (fends mode) must contain columns: "
                     "fend1, fend2, count"
                 )
-            for _, row in df.iterrows():
-                f1 = int(row["fend1"])
-                f2 = int(row["fend2"])
+            f1_arr = df["fend1"].to_numpy(dtype=int)
+            f2_arr = df["fend2"].to_numpy(dtype=int)
+            count_arr = df["count"].to_numpy(dtype=float)
+            for i in range(len(f1_arr)):
+                f1 = int(f1_arr[i])
+                f2 = int(f2_arr[i])
                 if f1 not in fend_map:
                     raise ValueError(f"Unknown fend id: {f1}")
                 if f2 not in fend_map:
                     raise ValueError(f"Unknown fend id: {f2}")
                 c1, coord1 = fend_map[f1]
                 c2, coord2 = fend_map[f2]
-                records.append((c1, coord1, c2, coord2, float(row["count"])))
+                records.append((c1, coord1, c2, coord2, count_arr[i]))
         else:
             # intervals-value format
             if len(df.columns) < 7:
@@ -3283,12 +3288,19 @@ def gtrack_2d_import_contacts(
             # Ensure chrom columns are strings (pandas may parse '1' as int/float)
             df["chrom1"] = df["chrom1"].astype(str).str.replace(r'\.0$', '', regex=True)
             df["chrom2"] = df["chrom2"].astype(str).str.replace(r'\.0$', '', regex=True)
-            for _, row in df.iterrows():
-                mid1 = int((int(row["start1"]) + int(row["end1"])) // 2)
-                mid2 = int((int(row["start2"]) + int(row["end2"])) // 2)
+            c1_arr = df["chrom1"].to_numpy(dtype=str)
+            s1_arr = df["start1"].to_numpy(dtype=int)
+            e1_arr = df["end1"].to_numpy(dtype=int)
+            c2_arr = df["chrom2"].to_numpy(dtype=str)
+            s2_arr = df["start2"].to_numpy(dtype=int)
+            e2_arr = df["end2"].to_numpy(dtype=int)
+            val_arr = df[value_col].to_numpy(dtype=float)
+            mid1_arr = (s1_arr + e1_arr) // 2
+            mid2_arr = (s2_arr + e2_arr) // 2
+            for i in range(len(c1_arr)):
                 records.append(
-                    (str(row["chrom1"]), mid1, str(row["chrom2"]), mid2,
-                     float(row[value_col]))
+                    (c1_arr[i], int(mid1_arr[i]), c2_arr[i], int(mid2_arr[i]),
+                     val_arr[i])
                 )
 
     if not records:
@@ -3414,13 +3426,11 @@ def gtrack_2d_import_contacts(
             if cs1 is None or cs2 is None:
                 continue
             arena = (0, 0, cs1, cs2)
-            objs = []
-            for _, row in group.iterrows():
-                oi = row.name
-                objs.append((
-                    int(row["start1"]), int(row["start2"]),
-                    float(values_arr[orig_idx[oi]])
-                ))
+            group_indices = group.index.to_numpy()
+            s1 = group["start1"].to_numpy(dtype=int)
+            s2 = group["start2"].to_numpy(dtype=int)
+            vals = values_arr[orig_idx[group_indices]].astype(float)
+            objs = list(zip(s1, s2, vals, strict=False))
             filename = os.path.join(str(track_dir), f"{c1}-{c2}")
             write_2d_track_file(filename, objs, arena, is_points=True)
 

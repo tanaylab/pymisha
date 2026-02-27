@@ -382,6 +382,29 @@ def _read_leaf_objects(data, offset, num_objs, is_points):
     return objs
 
 
+def _resolve_chunk_node(data, chunk_fpos):
+    """Read a chunk header and return (chunk_fpos, top_node_offset).
+
+    A chunk starts with [int64 chunk_size][int64 top_node_offset].
+    The top_node_offset is relative to chunk_fpos.
+
+    Parameters
+    ----------
+    data : mmap or bytes
+        The raw file data.
+    chunk_fpos : int
+        Absolute file position where the chunk starts.
+
+    Returns
+    -------
+    tuple of (int, int)
+        (chunk_fpos, top_node_offset) so the caller can recurse with
+        chunk_data_offset=chunk_fpos and node_offset=top_node_offset.
+    """
+    top_node_offset = struct.unpack_from("<q", data, chunk_fpos + 8)[0]
+    return chunk_fpos, top_node_offset
+
+
 def _collect_all_objects(data, chunk_data_offset, node_offset, is_points, _visited=None, _depth=0, _out=None):
     """Recursively collect all objects from a quad-tree node."""
     if _visited is None:
@@ -413,8 +436,12 @@ def _collect_all_objects(data, chunk_data_offset, node_offset, is_points, _visit
                     data, chunk_data_offset, kid_off, is_points, _visited, _depth + 1, _out
                 )
             else:
-                # Negative: absolute file position (cross-chunk reference)
-                _collect_all_objects(data, 0, -kid_off, is_points, _visited, _depth + 1, _out)
+                # Negative: absolute file position of another chunk.
+                # Read the chunk header to find its top_node_offset.
+                cross_chunk_fpos, cross_top_node = _resolve_chunk_node(data, -kid_off)
+                _collect_all_objects(
+                    data, cross_chunk_fpos, cross_top_node, is_points, _visited, _depth + 1, _out
+                )
         return _out
     finally:
         _visited.discard(key)
@@ -472,8 +499,11 @@ def _query_node(data, chunk_data_offset, node_offset, is_points, qx1, qy1, qx2, 
                                 qx1, qy1, qx2, qy2, seen_ids, _visited, _depth + 1)
                 )
             else:
+                # Negative: absolute file position of another chunk.
+                # Read the chunk header to find its top_node_offset.
+                cross_chunk_fpos, cross_top_node = _resolve_chunk_node(data, -kid_off)
                 results.extend(
-                    _query_node(data, 0, -kid_off, is_points,
+                    _query_node(data, cross_chunk_fpos, cross_top_node, is_points,
                                 qx1, qy1, qx2, qy2, seen_ids, _visited, _depth + 1)
                 )
         return results
@@ -548,6 +578,54 @@ def read_2d_track_objects(filepath):
         data.close()
 
 
+def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, qx2, qy2):
+    """
+    Query a pre-opened 2D track mmap for objects intersecting a rectangle.
+
+    This avoids repeated file open/mmap/close when querying multiple intervals
+    on the same chrom pair.
+
+    Parameters
+    ----------
+    data : mmap or bytes
+        Memory-mapped file data (from ``_read_file_header``).
+    is_points : bool
+        Whether the track stores points (True) or rectangles (False).
+    num_objs : int
+        Total number of objects in the file (from header).
+    root_chunk_fpos : int
+        File position of the root chunk (``struct.unpack_from("<q", data, 12)[0]``).
+    qx1, qy1, qx2, qy2 : int
+        Query rectangle bounds.
+
+    Returns
+    -------
+    list of tuples
+        For RECTS: (x1, y1, x2, y2, value)
+        For POINTS: (x, y, value)
+    """
+    if num_objs == 0:
+        return []
+
+    top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
+
+    seen_ids = set()
+    raw_objs = _query_node(data, root_chunk_fpos, top_node_offset, is_points,
+                           qx1, qy1, qx2, qy2, seen_ids)
+
+    # Strip obj_id from output
+    result = []
+    for obj in raw_objs:
+        if is_points:
+            _, x, y, val = obj
+            result.append((x, y, val))
+        else:
+            _, x1, y1, x2, y2, val = obj
+            result.append((x1, y1, x2, y2, val))
+
+    return result
+
+
 def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):
     """
     Query a misha 2D track file for objects intersecting a rectangle.
@@ -571,22 +649,7 @@ def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):
             return []
 
         root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
-        top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
-
-        seen_ids = set()
-        raw_objs = _query_node(data, root_chunk_fpos, top_node_offset, is_points,
-                               qx1, qy1, qx2, qy2, seen_ids)
-
-        # Strip obj_id from output
-        result = []
-        for obj in raw_objs:
-            if is_points:
-                _, x, y, val = obj
-                result.append((x, y, val))
-            else:
-                _, x1, y1, x2, y2, val = obj
-                result.append((x1, y1, x2, y2, val))
-
-        return result
+        return query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
+                                     qx1, qy1, qx2, qy2)
     finally:
         data.close()
