@@ -386,8 +386,8 @@ def _canonicalize_known_chroms(df):
     # Vectorized apply via map
     canonical = raw_chroms.map(canon_map)
     mask = canonical.notna()
-    out = df.loc[mask.values].copy()
-    out["chrom"] = canonical.loc[mask.values].values
+    out = df.loc[mask.to_numpy()].copy()
+    out["chrom"] = canonical.loc[mask.to_numpy()].to_numpy()
     return out.reset_index(drop=True)
 
 
@@ -2784,7 +2784,7 @@ def gtrack_var_get(track, var):
         if isinstance(result, pd.DataFrame):
             # Single column → return as array
             if result.shape[1] == 1:
-                return result.iloc[:, 0].values
+                return result.iloc[:, 0].to_numpy()
             return result
         return result
     except Exception:

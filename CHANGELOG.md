@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.11 (2026-03-01)
+
+### Features
+
+- **2D virtual track aggregation:** All five 2D vtrack functions (`area`, `weighted.sum`, `min`, `max`, `avg`) are now supported, matching R misha feature parity. Previously only alias-style vtracks (`avg`/`mean`) were allowed in 2D extraction.
+- **Hybrid quad-tree stat traversal:** 2D aggregation uses R misha's `get_stat` algorithm — O(1) for fully-contained subtrees via pre-computed node stats, O(K) enumeration only at partially-overlapping leaves. Arena-clamped 3-way intersection prevents double-counting across sibling nodes.
+- **Band filter support:** 2D aggregation vtracks work with band filters (falls back to per-object enumeration since node-level stats don't account for diagonal band constraints).
+
+### Bug fixes
+
+- **pandas 3.0 compatibility:** Fixed C++ extension and Python codebase for pandas 3.0 (DataFrame construction, deprecated APIs).
+
 ## v0.1.10 (2026-02-27)
 
 ### Documentation

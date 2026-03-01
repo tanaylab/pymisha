@@ -355,12 +355,24 @@ _POINT_OBJ_SIZE = 32  # uint64(8) + 2*int64(16) + float(4) + pad(4)
 
 
 def _unpack_node_base(data, offset):
-    """Unpack NodeBase from data at offset. Returns (is_leaf, arena, new_offset)."""
+    """Unpack NodeBase from data at offset. Returns (is_leaf, arena)."""
     is_leaf = struct.unpack_from("<B", data, offset)[0] != 0
     # Skip pad(7) + Stat(32) = 39 bytes to get to arena at offset+40
     arena_off = offset + 8 + 32  # bool+pad(8) + stat(32)
     x1, y1, x2, y2 = struct.unpack_from("<qqqq", data, arena_off)
     return is_leaf, (x1, y1, x2, y2)
+
+
+def _unpack_stat(data, offset):
+    """Unpack Stat struct from a NodeBase at *offset*.
+
+    Stat is at offset+8 (after bool(1)+pad(7)): int64 occupied_area,
+    double weighted_sum, double min_val, double max_val = 32 bytes.
+
+    Returns (occupied_area, weighted_sum, min_val, max_val).
+    """
+    stat_off = offset + 8  # bool+pad(8)
+    return struct.unpack_from("<qddd", data, stat_off)
 
 
 def _read_leaf_objects(data, offset, num_objs, is_points):
@@ -624,6 +636,224 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
             result.append((x1, y1, x2, y2, val))
 
     return result
+
+
+def _query_node_stats(data, chunk_data_offset, node_offset, is_points,
+                      qx1, qy1, qx2, qy2, stat,
+                      _visited=None, _depth=0):
+    """Hybrid quad-tree stat traversal matching R misha's ``get_stat``.
+
+    For internal nodes whose arena is *fully contained* by the query rectangle,
+    the pre-computed node stats are used directly (O(1) per subtree).  For
+    partially overlapping nodes, recursion continues.  Leaf nodes enumerate
+    objects and compute intersection-based stats **clamped to the leaf's arena**
+    so that each node only accounts for the portion of objects within its own
+    bounding box (avoiding double-counting of objects that span siblings).
+
+    This matches R misha's ``obj.intersect(rect, leaf->arena)`` 3-way
+    intersection approach.
+
+    *stat* is a 4-element list ``[occupied_area, weighted_sum, min_val, max_val]``
+    that is updated in-place.
+    """
+    if _visited is None:
+        _visited = set()
+    key = (chunk_data_offset, node_offset)
+    if key in _visited:
+        raise RecursionError("Corrupt 2D track file: cyclic quad-tree node reference")
+    if _depth > 100000:
+        raise RecursionError("Corrupt 2D track file: excessive quad-tree recursion depth")
+    _visited.add(key)
+
+    abs_offset = chunk_data_offset + node_offset
+    is_leaf, arena = _unpack_node_base(data, abs_offset)
+    ax1, ay1, ax2, ay2 = arena
+
+    # Prune: no intersection with query
+    if ax1 >= qx2 or ax2 <= qx1 or ay1 >= qy2 or ay2 <= qy1:
+        _visited.discard(key)
+        return
+
+    # Effective query rect clamped to this node's arena — ensures each node
+    # only accounts for the portion of objects within its own bounding box.
+    eqx1 = max(qx1, ax1)
+    eqy1 = max(qy1, ay1)
+    eqx2 = min(qx2, ax2)
+    eqy2 = min(qy2, ay2)
+
+    try:
+        if is_leaf:
+            # Enumerate objects and compute intersection stats, clamped to arena.
+            num_objs = struct.unpack_from("<I", data, abs_offset + _NODEBASE_SIZE)[0]
+            raw_objs = _read_leaf_objects(data, abs_offset + _LEAF_SIZE, num_objs, is_points)
+            for obj in raw_objs:
+                if is_points:
+                    _, ox, oy, val = obj
+                    # Point inside both query and arena?
+                    if (eqx1 <= ox < eqx2 and eqy1 <= oy < eqy2):
+                        stat[0] += 1           # occupied_area
+                        stat[1] += val         # weighted_sum
+                        if val < stat[2]:
+                            stat[2] = val      # min_val
+                        if val > stat[3]:
+                            stat[3] = val      # max_val
+                else:
+                    _, ox1, oy1, ox2, oy2, val = obj
+                    # Intersection clamped to effective query (query ∩ arena)
+                    inter = (max(0, min(eqx2, ox2) - max(eqx1, ox1))
+                             * max(0, min(eqy2, oy2) - max(eqy1, oy1)))
+                    if inter > 0:
+                        stat[0] += inter           # occupied_area
+                        stat[1] += val * inter     # weighted_sum
+                        if val < stat[2]:
+                            stat[2] = val
+                        if val > stat[3]:
+                            stat[3] = val
+        else:
+            # Internal node: check each child quadrant
+            kid_offsets = struct.unpack_from("<qqqq", data, abs_offset + _NODEBASE_SIZE)
+            for kid_off in kid_offsets:
+                if kid_off >= 0:
+                    child_abs = chunk_data_offset + kid_off
+                    child_chunk = chunk_data_offset
+                    child_node = kid_off
+                else:
+                    child_chunk, child_node = _resolve_chunk_node(data, -kid_off)
+                    child_abs = child_chunk + child_node
+
+                _, child_arena = _unpack_node_base(data, child_abs)
+                cx1, cy1, cx2, cy2 = child_arena
+
+                # Skip if child doesn't intersect query
+                if cx1 >= qx2 or cx2 <= qx1 or cy1 >= qy2 or cy2 <= qy1:
+                    continue
+
+                # Fast path: child fully inside query -> use pre-computed stats
+                if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
+                    c_occ, c_ws, c_min, c_max = _unpack_stat(data, child_abs)
+                    if c_occ > 0:
+                        stat[0] += c_occ
+                        stat[1] += c_ws
+                        if c_min < stat[2]:
+                            stat[2] = c_min
+                        if c_max > stat[3]:
+                            stat[3] = c_max
+                    continue
+
+                # Partial overlap: recurse
+                _query_node_stats(data, child_chunk, child_node, is_points,
+                                  qx1, qy1, qx2, qy2, stat,
+                                  _visited, _depth + 1)
+    finally:
+        _visited.discard(key)
+
+
+def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
+                         qx1, qy1, qx2, qy2, band=None):
+    """
+    Query a pre-opened 2D track mmap and return aggregated stats for a query rectangle.
+
+    Uses a hybrid quad-tree traversal matching R misha's ``get_stat`` algorithm:
+    for subtrees fully contained by the query, pre-computed node statistics are
+    used directly (O(1) per subtree), avoiding object enumeration.
+
+    Parameters
+    ----------
+    data : mmap or bytes
+        Memory-mapped file data (from ``_read_file_header``).
+    is_points : bool
+        Whether the track stores points (True) or rectangles (False).
+    num_objs : int
+        Total number of objects in the file (from header).
+    root_chunk_fpos : int
+        File position of the root chunk.
+    qx1, qy1, qx2, qy2 : int
+        Query rectangle bounds.
+    band : tuple of (int, int) or None
+        If not None, ``(d1, d2)`` diagonal band filter. When a band is
+        specified, the fast node-stats path cannot be used and a full
+        object-level enumeration is performed instead.
+
+    Returns
+    -------
+    dict
+        ``{"occupied_area": int, "weighted_sum": float,
+        "min_val": float, "max_val": float}``.
+        When no objects contribute, *min_val* and *max_val* are ``float("nan")``.
+    """
+    if num_objs == 0:
+        return {"occupied_area": 0, "weighted_sum": 0.0,
+                "min_val": float("nan"), "max_val": float("nan")}
+
+    if band is not None:
+        # Band filtering requires per-object inspection — fall back to object
+        # enumeration.  The node-level stats don't account for band constraints.
+        return _query_2d_track_stats_with_band(
+            data, is_points, num_objs, root_chunk_fpos,
+            qx1, qy1, qx2, qy2, band)
+
+    top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
+
+    # stat = [occupied_area, weighted_sum, min_val, max_val]
+    stat = [0, 0.0, float("inf"), float("-inf")]
+
+    _query_node_stats(data, root_chunk_fpos, top_node_offset, is_points,
+                      qx1, qy1, qx2, qy2, stat)
+
+    if stat[0] == 0:
+        return {"occupied_area": 0, "weighted_sum": 0.0,
+                "min_val": float("nan"), "max_val": float("nan")}
+
+    return {"occupied_area": stat[0], "weighted_sum": stat[1],
+            "min_val": stat[2], "max_val": stat[3]}
+
+
+def _query_2d_track_stats_with_band(data, is_points, num_objs, root_chunk_fpos,
+                                     qx1, qy1, qx2, qy2, band):
+    """Fall-back stat query when a diagonal band filter is active.
+
+    Band filtering cannot leverage node-level stats (the stored stats don't
+    account for band constraints), so we enumerate objects via
+    ``query_2d_track_opened`` and compute stats per-object.
+    """
+    objs = query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
+                                 qx1, qy1, qx2, qy2)
+    d1, d2 = band
+    occupied_area = 0
+    weighted_sum = 0.0
+    min_val = float("inf")
+    max_val = float("-inf")
+
+    if is_points:
+        for x, y, val in objs:
+            if not (d1 <= (x - y) < d2):
+                continue
+            occupied_area += 1
+            weighted_sum += val
+            if val < min_val:
+                min_val = val
+            if val > max_val:
+                max_val = val
+    else:
+        for ox1, oy1, ox2, oy2, val in objs:
+            if not ((ox2 - oy1 > d1) and (ox1 - oy2 + 1 < d2)):
+                continue
+            inter = (max(0, min(qx2, ox2) - max(qx1, ox1))
+                     * max(0, min(qy2, oy2) - max(qy1, oy1)))
+            if inter > 0:
+                occupied_area += inter
+                weighted_sum += val * inter
+            if val < min_val:
+                min_val = val
+            if val > max_val:
+                max_val = val
+
+    if occupied_area == 0 and min_val == float("inf"):
+        return {"occupied_area": 0, "weighted_sum": 0.0,
+                "min_val": float("nan"), "max_val": float("nan")}
+
+    return {"occupied_area": occupied_area, "weighted_sum": weighted_sum,
+            "min_val": min_val, "max_val": max_val}
 
 
 def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):

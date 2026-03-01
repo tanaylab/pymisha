@@ -489,16 +489,16 @@ def gintervals_2d_all(mode="diagonal"):
 
     if mode == "diagonal":
         df = _pandas.DataFrame({
-            'chrom1': intervals['chrom'].values,
+            'chrom1': intervals['chrom'].to_numpy(),
             'start1': intervals['start'].values,
             'end1': intervals['end'].values,
-            'chrom2': intervals['chrom'].values,
+            'chrom2': intervals['chrom'].to_numpy(),
             'start2': intervals['start'].values,
             'end2': intervals['end'].values,
         })
     else:
         # Full cartesian product (vectorized)
-        chrom = intervals["chrom"].to_numpy(copy=False)
+        chrom = intervals["chrom"].to_numpy()
         start = intervals["start"].to_numpy(copy=False)
         end = intervals["end"].to_numpy(copy=False)
         n = len(intervals)
@@ -3204,7 +3204,7 @@ def gintervals_rbind(*intervals, intervals_set_out=None):
     if not loaded:
         return None
 
-    result = _pandas.concat(loaded, ignore_index=True, sort=False, copy=False)
+    result = _pandas.concat(loaded, ignore_index=True, sort=False)
     if intervals_set_out is not None:
         gintervals_save(result, intervals_set_out)
         return None
@@ -3463,12 +3463,12 @@ def gintervals_annotate(intervals, annotation_intervals,
     output = _pandas.DataFrame()
     for col in out_cols:
         if col in result.columns:
-            output[col] = result[col].values
+            output[col] = result[col].to_numpy()
 
     # Add annotation columns with proper names
     for out_name, actual_col in ann_col_map.items():
         if actual_col is not None:
-            output[out_name] = result[actual_col].values
+            output[out_name] = result[actual_col].to_numpy()
         else:
             if isinstance(na_value, dict) and out_name in na_value:
                 output[out_name] = na_value[out_name]
@@ -3587,7 +3587,7 @@ def gintervals_normalize(intervals, size):
     # Compute new intervals
     starts = intervals["start"].values.astype(_numpy.int64)
     ends = intervals["end"].values.astype(_numpy.int64)
-    chroms = intervals["chrom"].values
+    chroms = intervals["chrom"].to_numpy()
 
     centers = (starts + ends) / 2.0
     half = size / 2.0
@@ -3617,7 +3617,7 @@ def gintervals_normalize(intervals, size):
     basic_cols = {"chrom", "start", "end"}
     for col in intervals.columns:
         if col not in basic_cols:
-            result[col] = intervals[col].values
+            result[col] = intervals[col].to_numpy()
 
     return result
 

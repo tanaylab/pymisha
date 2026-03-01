@@ -446,7 +446,7 @@ def _handle_tgt_overlaps_auto(df, policy):
         src_ends = group["endsrc"].to_numpy(dtype=np.int64, copy=False)
         chain_ids = group["chain_id"].to_numpy(dtype=np.int64, copy=False)
         scores = group["score"].to_numpy(dtype=float, copy=False)
-        chromsrc_vals = group["chromsrc"].to_numpy(copy=False)
+        chromsrc_vals = group["chromsrc"].to_numpy()
         strandsrc_vals = group["strandsrc"].to_numpy(dtype=np.int64, copy=False)
         spans = ends - starts
 

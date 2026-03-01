@@ -28,8 +28,8 @@ def _check_partition_invariants(result, breaks, scope_intervals=None):
     # Correct columns in order
     assert list(result.columns) == ["chrom", "start", "end", "bin"]
 
-    # Column types
-    assert result["chrom"].dtype == object  # string
+    # Column types — pandas 2.x uses object, pandas 3.0 uses StringDtype
+    assert result["chrom"].dtype == object or str(result["chrom"].dtype) == "str"
     assert result["start"].dtype == np.int64
     assert result["end"].dtype == np.int64
     assert result["bin"].dtype == np.int64

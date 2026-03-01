@@ -143,14 +143,19 @@ def _gextract_2d_single(track, col_name, intervals, band):
     ).reset_index(drop=True)
 
 
+_2D_VTRACK_FUNCS = {"avg", "mean", "area", "weighted.sum", "min", "max"}
+_2D_AGG_FUNCS = {"area", "weighted.sum", "min", "max", "avg"}
+
+
 def _resolve_2d_vtrack_source(vtrack_name):
     """Resolve a 2D-capable virtual track to its backing 2D physical track.
 
     Returns
     -------
-    tuple of (str, dict)
-        The physical track name and a dict with 2D shift values
-        ``{"sshift1": int, "eshift1": int, "sshift2": int, "eshift2": int}``.
+    tuple of (str, dict, str)
+        The physical track name, a dict with 2D shift values
+        ``{"sshift1": int, "eshift1": int, "sshift2": int, "eshift2": int}``,
+        and the aggregation function name (``"mean"`` is normalized to ``"avg"``).
     """
     from .tracks import gtrack_info
 
@@ -172,9 +177,14 @@ def _resolve_2d_vtrack_source(vtrack_name):
 
     func = str(cfg.get("func", "avg")).lower()
     params = cfg.get("params")
-    if func not in {"avg", "mean"} or params is not None:
+    if func not in _2D_VTRACK_FUNCS:
         raise ValueError(
-            f"2D extraction for virtual track '{vtrack_name}' supports only direct aliases"
+            f"2D extraction for virtual track '{vtrack_name}': "
+            f"unsupported function '{func}' (supported: {sorted(_2D_VTRACK_FUNCS)})"
+        )
+    if params is not None:
+        raise ValueError(
+            f"2D extraction for virtual track '{vtrack_name}' does not support params"
         )
     if int(cfg.get("sshift", 0) or 0) != 0 or int(cfg.get("eshift", 0) or 0) != 0:
         raise ValueError(
@@ -185,13 +195,17 @@ def _resolve_2d_vtrack_source(vtrack_name):
             f"2D extraction for virtual track '{vtrack_name}' does not support filters"
         )
 
+    # Normalize "mean" → "avg"
+    if func == "mean":
+        func = "avg"
+
     shifts = {
         "sshift1": int(cfg.get("sshift1", 0) or 0),
         "eshift1": int(cfg.get("eshift1", 0) or 0),
         "sshift2": int(cfg.get("sshift2", 0) or 0),
         "eshift2": int(cfg.get("eshift2", 0) or 0),
     }
-    return src, shifts
+    return src, shifts, func
 
 
 def _maybe_load_2d_intervals_set(intervals, exprs, iterator, band):
@@ -231,6 +245,100 @@ def _apply_2d_shifts(intervals, sshift1, eshift1, sshift2, eshift2):
     shifted["start2"] = shifted["start2"] + sshift2
     shifted["end2"] = shifted["end2"] + eshift2
     return shifted
+
+
+def _gextract_2d_vtrack_agg(track, col_name, intervals, band, func):
+    """Extract aggregated stats from a 2D track for 2D intervals.
+
+    Returns one row per query interval with the aggregated value.
+
+    Parameters
+    ----------
+    track : str
+        Physical 2D track name.
+    col_name : str
+        Column name for the aggregated value in the output DataFrame.
+    intervals : DataFrame
+        2D intervals with chrom1/start1/end1/chrom2/start2/end2 columns.
+    band : tuple of (int, int) or None
+        Diagonal band filter ``(d1, d2)``.
+    func : str
+        Aggregation function: ``"area"``, ``"weighted.sum"``, ``"min"``,
+        ``"max"``, or ``"avg"``.
+
+    Returns
+    -------
+    DataFrame
+        One row per query interval with columns: chrom1, start1, end1,
+        chrom2, start2, end2, <col_name>, intervalID.
+    """
+    import struct
+
+    from ._quadtree import _read_file_header, query_2d_track_stats
+
+    track_path = _pymisha.pm_track_path(track)
+
+    n = len(intervals)
+    values = _numpy.full(n, _numpy.nan, dtype=float)
+
+    # Group intervals by (chrom1, chrom2) to open each file only once.
+    chrom_pair_intervals = {}  # (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...]
+    for interval_idx, qrow in enumerate(intervals.itertuples(index=False)):
+        c1 = str(qrow.chrom1)
+        c2 = str(qrow.chrom2)
+        s1 = int(qrow.start1)
+        e1 = int(qrow.end1)
+        s2 = int(qrow.start2)
+        e2 = int(qrow.end2)
+        key = (c1, c2)
+        if key not in chrom_pair_intervals:
+            chrom_pair_intervals[key] = []
+        chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
+
+    for (c1, c2), interval_list in chrom_pair_intervals.items():
+        filepath = _find_2d_track_file(track_path, c1, c2)
+        if filepath is None:
+            # No data file for this chrom pair — values stay NaN.
+            continue
+
+        file_is_points, num_objs, data = _read_file_header(filepath)
+        try:
+            if num_objs == 0:
+                continue
+            root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
+
+            for interval_idx, s1, e1, s2, e2 in interval_list:
+                stats = query_2d_track_stats(
+                    data, file_is_points, num_objs, root_chunk_fpos,
+                    s1, s2, e1, e2, band=band,
+                )
+                occ = stats["occupied_area"]
+                if occ == 0:
+                    # No objects matched — leave as NaN (pre-filled).
+                    continue
+                if func == "area":
+                    values[interval_idx] = float(occ)
+                elif func == "weighted.sum":
+                    values[interval_idx] = stats["weighted_sum"]
+                elif func == "min":
+                    values[interval_idx] = stats["min_val"]
+                elif func == "max":
+                    values[interval_idx] = stats["max_val"]
+                elif func == "avg":
+                    values[interval_idx] = stats["weighted_sum"] / occ
+        finally:
+            data.close()
+
+    return _pandas.DataFrame({
+        "chrom1": intervals["chrom1"].to_numpy(),
+        "start1": intervals["start1"].values,
+        "end1": intervals["end1"].values,
+        "chrom2": intervals["chrom2"].to_numpy(),
+        "start2": intervals["start2"].values,
+        "end2": intervals["end2"].values,
+        col_name: values,
+        "intervalID": _numpy.arange(n, dtype=int),
+    })
 
 
 def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
@@ -285,11 +393,93 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
 
     vtrack_to_track = {}
     vtrack_shifts = {}
+    vtrack_funcs = {}
     for vt_name in used_vtracks:
-        src, shifts = _resolve_2d_vtrack_source(vt_name)
+        src, shifts, func = _resolve_2d_vtrack_source(vt_name)
         vtrack_to_track[vt_name] = src
         vtrack_shifts[vt_name] = shifts
+        vtrack_funcs[vt_name] = func
 
+    # Classify vtracks: aggregation vs alias (passthrough).
+    agg_vtracks = {vt for vt in used_vtracks if vtrack_funcs[vt] in _2D_AGG_FUNCS}
+    alias_vtracks = used_vtracks - agg_vtracks
+
+    has_raw = bool(used_tracks)
+    has_alias = bool(alias_vtracks)
+    has_agg = bool(agg_vtracks)
+
+    # ── Pure aggregation path (only agg vtracks, no raw/alias) ─────────
+    if has_agg and not has_raw and not has_alias:
+        key_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
+        coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+
+        # Build one aggregated DataFrame per vtrack, then merge.
+        agg_results = {}
+        for vt_name in agg_vtracks:
+            src_track = vtrack_to_track[vt_name]
+            s = vtrack_shifts[vt_name]
+            shifted = _apply_2d_shifts(
+                intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"]
+            )
+            safe_col = _expr_safe_name(vt_name)
+            agg_results[vt_name] = _gextract_2d_vtrack_agg(
+                src_track, safe_col, shifted, band, vtrack_funcs[vt_name]
+            )
+
+        # Start from the first vtrack's result as the base.
+        vt_list = list(agg_vtracks)
+        result = agg_results[vt_list[0]]
+
+        for vt_name in vt_list[1:]:
+            cur = agg_results[vt_name]
+            safe_col = _expr_safe_name(vt_name)
+            cur = cur[key_cols + [safe_col]]
+            result = result.merge(cur, on=key_cols, how="left")
+
+        # Evaluate expressions.
+        out_cols = colnames if colnames is not None else exprs
+        out_data = {}
+        for out_col, (orig_expr, expr_eval, _expr_tracks, expr_vtracks) in zip(
+            out_cols, parsed, strict=False
+        ):
+            allowed_names = {
+                "np",
+                "numpy",
+                *(_expr_safe_name(vt) for vt in expr_vtracks),
+            }
+            try:
+                code_obj = compile_safe_expression(expr_eval, allowed_names)
+            except UnsafeExpressionError as exc:
+                raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
+
+            local_ns = {"np": _numpy, "numpy": _numpy}
+            for vt_name in expr_vtracks:
+                safe_col = _expr_safe_name(vt_name)
+                local_ns[safe_col] = result[safe_col].to_numpy(dtype=float, copy=False)
+
+            vals = eval(code_obj, {"__builtins__": {}}, local_ns)
+            if _numpy.isscalar(vals):
+                vals = _numpy.full(len(result), vals, dtype=float)
+            out_data[out_col] = _numpy.asarray(vals, dtype=float)
+
+        out_df = result[coord_cols].copy()
+        for out_col in out_cols:
+            out_df[out_col] = out_data[out_col]
+        out_df["intervalID"] = result["intervalID"].to_numpy(dtype=int, copy=False)
+        return out_df.sort_values(
+            ["chrom1", "start1", "chrom2", "start2", "intervalID"]
+        ).reset_index(drop=True)
+
+    # When aggregation vtracks are mixed with raw tracks or alias vtracks,
+    # treat the agg vtracks as alias (one row per object) so that the
+    # expression can combine them in a row-aligned manner.
+    if has_agg:
+        alias_vtracks = alias_vtracks | agg_vtracks
+        agg_vtracks = set()
+        has_alias = bool(alias_vtracks)
+        has_agg = False
+
+    # ── Raw / alias path (existing behaviour) ─────────────────────────
     required_tracks = []
 
     def _add_required(track_name):
@@ -593,7 +783,7 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
 
     result_arrays = {col: _numpy.empty(n_rows, dtype=float) for col in result_cols}
 
-    chrom_vals = iter_df["chrom"].values
+    chrom_vals = iter_df["chrom"].to_numpy()
     start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
     end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 
@@ -792,7 +982,7 @@ def gscreen(expr, intervals=None, **kwargs):
     chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)
     mask = _numpy.zeros(n_rows, dtype=bool)
 
-    chrom_vals = iter_df["chrom"].values
+    chrom_vals = iter_df["chrom"].to_numpy()
     start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
     end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 

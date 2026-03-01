@@ -135,7 +135,7 @@ def _checkroot():
 def _df2pymisha(arg):
     """Convert DataFrame to internal format (following pynaryn pattern)."""
     if isinstance(arg, _pandas.DataFrame):
-        colnames = arg.columns.values
+        colnames = arg.columns.to_numpy()
         cols = [colnames]
 
         for i in range(colnames.size):
@@ -144,12 +144,12 @@ def _df2pymisha(arg):
                 cat = series.astype("category")
                 cols.append(
                     [
-                        cat.cat.categories.to_numpy(copy=False),
-                        cat.cat.codes.to_numpy(copy=False),
+                        cat.cat.categories.to_numpy(),
+                        cat.cat.codes.to_numpy(),
                     ]
                 )
             else:
-                cols.append(series.to_numpy(copy=False))
+                cols.append(series.to_numpy())
         return cols
     return arg
 

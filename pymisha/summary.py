@@ -347,7 +347,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
     result = _numpy.zeros(n_bins, dtype=int)
     breaks_arrays = [_numpy.asarray(b, dtype=float) for b in breaks_list]
 
-    chrom_vals = iter_df["chrom"].values
+    chrom_vals = iter_df["chrom"].to_numpy()
     start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
     end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 
@@ -507,7 +507,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
     val_min = _numpy.inf
     val_max = -_numpy.inf
 
-    chrom_vals = iter_df["chrom"].values
+    chrom_vals = iter_df["chrom"].to_numpy()
     start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
     end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 
@@ -687,7 +687,7 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
-    chrom_vals = iter_df["chrom"].values
+    chrom_vals = iter_df["chrom"].to_numpy()
     start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
     end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 

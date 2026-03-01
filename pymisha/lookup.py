@@ -225,8 +225,8 @@ def _glookup_python(lookup_table, exprs, breaks_list, intervals,
                 )
             for c in coord_cols:
                 if not _numpy.array_equal(
-                    result[c].to_numpy(copy=False),
-                    extract_result[c].to_numpy(copy=False),
+                    result[c].to_numpy(),
+                    extract_result[c].to_numpy(),
                 ):
                     raise ValueError(
                         f"glookup expression extraction produced misaligned rows (column '{c}')"
