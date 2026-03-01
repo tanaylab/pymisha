@@ -6,6 +6,16 @@ import pytest
 
 import pymisha as pm
 
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip benchmark tests unless explicitly selected with ``-m benchmark``."""
+    if config.getoption("-m") and "benchmark" in config.getoption("-m"):
+        return  # user explicitly asked for benchmarks
+    skip_bench = pytest.mark.skip(reason="benchmarks not selected (use -m benchmark)")
+    for item in items:
+        if "benchmark" in item.keywords:
+            item.add_marker(skip_bench)
+
 TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
 os.environ.setdefault("PYMISHA_EXAMPLES_DB", str(TEST_DB))
 
