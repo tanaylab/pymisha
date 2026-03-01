@@ -40,6 +40,7 @@ dev = [
     "pytest-cov",
     "ruff>=0.6",
     "mypy",
+    "pyreadr",
 ]
 docs = [
     "mkdocs-material>=9.0",
