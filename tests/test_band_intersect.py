@@ -135,6 +135,7 @@ class TestGintervals2dBandIntersect:
 
     def test_intervals_set_out(self, tmp_path):
         """intervals_set_out writes result to disk and returns None."""
+        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         intervals = self._make_2d(["1"], [300], [400], ["1"], [100], [200])
         set_name = "test.band_intersect_out"
         try:

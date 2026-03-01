@@ -133,6 +133,7 @@ class TestGwilcoxEdgeCases:
 
     def test_intervals_set_out(self):
         """gwilcox with intervals_set_out saves result and returns None."""
+        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         intervals = pm.gintervals([1, 2], 0, 200000)
         set_name = "test.tmp_gwilcox_out"
         try:
@@ -213,6 +214,7 @@ class TestGwilcoxRParity:
 
     def test_gwilcox_intervals_set_out_golden(self):
         """Port of: gwilcox with interval setting and max data size — golden-master."""
+        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         set_name = "test.tmp_gwilcox_parity"
         try:
             pm.gwilcox(

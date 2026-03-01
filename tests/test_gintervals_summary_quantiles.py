@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import pymisha as pm
 
@@ -113,6 +114,7 @@ df <- gintervals.quantiles("dense_track", percentiles=c(0.25, 0.5, 0.9), interva
 
 
 def test_gintervals_summary_intervals_set_out_roundtrip():
+    pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
     intervs = pm.gintervals("1", [0, 100], [200, 400])
     set_name = "test_summary_set_out"
 
@@ -144,6 +146,7 @@ def test_gintervals_summary_intervals_set_out_roundtrip():
 
 
 def test_gintervals_quantiles_intervals_set_out_roundtrip():
+    pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
     intervs = pm.gintervals("1", [0, 100], [200, 400])
     percentiles = [0.25, 0.5, 0.9]
     set_name = "test_quantiles_set_out"

@@ -117,6 +117,7 @@ class TestGintervalsMapply:
 
     def test_intervals_set_out(self, tmp_path):
         """Result can be saved to an intervals set."""
+        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         intervals = pymisha.gintervals(["1", "2"], [0, 0], [10000, 10000])
         set_name = "test_mapply_out"
         if pymisha.gintervals_exists(set_name):
