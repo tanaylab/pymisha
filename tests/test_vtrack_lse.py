@@ -9,7 +9,9 @@ where m = max(x_i).
 
 import numpy as np
 import pandas as pd
-from scipy.special import logsumexp
+import pytest
+
+logsumexp = pytest.importorskip("scipy.special", reason="scipy required for LSE reference tests").logsumexp
 
 import pymisha as pm
 
