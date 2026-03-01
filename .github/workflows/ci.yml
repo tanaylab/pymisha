@@ -35,5 +35,4 @@ jobs:
         run: ruff check pymisha/
 
       - name: Run tests
-        continue-on-error: true
         run: pytest tests/ -x -q --override-ini="addopts="
