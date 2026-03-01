@@ -1,12 +1,17 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import pymisha as pm
+
+if shutil.which("R") is None:
+    pytest.skip("R not available; skipping golden-master vtrack tests", allow_module_level=True)
 
 TESTDB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
 

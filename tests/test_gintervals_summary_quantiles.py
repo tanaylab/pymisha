@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +9,8 @@ import pandas as pd
 import pytest
 
 import pymisha as pm
+
+_has_R = shutil.which("R") is not None
 
 TESTDB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
 
@@ -57,6 +60,7 @@ def _format_percentile(value):
     return f"{float(value):g}"
 
 
+@pytest.mark.skipif(not _has_R, reason="R not available")
 def test_gintervals_summary_matches_r():
     intervs = pm.gintervals("1", [0, 100], [200, 400])
     py = pm.gintervals_summary("dense_track", intervs)
@@ -91,6 +95,7 @@ df <- gintervals.summary("dense_track", intervs)
         np.testing.assert_allclose(py[col].to_numpy(dtype=float), r_df[col].to_numpy(dtype=float), rtol=1e-6, atol=1e-9)
 
 
+@pytest.mark.skipif(not _has_R, reason="R not available")
 def test_gintervals_quantiles_matches_r():
     intervs = pm.gintervals("1", [0, 100], [200, 400])
     percentiles = [0.25, 0.5, 0.9]

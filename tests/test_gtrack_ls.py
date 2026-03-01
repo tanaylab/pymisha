@@ -6,9 +6,13 @@ These tests verify that gtrack_ls() can filter tracks by:
 2. Attribute filtering (e.g., created_by="pattern")
 3. Options like ignore_case
 """
+import shutil
+
 import pytest
 
 import pymisha as pm
+
+_has_R = shutil.which("R") is not None
 
 # Path to test database
 TESTDB = "tests/testdb/trackdb/test"
@@ -132,6 +136,7 @@ class TestGtrackLsGoldenMaster:
         """Initialize the database before each test."""
         pm.gdb_init(TESTDB)
 
+    @pytest.mark.skipif(not _has_R, reason="R not available")
     def test_gtrack_ls_matches_r_basic(self):
         """gtrack_ls() basic output matches R."""
         import os
@@ -181,6 +186,7 @@ cat(paste(tracks, collapse="\\n"))
 
         assert py_set == r_set, f"Track lists differ:\npymisha: {py_set}\nR: {r_set}"
 
+    @pytest.mark.skipif(not _has_R, reason="R not available")
     def test_gtrack_ls_with_pattern_matches_r(self):
         """gtrack_ls() with pattern matches R output."""
         import os
