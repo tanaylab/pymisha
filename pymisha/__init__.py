@@ -2,7 +2,7 @@
 PyMisha - Python wrapper for the misha Genomic Data Analysis Toolkit
 """
 
-__version__ = '0.1.5'
+__version__ = '0.1.12'
 
 # Make numpy available for expressions
 import numpy as np  # noqa: F401
@@ -20,6 +20,7 @@ from ._shared import (
     _progress_context,
     _pymisha,
     _pymisha2df,
+    gmax_processes,
 )
 from .analysis import gcis_decay, gsegment, gwilcox
 from .dataset import (
@@ -41,7 +42,7 @@ from .db import (
 )
 from .db_attrs import gdb_get_readonly_attrs, gdb_set_readonly_attrs
 from .db_create import gdb_convert_to_indexed, gdb_create, gdb_create_genome, gdb_create_linked
-from .extract import gextract, gscreen
+from .extract import gextract, giterator_intervals_2d, gscreen
 from .gdir import (
     gdir_cd,
     gdir_create,
@@ -65,6 +66,8 @@ from .intervals import (
     gintervals_2d_all,
     gintervals_2d_band_intersect,
     gintervals_2d_convert_to_indexed,
+    gintervals_2d_intersect,
+    gintervals_2d_union,
     gintervals_all,
     gintervals_annotate,
     gintervals_canonic,
@@ -73,6 +76,7 @@ from .intervals import (
     gintervals_coverage_fraction,
     gintervals_covered_bp,
     gintervals_dataset,
+    gintervals_dbs,
     gintervals_diff,
     gintervals_exists,
     gintervals_force_range,
@@ -92,6 +96,7 @@ from .intervals import (
     gintervals_neighbors_downstream,
     gintervals_neighbors_upstream,
     gintervals_normalize,
+    gintervals_path,
     gintervals_random,
     gintervals_rbind,
     gintervals_rm,
@@ -147,6 +152,7 @@ from .tracks import (
     gtrack_create_pwm_energy,
     gtrack_create_sparse,
     gtrack_dataset,
+    gtrack_dbs,
     gtrack_exists,
     gtrack_import,
     gtrack_import_mappedseq,
@@ -155,6 +161,7 @@ from .tracks import (
     gtrack_ls,
     gtrack_modify,
     gtrack_mv,
+    gtrack_path,
     gtrack_rm,
     gtrack_smooth,
     gtrack_var_get,
@@ -184,6 +191,7 @@ def __getattr__(name):
 __all__ = [
     # Configuration
     'CONFIG',
+    'gmax_processes',
 
     # Database functions
     'gdb_init',
@@ -220,9 +228,11 @@ __all__ = [
     'gcis_decay',
     'gsegment',
     'gwilcox',
+    'gtrack_dbs',
     'gtrack_ls',
     'gtrack_info',
     'gtrack_exists',
+    'gtrack_path',
     'gtrack_dataset',
     'gtrack_create',
     'gtrack_create_dense',
@@ -257,6 +267,8 @@ __all__ = [
     'gintervals_2d',
     'gintervals_2d_all',
     'gintervals_2d_band_intersect',
+    'gintervals_2d_intersect',
+    'gintervals_2d_union',
     'gintervals_union',
     'gintervals_intersect',
     'gintervals_diff',
@@ -275,8 +287,10 @@ __all__ = [
     'gintervals_from_bed',
     'gintervals_import_genes',
     'gintervals_window',
+    'gintervals_dbs',
     'gintervals_ls',
     'gintervals_exists',
+    'gintervals_path',
     'gintervals_is_bigset',
     'gintervals_dataset',
     'gintervals_chrom_sizes',
@@ -290,6 +304,7 @@ __all__ = [
     'gintervals_rm',
     'giterator_cartesian_grid',
     'giterator_intervals',
+    'giterator_intervals_2d',
     'gintervals_rbind',
     'gintervals_mark_overlaps',
     'gintervals_annotate',

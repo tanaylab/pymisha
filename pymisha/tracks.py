@@ -167,6 +167,65 @@ def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
     return tracks
 
 
+def gtrack_dbs(track, dataframe=False):
+    """
+    Return database root(s) containing the given track(s).
+
+    For each track name, searches the current database root and all
+    loaded dataset roots to find which databases contain the track.
+
+    Parameters
+    ----------
+    track : str or list of str
+        Track name(s) to look up.
+    dataframe : bool, default False
+        If True, return a DataFrame with columns ``track`` and ``db``.
+        If False, return a dict mapping track names to lists of database paths.
+
+    Returns
+    -------
+    dict or DataFrame
+        If *dataframe* is False, a dict ``{track_name: [db_path, ...]}``.
+        If *dataframe* is True, a DataFrame with columns ``track`` and ``db``.
+
+    See Also
+    --------
+    gtrack_ls : List available tracks.
+    gtrack_exists : Test whether a track exists.
+    gintervals_dbs : Same for interval sets.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gtrack_dbs("dense_track")  # doctest: +SKIP
+    {'dense_track': ['/path/to/db']}
+    """
+    _checkroot()
+
+    tracks = [track] if isinstance(track, str) else list(track)
+
+    all_dbs = [_shared._GROOT] + list(_shared._GDATASETS)
+
+    result = {}
+    for t in tracks:
+        rel_path = os.path.join("tracks", t.replace(".", os.sep) + ".track")
+        dbs = [db for db in all_dbs if os.path.exists(os.path.join(db, rel_path))]
+        result[t] = dbs
+
+    if dataframe:
+        rows_track = []
+        rows_db = []
+        for t, dbs in result.items():
+            for db in dbs:
+                rows_track.append(t)
+                rows_db.append(db)
+        import pandas as pd
+        return pd.DataFrame({"track": rows_track, "db": rows_db})
+
+    return result
+
+
 def gtrack_info(track):
     """
     Return metadata about a track.
@@ -1064,6 +1123,9 @@ def gtrack_modify(track, expr, intervals=None):
     if intervals is None:
         intervals = gintervals_all()
 
+    from .extract import _maybe_load_intervals_set
+    intervals = _maybe_load_intervals_set(intervals)
+
     _pymisha.pm_modify(track, str(expr), _df2pymisha(intervals), binsize)
 
     # Update created.by attribute (bypass readonly check for internal update)
@@ -1406,9 +1468,7 @@ def gtrack_create_pwm_energy(track, description, pssmset, pssmid, prior, iterato
     ... )
     >>> pm.gtrack_rm("pwm_track", force=True)  # doctest: +SKIP
     """
-    from .extract import gextract
     from .intervals import gintervals_all
-    from .vtracks import gvtrack_create, gvtrack_rm
 
     _checkroot()
 
@@ -1426,7 +1486,12 @@ def gtrack_create_pwm_energy(track, description, pssmset, pssmid, prior, iterato
 
     pssm = _load_pssm_from_db(pssmset, int(pssmid))
 
-    # Create a temporary PWM virtual track and extract values
+    # Create a temporary PWM virtual track and extract values.
+    # The vtrack path uses C++ pm_vtrack_compute for scoring (already fast)
+    # and GAP-019's pre-computed vtrack optimization avoids per-chunk recomputation.
+    from .extract import gextract
+    from .vtracks import gvtrack_create, gvtrack_rm
+
     vtrack_name = f"_pm_pwm_tmp_{track}"
     try:
         gvtrack_create(vtrack_name, None, func="pwm", pssm=pssm, prior=float(prior))
@@ -1435,11 +1500,9 @@ def gtrack_create_pwm_energy(track, description, pssmset, pssmid, prior, iterato
         if df is None or len(df) == 0:
             raise ValueError("No values extracted for PWM energy track")
 
-        intervals = df[["chrom", "start", "end"]]
-        values = df[vtrack_name].values
-
         gtrack_create_dense(
-            track, description, intervals, values, iterator, defval=np.nan,
+            track, description, df[["chrom", "start", "end"]],
+            df[vtrack_name].values, iterator, defval=np.nan,
         )
 
         # Overwrite the created.by attribute to match R's format
@@ -2292,6 +2355,47 @@ def gtrack_exists(track):
     return _track_exists(track)
 
 
+def gtrack_path(track):
+    """
+    Return the filesystem path of a track's directory.
+
+    Parameters
+    ----------
+    track : str
+        Track name (e.g. ``"dense_track"`` or ``"subdir.my_track"``).
+
+    Returns
+    -------
+    str
+        Absolute path to the track directory on disk.
+
+    Raises
+    ------
+    ValueError
+        If *track* is ``None`` or the track does not exist.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gtrack_path("dense_track")  # doctest: +ELLIPSIS
+    '...dense_track.track'
+
+    See Also
+    --------
+    gtrack_exists : Check whether a track exists.
+    gtrack_info : Get track metadata.
+    gtrack_dataset : Get dataset root for a track.
+    """
+    if track is None:
+        raise ValueError("track cannot be None")
+    _checkroot()
+    path = _pymisha.pm_track_path(track)
+    if path is None:
+        raise ValueError(f"Track '{track}' does not exist")
+    return path
+
+
 def gtrack_attr_get(track, attr):
     """
     Get a single track attribute value.
@@ -2770,28 +2874,29 @@ def gtrack_var_get(track, var):
             f"Variable '{var}' does not exist for track '{track}'"
         )
 
-    # Try pickle (pymisha-native) first
-    try:
-        with open(filepath, "rb") as f:
-            return restricted_load(f)
-    except (pickle.UnpicklingError, EOFError, ModuleNotFoundError):
-        pass
+    with open(filepath, "rb") as f:
+        header = f.read(2)
+        f.seek(0)
 
-    # Fallback: try R serialized format via pyreadr
-    try:
-        import pyreadr
-        result = pyreadr.read_rds(filepath)
-        if isinstance(result, pd.DataFrame):
-            # Single column → return as array
-            if result.shape[1] == 1:
-                return result.iloc[:, 0].to_numpy()
-            return result
-        return result
-    except Exception:
-        pass
+        # Detect R serialization formats before attempting pickle.
+        # R serialize v2 ASCII starts with b'A\n', XDR binary with b'X\n',
+        # R serialize v3 with b'B\n', and gzip-compressed RDS with the
+        # gzip magic number b'\x1f\x8b'.
+        if header in (b"A\n", b"X\n", b"B\n", b"\x1f\x8b"):
+            raise ValueError(
+                f"Track variable '{var}' on track '{track}' was written by "
+                f"R misha and cannot be read by PyMisha. Use R misha to read "
+                f"this variable, or re-create it in Python."
+            )
+
+        try:
+            return restricted_load(f)
+        except (pickle.UnpicklingError, EOFError, ModuleNotFoundError):
+            pass
 
     raise ValueError(
-        f"Cannot read variable '{var}' for track '{track}': unknown or unsafe format"
+        f"Cannot read variable '{var}' for track '{track}': "
+        f"unknown or unsafe format"
     )
 
 
@@ -3167,8 +3272,8 @@ def gtrack_2d_import_contacts(
         Track name (dot-separated namespace).
     description : str
         Track description.
-    contacts : list of str
-        Paths to contact files. If ``fends`` is None the files must be in
+    contacts : str or list of str
+        Path(s) to contact files. If ``fends`` is None the files must be in
         "intervals-value" tab-separated format (columns: chrom1, start1, end1,
         chrom2, start2, end2, <value>).  Otherwise they must be in
         "fends-value" format (columns: fend1, fend2, count).
@@ -3186,6 +3291,9 @@ def gtrack_2d_import_contacts(
       and coord2 < coord1) the two sides are swapped.
     * Cis contacts (same chromosome) are mirrored: both (X,Y) and (Y,X)
       are stored unless X == Y.
+    * Trans contacts (different chromosomes) are written in both directions:
+      a chrA-chrB file and a chrB-chrA file (with swapped coordinates) are
+      created so that queries work regardless of chromosome pair order.
 
     Returns
     -------
@@ -3212,6 +3320,10 @@ def gtrack_2d_import_contacts(
     _checkroot()
     _validate_track_name(track)
     _ensure_track_absent(track)
+
+    # Accept a single file path as a convenience
+    if isinstance(contacts, str):
+        contacts = [contacts]
 
     if not contacts:
         raise ValueError(
@@ -3433,6 +3545,20 @@ def gtrack_2d_import_contacts(
             objs = list(zip(s1, s2, vals, strict=False))
             filename = os.path.join(str(track_dir), f"{c1}-{c2}")
             write_2d_track_file(filename, objs, arena, is_points=True)
+
+            # Trans contacts: also write mirrored file (chrB-chrA) with
+            # swapped coordinates so queries in both directions work.
+            # R misha writes both directions for trans pairs.
+            if str(c1) != str(c2):
+                mirror_arena = (0, 0, cs2, cs1)
+                mirror_objs = [(y, x, v) for x, y, v in objs]
+                mirror_filename = os.path.join(
+                    str(track_dir), f"{c2}-{c1}"
+                )
+                write_2d_track_file(
+                    mirror_filename, mirror_objs, mirror_arena,
+                    is_points=True,
+                )
 
         _pymisha.pm_dbreload()
 

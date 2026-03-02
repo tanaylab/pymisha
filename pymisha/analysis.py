@@ -13,6 +13,7 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
 )
+from .extract import _maybe_load_intervals_set
 
 _APPROX_QNORM_WARNED = False
 
@@ -116,6 +117,8 @@ def gsegment(expr, minsegment, maxpval=0.05, onetailed=True, intervals=None,
         from .intervals import gintervals_all
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     if intervals is None or (hasattr(intervals, '__len__') and len(intervals) == 0):
         return None
 
@@ -198,6 +201,8 @@ def gwilcox(expr, winsize1, winsize2, maxpval=0.05, onetailed=True,
     if intervals is None:
         from .intervals import gintervals_all
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     if intervals is None or (hasattr(intervals, '__len__') and len(intervals) == 0):
         return None
@@ -334,6 +339,82 @@ def _containing_interval(intervals_sorted, start, end):
     return -1
 
 
+# ---------------------------------------------------------------------------
+# Vectorized helpers for gcis_decay
+# ---------------------------------------------------------------------------
+
+
+def _containing_interval_vec(iv_starts, iv_ends, starts, ends):
+    """Vectorized containment check: for each (start, end) pair, find the
+    index of the interval that fully contains it, or -1.
+
+    Parameters
+    ----------
+    iv_starts : ndarray of int64
+        Sorted start positions of non-overlapping intervals.
+    iv_ends : ndarray of int64
+        Corresponding end positions.
+    starts : ndarray of int64
+        Query start positions.
+    ends : ndarray of int64
+        Query end positions.
+
+    Returns
+    -------
+    ndarray of int64
+        Index into iv_starts/iv_ends for each query, or -1 if not contained.
+    """
+    if len(iv_starts) == 0:
+        return _numpy.full(len(starts), -1, dtype=_numpy.int64)
+
+    # For each query start, find the last interval whose start <= query start
+    # searchsorted('right') gives insertion point; subtract 1 for last <= value
+    idx = _numpy.searchsorted(iv_starts, starts, side="right").astype(_numpy.int64) - 1
+
+    # Clamp to valid range for safe indexing
+    idx_safe = _numpy.clip(idx, 0, len(iv_starts) - 1)
+
+    # Check containment: iv_starts[idx] <= start AND end <= iv_ends[idx]
+    contained = (
+        (idx >= 0)
+        & (iv_starts[idx_safe] <= starts)
+        & (ends <= iv_ends[idx_safe])
+    )
+
+    return _numpy.where(contained, idx_safe, -1)
+
+
+def _val2bin_vec(values, breaks_arr, include_lowest):
+    """Vectorized binning: map values to bin indices.
+
+    Bins are half-open ``(breaks[i], breaks[i+1]]``.
+    With *include_lowest*, the first bin becomes ``[breaks[0], breaks[1]]``.
+
+    Returns ndarray of int64 bin indices, -1 for values outside all bins.
+    """
+    n_bins = len(breaks_arr) - 1
+
+    # searchsorted('right') maps value to the bin it falls in:
+    # For bins (b0, b1], (b1, b2], ..., (b_{n-1}, b_n]:
+    # searchsorted(breaks, val, 'right') - 1 gives the bin index
+    # But we need to handle edge cases:
+    #   val <= breaks[0] -> -1 (unless include_lowest and val == breaks[0])
+    #   val > breaks[-1] -> -1
+
+    idx = _numpy.searchsorted(breaks_arr, values, side="right").astype(_numpy.int64) - 1
+
+    # Valid bins: 0 <= idx < n_bins, and value > breaks[0] (or == if include_lowest)
+    valid = (idx >= 0) & (idx < n_bins) & (values > breaks_arr[0]) & (values <= breaks_arr[-1])
+
+    if include_lowest:
+        # Include values exactly at breaks[0] in bin 0
+        at_lowest = values == breaks_arr[0]
+        valid = valid | at_lowest
+        idx = _numpy.where(at_lowest & (idx < 0), 0, idx)
+
+    return _numpy.where(valid, idx, -1)
+
+
 def gcis_decay(expr, breaks, src, domain, intervals=None,
                include_lowest=False, iterator=None, band=None):
     """
@@ -410,8 +491,11 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
             "intervals=None, include_lowest=False, iterator=None, band=None)"
         )
 
-    from ._quadtree import query_2d_track_objects
-    from .extract import _find_2d_track_file, _obj_in_band, _validate_band
+    from ._quadtree import (
+        _read_file_header,
+        query_2d_track_opened_arrays,
+    )
+    from .extract import _find_2d_track_file, _validate_band
     from .intervals import _normalize_chroms, gintervals_all
     from .tracks import gtrack_info
 
@@ -419,6 +503,7 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
     if len(breaks) < 2:
         raise ValueError("breaks must have at least 2 elements")
 
+    breaks_arr = _numpy.asarray(breaks, dtype=_numpy.float64)
     n_bins = len(breaks) - 1
     intra_dist = _numpy.zeros(n_bins, dtype=_numpy.float64)
     inter_dist = _numpy.zeros(n_bins, dtype=_numpy.float64)
@@ -442,13 +527,13 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
     info = gtrack_info(expr)
     if info.get("dimensions") != 2:
         raise ValueError(f"Track '{expr}' is not a 2D track")
-    is_points = info.get("type") == "points"
-
     track_path = _pymisha.pm_track_path(expr)
 
     # Determine which chromosomes to iterate over
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     if intervals is not None and "chrom" in intervals.columns:
         intervals = intervals.copy()
@@ -466,7 +551,7 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
 
     chroms = list(chrom_sizes.keys())
 
-    # Iterate over cis chromosome pairs
+    # Iterate over cis chromosome pairs — vectorized inner loop
     for chrom in chroms:
         filepath = _find_2d_track_file(track_path, chrom, chrom)
         if filepath is None:
@@ -480,42 +565,87 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
 
         csize = chrom_sizes[chrom]
 
-        # Query all objects in this chrom-chrom file
-        objs = query_2d_track_objects(filepath, 0, 0, csize, csize)
-
-        for obj in objs:
-            # Apply band filter if specified
-            if band is not None and not _obj_in_band(obj, is_points, band):
+        # Open file once, query all objects as numpy arrays
+        file_is_points, num_objs, data = _read_file_header(filepath)
+        try:
+            if num_objs == 0:
                 continue
+            import struct as _struct
 
-            if is_points:
-                x, y, val = obj
-                s1, e1 = x, x + 1
-                s2, e2 = y, y + 1
-            else:
-                x1, y1, x2, y2, val = obj
-                s1, e1 = x1, x2
-                s2, e2 = y1, y2
+            root_chunk_fpos = _struct.unpack_from("<q", data, 12)[0]
+            arrays = query_2d_track_opened_arrays(
+                data, file_is_points, num_objs, root_chunk_fpos,
+                0, 0, csize, csize, band=band,
+            )
+        finally:
+            data.close()
 
-            # Check if I1 is fully within unified src intervals
-            if _containing_interval(src_intervals, s1, e1) < 0:
-                continue
+        x1 = arrays["x1"]  # int64 arrays
+        y1 = arrays["y1"]
+        x2 = arrays["x2"]
+        y2 = arrays["y2"]
 
-            # Distance between interval centers (integer division as in C++)
-            distance = abs((s1 + e1 - s2 - e2) // 2)
+        n_objs = len(x1)
+        if n_objs == 0:
+            continue
 
-            idx = _val2bin(distance, breaks, include_lowest)
-            if idx < 0:
-                continue
+        # I1 = (x1, x2), I2 = (y1, y2) — contact coordinates
+        s1 = x1   # start1
+        e1 = x2   # end1
+        s2 = y1   # start2
+        e2 = y2   # end2
 
-            # Check domain containment for intra/inter classification
-            d1_idx = _containing_interval(domain_intervals, s1, e1)
-            d2_idx = _containing_interval(domain_intervals, s2, e2)
+        # --- Vectorized src containment check ---
+        src_starts = _numpy.array([iv[0] for iv in src_intervals], dtype=_numpy.int64)
+        src_ends = _numpy.array([iv[1] for iv in src_intervals], dtype=_numpy.int64)
+        src_idx = _containing_interval_vec(src_starts, src_ends, s1, e1)
+        in_src = src_idx >= 0
 
-            if d1_idx >= 0 and d1_idx == d2_idx:
-                intra_dist[idx] += 1
-            else:
-                inter_dist[idx] += 1
+        if not in_src.any():
+            continue
+
+        # --- Vectorized distance computation (integer division as in C++) ---
+        # distance = abs((s1 + e1 - s2 - e2) // 2)
+        distances = _numpy.abs((s1 + e1 - s2 - e2) // 2).astype(_numpy.float64)
+
+        # --- Vectorized binning ---
+        bin_idx = _val2bin_vec(distances, breaks_arr, include_lowest)
+        in_bin = bin_idx >= 0
+
+        # Combine masks: must be in src AND in a valid bin
+        valid = in_src & in_bin
+
+        if not valid.any():
+            continue
+
+        # --- Vectorized domain lookup ---
+        if domain_intervals:
+            dom_starts = _numpy.array(
+                [iv[0] for iv in domain_intervals], dtype=_numpy.int64
+            )
+            dom_ends = _numpy.array(
+                [iv[1] for iv in domain_intervals], dtype=_numpy.int64
+            )
+            d1_idx = _containing_interval_vec(dom_starts, dom_ends, s1, e1)
+            d2_idx = _containing_interval_vec(dom_starts, dom_ends, s2, e2)
+            is_intra = (d1_idx >= 0) & (d1_idx == d2_idx) & valid
+        else:
+            is_intra = _numpy.zeros(n_objs, dtype=bool)
+
+        is_inter = valid & ~is_intra
+
+        # --- Accumulate into bins using bincount ---
+        intra_bins = bin_idx[is_intra]
+        if len(intra_bins) > 0:
+            intra_dist += _numpy.bincount(
+                intra_bins, minlength=n_bins
+            ).astype(_numpy.float64)[:n_bins]
+
+        inter_bins = bin_idx[is_inter]
+        if len(inter_bins) > 0:
+            inter_dist += _numpy.bincount(
+                inter_bins, minlength=n_bins
+            ).astype(_numpy.float64)[:n_bins]
 
     # Build result: 2D array (n_bins x 2), column-major like R
     result = _numpy.column_stack([intra_dist, inter_dist])

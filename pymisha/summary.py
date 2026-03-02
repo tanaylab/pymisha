@@ -15,7 +15,7 @@ from ._shared import (
     _pymisha2df,
 )
 from .expr import _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars
-from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, gextract
+from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 from .vtracks import _compute_vtrack_values
 
@@ -157,6 +157,7 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     # Calculate number of bins for each dimension
     n_bins = [len(b) - 1 for b in breaks_list]
 
+    intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
     # Band or 2D intervals require extract-then-bin path
@@ -770,6 +771,31 @@ def _extract_expr_values(expr, intervals, iterator=None, band=None,
     raise TypeError("Unexpected gextract result type for summary/quantiles")
 
 
+def _extract_values_direct(expr, intervals, iterator=None, band=None):
+    """Fast extraction path that bypasses gextract overhead.
+
+    For simple track expressions (no virtual tracks, no band, no 2D),
+    calls pm_extract directly and returns just the value array.
+    Falls back to _extract_expr_values for complex cases.
+    """
+    # Fall back for band or 2D intervals
+    if band is not None or _is_2d_intervals(intervals):
+        return _extract_expr_values(expr, intervals, iterator=iterator, band=band)
+
+    # Check for virtual tracks
+    if _find_vtracks_in_expr(expr):
+        return _extract_expr_values(expr, intervals, iterator=iterator, band=band)
+
+    # Direct C++ path — skip gextract wrapper
+    result = _pymisha.pm_extract([expr], _df2pymisha(intervals), iterator, CONFIG)
+    df = _pymisha2df(result)
+    if df is None or len(df) == 0:
+        return _numpy.array([], dtype=float)
+
+    col = expr if expr in df.columns else _bound_colname(expr, 40)
+    return df[col].to_numpy(dtype=float, copy=False)
+
+
 def _format_percentile(value):
     try:
         return f"{float(value):g}"
@@ -829,6 +855,7 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
     try:
@@ -922,6 +949,7 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
     try:
@@ -1011,6 +1039,8 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
     band = kwargs.get("band")
 
     _checkroot()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_summary")
@@ -1129,6 +1159,8 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
     band = kwargs.get("band")
 
     _checkroot()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_quantiles")
@@ -1276,6 +1308,8 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     result = _pymisha.pm_partition(
         expr,
         breaks_list,
@@ -1288,7 +1322,15 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
     if result is None:
         return None
 
-    return _pandas.DataFrame(result)
+    out = _pandas.DataFrame(result)
+
+    intervals_set_out = kwargs.get("intervals_set_out")
+    if intervals_set_out is not None:
+        from .intervals import gintervals_save
+        gintervals_save(out[["chrom", "start", "end"]], intervals_set_out)
+        return None
+
+    return out
 
 
 def gsample(expr, n, intervals=None, iterator=None):
@@ -1342,6 +1384,8 @@ def gsample(expr, n, intervals=None, iterator=None):
 
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     result = _pymisha.pm_sample(
         expr,
@@ -1438,6 +1482,8 @@ def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False,
 
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     result = _pymisha.pm_cor(
         expr_list,
@@ -1600,12 +1646,14 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     # Extract each expression individually (handles mixed track types)
     all_exprs = list(dict.fromkeys(list(bin_exprs) + [expr]))
     expr_cache = {}
     for e in all_exprs:
         if e not in expr_cache:
-            expr_cache[e] = _extract_expr_values(
+            expr_cache[e] = _extract_values_direct(
                 e, intervals, iterator=iterator, band=band,
             )
 
@@ -1626,6 +1674,10 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
     for idx_arr in bin_idx_arrays:
         valid &= idx_arr >= 0
 
+    total_flat_bins = 1
+    for nb in n_bins:
+        total_flat_bins *= nb
+
     # Flat multi-dimensional index
     result = _numpy.full(n_bins + [7], _numpy.nan)
 
@@ -1643,18 +1695,72 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
     flat_idx = _numpy.ravel_multi_index(valid_bin_idx, n_bins)
     vals = expr_values[valid]
 
-    sort_order = _numpy.argsort(flat_idx, kind="mergesort")
-    flat_sorted = flat_idx[sort_order]
-    vals_sorted = vals[sort_order]
-
-    unique_bins, starts = _numpy.unique(flat_sorted, return_index=True)
-    ends = _numpy.empty_like(starts)
-    ends[:-1] = starts[1:]
-    ends[-1] = len(flat_sorted)
-
+    # Vectorized per-bin summary stats
     result_flat = result.reshape(-1, 7)
-    for ub, s, e in zip(unique_bins, starts, ends, strict=False):
-        result_flat[int(ub)] = _compute_summary_stats(vals_sorted[s:e])
+    nan_mask = _numpy.isnan(vals)
+
+    # Total intervals per bin (all values, including NaN)
+    total_per_bin = _numpy.bincount(flat_idx, minlength=total_flat_bins)
+    result_flat[:, 0] = total_per_bin.astype(float)
+
+    # NaN intervals per bin
+    nan_per_bin = _numpy.bincount(flat_idx, weights=nan_mask.astype(float),
+                                  minlength=total_flat_bins)
+    result_flat[:, 1] = nan_per_bin
+
+    # For min/max/sum/mean/std, work only with non-NaN values
+    has_valid = total_per_bin > nan_per_bin
+    if _numpy.any(~nan_mask):
+        valid_vals_mask = ~nan_mask
+        flat_valid = flat_idx[valid_vals_mask]
+        vals_valid = vals[valid_vals_mask]
+
+        valid_count = _numpy.bincount(flat_valid, minlength=total_flat_bins)
+
+        # Sort by bin for grouped operations
+        sort_order = _numpy.argsort(flat_valid, kind="mergesort")
+        flat_sorted = flat_valid[sort_order]
+        vals_sorted = vals_valid[sort_order]
+
+        unique_bins, starts = _numpy.unique(flat_sorted, return_index=True)
+        ends = _numpy.empty_like(starts)
+        ends[:-1] = starts[1:]
+        ends[-1] = len(flat_sorted)
+
+        # Sum per bin (vectorized)
+        sum_per_bin = _numpy.bincount(flat_valid, weights=vals_valid,
+                                      minlength=total_flat_bins)
+
+        # Mean per bin
+        mean_per_bin = _numpy.full(total_flat_bins, _numpy.nan)
+        mean_per_bin[has_valid] = sum_per_bin[has_valid] / valid_count[has_valid]
+
+        # Min/max per bin (requires sorted iteration, but vectorized where possible)
+        min_per_bin = _numpy.full(total_flat_bins, _numpy.nan)
+        max_per_bin = _numpy.full(total_flat_bins, _numpy.nan)
+
+        for ub, s, e in zip(unique_bins, starts, ends, strict=False):
+            chunk = vals_sorted[s:e]
+            min_per_bin[ub] = chunk[0] if len(chunk) == 1 else _numpy.min(chunk)
+            max_per_bin[ub] = chunk[-1] if len(chunk) == 1 else _numpy.max(chunk)
+
+        result_flat[:, 2] = min_per_bin
+        result_flat[:, 3] = max_per_bin
+        result_flat[:, 4] = _numpy.where(has_valid, sum_per_bin, _numpy.nan)
+        result_flat[:, 5] = mean_per_bin
+
+        # Std dev per bin: use sum of squared deviations
+        std_per_bin = _numpy.full(total_flat_bins, _numpy.nan)
+        has_multiple = valid_count > 1
+        if _numpy.any(has_multiple):
+            # Compute sum of (x - mean)^2 per bin
+            deviations = vals_valid - mean_per_bin[flat_valid]
+            sq_dev_per_bin = _numpy.bincount(flat_valid, weights=deviations ** 2,
+                                             minlength=total_flat_bins)
+            std_per_bin[has_multiple] = _numpy.sqrt(
+                sq_dev_per_bin[has_multiple] / (valid_count[has_multiple] - 1)
+            )
+        result_flat[:, 6] = std_per_bin
 
     return result
 
@@ -1714,11 +1820,13 @@ def gbins_quantiles(*args, expr=None, percentiles=0.5, intervals=None,
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     all_exprs = list(dict.fromkeys(list(bin_exprs) + [expr]))
     expr_cache = {}
     for e in all_exprs:
         if e not in expr_cache:
-            expr_cache[e] = _extract_expr_values(
+            expr_cache[e] = _extract_values_direct(
                 e, intervals, iterator=iterator, band=band,
             )
 
@@ -1742,14 +1850,30 @@ def gbins_quantiles(*args, expr=None, percentiles=0.5, intervals=None,
     if not _numpy.any(valid):
         return result
 
-    import itertools
-    for bin_combo in itertools.product(*[range(n) for n in n_bins]):
-        mask = valid.copy()
-        for dim, bi in enumerate(bin_combo):
-            mask &= bin_idx_arrays[dim] == bi
-        bin_values = expr_values[mask]
-        bin_values = bin_values[~_numpy.isnan(bin_values)]
-        if len(bin_values) > 0:
-            result[bin_combo] = _numpy.quantile(bin_values, pct)
+    # Sort-based grouping: sort by flat bin index, then iterate unique bins
+    valid_bin_idx = [idx[valid].astype(_numpy.int64, copy=False) for idx in bin_idx_arrays]
+    flat_idx = _numpy.ravel_multi_index(valid_bin_idx, n_bins)
+    vals = expr_values[valid]
+
+    # Filter out NaN expression values
+    non_nan = ~_numpy.isnan(vals)
+    flat_idx_nn = flat_idx[non_nan]
+    vals_nn = vals[non_nan]
+
+    if len(vals_nn) == 0:
+        return result
+
+    sort_order = _numpy.argsort(flat_idx_nn, kind="mergesort")
+    flat_sorted = flat_idx_nn[sort_order]
+    vals_sorted = vals_nn[sort_order]
+
+    unique_bins, starts = _numpy.unique(flat_sorted, return_index=True)
+    ends = _numpy.empty_like(starts)
+    ends[:-1] = starts[1:]
+    ends[-1] = len(flat_sorted)
+
+    result_flat = result.reshape(-1, len(pct))
+    for ub, s, e in zip(unique_bins, starts, ends, strict=False):
+        result_flat[int(ub)] = _numpy.quantile(vals_sorted[s:e], pct)
 
     return result

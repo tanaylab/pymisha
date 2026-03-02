@@ -44,6 +44,32 @@ _GDATASETS = []  # Loaded dataset roots (in load order)
 _VTRACKS = {}    # Virtual tracks
 
 
+def gmax_processes(n=None):
+    """Get or set the maximum number of worker processes for parallel operations.
+
+    When called without arguments, returns the current value.
+    When called with a positive integer, sets the value and returns it.
+
+    Parameters
+    ----------
+    n : int, optional
+        Maximum number of worker processes.  Must be >= 1.
+        ``1`` means single-process (no parallelism).
+
+    Returns
+    -------
+    int
+        Current (or newly set) maximum process count.
+    """
+    if n is None:
+        return int(CONFIG.get("max_processes", 1))
+    n = int(n)
+    if n < 1:
+        raise ValueError("gmax_processes must be >= 1")
+    CONFIG["max_processes"] = n
+    return n
+
+
 def _make_progress_callback(progress, total=None, desc=None):
     if progress is None:
         progress = CONFIG.get('progress', "rich")

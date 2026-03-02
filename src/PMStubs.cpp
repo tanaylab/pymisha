@@ -13,6 +13,7 @@
 #include "RandomShuffle.h"
 #include "BinFinder.h"
 #include "BinsManager.h"
+#include "QuadTreeReader.h"
 #include "pmutils.h"
 #include <new>
 #include <vector>
@@ -4824,4 +4825,272 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
         PyMisha::handle_error("Out of memory");
         return NULL;
     }
+}
+
+// -------------------------------------------------------------------
+// Quad-tree C++ reader functions
+// -------------------------------------------------------------------
+
+PyObject *pm_quadtree_query_stats(PyObject *self, PyObject *args)
+{
+    Py_buffer pybuf;
+    long long qx1, qy1, qx2, qy2;
+    int is_points_int;
+    long long band_d1 = 0, band_d2 = 0;
+    int has_band = 0;
+
+    // Args: buffer, x1, y1, x2, y2, is_points, has_band, band_d1, band_d2
+    if (!PyArg_ParseTuple(args, "y*LLLLi|iLL",
+                          &pybuf, &qx1, &qy1, &qx2, &qy2,
+                          &is_points_int, &has_band, &band_d1, &band_d2)) {
+        return NULL;
+    }
+
+    const char *buf = static_cast<const char *>(pybuf.buf);
+    size_t len = static_cast<size_t>(pybuf.len);
+    bool is_points = (is_points_int != 0);
+
+    PyObject *result = NULL;
+
+    try {
+        // Parse file header (signature at offset 0, then num_objs, root_chunk_fpos)
+        uint64_t num_objs;
+        int64_t root_chunk_fpos;
+        quadtree::parse_header(buf, len, num_objs, root_chunk_fpos);
+
+        quadtree::QueryStat stat;
+        if (num_objs == 0) {
+            stat.occupied_area = 0;
+            stat.weighted_sum = std::numeric_limits<double>::quiet_NaN();
+            stat.min_val = std::numeric_limits<double>::quiet_NaN();
+            stat.max_val = std::numeric_limits<double>::quiet_NaN();
+        } else {
+            if (has_band) {
+                quadtree::DiagonalBand band(band_d1, band_d2);
+                stat = quadtree::query_stats(buf, len, is_points, root_chunk_fpos,
+                                             qx1, qy1, qx2, qy2, &band);
+            } else {
+                stat = quadtree::query_stats(buf, len, is_points, root_chunk_fpos,
+                                             qx1, qy1, qx2, qy2);
+            }
+        }
+
+        // Build result dict
+        result = PyDict_New();
+        if (!result) goto cleanup;
+
+        {
+            PyObject *v;
+            v = PyLong_FromLongLong(stat.occupied_area);
+            PyDict_SetItemString(result, "occupied_area", v);
+            Py_DECREF(v);
+
+            v = PyFloat_FromDouble(stat.weighted_sum);
+            PyDict_SetItemString(result, "weighted_sum", v);
+            Py_DECREF(v);
+
+            v = PyFloat_FromDouble(stat.min_val);
+            PyDict_SetItemString(result, "min_val", v);
+            Py_DECREF(v);
+
+            v = PyFloat_FromDouble(stat.max_val);
+            PyDict_SetItemString(result, "max_val", v);
+            Py_DECREF(v);
+        }
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        result = NULL;
+    }
+
+cleanup:
+    PyBuffer_Release(&pybuf);
+    return result;
+}
+
+PyObject *pm_quadtree_query_objects(PyObject *self, PyObject *args)
+{
+    Py_buffer pybuf;
+    long long qx1, qy1, qx2, qy2;
+    int is_points_int;
+    long long band_d1 = 0, band_d2 = 0;
+    int has_band = 0;
+
+    if (!PyArg_ParseTuple(args, "y*LLLLi|iLL",
+                          &pybuf, &qx1, &qy1, &qx2, &qy2,
+                          &is_points_int, &has_band, &band_d1, &band_d2)) {
+        return NULL;
+    }
+
+    const char *buf = static_cast<const char *>(pybuf.buf);
+    size_t len = static_cast<size_t>(pybuf.len);
+    bool is_points = (is_points_int != 0);
+
+    PyObject *result = NULL;
+
+    try {
+        uint64_t num_objs;
+        int64_t root_chunk_fpos;
+        quadtree::parse_header(buf, len, num_objs, root_chunk_fpos);
+
+        quadtree::QueryObjects qresult;
+        if (num_objs > 0) {
+            if (has_band) {
+                quadtree::DiagonalBand band(band_d1, band_d2);
+                qresult = quadtree::query_objects(buf, len, is_points, root_chunk_fpos,
+                                                  qx1, qy1, qx2, qy2, &band);
+            } else {
+                qresult = quadtree::query_objects(buf, len, is_points, root_chunk_fpos,
+                                                  qx1, qy1, qx2, qy2);
+            }
+        }
+
+        // Build result dict of numpy arrays
+        size_t n = qresult.ids.size();
+        npy_intp dims[1] = {static_cast<npy_intp>(n)};
+
+        result = PyDict_New();
+        if (!result) goto cleanup;
+
+        {
+            // id array (uint64)
+            PyObject *arr_id = PyArray_SimpleNew(1, dims, NPY_UINT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_id), qresult.ids.data(), n * sizeof(uint64_t));
+            PyDict_SetItemString(result, "id", arr_id);
+            Py_DECREF(arr_id);
+
+            // x1 array (int64)
+            PyObject *arr_x1 = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_x1), qresult.x1s.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "x1", arr_x1);
+            Py_DECREF(arr_x1);
+
+            // y1 array (int64)
+            PyObject *arr_y1 = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_y1), qresult.y1s.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "y1", arr_y1);
+            Py_DECREF(arr_y1);
+
+            // x2 array (int64)
+            PyObject *arr_x2 = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_x2), qresult.x2s.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "x2", arr_x2);
+            Py_DECREF(arr_x2);
+
+            // y2 array (int64)
+            PyObject *arr_y2 = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_y2), qresult.y2s.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "y2", arr_y2);
+            Py_DECREF(arr_y2);
+
+            // val array (float32)
+            PyObject *arr_val = PyArray_SimpleNew(1, dims, NPY_FLOAT32);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_val), qresult.vals.data(), n * sizeof(float));
+            PyDict_SetItemString(result, "val", arr_val);
+            Py_DECREF(arr_val);
+        }
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        result = NULL;
+    }
+
+cleanup:
+    PyBuffer_Release(&pybuf);
+    return result;
+}
+
+PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args)
+{
+    Py_buffer pybuf;
+    PyArrayObject *rects_arr = NULL;
+    int is_points_int;
+    int has_band = 0;
+    long long band_d1 = 0, band_d2 = 0;
+
+    // Args: buffer, rects_numpy(N×4 int64), is_points, has_band, band_d1, band_d2
+    if (!PyArg_ParseTuple(args, "y*O!i|iLL",
+                          &pybuf,
+                          &PyArray_Type, &rects_arr,
+                          &is_points_int,
+                          &has_band, &band_d1, &band_d2)) {
+        return NULL;
+    }
+
+    const char *buf = static_cast<const char *>(pybuf.buf);
+    size_t len = static_cast<size_t>(pybuf.len);
+    bool is_points = (is_points_int != 0);
+
+    // Validate rects array: must be contiguous int64 with shape (N, 4)
+    if (PyArray_NDIM(rects_arr) != 2 || PyArray_DIM(rects_arr, 1) != 4 ||
+        PyArray_TYPE(rects_arr) != NPY_INT64 ||
+        !PyArray_IS_C_CONTIGUOUS(rects_arr)) {
+        PyBuffer_Release(&pybuf);
+        PyErr_SetString(PyExc_ValueError,
+                        "rects must be a contiguous int64 array with shape (N, 4)");
+        return NULL;
+    }
+
+    size_t n = static_cast<size_t>(PyArray_DIM(rects_arr, 0));
+    const int64_t *rects_data = static_cast<const int64_t *>(PyArray_DATA(rects_arr));
+
+    PyObject *result = NULL;
+
+    try {
+        uint64_t num_objs;
+        int64_t root_chunk_fpos;
+        quadtree::parse_header(buf, len, num_objs, root_chunk_fpos);
+
+        quadtree::BatchQueryStats batch;
+        if (num_objs == 0 || n == 0) {
+            batch.resize(n);
+        } else {
+            if (has_band) {
+                quadtree::DiagonalBand band_obj(band_d1, band_d2);
+                batch = quadtree::query_stats_batch(buf, len, is_points,
+                                                     root_chunk_fpos,
+                                                     rects_data, n, &band_obj);
+            } else {
+                batch = quadtree::query_stats_batch(buf, len, is_points,
+                                                     root_chunk_fpos,
+                                                     rects_data, n);
+            }
+        }
+
+        // Build result dict of numpy arrays
+        npy_intp dims[1] = {static_cast<npy_intp>(n)};
+        result = PyDict_New();
+        if (!result) goto batch_cleanup;
+
+        {
+            PyObject *arr_occ = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_occ),
+                              batch.occupied_area.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "occupied_area", arr_occ);
+            Py_DECREF(arr_occ);
+
+            PyObject *arr_ws = PyArray_SimpleNew(1, dims, NPY_FLOAT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_ws),
+                              batch.weighted_sum.data(), n * sizeof(double));
+            PyDict_SetItemString(result, "weighted_sum", arr_ws);
+            Py_DECREF(arr_ws);
+
+            PyObject *arr_min = PyArray_SimpleNew(1, dims, NPY_FLOAT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_min),
+                              batch.min_val.data(), n * sizeof(double));
+            PyDict_SetItemString(result, "min_val", arr_min);
+            Py_DECREF(arr_min);
+
+            PyObject *arr_max = PyArray_SimpleNew(1, dims, NPY_FLOAT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_max),
+                              batch.max_val.data(), n * sizeof(double));
+            PyDict_SetItemString(result, "max_val", arr_max);
+            Py_DECREF(arr_max);
+        }
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        result = NULL;
+    }
+
+batch_cleanup:
+    PyBuffer_Release(&pybuf);
+    return result;
 }

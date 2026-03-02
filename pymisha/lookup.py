@@ -10,7 +10,7 @@ from ._shared import (
     _pymisha2df,
 )
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
-from .extract import _is_2d_intervals, gextract
+from .extract import _is_2d_intervals, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_2d_all, gintervals_all
 
 
@@ -93,6 +93,8 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
 
     _checkroot()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     if len(intervals) == 0:
         return None
 
@@ -140,6 +142,7 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
             )
 
     # Check if we need the Python path (vtracks, band, or 2D intervals)
+    intervals_set_out = kwargs.get("intervals_set_out")
     has_vtracks = any(_find_vtracks_in_expr(e) for e in exprs)
     use_python = has_vtracks or band is not None or _is_2d_intervals(intervals)
 
@@ -169,15 +172,25 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
         if result is None:
             return None
 
-        return _pymisha2df(result)
+        df = _pymisha2df(result)
+        if intervals_set_out is not None:
+            from .intervals import gintervals_save
+            gintervals_save(df[["chrom", "start", "end"]], intervals_set_out)
+            return None
+        return df
 
     # Fall back to Python implementation for virtual tracks / band / 2D
-    return _glookup_python(
+    result = _glookup_python(
         lookup_table, exprs, breaks_list, intervals,
         include_lowest=include_lowest, force_binning=force_binning,
         iterator=iterator, band=band,
         progress=progress, progress_desc=progress_desc,
     )
+    if result is not None and intervals_set_out is not None:
+        from .intervals import gintervals_save
+        gintervals_save(result[["chrom", "start", "end"]], intervals_set_out)
+        return None
+    return result
 
 
 def _glookup_python(lookup_table, exprs, breaks_list, intervals,

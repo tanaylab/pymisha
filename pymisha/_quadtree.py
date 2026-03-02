@@ -17,6 +17,12 @@ import struct
 
 import numpy as np
 
+try:
+    import _pymisha
+    _HAS_CPP_QUADTREE = True
+except ImportError:
+    _HAS_CPP_QUADTREE = False
+
 # Format signatures from GenomeTrack.cpp
 SIGNATURE_RECTS = -9
 SIGNATURE_POINTS = -10
@@ -194,12 +200,29 @@ class QuadTree:
                 if inter is not None:
                     self._insert(kid, inter, depth + 1, oi, obj_rect)
 
+    def _count_subtree_bytes(self, node):
+        """Estimate serialized byte size of a subtree (excluding chunk header)."""
+        obj_size = 32 if self.is_points else 48
+        if node.is_leaf:
+            return 80 + len(node.obj_indices) * obj_size
+        size = 104  # Node struct
+        for iquad in range(4):
+            size += self._count_subtree_bytes(node.kids[iquad])
+        return size
+
     def serialize(self, f, chunk_size=0):
         """
         Serialize the quad-tree to a file-like object in StatQuadTreeCached format.
 
         This writes the portion AFTER the format signature (which is written by the caller).
         Format: [uint64 num_objs] [int64 root_chunk_fpos] [chunk data]
+
+        Parameters
+        ----------
+        chunk_size : int
+            Maximum chunk size in bytes. Subtrees exceeding this size are
+            written as separate chunks with cross-chunk negative kid pointers.
+            0 means unlimited (single chunk).
         """
         num_objs = len(self.objs)
         f.write(struct.pack("<Q", num_objs))
@@ -211,15 +234,21 @@ class QuadTree:
         root_fpos_pos = f.tell()
         f.write(struct.pack("<q", 0))
 
-        # Serialize the tree as a single chunk (chunk_size=0 means no splitting)
-        chunk_start = f.tell()
+        # Map node id -> chunk file position (for cross-chunk references)
+        # A node gets an entry here if it was serialized as a separate chunk.
+        node_chunk_fpos = {}
 
-        # Chunk header: [int64 chunk_size] [int64 top_node_offset]
+        if chunk_size > 0:
+            # Multi-chunk: analyze subtree sizes and write large subtrees
+            # as separate chunks (bottom-up, matching R misha algorithm)
+            self._analyze_and_serialize(f, self.root, chunk_size, node_chunk_fpos)
+
+        # Serialize root as a chunk (always)
+        chunk_start = f.tell()
         f.write(struct.pack("<q", 0))   # placeholder for chunk_size
         f.write(struct.pack("<q", 0))   # placeholder for top_node_offset
 
-        # Serialize nodes depth-first, leaves first (bottom-up to know kid offsets)
-        top_node_offset = self._serialize_node(f, self.root, chunk_start)
+        top_node_offset = self._serialize_node(f, self.root, chunk_start, node_chunk_fpos)
 
         chunk_end = f.tell()
         chunk_total_size = chunk_end - chunk_start
@@ -235,7 +264,47 @@ class QuadTree:
 
         f.seek(chunk_end)
 
-    def _serialize_node(self, f, node, chunk_start):
+    def _analyze_and_serialize(self, f, node, chunk_size, node_chunk_fpos):
+        """Recursively analyze subtree sizes and write large subtrees as separate chunks.
+
+        Follows R misha's analyze_n_serialize_subtree algorithm: bottom-up
+        traversal. If a subtree exceeds chunk_size bytes, write it as a
+        separate chunk and record its file position.
+        """
+        if node.is_leaf:
+            return self._count_subtree_bytes(node)
+
+        size = 104  # Node struct
+        for iquad in range(4):
+            kid = node.kids[iquad]
+            subtree_size = self._analyze_and_serialize(f, kid, chunk_size, node_chunk_fpos)
+            if subtree_size > 0:
+                size += subtree_size
+
+        # If this subtree exceeds chunk_size, write it as a separate chunk
+        # (but not the root — the root is always written by serialize())
+        if size > chunk_size and node is not self.root:
+            chunk_start = f.tell()
+            f.write(struct.pack("<q", 0))   # placeholder for chunk_size
+            f.write(struct.pack("<q", 0))   # placeholder for top_node_offset
+
+            top_node_offset = self._serialize_node(f, node, chunk_start, node_chunk_fpos)
+
+            chunk_end = f.tell()
+            chunk_total_size = chunk_end - chunk_start
+
+            # Patch chunk header
+            f.seek(chunk_start)
+            f.write(struct.pack("<q", chunk_total_size))
+            f.write(struct.pack("<q", top_node_offset))
+            f.seek(chunk_end)
+
+            node_chunk_fpos[id(node)] = chunk_start
+            return 0  # subtree was written as chunk, size = 0 for parent
+
+        return size
+
+    def _serialize_node(self, f, node, chunk_start, node_chunk_fpos):
         """Serialize a node, return offset from chunk_start."""
         if node.is_leaf:
             return self._serialize_leaf(f, node, chunk_start)
@@ -243,7 +312,13 @@ class QuadTree:
         # Serialize children first to get their offsets
         kid_offsets = [0, 0, 0, 0]
         for iquad in range(4):
-            kid_offsets[iquad] = self._serialize_node(f, node.kids[iquad], chunk_start)
+            kid = node.kids[iquad]
+            kid_fpos = node_chunk_fpos.get(id(kid))
+            if kid_fpos is not None:
+                # Kid was written as a separate chunk — store negative file position
+                kid_offsets[iquad] = -kid_fpos
+            else:
+                kid_offsets[iquad] = self._serialize_node(f, kid, chunk_start, node_chunk_fpos)
 
         # Write node
         offset = f.tell() - chunk_start
@@ -282,7 +357,7 @@ class QuadTree:
         return offset
 
 
-def write_2d_track_file(filepath, objects, arena, is_points=False):
+def write_2d_track_file(filepath, objects, arena, is_points=False, chunk_size=0):
     """
     Write a misha-compatible 2D track file for one chromosome pair.
 
@@ -297,6 +372,11 @@ def write_2d_track_file(filepath, objects, arena, is_points=False):
         (x1, y1, x2, y2) bounding rectangle (typically (0, 0, chromsize1, chromsize2)).
     is_points : bool
         Whether objects are points (True) or rectangles (False).
+    chunk_size : int
+        Maximum chunk size in bytes for multi-chunk serialization.
+        Subtrees exceeding this size are written as separate chunks with
+        cross-chunk negative kid pointers. 0 means single chunk (default).
+        Recommended: ~10MB (10_000_000) for large datasets.
     """
     signature = SIGNATURE_POINTS if is_points else SIGNATURE_RECTS
     qtree = QuadTree(*arena, is_points=is_points)
@@ -306,7 +386,7 @@ def write_2d_track_file(filepath, objects, arena, is_points=False):
 
     with open(filepath, "wb") as f:
         f.write(struct.pack("<i", signature))
-        qtree.serialize(f)
+        qtree.serialize(f, chunk_size=chunk_size)
 
 
 def verify_no_overlaps_2d(rects):
@@ -590,7 +670,7 @@ def read_2d_track_objects(filepath):
         data.close()
 
 
-def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, qx2, qy2):
+def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, qx2, qy2, band=None):
     """
     Query a pre-opened 2D track mmap for objects intersecting a rectangle.
 
@@ -609,6 +689,8 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
         File position of the root chunk (``struct.unpack_from("<q", data, 12)[0]``).
     qx1, qy1, qx2, qy2 : int
         Query rectangle bounds.
+    band : tuple of (int, int) or None
+        If not None, ``(d1, d2)`` diagonal band filter.
 
     Returns
     -------
@@ -618,6 +700,29 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
     """
     if num_objs == 0:
         return []
+
+    # C++ fast path
+    if _HAS_CPP_QUADTREE:
+        try:
+            has_band = 1 if band is not None else 0
+            band_d1 = band[0] if band else 0
+            band_d2 = band[1] if band else 0
+            r = _pymisha.pm_quadtree_query_objects(
+                data, int(qx1), int(qy1), int(qx2), int(qy2),
+                1 if is_points else 0, has_band, int(band_d1), int(band_d2))
+            n = len(r["id"])
+            result = []
+            if is_points:
+                for i in range(n):
+                    result.append((int(r["x1"][i]), int(r["y1"][i]), float(r["val"][i])))
+            else:
+                for i in range(n):
+                    result.append((int(r["x1"][i]), int(r["y1"][i]),
+                                   int(r["x2"][i]), int(r["y2"][i]),
+                                   float(r["val"][i])))
+            return result
+        except Exception:
+            pass  # Fall back to Python implementation
 
     top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
 
@@ -634,6 +739,15 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
         else:
             _, x1, y1, x2, y2, val = obj
             result.append((x1, y1, x2, y2, val))
+
+    # Apply band filter if needed (Python fallback doesn't handle band)
+    if band is not None:
+        d1, d2 = band
+        if is_points:
+            result = [(x, y, v) for x, y, v in result if d1 <= (x - y) < d2]
+        else:
+            result = [(x1, y1, x2, y2, v) for x1, y1, x2, y2, v in result
+                      if (x2 - y1 > d1) and (x1 - y2 + 1 < d2)]
 
     return result
 
@@ -785,8 +899,20 @@ def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
         return {"occupied_area": 0, "weighted_sum": 0.0,
                 "min_val": float("nan"), "max_val": float("nan")}
 
+    # C++ fast path
+    if _HAS_CPP_QUADTREE:
+        try:
+            has_band = 1 if band is not None else 0
+            band_d1 = band[0] if band else 0
+            band_d2 = band[1] if band else 0
+            return _pymisha.pm_quadtree_query_stats(
+                data, int(qx1), int(qy1), int(qx2), int(qy2),
+                1 if is_points else 0, has_band, int(band_d1), int(band_d2))
+        except Exception:
+            pass  # Fall back to Python implementation
+
     if band is not None:
-        # Band filtering requires per-object inspection — fall back to object
+        # Band filtering requires per-object inspection -- fall back to object
         # enumeration.  The node-level stats don't account for band constraints.
         return _query_2d_track_stats_with_band(
             data, is_points, num_objs, root_chunk_fpos,
@@ -806,6 +932,72 @@ def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
 
     return {"occupied_area": stat[0], "weighted_sum": stat[1],
             "min_val": stat[2], "max_val": stat[3]}
+
+
+def query_2d_track_stats_batch(data, is_points, num_objs, root_chunk_fpos,
+                                rects, band=None):
+    """
+    Batch stats query: compute aggregated stats for N query rectangles in one call.
+
+    Parameters
+    ----------
+    data : mmap or bytes
+        Memory-mapped file data (from ``_read_file_header``).
+    is_points : bool
+        Whether the track stores points (True) or rectangles (False).
+    num_objs : int
+        Total number of objects in the file (from header).
+    root_chunk_fpos : int
+        File position of the root chunk.
+    rects : numpy.ndarray
+        (N, 4) int64 array of query rectangles ``[qx1, qy1, qx2, qy2]``.
+    band : tuple of (int, int) or None
+        If not None, ``(d1, d2)`` diagonal band filter.
+
+    Returns
+    -------
+    dict
+        ``{"occupied_area": ndarray(N, int64), "weighted_sum": ndarray(N, float64),
+        "min_val": ndarray(N, float64), "max_val": ndarray(N, float64)}``.
+    """
+    n = len(rects) if rects is not None else 0
+    if n == 0 or num_objs == 0:
+        return {
+            "occupied_area": np.zeros(n, dtype=np.int64),
+            "weighted_sum": np.full(n, np.nan),
+            "min_val": np.full(n, np.nan),
+            "max_val": np.full(n, np.nan),
+        }
+
+    rects_arr = np.ascontiguousarray(rects, dtype=np.int64).reshape(-1, 4)
+
+    # C++ fast path
+    if _HAS_CPP_QUADTREE:
+        try:
+            has_band = 1 if band is not None else 0
+            band_d1 = band[0] if band else 0
+            band_d2 = band[1] if band else 0
+            return _pymisha.pm_quadtree_query_stats_batch(
+                data, rects_arr,
+                1 if is_points else 0,
+                has_band, int(band_d1), int(band_d2))
+        except Exception:
+            pass  # Fall back to Python per-rect loop
+
+    # Python fallback: loop over rects
+    occ = np.zeros(n, dtype=np.int64)
+    ws = np.full(n, np.nan)
+    mn = np.full(n, np.nan)
+    mx = np.full(n, np.nan)
+    for i in range(n):
+        qx1, qy1, qx2, qy2 = int(rects_arr[i, 0]), int(rects_arr[i, 1]), int(rects_arr[i, 2]), int(rects_arr[i, 3])
+        s = query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
+                                  qx1, qy1, qx2, qy2, band=band)
+        occ[i] = s["occupied_area"]
+        ws[i] = s["weighted_sum"]
+        mn[i] = s["min_val"]
+        mx[i] = s["max_val"]
+    return {"occupied_area": occ, "weighted_sum": ws, "min_val": mn, "max_val": mx}
 
 
 def _query_2d_track_stats_with_band(data, is_points, num_objs, root_chunk_fpos,
@@ -854,6 +1046,101 @@ def _query_2d_track_stats_with_band(data, is_points, num_objs, root_chunk_fpos,
 
     return {"occupied_area": occupied_area, "weighted_sum": weighted_sum,
             "min_val": min_val, "max_val": max_val}
+
+
+def query_2d_track_opened_arrays(data, is_points, num_objs, root_chunk_fpos,
+                                  qx1, qy1, qx2, qy2, band=None):
+    """
+    Query a pre-opened 2D track mmap and return numpy arrays directly.
+
+    Unlike ``query_2d_track_opened``, this returns raw numpy arrays without
+    converting to Python tuples, which is much faster for vectorized consumers.
+
+    Parameters
+    ----------
+    data : mmap or bytes
+        Memory-mapped file data (from ``_read_file_header``).
+    is_points : bool
+        Whether the track stores points (True) or rectangles (False).
+    num_objs : int
+        Total number of objects in the file (from header).
+    root_chunk_fpos : int
+        File position of the root chunk.
+    qx1, qy1, qx2, qy2 : int
+        Query rectangle bounds.
+    band : tuple of (int, int) or None
+        If not None, ``(d1, d2)`` diagonal band filter.
+
+    Returns
+    -------
+    dict
+        ``{"x1": ndarray(int64), "y1": ndarray(int64),
+        "x2": ndarray(int64), "y2": ndarray(int64),
+        "val": ndarray(float32)}``.
+        For POINTS, x2 = x1 + 1, y2 = y1 + 1.
+        Empty arrays if no objects found.
+    """
+    _empty = {
+        "x1": np.empty(0, dtype=np.int64),
+        "y1": np.empty(0, dtype=np.int64),
+        "x2": np.empty(0, dtype=np.int64),
+        "y2": np.empty(0, dtype=np.int64),
+        "val": np.empty(0, dtype=np.float32),
+    }
+
+    if num_objs == 0:
+        return _empty
+
+    # C++ fast path — already returns dict of numpy arrays
+    if _HAS_CPP_QUADTREE:
+        try:
+            has_band = 1 if band is not None else 0
+            band_d1 = band[0] if band else 0
+            band_d2 = band[1] if band else 0
+            r = _pymisha.pm_quadtree_query_objects(
+                data, int(qx1), int(qy1), int(qx2), int(qy2),
+                1 if is_points else 0, has_band, int(band_d1), int(band_d2))
+            n = len(r["id"])
+            if n == 0:
+                return _empty
+            result = {
+                "x1": r["x1"].astype(np.int64),
+                "y1": r["y1"].astype(np.int64),
+                "x2": r["x2"].astype(np.int64),
+                "y2": r["y2"].astype(np.int64),
+                "val": r["val"],
+            }
+            if is_points:
+                result["x2"] = result["x1"] + 1
+                result["y2"] = result["y1"] + 1
+            return result
+        except Exception:
+            pass  # Fall back to Python implementation
+
+    # Python fallback: query tuples, convert to arrays
+    objs = query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
+                                  qx1, qy1, qx2, qy2, band=band)
+    if not objs:
+        return _empty
+
+    if is_points:
+        arr = np.array(objs, dtype=np.float64)
+        return {
+            "x1": arr[:, 0].astype(np.int64),
+            "y1": arr[:, 1].astype(np.int64),
+            "x2": arr[:, 0].astype(np.int64) + 1,
+            "y2": arr[:, 1].astype(np.int64) + 1,
+            "val": arr[:, 2].astype(np.float32),
+        }
+
+    arr = np.array(objs, dtype=np.float64)
+    return {
+        "x1": arr[:, 0].astype(np.int64),
+        "y1": arr[:, 1].astype(np.int64),
+        "x2": arr[:, 2].astype(np.int64),
+        "y2": arr[:, 3].astype(np.int64),
+        "val": arr[:, 4].astype(np.float32),
+    }
 
 
 def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):

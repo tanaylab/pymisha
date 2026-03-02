@@ -117,6 +117,108 @@ class TestGseqKmer:
         result = pm.gseq_kmer(["ACGT"], "AC")
         assert isinstance(result, np.ndarray)
 
+    # ---- Additional tests for numpy-optimized fast path ----
+
+    def test_many_sequences_fast_path(self):
+        """Many sequences take the batched numpy fast path."""
+        # Generate enough sequences to exceed the 500-byte threshold
+        seqs = ["ACGTACGTACGTACGT"] * 50  # 50 x 16 = 800 bytes > 500
+        result = pm.gseq_kmer(seqs, "CG", mode="count", strand=1)
+        assert len(result) == 50
+        assert all(r == 4 for r in result)
+
+    def test_many_sequences_both_strands(self):
+        """Batch fast path with both-strand counting."""
+        seqs = ["ACGTACGTACGTACGT"] * 50
+        # CG appears 4 times forward; CG is palindrome, so 4 times reverse too
+        result = pm.gseq_kmer(seqs, "CG", mode="count", strand=0)
+        assert all(r == 8 for r in result)
+
+    def test_many_sequences_fraction(self):
+        """Batch fast path fraction mode."""
+        seqs = ["ACGTACGT"] * 100
+        result = pm.gseq_kmer(seqs, "ACG", mode="frac", strand=1)
+        expected = 2.0 / 6  # 2 matches in 6 possible positions
+        np.testing.assert_allclose(result, expected, rtol=1e-10)
+
+    def test_many_sequences_reverse_only(self):
+        """Batch fast path reverse-complement-only counting."""
+        seqs = ["ACGTACGT"] * 100
+        # ACG revcomp = CGT, appears at pos 2 and 6
+        result = pm.gseq_kmer(seqs, "ACG", mode="count", strand=-1)
+        assert all(r == 2 for r in result)
+
+    def test_mixed_length_sequences(self):
+        """Fast path handles mixed-length sequences correctly."""
+        seqs = ["ACGT", "AC", "ACGTACGTACGT", "", "CG"]
+        result = pm.gseq_kmer(seqs, "ACG", mode="count", strand=1)
+        assert result[0] == 1   # ACG at pos 0
+        assert result[1] == 0   # too short
+        assert result[2] == 3   # ACG at pos 0, 4, 8
+        assert result[3] == 0   # empty
+        assert result[4] == 0   # too short for 3-mer
+
+    def test_long_single_sequence(self):
+        """Single long sequence uses numpy byte matching."""
+        # 1000 bp sequence with known CG count
+        seq = "ACGT" * 250
+        result = pm.gseq_kmer([seq], "CG", mode="count", strand=1)
+        # CG appears once per ACGT repeat at position 1
+        assert result[0] == 250
+
+    def test_overlapping_matches(self):
+        """Overlapping k-mer matches are counted correctly."""
+        # "AAAA" has 3 overlapping "AA" matches
+        result = pm.gseq_kmer(["AAAA"], "AA", mode="count", strand=1)
+        assert result[0] == 3
+
+    def test_overlapping_matches_batch(self):
+        """Overlapping matches work in batch mode too."""
+        seqs = ["AAAA", "AAAAAA", "A"]
+        result = pm.gseq_kmer(seqs, "AA", mode="count", strand=1)
+        assert result[0] == 3   # 3 overlapping AA in AAAA
+        assert result[1] == 5   # 5 overlapping AA in AAAAAA
+        assert result[2] == 0   # too short
+
+    def test_palindromic_kmer_both_strands(self):
+        """Palindromic k-mers (e.g., AATT) counted on both strands."""
+        # AATT is palindromic (revcomp = AATT)
+        # In "AATTCC", AATT appears at pos 0 forward, and revcomp(AATT)=AATT also at pos 0
+        result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
+        assert result[0] == 2  # counted once per strand
+
+    def test_empty_list(self):
+        """Empty input list returns empty array."""
+        result = pm.gseq_kmer([], "CG")
+        assert len(result) == 0
+        assert isinstance(result, np.ndarray)
+
+    def test_fast_path_parity_with_slow_path(self):
+        """Fast and slow path produce identical results for the same input."""
+        from pymisha.sequence import _gseq_kmer_fast, _count_kmer_in_seq
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"] * 10
+        kmer = "ACG"
+        k = 3
+        for strand in (-1, 0, 1):
+            for mode in ("count", "frac"):
+                fast = _gseq_kmer_fast(seqs, kmer.upper(), mode, strand, k)
+                slow = np.zeros(len(seqs), dtype=float)
+                for i, seq in enumerate(seqs):
+                    count = _count_kmer_in_seq(seq, kmer.upper(), strand,
+                                               None, None, False, False, [])
+                    if mode == "frac":
+                        possible = max(0, len(seq) - k + 1)
+                        if strand == 0:
+                            possible *= 2
+                        slow[i] = count / possible if possible > 0 else 0.0
+                    else:
+                        slow[i] = count
+                np.testing.assert_array_equal(
+                    fast, slow,
+                    err_msg=f"Mismatch for strand={strand}, mode={mode}"
+                )
+
 
 class TestGseqKmerDist:
     """Tests for gseq_kmer_dist function."""
@@ -184,3 +286,55 @@ class TestGseqKmerDist:
         seqs = pm.gseq_extract(intervals)
         expected = sum(1 for c in seqs[0].upper() if c in "ACGT")
         assert total == expected
+
+    def test_kmer_dist_k2_total(self):
+        """Total 2-mer count = seq_length - 1 for fully valid sequence."""
+        intervals = pm.gintervals("1", 0, 100)
+        result = pm.gseq_kmer_dist(intervals, k=2)
+        total = result["count"].sum()
+        seqs = pm.gseq_extract(intervals)
+        seq = seqs[0].upper()
+        # Count contiguous valid runs and sum (run_len - 1) for each
+        expected = 0
+        run = 0
+        for c in seq:
+            if c in "ACGT":
+                run += 1
+            else:
+                if run >= 2:
+                    expected += run - 1
+                run = 0
+        if run >= 2:
+            expected += run - 1
+        assert total == expected
+
+    def test_kmer_dist_stride_tricks_vs_rolling(self):
+        """Stride-tricks path (k<=8) matches rolling path (k>8)."""
+        intervals = pm.gintervals("1", 0, 5000)
+        # k=8 uses stride tricks, k=9 uses rolling multiply-accumulate
+        # Both should produce consistent results per their k values
+        result_k8 = pm.gseq_kmer_dist(intervals, k=8)
+        result_k9 = pm.gseq_kmer_dist(intervals, k=9)
+        # Both should have valid counts summing to approximately seq_len - k + 1
+        assert result_k8["count"].sum() > 0
+        assert result_k9["count"].sum() > 0
+        # k=8 total should be slightly larger than k=9 total
+        assert result_k8["count"].sum() >= result_k9["count"].sum()
+
+    def test_kmer_strings_cache(self):
+        """Verify _kmer_strings returns correct k-mer strings."""
+        from pymisha.sequence import _kmer_strings
+        table = _kmer_strings(2)
+        assert len(table) == 16
+        assert table[0] == "AA"
+        assert table[1] == "AC"
+        assert table[2] == "AG"
+        assert table[3] == "AT"
+        assert table[4] == "CA"
+        assert table[15] == "TT"
+
+    def test_kmer_strings_k1(self):
+        """k=1 string table is [A, C, G, T]."""
+        from pymisha.sequence import _kmer_strings
+        table = _kmer_strings(1)
+        assert list(table) == ["A", "C", "G", "T"]

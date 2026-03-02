@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.1.12 (2026-03-02)
+
+### Features
+
+- **2D vtrack non-aggregation functions:** Added `exists`, `size`, `first`, `last`, `sample`, and `global.percentile` for 2D virtual tracks. All return one row per query interval.
+- **2D set operations:** `gintervals_2d_intersect` (vectorized numpy pairwise rectangle intersection) and `gintervals_2d_union` (concatenate + sort).
+- **2D iterator:** `giterator_intervals_2d` generator yields one DataFrame per input 2D interval. Supports band filtering, virtual tracks, multiple expressions.
+- **Trans contact mirroring:** `gtrack_2d_import_contacts` now writes both chrA-chrB and chrB-chrA files for trans contacts, matching R misha symmetric behavior.
+- **Path functions:** Added `gtrack_path(track)` and `gintervals_path(name)` convenience functions returning filesystem paths to track/interval set directories.
+- **R-serialization detection:** `gtrack_var_get` now detects R-serialized track variables (RDS/serialize format) and raises an informative error instead of returning garbage or crashing.
+- **gextract file output:** Added `file` parameter (streaming TSV write) and `intervals_set_out` parameter (save result intervals as named set) to `gextract`.
+- **PWM spatial weighting:** Implemented `spat_factor`/`spat_bin` parameters for `gseq_pwm`, matching R misha's log-space spatial weight modulation. Removed NotImplementedError.
+- **Bigset transparent iteration:** Named bigset interval sets are now transparently loaded in 21 functions across all modules (extract, summary, intervals, liftover, lookup, sequence, analysis, gsynth).
+- **`gtrack_dbs` / `gintervals_dbs`:** Return the dataset that provides each track or interval set, matching R misha `gtrack.dbs` / `gintervals.dbs`.
+- **`intervals_set_out` parameter:** Added to 8 functions (`gscreen`, `gpartition`, `glookup`, `gintervals_force_range`, `gintervals_union`, `gintervals_intersect`, `gintervals_diff`, `gintervals_normalize`) for saving results as named interval sets.
+- **`gsynth_sample` bin_merge override:** Added `bin_merge` parameter for sampling-time bin merge overrides without modifying the model.
+- **Parallel extraction (`gmax_processes`):** Multi-process `gextract` splits work by chromosome across forked workers. Configurable via `gmax_processes(n)`.
+
+### Bug fixes
+
+- **`dim` parameter in `gvtrack_iterator`:** Fixed correctness bug where `dim=1`/`dim=2` was silently ignored. 2D tracks can now be projected to 1D for extraction over 1D intervals.
+- **`gintervals_force_range` column preservation:** Extra columns beyond chrom/start/end are now preserved when clipping intervals to chromosome boundaries, matching R misha behavior.
+
+### Performance
+
+- **C++ quad-tree reader:** Replaced pure-Python `struct.unpack` quad-tree traversal with C++ implementation (`QuadTreeReader.h/cpp`). Stats queries 182x faster, object queries 14x faster. Batch stats API (`pm_quadtree_query_stats_batch`) eliminates per-interval Python→C++ overhead for 2D vtrack aggregation.
+- **gcis_decay vectorization:** C++ bulk quad-tree object extraction + numpy vectorized distance computation, binning (`np.searchsorted` + `np.bincount`), and domain containment checks. Eliminates per-object Python loop.
+- **Liftover mapping vectorization:** Replaced per-interval Python mapping loop with numpy prefix-max overlap search, batch `searchsorted`, and vectorized strand-aware coordinate transformation.
+- **DataFrame construction:** Replaced list-of-dicts `pd.DataFrame(rows)` patterns with column-wise numpy array construction in liftover.py and intervals.py (5 sites, 2-5x faster for large results).
+- **gbins optimization:** Vectorized `gbins_summary` with `numpy.bincount` and optimized `gbins_quantiles` with sort-based grouping. 1.4-1.5x speedup.
+- **K-mer vectorization:** Numpy stride_tricks-based k-mer hashing in `gseq_kmer` and `gseq_kmer_dist`. 3.5x average speedup over per-sequence Python loops.
+- **Liftover overlap resolution:** Vectorized 7 overlap resolution functions using pandas groupby, numpy cumsum merging, and vectorized interval operations.
+- **PWM scoring vectorization:** Numpy stride-tricks vectorized PWM scoring in `gseq_pwm` — sliding window via `as_strided`, fancy indexing into log_pssm, vectorized base encoding. 17.6x speedup for batch scoring.
+- **VTrack per-row vectorization:** Replaced 4 iterrows/per-row loops in vtracks.py with numpy operations: `_build_unmasked_segments` no-mask path, overlap matching, nearest fallback, `base_starts` extraction.
+- **Pre-computed vtrack values:** Eliminated per-chunk vtrack recomputation in mixed C++/vtrack extraction. Vtracks are now computed once for the full interval set and sliced per chunk.
+- **Multi-chunk quad-tree writer:** `_quadtree.py` now supports multi-chunk serialization matching R misha's `StatQuadTreeCached` format. Prevents OOM on very large 2D tracks.
+- **Batch gintervals_mapply:** Replaced per-interval `gextract` calls with single batch extraction + intervalID grouping. Eliminates N separate C++ calls.
+- **C++ band-filtered query:** Added `pm_quadtree_query_objects_band` for C++ band-filtered quad-tree object enumeration, replacing pure-Python band filtering.
+
 ## v0.1.11 (2026-03-01)
 
 ### Features

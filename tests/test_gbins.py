@@ -373,3 +373,97 @@ def test_gbins_summary_r_parity():
     # Fourth bin: 0 total, NaN stats
     assert result[3, 0] == 0
     assert np.isnan(result[3, 2])
+
+
+# ---------------------------------------------------------------------------
+# Optimization parity tests
+# ---------------------------------------------------------------------------
+
+
+def test_gbins_summary_vectorized_stats_match_per_bin():
+    """Verify vectorized summary stats match per-bin _compute_summary_stats."""
+    from pymisha.summary import _assign_bins, _compute_summary_stats
+
+    breaks = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    result = pm.gbins_summary(
+        "dense_track", breaks,
+        expr="sparse_track",
+        iterator=100,
+    )
+
+    # Manual per-bin computation (the old algorithm)
+    data_bin = pm.gextract("dense_track", pm.gintervals_all(), iterator=100)
+    data_expr = pm.gextract("sparse_track", pm.gintervals_all(), iterator=100)
+    bin_vals = data_bin["dense_track"].values
+    expr_vals = data_expr["sparse_track"].values
+
+    idx = _assign_bins(bin_vals, np.array(breaks), False)
+    for i in range(len(breaks) - 1):
+        mask = idx == i
+        bv = expr_vals[mask]
+        expected = _compute_summary_stats(bv)
+        np.testing.assert_allclose(result[i], expected, rtol=1e-10,
+                                   err_msg=f"Bin {i} mismatch")
+
+
+def test_gbins_quantiles_sort_based_matches_itertools():
+    """Verify sort-based quantiles match itertools.product approach."""
+    breaks1 = [0, 0.3, 0.7, 1.0]
+    breaks2 = [0, 0.5, 1.0]
+    pcts = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+    result = pm.gbins_quantiles(
+        "dense_track", breaks1,
+        "dense_track", breaks2,
+        expr="sparse_track",
+        percentiles=pcts,
+        iterator=100,
+    )
+
+    # Manual per-bin computation (the old algorithm)
+    from pymisha.summary import _assign_bins
+    data_bin = pm.gextract("dense_track", pm.gintervals_all(), iterator=100)
+    data_expr = pm.gextract("sparse_track", pm.gintervals_all(), iterator=100)
+    bin_vals = data_bin["dense_track"].values
+    expr_vals = data_expr["sparse_track"].values
+
+    idx1 = _assign_bins(bin_vals, np.array(breaks1), False)
+    idx2 = _assign_bins(bin_vals, np.array(breaks2), False)
+
+    import itertools
+    for b1, b2 in itertools.product(range(len(breaks1) - 1), range(len(breaks2) - 1)):
+        mask = (idx1 == b1) & (idx2 == b2)
+        bv = expr_vals[mask]
+        bv = bv[~np.isnan(bv)]
+        if len(bv) > 0:
+            expected = np.quantile(bv, pcts)
+            np.testing.assert_allclose(result[b1, b2], expected, rtol=1e-10,
+                                       err_msg=f"Bin ({b1},{b2}) mismatch")
+        else:
+            assert np.all(np.isnan(result[b1, b2]))
+
+
+def test_gbins_summary_single_value_bin_stddev_nan():
+    """A bin with exactly one non-NaN value should have NaN stddev."""
+    # Use narrow breaks to get a bin with exactly 1 value
+    result = pm.gbins_summary(
+        "dense_track", [0, 0.001, 0.01],
+        expr="dense_track",
+        iterator=1,
+    )
+    for i in range(result.shape[0]):
+        n_valid = result[i, 0] - result[i, 1]
+        if n_valid == 1:
+            assert np.isnan(result[i, 6]), f"Bin {i}: stddev should be NaN for n=1"
+
+
+def test_extract_values_direct_matches_gextract():
+    """_extract_values_direct must return same arrays as _extract_expr_values."""
+    from pymisha.summary import _extract_expr_values, _extract_values_direct
+
+    intervals = pm.gintervals_all()
+    for track in ["dense_track", "sparse_track"]:
+        direct = _extract_values_direct(track, intervals, iterator=100)
+        via_gextract = _extract_expr_values(track, intervals, iterator=100)
+        np.testing.assert_array_equal(direct, via_gextract,
+                                      err_msg=f"{track}: direct != gextract")

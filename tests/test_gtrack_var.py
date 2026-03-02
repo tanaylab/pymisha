@@ -1,5 +1,7 @@
 """Tests for gtrack.var.* functions (track variable management)."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -208,6 +210,105 @@ class TestGtrackVarRm:
             pm.gtrack_var_set(track, "v2", [5, 6])
             assert sorted(pm.gtrack_var_ls(track)) == ["v1", "v2"]
             assert pm.gtrack_var_get(track, "v2") == [5, 6]
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+
+class TestGtrackVarRSerializationDetection:
+    """Test that R-serialized track variables are detected with a clear error."""
+
+    def _write_fake_var(self, track, var, data):
+        """Write raw bytes to a track variable file."""
+        track_path = pm.gtrack_path(track)
+        var_dir = os.path.join(track_path, "vars")
+        os.makedirs(var_dir, exist_ok=True)
+        filepath = os.path.join(var_dir, var)
+        with open(filepath, "wb") as f:
+            f.write(data)
+
+    def test_r_serialize_v2_ascii_detected(self):
+        """R serialize v2 ASCII format (starts with b'A\\n') raises clear error."""
+        track = "test_rvar_ascii"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            self._write_fake_var(track, "rvar", b"A\n2\n12345\n")
+            with pytest.raises(ValueError, match="written by R misha"):
+                pm.gtrack_var_get(track, "rvar")
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+    def test_r_serialize_v2_xdr_detected(self):
+        """R serialize v2 XDR binary format (starts with b'X\\n') raises clear error."""
+        track = "test_rvar_xdr"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            self._write_fake_var(track, "rvar", b"X\n\x00\x00\x00\x02")
+            with pytest.raises(ValueError, match="written by R misha"):
+                pm.gtrack_var_get(track, "rvar")
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+    def test_r_serialize_v3_detected(self):
+        """R serialize v3 format (starts with b'B\\n') raises clear error."""
+        track = "test_rvar_v3"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            self._write_fake_var(track, "rvar", b"B\n\x00\x00\x00\x03")
+            with pytest.raises(ValueError, match="written by R misha"):
+                pm.gtrack_var_get(track, "rvar")
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+    def test_gzip_rds_detected(self):
+        """Gzip-compressed RDS file (starts with b'\\x1f\\x8b') raises clear error."""
+        track = "test_rvar_gzip"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            self._write_fake_var(track, "rvar", b"\x1f\x8b\x08\x00\x00")
+            with pytest.raises(ValueError, match="written by R misha"):
+                pm.gtrack_var_get(track, "rvar")
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+    def test_error_message_includes_track_and_var_names(self):
+        """Error message includes the track and variable names."""
+        track = "test_rvar_msg"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            self._write_fake_var(track, "my_rvar", b"X\n\x00\x00\x00\x02")
+            with pytest.raises(
+                ValueError, match=r"'my_rvar'.*'test_rvar_msg'"
+            ):
+                pm.gtrack_var_get(track, "my_rvar")
+        finally:
+            pm.gtrack_rm(track, force=True)
+            pm.gdb_reload()
+
+    def test_python_pickle_still_works(self):
+        """Normal Python pickle variables are unaffected by R detection."""
+        track = "test_rvar_pickle_ok"
+        try:
+            pm.gtrack_create_sparse(
+                track, "test", pm.gintervals(1, 0, 1000), [1.0]
+            )
+            pm.gtrack_var_set(track, "pyvar", {"key": [1, 2, 3]})
+            result = pm.gtrack_var_get(track, "pyvar")
+            assert result == {"key": [1, 2, 3]}
         finally:
             pm.gtrack_rm(track, force=True)
             pm.gdb_reload()

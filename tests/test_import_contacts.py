@@ -173,6 +173,21 @@ class TestGtrack2dImportContacts:
         finally:
             self._cleanup(tname)
 
+    def test_single_string_contact_file(self, tmp_path):
+        """A single string (not list) is accepted as contacts parameter."""
+        tname = "test.test_contacts_str"
+        self._cleanup(tname)
+        try:
+            f = tmp_path / "contacts.tsv"
+            f.write_text(
+                "chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tcount\n"
+                "1\t100\t200\t1\t300\t400\t5.0\n"
+            )
+            pm.gtrack_2d_import_contacts(tname, "str test", str(f))
+            assert pm.gtrack_exists(tname)
+        finally:
+            self._cleanup(tname)
+
     def test_missing_contacts_raises(self):
         """Missing contacts parameter raises error."""
         with pytest.raises((ValueError, TypeError)):

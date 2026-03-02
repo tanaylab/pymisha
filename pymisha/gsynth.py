@@ -12,7 +12,7 @@ import numpy as _numpy
 
 from ._safe_pickle import restricted_load, restricted_loads
 from ._shared import _checkroot, _df2pymisha, _pymisha
-from .extract import gextract
+from .extract import _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 
 _logger = _logging.getLogger(__name__)
@@ -214,8 +214,21 @@ def gsynth_bin_map(breaks, merge_ranges):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _extract_bin_data(dim_specs, intervals, iterator):
+def _extract_bin_data(dim_specs, intervals, iterator, sample_bin_merge=None):
     """Extract track values and compute flat bin indices.
+
+    Parameters
+    ----------
+    dim_specs : list of dict
+        Per-dimension specification from the model.
+    intervals : DataFrame
+        Genomic intervals.
+    iterator : int or None
+        Iterator bin size.
+    sample_bin_merge : list or None
+        Optional sampling-time bin merge overrides, one per dimension.
+        Each element is either ``None`` (use training-time bin_merge) or
+        a list of merge-range dicts passed to :func:`gsynth_bin_map`.
 
     Returns
     -------
@@ -247,7 +260,7 @@ def _extract_bin_data(dim_specs, intervals, iterator):
     dim_data = []
     dim_sizes = []
 
-    for spec in dim_specs:
+    for d_idx, spec in enumerate(dim_specs):
         expr = spec["expr"]
         breaks = _numpy.asarray(spec["breaks"], dtype=float)
         n_bins = len(breaks) - 1
@@ -267,8 +280,12 @@ def _extract_bin_data(dim_specs, intervals, iterator):
         # Keep binning semantics consistent with gdist/gbins.
         bin_idx = _bin_values(values, breaks, include_lowest=False)
 
-        # Apply bin_merge if specified
-        bm_spec = spec.get("bin_merge")
+        # Determine effective bin_merge for this dimension:
+        # sample_bin_merge overrides training-time bin_merge when provided.
+        if sample_bin_merge is not None and d_idx < len(sample_bin_merge) and sample_bin_merge[d_idx] is not None:
+            bm_spec = sample_bin_merge[d_idx]
+        else:
+            bm_spec = spec.get("bin_merge")
         if bm_spec:
             bm = gsynth_bin_map(breaks, bm_spec)
             valid = bin_idx >= 0
@@ -522,7 +539,7 @@ def _worker_sample_chunk(args):
     ----------
     args : tuple
         (chunk_intervals_dict, dim_specs_list, cdf_list,
-         iterator, mask_copy_dict, n_samples, chunk_seed)
+         iterator, mask_copy_dict, n_samples, chunk_seed, bin_merge)
 
     Returns
     -------
@@ -530,7 +547,8 @@ def _worker_sample_chunk(args):
         Sampled sequences for this chunk.
     """
     (chunk_intervals_dict, dim_specs_list, cdf_list_data,
-     iterator, mask_copy_dict, n_samples, chunk_seed) = args
+     iterator, mask_copy_dict, n_samples, chunk_seed,
+     sample_bin_merge) = args
 
     import pandas as pd
     chunk_intervals = pd.DataFrame(chunk_intervals_dict)
@@ -552,7 +570,8 @@ def _worker_sample_chunk(args):
 
     # Extract bin data for this chunk
     bin_indices, iter_starts, iter_chroms, flat_breaks, _, _ = \
-        _extract_bin_data(dim_specs, chunk_intervals, iterator)
+        _extract_bin_data(dim_specs, chunk_intervals, iterator,
+                          sample_bin_merge=sample_bin_merge)
 
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
@@ -703,6 +722,8 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
     if intervals is None:
         intervals = gintervals_all()
 
+    intervals = _maybe_load_intervals_set(intervals)
+
     # Compute per-dimension bin_map for storage
     for _i, spec in enumerate(parsed_specs):
         if spec["bin_merge"]:
@@ -813,7 +834,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
 
 def gsynth_sample(model, output=None, *, output_format="fasta",
                   intervals=None, iterator=None, mask_copy=None,
-                  n_samples=1, seed=None,
+                  n_samples=1, seed=None, bin_merge=None,
                   allow_parallel=True, num_cores=None,
                   max_chunk_size=None):
     """Sample synthetic genome sequences from a trained model.
@@ -865,6 +886,13 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
     seed : int, optional
         Random seed for reproducibility.  If ``None``, uses the current
         random state.
+    bin_merge : list, optional
+        Sampling-time bin merge overrides, one element per model dimension.
+        Each element is either ``None`` (use the training-time bin_merge)
+        or a list of merge-range dicts as accepted by
+        :func:`gsynth_bin_map`.  This allows redirecting sparse bins to
+        better-populated ones at sampling time without retraining the
+        model.
     allow_parallel : bool, default True
         Whether to enable parallel chunking for large genomes.  When
         ``True`` and the total bases exceed *max_chunk_size*, intervals
@@ -914,8 +942,18 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
     if not isinstance(model, GsynthModel):
         raise TypeError("model must be a GsynthModel")
 
+    if bin_merge is not None and (
+        not isinstance(bin_merge, list) or len(bin_merge) != model.n_dims
+    ):
+        raise ValueError(
+            f"bin_merge must be a list with {model.n_dims} elements "
+            "(one per dimension)"
+        )
+
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     # Check whether to parallelize
     do_parallel, effective_cores = _should_parallelize(
@@ -944,7 +982,7 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
         worker_args = [
             (chunk.to_dict(orient="list"), dim_specs_list,
              cdf_list, iterator, mask_copy_dict, n_samples,
-             chunk_seeds[i])
+             chunk_seeds[i], bin_merge)
             for i, chunk in enumerate(chunks)
         ]
 
@@ -997,7 +1035,8 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
 
     # Extract bin data for model dimensions
     bin_indices, iter_starts, iter_chroms, flat_breaks, _, _ = \
-        _extract_bin_data(model.dim_specs, intervals, iterator)
+        _extract_bin_data(model.dim_specs, intervals, iterator,
+                          sample_bin_merge=bin_merge)
 
     # Get CDF list from model
     cdf_list = model.model_data["cdf"]
@@ -1121,6 +1160,8 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
 
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     # Build uniform/custom CDF for a single bin
     if nuc_probs is None:
@@ -1278,6 +1319,8 @@ def gsynth_replace_kmer(target, replacement, *, intervals=None, output=None,
 
     if intervals is None:
         intervals = gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     # Output setup
     fmt_map = {"seq": 0, "fasta": 1, "vector": 2}

@@ -629,6 +629,203 @@ def gintervals_2d_band_intersect(intervals, band, intervals_set_out=None):
     return result
 
 
+def _sort_2d_intervals(df):
+    """Sort 2D intervals by (chrom1, start1, chrom2, start2) and reset index."""
+    return df.sort_values(
+        ['chrom1', 'start1', 'chrom2', 'start2']
+    ).reset_index(drop=True)
+
+
+def _validate_2d_intervals(intervals, name="intervals"):
+    """Validate that a DataFrame has the required 2D interval columns."""
+    required = {'chrom1', 'start1', 'end1', 'chrom2', 'start2', 'end2'}
+    if not required.issubset(intervals.columns):
+        missing = required - set(intervals.columns)
+        raise ValueError(
+            f"{name} is missing required 2D columns: {missing}"
+        )
+
+
+def gintervals_2d_intersect(intervals1, intervals2):
+    """
+    Compute the intersection of two 2D interval sets.
+
+    Returns rectangles representing the overlapping regions between pairs
+    of intervals from *intervals1* and *intervals2*. Each result rectangle
+    is the pairwise intersection of one rectangle from each input set:
+
+    - ``new_start1 = max(rect1.start1, rect2.start1)``
+    - ``new_end1   = min(rect1.end1,   rect2.end1)``
+    - ``new_start2 = max(rect1.start2, rect2.start2)``
+    - ``new_end2   = min(rect1.end2,   rect2.end2)``
+
+    An intersection rectangle is emitted only when
+    ``new_start1 < new_end1`` **and** ``new_start2 < new_end2``.
+
+    Parameters
+    ----------
+    intervals1 : DataFrame
+        First set of 2D intervals (chrom1, start1, end1, chrom2, start2, end2).
+    intervals2 : DataFrame
+        Second set of 2D intervals (chrom1, start1, end1, chrom2, start2, end2).
+
+    Returns
+    -------
+    DataFrame or None
+        2D intervals representing pairwise intersections, sorted by
+        (chrom1, start1, chrom2, start2), or ``None`` if no intersections
+        exist.
+
+    See Also
+    --------
+    gintervals_intersect : Intersection of two 1D interval sets.
+    gintervals_2d_union : Union of two 2D interval sets.
+    gintervals_2d_band_intersect : Intersect 2D intervals with a diagonal band.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> iv1 = pm.gintervals_2d("1", 0, 1000, "1", 0, 1000)
+    >>> iv2 = pm.gintervals_2d("1", 500, 1500, "1", 500, 1500)
+    >>> pm.gintervals_2d_intersect(iv1, iv2)  # doctest: +SKIP
+    """
+    np = _numpy
+
+    if intervals1 is None or intervals2 is None:
+        raise ValueError("intervals1 and intervals2 cannot be None")
+
+    _validate_2d_intervals(intervals1, "intervals1")
+    _validate_2d_intervals(intervals2, "intervals2")
+
+    if len(intervals1) == 0 or len(intervals2) == 0:
+        return None
+
+    # Group both sets by (chrom1, chrom2) pair
+    g1 = intervals1.groupby(['chrom1', 'chrom2'], observed=True)
+    g2 = intervals2.groupby(['chrom1', 'chrom2'], observed=True)
+
+    common_keys = set(g1.groups.keys()) & set(g2.groups.keys())
+    if not common_keys:
+        return None
+
+    res_chrom1 = []
+    res_start1 = []
+    res_end1 = []
+    res_chrom2 = []
+    res_start2 = []
+    res_end2 = []
+
+    for key in sorted(common_keys):
+        df1 = g1.get_group(key)
+        df2 = g2.get_group(key)
+
+        s1_1 = df1['start1'].values
+        e1_1 = df1['end1'].values
+        s2_1 = df1['start2'].values
+        e2_1 = df1['end2'].values
+
+        s1_2 = df2['start1'].values
+        e1_2 = df2['end1'].values
+        s2_2 = df2['start2'].values
+        e2_2 = df2['end2'].values
+
+        # Vectorized pairwise comparison using broadcasting
+        # Shape: (n1, n2)
+        new_s1 = np.maximum(s1_1[:, None], s1_2[None, :])
+        new_e1 = np.minimum(e1_1[:, None], e1_2[None, :])
+        new_s2 = np.maximum(s2_1[:, None], s2_2[None, :])
+        new_e2 = np.minimum(e2_1[:, None], e2_2[None, :])
+
+        valid = (new_s1 < new_e1) & (new_s2 < new_e2)
+
+        if not np.any(valid):
+            continue
+
+        idx = np.nonzero(valid)
+        c1, c2 = key
+
+        count = len(idx[0])
+        res_chrom1.extend([c1] * count)
+        res_start1.append(new_s1[idx])
+        res_end1.append(new_e1[idx])
+        res_chrom2.extend([c2] * count)
+        res_start2.append(new_s2[idx])
+        res_end2.append(new_e2[idx])
+
+    if not res_chrom1:
+        return None
+
+    result = _pandas.DataFrame({
+        'chrom1': res_chrom1,
+        'start1': np.concatenate(res_start1),
+        'end1': np.concatenate(res_end1),
+        'chrom2': res_chrom2,
+        'start2': np.concatenate(res_start2),
+        'end2': np.concatenate(res_end2),
+    })
+
+    return _sort_2d_intervals(result)
+
+
+def gintervals_2d_union(intervals1, intervals2):
+    """
+    Compute the union of two 2D interval sets.
+
+    Concatenates the two interval sets and sorts the result by
+    (chrom1, start1, chrom2, start2). Since merging overlapping 2D
+    rectangles is not well-defined in general (the union of two rectangles
+    is not necessarily a rectangle), this function simply returns the
+    combined sorted set.
+
+    Parameters
+    ----------
+    intervals1 : DataFrame
+        First set of 2D intervals (chrom1, start1, end1, chrom2, start2, end2).
+    intervals2 : DataFrame
+        Second set of 2D intervals (chrom1, start1, end1, chrom2, start2, end2).
+
+    Returns
+    -------
+    DataFrame or None
+        Combined 2D intervals sorted by (chrom1, start1, chrom2, start2),
+        or ``None`` if both inputs are empty.
+
+    See Also
+    --------
+    gintervals_union : Union of two 1D interval sets.
+    gintervals_2d_intersect : Intersection of two 2D interval sets.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> iv1 = pm.gintervals_2d("1", 0, 1000, "1", 0, 1000)
+    >>> iv2 = pm.gintervals_2d("1", 500, 1500, "1", 500, 1500)
+    >>> pm.gintervals_2d_union(iv1, iv2)  # doctest: +SKIP
+    """
+    if intervals1 is None or intervals2 is None:
+        raise ValueError("intervals1 and intervals2 cannot be None")
+
+    _validate_2d_intervals(intervals1, "intervals1")
+    _validate_2d_intervals(intervals2, "intervals2")
+
+    cols = ['chrom1', 'start1', 'end1', 'chrom2', 'start2', 'end2']
+
+    if len(intervals1) == 0 and len(intervals2) == 0:
+        return None
+    if len(intervals1) == 0:
+        return _sort_2d_intervals(intervals2[cols].copy())
+    if len(intervals2) == 0:
+        return _sort_2d_intervals(intervals1[cols].copy())
+
+    combined = _pandas.concat(
+        [intervals1[cols], intervals2[cols]],
+        ignore_index=True,
+    )
+    return _sort_2d_intervals(combined)
+
+
 def gintervals_from_tuples(rows, strand=None):
     """
     Create intervals from a list of tuples or dicts.
@@ -876,7 +1073,7 @@ def gintervals_window(chroms, centers, half_width):
     return gintervals(chroms, starts, ends)
 
 
-def gintervals_force_range(intervals):
+def gintervals_force_range(intervals, intervals_set_out=None):
     """
     Force intervals into valid chromosome ranges.
 
@@ -979,14 +1176,18 @@ def gintervals_force_range(intervals):
         ]
         if not keep:
             return None
-        return _pandas.DataFrame({
-            "chrom1": [c1[i] for i in keep],
-            "start1": [s1[i] for i in keep],
-            "end1": [e1[i] for i in keep],
-            "chrom2": [c2[i] for i in keep],
-            "start2": [s2[i] for i in keep],
-            "end2": [e2[i] for i in keep],
-        })
+        result = intervals.iloc[keep].copy()
+        result["chrom1"] = [c1[i] for i in keep]
+        result["start1"] = [s1[i] for i in keep]
+        result["end1"] = [e1[i] for i in keep]
+        result["chrom2"] = [c2[i] for i in keep]
+        result["start2"] = [s2[i] for i in keep]
+        result["end2"] = [e2[i] for i in keep]
+        result = result.reset_index(drop=True)
+        if intervals_set_out is not None:
+            gintervals_save(result, intervals_set_out)
+            return None
+        return result
 
     # 1D intervals
     chrom_vals, starts, ends = _force_axis(
@@ -997,11 +1198,15 @@ def gintervals_force_range(intervals):
     keep = [i for i in range(len(chrom_vals)) if chrom_vals[i] is not None]
     if not keep:
         return None
-    return _pandas.DataFrame({
-        "chrom": [chrom_vals[i] for i in keep],
-        "start": [starts[i] for i in keep],
-        "end": [ends[i] for i in keep],
-    })
+    result = intervals.iloc[keep].copy()
+    result["chrom"] = [chrom_vals[i] for i in keep]
+    result["start"] = [starts[i] for i in keep]
+    result["end"] = [ends[i] for i in keep]
+    result = result.reset_index(drop=True)
+    if intervals_set_out is not None:
+        gintervals_save(result, intervals_set_out)
+        return None
+    return result
 
 
 def gintervals_is_bigset(intervals_set):
@@ -1082,7 +1287,7 @@ def _intervals_to_cpp(intervals):
     return _df2pymisha(df)
 
 
-def gintervals_union(intervals1, intervals2):
+def gintervals_union(intervals1, intervals2, intervals_set_out=None):
     """
     Calculate the union of two sets of intervals.
 
@@ -1136,10 +1341,14 @@ def gintervals_union(intervals1, intervals2):
     if result is None or len(result['chrom']) == 0:
         return None
 
-    return _pandas.DataFrame(result)
+    out = _pandas.DataFrame(result)
+    if intervals_set_out is not None:
+        gintervals_save(out, intervals_set_out)
+        return None
+    return out
 
 
-def gintervals_intersect(intervals1, intervals2):
+def gintervals_intersect(intervals1, intervals2, intervals_set_out=None):
     """
     Calculate the intersection of two sets of intervals.
 
@@ -1188,10 +1397,14 @@ def gintervals_intersect(intervals1, intervals2):
     if result is None or len(result['chrom']) == 0:
         return None
 
-    return _pandas.DataFrame(result)
+    out = _pandas.DataFrame(result)
+    if intervals_set_out is not None:
+        gintervals_save(out, intervals_set_out)
+        return None
+    return out
 
 
-def gintervals_diff(intervals1, intervals2):
+def gintervals_diff(intervals1, intervals2, intervals_set_out=None):
     """
     Calculate the difference of two interval sets.
 
@@ -1241,7 +1454,11 @@ def gintervals_diff(intervals1, intervals2):
     if result is None or len(result['chrom']) == 0:
         return None
 
-    return _pandas.DataFrame(result)
+    out = _pandas.DataFrame(result)
+    if intervals_set_out is not None:
+        gintervals_save(out, intervals_set_out)
+        return None
+    return out
 
 
 def gintervals_canonic(intervals, unify_touching_intervals=True):
@@ -1727,6 +1944,70 @@ def gintervals_ls(pattern="", ignore_case=False):
     return interval_sets
 
 
+def gintervals_dbs(intervals, dataframe=False):
+    """
+    Return database root(s) containing the given interval set(s).
+
+    For each interval set name, searches the current database root and
+    all loaded dataset roots to find which databases contain the set.
+
+    Parameters
+    ----------
+    intervals : str or list of str
+        Interval set name(s) to look up.
+    dataframe : bool, default False
+        If True, return a DataFrame with columns ``intervals`` and ``db``.
+        If False, return a dict mapping set names to lists of database paths.
+
+    Returns
+    -------
+    dict or DataFrame
+        If *dataframe* is False, a dict ``{set_name: [db_path, ...]}``.
+        If *dataframe* is True, a DataFrame with columns ``intervals`` and ``db``.
+
+    See Also
+    --------
+    gintervals_ls : List available interval sets.
+    gintervals_exists : Check if a named interval set exists.
+    gtrack_dbs : Same for tracks.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gintervals_dbs("annotations1")  # doctest: +SKIP
+    {'annotations1': ['/path/to/db']}
+    """
+    _checkroot()
+    from . import _shared
+
+    names = [intervals] if isinstance(intervals, str) else list(intervals)
+
+    all_dbs = [_shared._GROOT] + list(_shared._GDATASETS)
+
+    result = {}
+    for name in names:
+        rel_base = os.path.join("tracks", name.replace(".", os.sep))
+        dbs = []
+        for db in all_dbs:
+            if (os.path.exists(os.path.join(db, rel_base + ".interv"))
+                    or os.path.exists(os.path.join(db, rel_base + ".interv2d"))):
+                dbs.append(db)
+        result[name] = dbs
+
+    if dataframe:
+        rows_name = []
+        rows_db = []
+        for n, dbs in result.items():
+            for db in dbs:
+                rows_name.append(n)
+                rows_db.append(db)
+        import pandas as pd
+        return pd.DataFrame({"intervals": rows_name, "db": rows_db})
+
+    return result
+
+
 def gintervals_exists(name):
     """
     Check if a named interval set exists.
@@ -1757,6 +2038,54 @@ def gintervals_exists(name):
     """
     _checkroot()
     return gintervals_dataset(name) is not None
+
+
+def gintervals_path(name):
+    """
+    Return the filesystem path of a named interval set's directory.
+
+    Parameters
+    ----------
+    name : str
+        Name of the interval set (e.g. ``"annotations"``).
+
+    Returns
+    -------
+    str
+        Absolute path to the interval set on disk (the ``.interv``
+        or ``.interv2d`` file/directory).
+
+    Raises
+    ------
+    ValueError
+        If *name* is ``None`` or the interval set does not exist.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gintervals_path("annotations")  # doctest: +ELLIPSIS
+    '...annotations.interv'
+
+    See Also
+    --------
+    gintervals_exists : Check whether an interval set exists.
+    gintervals_dataset : Get dataset root for an interval set.
+    gintervals_load : Load a named interval set.
+    """
+    if name is None:
+        raise ValueError("name cannot be None")
+    _checkroot()
+    root = gintervals_dataset(name)
+    if root is None:
+        raise ValueError(f"Interval set '{name}' does not exist")
+    path_part = name.replace(".", "/")
+    for suffix in (".interv", ".interv2d"):
+        candidate = os.path.join(root, "tracks", f"{path_part}{suffix}")
+        if os.path.exists(candidate):
+            return candidate
+    # Should not happen if gintervals_dataset found it, but be safe
+    raise ValueError(f"Interval set '{name}' does not exist")
 
 
 def gintervals_dataset(intervals=None):
@@ -2477,12 +2806,14 @@ def gintervals_mapply(func, *exprs, intervals=None, iterator=None,
     ...     intervals=pm.gintervals(["1", "2"], 0, 10000),
     ... )  # doctest: +SKIP
     """
-    from .extract import gextract
+    from .extract import _maybe_load_intervals_set, gextract
 
     _checkroot()
 
     if intervals is None:
         raise ValueError("intervals parameter is required")
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     expr_list = list(exprs)
     if not expr_list:
@@ -2503,28 +2834,55 @@ def gintervals_mapply(func, *exprs, intervals=None, iterator=None,
         # Without iterator, iterate over original intervals directly
         work_intervals = intervals
 
+    # --- Batch extraction: one gextract call per expression for ALL intervals ---
+    # This avoids N separate C++ extraction calls (one per interval).
+    query_intervals = work_intervals[["chrom", "start", "end"]].copy()
+    query_intervals = query_intervals.reset_index(drop=True)
+
+    # Check strand reversal per interval
+    has_strand = "strand" in work_intervals.columns
+    reverse_flags = work_intervals["strand"].to_numpy() == -1 if has_strand else None
+
+    # Extract each expression once for all intervals
+    extracted = []
+    for expr in expr_list:
+        ext = gextract(expr, intervals=query_intervals)
+        extracted.append(ext)
+
+    n_intervals = len(query_intervals)
+
+    # Pre-group extracted data by intervalID for O(1) lookup per interval.
+    # gextract returns 1-based intervalIDs.
+    grouped_data = []
+    for ext in extracted:
+        if ext is not None and len(ext) > 0:
+            iid = ext["intervalID"].to_numpy()
+            val_cols = [c for c in ext.columns if c not in ("chrom", "start", "end", "intervalID")]
+            val_col = val_cols[0] if val_cols else None
+            vals = ext[val_col].to_numpy(dtype=float) if val_col else None
+            # Build dict: intervalID -> (start_idx, end_idx) for contiguous groups
+            grp_dict = {}
+            if len(iid) > 0:
+                breaks = np.flatnonzero(np.diff(iid) != 0)
+                starts = np.concatenate([[0], breaks + 1])
+                ends = np.concatenate([breaks + 1, [len(iid)]])
+                for s, e in zip(starts, ends, strict=False):
+                    grp_dict[iid[s]] = (s, e)
+            grouped_data.append((grp_dict, vals))
+        else:
+            grouped_data.append((None, None))
+
+    # Apply func per interval
     results = []
-    coord_rows = []
+    for i in range(n_intervals):
+        reverse = reverse_flags[i] if reverse_flags is not None else False
+        interval_id = i + 1  # gextract uses 1-based intervalIDs
 
-    for _idx, irow in work_intervals.iterrows():
-        single = _pandas.DataFrame([{
-            "chrom": irow["chrom"],
-            "start": irow["start"],
-            "end": irow["end"],
-        }])
-
-        # Check strand reversal
-        reverse = False
-        if "strand" in irow.index and irow.get("strand") == -1:
-            reverse = True
-
-        # Extract each expression for this single interval (at track resolution)
         arrays = []
-        for expr in expr_list:
-            ext = gextract(expr, intervals=single)
-            if ext is not None and len(ext) > 0:
-                val_cols = [c for c in ext.columns if c not in ("chrom", "start", "end", "intervalID")]
-                arr = ext[val_cols[0]].to_numpy(dtype=float) if val_cols else np.array([])
+        for grp_dict, vals in grouped_data:
+            if grp_dict is not None and interval_id in grp_dict:
+                s, e = grp_dict[interval_id]
+                arr = vals[s:e]
             else:
                 arr = np.array([])
             if reverse:
@@ -2533,10 +2891,9 @@ def gintervals_mapply(func, *exprs, intervals=None, iterator=None,
 
         val = func(*arrays)
         results.append(val)
-        coord_rows.append({"chrom": irow["chrom"], "start": irow["start"], "end": irow["end"]})
 
     # Build result DataFrame
-    result_df = _pandas.DataFrame(coord_rows)
+    result_df = query_intervals.copy()
     result_df[colnames] = results
 
     if intervals_set_out is not None:
@@ -3498,7 +3855,7 @@ def gintervals_annotate(intervals, annotation_intervals,
     return output
 
 
-def gintervals_normalize(intervals, size):
+def gintervals_normalize(intervals, size, intervals_set_out=None):
     """
     Normalize intervals to a specified size by centering.
 
@@ -3618,6 +3975,10 @@ def gintervals_normalize(intervals, size):
     for col in intervals.columns:
         if col not in basic_cols:
             result[col] = intervals[col].to_numpy()
+
+    if intervals_set_out is not None:
+        gintervals_save(result[["chrom", "start", "end"]], intervals_set_out)
+        return None
 
     return result
 

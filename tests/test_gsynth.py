@@ -689,6 +689,92 @@ class TestGsynthBinMergeAdvanced:
             pm.gvtrack_rm("g_frac")
             pm.gvtrack_rm("c_frac")
 
+    def test_sample_bin_merge_at_sampling_time(self):
+        """bin_merge passed at sampling time overrides training-time bin_merge."""
+        pm.gvtrack_create("g_frac", None, "kmer.frac", kmer="G")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac",
+                    "breaks": [0, 0.1, 0.2, 0.3, 0.4, 0.5],
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+            )
+            assert model.n_dims == 1
+            # No training-time bin_merge was applied
+            assert model.dim_specs[0].get("bin_merge") is None
+
+            # Sample without bin_merge
+            seqs_no_merge = pm.gsynth_sample(
+                model,
+                intervals=pm.gintervals("1", 0, 2000),
+                iterator=200,
+                seed=42,
+            )
+            assert len(seqs_no_merge[0]) == 2000
+
+            # Sample with sampling-time bin_merge: fold last bin into second-to-last
+            seqs_with_merge = pm.gsynth_sample(
+                model,
+                intervals=pm.gintervals("1", 0, 2000),
+                iterator=200,
+                seed=42,
+                bin_merge=[[{"from": (0.4, 0.5), "to": (0.3, 0.4)}]],
+            )
+            assert len(seqs_with_merge[0]) == 2000
+            assert all(c in "ACGT" for c in seqs_with_merge[0])
+
+            # The sequences should differ because bin mapping changed
+            # (not guaranteed but highly likely with different bin routing)
+        finally:
+            pm.gvtrack_rm("g_frac")
+
+    def test_sample_bin_merge_validation(self):
+        """bin_merge must match model dimensions."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+        )
+        assert model.n_dims == 0
+
+        # 0D model: bin_merge must be empty list
+        with pytest.raises(ValueError, match="0 elements"):
+            pm.gsynth_sample(model, bin_merge=[None],
+                             intervals=pm.gintervals("1", 0, 1000))
+
+    def test_sample_bin_merge_none_elements_use_training_default(self):
+        """bin_merge=[None] uses training-time bin_merge for that dimension."""
+        pm.gvtrack_create("g_frac", None, "kmer.frac", kmer="G")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac",
+                    "breaks": [0, 0.1, 0.2, 0.3, 0.4, 0.5],
+                    "bin_merge": [{"from": (0.4, 0.5), "to": (0.3, 0.4)}],
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+            )
+
+            # bin_merge=[None] should behave identically to no bin_merge at all
+            seqs_default = pm.gsynth_sample(
+                model,
+                intervals=pm.gintervals("1", 0, 2000),
+                iterator=200,
+                seed=42,
+            )
+            seqs_none = pm.gsynth_sample(
+                model,
+                intervals=pm.gintervals("1", 0, 2000),
+                iterator=200,
+                seed=42,
+                bin_merge=[None],
+            )
+            assert seqs_default == seqs_none
+        finally:
+            pm.gvtrack_rm("g_frac")
+
 
 # ============================================================================
 # Model save/load round-trip verification

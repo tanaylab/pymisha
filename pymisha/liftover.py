@@ -14,7 +14,6 @@ Strand note: intervals APIs use {-1,0,1}, while chain-derived columns
 import heapq
 import os
 import struct
-from bisect import bisect_left
 from collections import defaultdict
 from pathlib import Path
 
@@ -105,7 +104,17 @@ def _parse_chain_file(path, db_chrom_sizes, min_score=None):
     if not chain_path.is_file():
         raise ValueError(f"Chain path is not a regular file: {path}")
 
-    blocks = []
+    # Column-wise accumulators for parsed chain blocks
+    b_chrom = []
+    b_start = []
+    b_end = []
+    b_strand = []
+    b_chromsrc = []
+    b_startsrc = []
+    b_endsrc = []
+    b_strandsrc = []
+    b_chain_id = []
+    b_score = []
     src_chrom_sizes = {}  # track source chrom sizes for consistency validation
 
     with open(chain_path, encoding="utf-8") as f:
@@ -286,18 +295,16 @@ def _parse_chain_file(path, db_chrom_sizes, min_score=None):
                 block_tgt_start = tgt_size - cur_tgt_pos - size
                 block_tgt_end = tgt_size - cur_tgt_pos
 
-            blocks.append({
-                "chrom": tgt_chrom,
-                "start": block_tgt_start,
-                "end": block_tgt_end,
-                "strand": tgt_strand,
-                "chromsrc": src_chrom,
-                "startsrc": block_src_start,
-                "endsrc": block_src_end,
-                "strandsrc": src_strand,
-                "chain_id": chain_id,
-                "score": chain_score,
-            })
+            b_chrom.append(tgt_chrom)
+            b_start.append(block_tgt_start)
+            b_end.append(block_tgt_end)
+            b_strand.append(tgt_strand)
+            b_chromsrc.append(src_chrom)
+            b_startsrc.append(block_src_start)
+            b_endsrc.append(block_src_end)
+            b_strandsrc.append(src_strand)
+            b_chain_id.append(chain_id)
+            b_score.append(chain_score)
 
             # Advance positions
             if len(parts) == 3:
@@ -313,7 +320,20 @@ def _parse_chain_file(path, db_chrom_sizes, min_score=None):
                 cur_src_pos += size
                 cur_tgt_pos += size
 
-    return blocks
+    if not b_chrom:
+        return None
+    return {
+        "chrom": b_chrom,
+        "start": b_start,
+        "end": b_end,
+        "strand": b_strand,
+        "chromsrc": b_chromsrc,
+        "startsrc": b_startsrc,
+        "endsrc": b_endsrc,
+        "strandsrc": b_strandsrc,
+        "chain_id": b_chain_id,
+        "score": b_score,
+    }
 
 
 # ===================================================================
@@ -329,13 +349,20 @@ def _handle_src_overlaps(df, policy):
     df = df.sort_values(["chromsrc", "startsrc", "endsrc"]).reset_index(drop=True)
 
     if policy == "error":
-        for i in range(1, len(df)):
-            if (df.loc[i, "chromsrc"] == df.loc[i - 1, "chromsrc"] and
-                    df.loc[i, "startsrc"] < df.loc[i - 1, "endsrc"]):
+        n = len(df)
+        if n > 1:
+            chroms = df["chromsrc"].to_numpy()
+            starts = df["startsrc"].to_numpy(dtype=np.int64, copy=False)
+            ends = df["endsrc"].to_numpy(dtype=np.int64, copy=False)
+            same_chrom = chroms[1:] == chroms[:-1]
+            overlaps = same_chrom & (starts[1:] < ends[:-1])
+            idx = np.flatnonzero(overlaps)
+            if idx.size > 0:
+                i = idx[0] + 1
                 raise ValueError(
-                    f"Source overlap detected on {df.loc[i, 'chromsrc']}: "
-                    f"[{df.loc[i-1, 'startsrc']}, {df.loc[i-1, 'endsrc']}) overlaps "
-                    f"[{df.loc[i, 'startsrc']}, {df.loc[i, 'endsrc']})"
+                    f"Source overlap detected on {chroms[i]}: "
+                    f"[{starts[i-1]}, {ends[i-1]}) overlaps "
+                    f"[{starts[i]}, {ends[i]})"
                 )
         return df
 
@@ -354,13 +381,20 @@ def _handle_tgt_overlaps(df, policy):
     df = df.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
 
     if policy == "error":
-        for i in range(1, len(df)):
-            if (df.loc[i, "chrom"] == df.loc[i - 1, "chrom"] and
-                    df.loc[i, "start"] < df.loc[i - 1, "end"]):
+        n = len(df)
+        if n > 1:
+            chroms = df["chrom"].to_numpy()
+            starts_arr = df["start"].to_numpy(dtype=np.int64, copy=False)
+            ends_arr = df["end"].to_numpy(dtype=np.int64, copy=False)
+            same_chrom = chroms[1:] == chroms[:-1]
+            overlaps = same_chrom & (starts_arr[1:] < ends_arr[:-1])
+            idx = np.flatnonzero(overlaps)
+            if idx.size > 0:
+                i = idx[0] + 1
                 raise ValueError(
-                    f"Target overlap detected on {df.loc[i, 'chrom']}: "
-                    f"[{df.loc[i-1, 'start']}, {df.loc[i-1, 'end']}) overlaps "
-                    f"[{df.loc[i, 'start']}, {df.loc[i, 'end']})"
+                    f"Target overlap detected on {chroms[i]}: "
+                    f"[{starts_arr[i-1]}, {ends_arr[i-1]}) overlaps "
+                    f"[{starts_arr[i]}, {ends_arr[i]})"
                 )
         return df
 
@@ -388,34 +422,53 @@ def _discard_overlapping_intervals(df, chrom_col, start_col, end_col):
     if n < 2:
         return df
 
-    discard_mask = np.zeros(n, dtype=bool)
-    cluster_start = 0
-    cluster_end = int(df.loc[0, end_col])
-    cluster_has_overlap = False
+    chroms = df[chrom_col].to_numpy()
+    starts = df[start_col].to_numpy(dtype=np.int64, copy=False)
+    ends = df[end_col].to_numpy(dtype=np.int64, copy=False)
 
+    # Find where chroms change — these are group boundaries
+    chrom_change = np.empty(n, dtype=bool)
+    chrom_change[0] = True
+    chrom_change[1:] = chroms[1:] != chroms[:-1]
+
+    # Compute running max of ends within each chrom group, resetting at
+    # chrom boundaries. This is a prefix-max scan with resets — the data
+    # dependency prevents full vectorization, but iterating over numpy
+    # scalars (not pandas .loc) is fast.
+    max_end = ends.copy()
     for i in range(1, n):
-        cur_end = int(df.loc[i, end_col])
-        if df.loc[i, chrom_col] != df.loc[i - 1, chrom_col]:
-            if cluster_has_overlap:
-                discard_mask[cluster_start:i] = True
-            cluster_start = i
-            cluster_end = cur_end
-            cluster_has_overlap = False
-            continue
+        if not chrom_change[i] and max_end[i - 1] > max_end[i]:
+            max_end[i] = max_end[i - 1]
 
-        cur_start = int(df.loc[i, start_col])
-        if cur_start < cluster_end:
-            cluster_has_overlap = True
-            cluster_end = max(cluster_end, cur_end)
-        else:
-            if cluster_has_overlap:
-                discard_mask[cluster_start:i] = True
-            cluster_start = i
-            cluster_end = cur_end
-            cluster_has_overlap = False
+    # An interval at position i overlaps its predecessor's cluster if:
+    # same chrom AND start[i] < max_end up to i-1
+    # We detect overlap pairs: start[i] < max_end[i-1] and same chrom
+    overlaps_prev = np.zeros(n, dtype=bool)
+    overlaps_prev[1:] = (~chrom_change[1:]) & (starts[1:] < max_end[:-1])
 
-    if cluster_has_overlap:
-        discard_mask[cluster_start:n] = True
+    # Now we need to identify clusters of overlapping intervals and mark
+    # entire clusters that contain at least one overlap.
+    # A cluster boundary occurs where overlaps_prev is False.
+    # Assign cluster IDs
+    cluster_ids = np.cumsum(~overlaps_prev)
+
+    # Find clusters that have more than one member OR contain an overlap
+    # A cluster has an overlap if any overlaps_prev within it is True
+    # Since cluster boundaries are at ~overlaps_prev, a cluster with overlap
+    # means it has size > 1 (any overlaps_prev=True entry in it)
+    # Actually, we need: clusters where at least one pair overlaps.
+    # overlaps_prev[i] = True means interval i overlaps with something before it
+    # in the same cluster.
+
+    # Find which cluster IDs have any overlap
+    # Use np.bincount to find if any overlaps_prev is True per cluster
+    max_cluster = cluster_ids[-1]
+    has_overlap = np.zeros(max_cluster + 1, dtype=bool)
+    overlap_indices = np.flatnonzero(overlaps_prev)
+    if overlap_indices.size > 0:
+        has_overlap[cluster_ids[overlap_indices]] = True
+
+    discard_mask = has_overlap[cluster_ids]
 
     if discard_mask.any():
         return df.loc[~discard_mask].reset_index(drop=True)
@@ -428,15 +481,20 @@ def _handle_tgt_overlaps_auto(df, policy):
     auto_score: highest score wins (tiebreak: longer span, lower chain_id)
     auto_first: lowest chain_id wins
     auto_longer: longest span wins (tiebreak: higher score, lower chain_id)
+
+    Uses vectorized numpy operations for breakpoint segmentation, winner
+    selection, and adjacent merging.
     """
     if df.empty:
         return df
 
-    result_rows = []
+    result_parts = []
+
     # Process per chromosome
     for chrom, group in df.groupby("chrom", sort=False):
         group = group.sort_values(["start", "end"]).reset_index(drop=True)
-        if len(group) == 0:
+        ng = len(group)
+        if ng == 0:
             continue
 
         starts = group["start"].to_numpy(dtype=np.int64, copy=False)
@@ -445,154 +503,367 @@ def _handle_tgt_overlaps_auto(df, policy):
         src_starts = group["startsrc"].to_numpy(dtype=np.int64, copy=False)
         src_ends = group["endsrc"].to_numpy(dtype=np.int64, copy=False)
         chain_ids = group["chain_id"].to_numpy(dtype=np.int64, copy=False)
-        scores = group["score"].to_numpy(dtype=float, copy=False)
+        scores = group["score"].to_numpy(dtype=np.float64, copy=False)
         chromsrc_vals = group["chromsrc"].to_numpy()
         strandsrc_vals = group["strandsrc"].to_numpy(dtype=np.int64, copy=False)
         spans = ends - starts
 
         points = np.unique(np.concatenate((starts, ends)))
         if points.size < 2:
-            result_rows.extend(group.to_dict("records"))
+            result_parts.append(group)
             continue
 
-        starts_at = defaultdict(list)
-        ends_at = defaultdict(list)
-        for idx in range(len(group)):
-            starts_at[int(starts[idx])].append(idx)
-            ends_at[int(ends[idx])].append(idx)
+        n_segs = len(points) - 1
+        seg_starts = points[:-1]  # (n_segs,)
+        seg_ends = points[1:]     # (n_segs,)
 
-        if policy == "auto_score":
-            def prio(idx, scores=scores, spans=spans, chain_ids=chain_ids):
-                return (-float(scores[idx]), -int(spans[idx]), int(chain_ids[idx]), int(idx))
-        elif policy == "auto_first":
-            def prio(idx, chain_ids=chain_ids):
-                return (int(chain_ids[idx]), int(idx))
-        else:  # auto_longer
-            def prio(idx, spans=spans, scores=scores, chain_ids=chain_ids):
-                return (-int(spans[idx]), -float(scores[idx]), int(chain_ids[idx]), int(idx))
+        # For each segment, find which intervals cover it.
+        # Interval j covers segment i iff starts[j] <= seg_starts[i]
+        # and ends[j] >= seg_ends[i].
+        # Use broadcasting: (n_segs, ng) boolean matrix.
+        # For large groups this is memory-intensive; fall back to sweep-line
+        # for very large groups.
+        if n_segs * ng <= 500_000:
+            # Vectorized: build coverage matrix
+            # covers[i, j] = (starts[j] <= seg_starts[i]) & (ends[j] >= seg_ends[i])
+            covers = (
+                (starts[np.newaxis, :] <= seg_starts[:, np.newaxis])
+                & (ends[np.newaxis, :] >= seg_ends[:, np.newaxis])
+            )  # (n_segs, ng)
 
-        active = set()
-        heap = []
-        segments = []
+            # Build priority keys per interval for argsort
+            idx_arr = np.arange(ng, dtype=np.int64)
+            if policy == "auto_score":
+                # prio: (-score, -span, chain_id, idx) — lower is better
+                prio_keys = np.column_stack((
+                    -scores, -spans.astype(np.float64), chain_ids.astype(np.float64),
+                    idx_arr.astype(np.float64),
+                ))
+            elif policy == "auto_first":
+                prio_keys = np.column_stack((
+                    chain_ids.astype(np.float64), idx_arr.astype(np.float64),
+                ))
+            else:  # auto_longer
+                prio_keys = np.column_stack((
+                    -spans.astype(np.float64), -scores, chain_ids.astype(np.float64),
+                    idx_arr.astype(np.float64),
+                ))
 
-        for i in range(len(points) - 1):
-            coord = int(points[i])
-            next_coord = int(points[i + 1])
+            # For each segment, find the winner among covering intervals.
+            # Sort interval indices by priority; for each segment, the winner
+            # is the first interval in sorted order that covers the segment.
+            # Pre-sort intervals by priority.
+            if prio_keys.shape[1] == 2:
+                sort_order = np.lexsort((prio_keys[:, 1], prio_keys[:, 0]))
+            else:
+                sort_order = np.lexsort(tuple(
+                    prio_keys[:, k] for k in range(prio_keys.shape[1] - 1, -1, -1)
+                ))
 
-            for idx in ends_at.get(coord, ()):
-                active.discard(idx)
-            for idx in starts_at.get(coord, ()):
-                active.add(idx)
-                heapq.heappush(heap, (prio(idx), idx))
+            # Reorder covers columns by priority
+            covers_sorted = covers[:, sort_order]  # (n_segs, ng)
 
-            if next_coord <= coord or not active:
+            # Winner for each segment = first True in sorted covers
+            # argmax on axis=1 gives first True (or 0 if no True)
+            first_true = covers_sorted.argmax(axis=1)  # (n_segs,)
+            has_any = covers_sorted.any(axis=1)        # (n_segs,)
+
+            # Map back to original indices
+            winner_orig = sort_order[first_true]  # (n_segs,)
+
+            # Filter segments with no covering interval
+            valid = has_any
+            if not valid.any():
                 continue
 
-            while heap and heap[0][1] not in active:
-                heapq.heappop(heap)
-            if not heap:
+            seg_starts_v = seg_starts[valid]
+            seg_ends_v = seg_ends[valid]
+            w = winner_orig[valid]
+        else:
+            # Fall back to sweep-line for very large groups to avoid OOM
+            seg_starts_v, seg_ends_v, w = _sweep_line_winners(
+                starts, ends, spans, chain_ids, scores, points, policy,
+            )
+            if len(w) == 0:
                 continue
 
-            winner_idx = heap[0][1]
-            orig_tgt_start = int(starts[winner_idx])
-            orig_tgt_end = int(ends[winner_idx])
-            orig_src_start = int(src_starts[winner_idx])
-            orig_src_end = int(src_ends[winner_idx])
-            orig_tgt_len = orig_tgt_end - orig_tgt_start
+        # Compute source coordinates for each segment based on winner
+        orig_tgt_starts = starts[w]
+        orig_tgt_ends = ends[w]
+        orig_src_starts = src_starts[w]
+        orig_src_ends = src_ends[w]
+        orig_tgt_lens = orig_tgt_ends - orig_tgt_starts
+        w_strands = strands[w]
 
-            if orig_tgt_len > 0:
-                if int(strands[winner_idx]) == 0:
-                    src_start = orig_src_start + (coord - orig_tgt_start)
-                    src_end = orig_src_start + (next_coord - orig_tgt_start)
-                else:
-                    src_start = orig_src_end - (next_coord - orig_tgt_start)
-                    src_end = orig_src_end - (coord - orig_tgt_start)
-            else:
-                src_start = orig_src_start
-                src_end = orig_src_end
+        # Vectorized source coordinate mapping
+        seg_src_starts = np.empty_like(seg_starts_v)
+        seg_src_ends = np.empty_like(seg_ends_v)
 
-            segments.append({
-                "chrom": chrom,
-                "start": coord,
-                "end": next_coord,
-                "strand": int(strands[winner_idx]),
-                "chromsrc": chromsrc_vals[winner_idx],
-                "startsrc": src_start,
-                "endsrc": src_end,
-                "strandsrc": int(strandsrc_vals[winner_idx]),
-                "chain_id": int(chain_ids[winner_idx]),
-                "score": float(scores[winner_idx]),
-            })
+        pos_strand = w_strands == 0
+        nonzero_len = orig_tgt_lens > 0
+        # Positive strand, nonzero length
+        mask_pn = pos_strand & nonzero_len
+        if mask_pn.any():
+            seg_src_starts[mask_pn] = (
+                orig_src_starts[mask_pn] + (seg_starts_v[mask_pn] - orig_tgt_starts[mask_pn])
+            )
+            seg_src_ends[mask_pn] = (
+                orig_src_starts[mask_pn] + (seg_ends_v[mask_pn] - orig_tgt_starts[mask_pn])
+            )
+        # Negative strand, nonzero length
+        mask_nn = (~pos_strand) & nonzero_len
+        if mask_nn.any():
+            seg_src_starts[mask_nn] = (
+                orig_src_ends[mask_nn] - (seg_ends_v[mask_nn] - orig_tgt_starts[mask_nn])
+            )
+            seg_src_ends[mask_nn] = (
+                orig_src_ends[mask_nn] - (seg_starts_v[mask_nn] - orig_tgt_starts[mask_nn])
+            )
+        # Zero-length target
+        mask_z = ~nonzero_len
+        if mask_z.any():
+            seg_src_starts[mask_z] = orig_src_starts[mask_z]
+            seg_src_ends[mask_z] = orig_src_ends[mask_z]
 
-        # Merge adjacent segments from the same chain.
-        merged = []
-        for seg in segments:
-            if (
-                merged
-                and merged[-1]["chain_id"] == seg["chain_id"]
-                and merged[-1]["chrom"] == seg["chrom"]
-                and merged[-1]["end"] == seg["start"]
-            ):
-                merged[-1]["end"] = seg["end"]
-                merged[-1]["startsrc"] = min(merged[-1]["startsrc"], seg["startsrc"])
-                merged[-1]["endsrc"] = max(merged[-1]["endsrc"], seg["endsrc"])
-            else:
-                merged.append(seg)
-        result_rows.extend(merged)
+        seg_chain_ids = chain_ids[w]
+        seg_scores = scores[w]
+        seg_strands = w_strands
+        seg_strandsrc = strandsrc_vals[w]
+        seg_chromsrc = chromsrc_vals[w]
 
-    if not result_rows:
+        # Vectorized adjacent merging: merge consecutive segments with same
+        # chain_id (all segments are same chrom within this loop).
+        ns = len(seg_starts_v)
+        if ns == 0:
+            continue
+
+        # A new group starts where chain_id changes or segments are not adjacent
+        new_group = np.ones(ns, dtype=bool)
+        if ns > 1:
+            new_group[1:] = (
+                (seg_chain_ids[1:] != seg_chain_ids[:-1])
+                | (seg_starts_v[1:] != seg_ends_v[:-1])
+            )
+
+        group_ids = np.cumsum(new_group) - 1
+        n_groups = group_ids[-1] + 1
+
+        # For each merge group: start = first seg_start, end = last seg_end,
+        # startsrc = min(seg_src_starts), endsrc = max(seg_src_ends),
+        # other columns from the first segment in the group.
+        # Use np.minimum/maximum.reduceat for src bounds.
+        group_starts_idx = np.flatnonzero(new_group)
+
+        m_start = seg_starts_v[group_starts_idx]
+        # For end: last element of each group = element before next group start
+        group_ends_idx = np.empty(n_groups, dtype=np.intp)
+        group_ends_idx[:-1] = group_starts_idx[1:] - 1
+        group_ends_idx[-1] = ns - 1
+        m_end = seg_ends_v[group_ends_idx]
+
+        m_startsrc = np.minimum.reduceat(seg_src_starts, group_starts_idx)
+        m_endsrc = np.maximum.reduceat(seg_src_ends, group_starts_idx)
+
+        # Other columns: take from first element of each group
+        fi = group_starts_idx
+        m_strand = seg_strands[fi]
+        m_chain_id = seg_chain_ids[fi]
+        m_score = seg_scores[fi]
+        m_strandsrc = seg_strandsrc[fi]
+        m_chromsrc = seg_chromsrc[fi]
+
+        part = pd.DataFrame({
+            "chrom": np.full(n_groups, chrom, dtype=object),
+            "start": m_start,
+            "end": m_end,
+            "strand": m_strand,
+            "chromsrc": m_chromsrc,
+            "startsrc": m_startsrc,
+            "endsrc": m_endsrc,
+            "strandsrc": m_strandsrc,
+            "chain_id": m_chain_id,
+            "score": m_score,
+        })
+        result_parts.append(part)
+
+    if not result_parts:
         return _empty_chain_df()
-    return pd.DataFrame(result_rows)[_EMPTY_CHAIN_COLS].reset_index(drop=True)
+    return pd.concat(result_parts, ignore_index=True)[_EMPTY_CHAIN_COLS]
+
+
+def _sweep_line_winners(starts, ends, spans, chain_ids, scores, points, policy):
+    """Sweep-line fallback for large chrom groups in _handle_tgt_overlaps_auto.
+
+    Returns (seg_starts, seg_ends, winner_indices) as numpy arrays.
+    """
+    from collections import defaultdict as _defaultdict
+
+    n = len(starts)
+    starts_at = _defaultdict(list)
+    ends_at = _defaultdict(list)
+    for idx in range(n):
+        starts_at[int(starts[idx])].append(idx)
+        ends_at[int(ends[idx])].append(idx)
+
+    if policy == "auto_score":
+        def prio(idx):
+            return (-float(scores[idx]), -int(spans[idx]), int(chain_ids[idx]), int(idx))
+    elif policy == "auto_first":
+        def prio(idx):
+            return (int(chain_ids[idx]), int(idx))
+    else:  # auto_longer
+        def prio(idx):
+            return (-int(spans[idx]), -float(scores[idx]), int(chain_ids[idx]), int(idx))
+
+    active = set()
+    heap = []
+    r_seg_starts = []
+    r_seg_ends = []
+    r_winners = []
+
+    for i in range(len(points) - 1):
+        coord = int(points[i])
+        next_coord = int(points[i + 1])
+
+        for idx in ends_at.get(coord, ()):
+            active.discard(idx)
+        for idx in starts_at.get(coord, ()):
+            active.add(idx)
+            heapq.heappush(heap, (prio(idx), idx))
+
+        if next_coord <= coord or not active:
+            continue
+
+        while heap and heap[0][1] not in active:
+            heapq.heappop(heap)
+        if not heap:
+            continue
+
+        r_seg_starts.append(coord)
+        r_seg_ends.append(next_coord)
+        r_winners.append(heap[0][1])
+
+    return (
+        np.array(r_seg_starts, dtype=np.int64),
+        np.array(r_seg_ends, dtype=np.int64),
+        np.array(r_winners, dtype=np.intp),
+    )
 
 
 def _handle_tgt_overlaps_agg(df):
-    """Segment overlapping target regions, keeping all chains per segment."""
+    """Segment overlapping target regions, keeping all chains per segment.
+
+    Uses vectorized numpy operations for breakpoint segmentation and
+    interval-segment overlap computation.
+    """
     if df.empty:
         return df
 
-    result_rows = []
+    result_parts = []
+
     for chrom, group in df.groupby("chrom", sort=False):
         group = group.sort_values(["start", "end"]).reset_index(drop=True)
+        ng = len(group)
+        if ng == 0:
+            continue
 
-        breakpoints = set()
-        for row in group.itertuples(index=False):
-            breakpoints.add(row.start)
-            breakpoints.add(row.end)
-        breakpoints = sorted(breakpoints)
+        iv_starts = group["start"].to_numpy(dtype=np.int64, copy=False)
+        iv_ends = group["end"].to_numpy(dtype=np.int64, copy=False)
+        iv_strands = group["strand"].to_numpy(dtype=np.int64, copy=False)
+        iv_src_starts = group["startsrc"].to_numpy(dtype=np.int64, copy=False)
+        iv_src_ends = group["endsrc"].to_numpy(dtype=np.int64, copy=False)
+        iv_strandsrc = group["strandsrc"].to_numpy(dtype=np.int64, copy=False)
+        iv_chain_ids = group["chain_id"].to_numpy(dtype=np.int64, copy=False)
+        iv_scores = group["score"].to_numpy(dtype=np.float64, copy=False)
+        iv_chromsrc = group["chromsrc"].to_numpy()
 
-        for i in range(len(breakpoints) - 1):
-            seg_start = breakpoints[i]
-            seg_end = breakpoints[i + 1]
+        points = np.unique(np.concatenate((iv_starts, iv_ends)))
+        if points.size < 2:
+            result_parts.append(group[_EMPTY_CHAIN_COLS])
+            continue
 
-            for row in group.itertuples(index=False):
-                if row.start < seg_end and row.end > seg_start:
-                    orig_tgt_start = row.start
-                    orig_src_start = row.startsrc
-                    orig_src_end = row.endsrc
+        n_segs = len(points) - 1
+        seg_starts = points[:-1]
+        seg_ends = points[1:]
 
-                    if row.strand == 0:
-                        src_start = orig_src_start + (seg_start - orig_tgt_start)
-                        src_end = orig_src_start + (seg_end - orig_tgt_start)
-                    else:
-                        src_start = orig_src_end - (seg_end - orig_tgt_start)
-                        src_end = orig_src_end - (seg_start - orig_tgt_start)
+        # Coverage: interval j covers segment i iff
+        # iv_starts[j] < seg_ends[i] AND iv_ends[j] > seg_starts[i]
+        if n_segs * ng <= 500_000:
+            # Vectorized coverage matrix
+            covers = (
+                (iv_starts[np.newaxis, :] < seg_ends[:, np.newaxis])
+                & (iv_ends[np.newaxis, :] > seg_starts[:, np.newaxis])
+            )  # (n_segs, ng)
 
-                    result_rows.append({
-                        "chrom": chrom,
-                        "start": seg_start,
-                        "end": seg_end,
-                        "strand": row.strand,
-                        "chromsrc": row.chromsrc,
-                        "startsrc": src_start,
-                        "endsrc": src_end,
-                        "strandsrc": row.strandsrc,
-                        "chain_id": row.chain_id,
-                        "score": row.score,
-                    })
+            seg_idx, iv_idx = np.nonzero(covers)
+        else:
+            # Fall back to per-segment check for very large groups
+            seg_idx_list = []
+            iv_idx_list = []
+            for i in range(n_segs):
+                mask = (iv_starts < seg_ends[i]) & (iv_ends > seg_starts[i])
+                js = np.flatnonzero(mask)
+                seg_idx_list.append(np.full(len(js), i, dtype=np.intp))
+                iv_idx_list.append(js)
+            if seg_idx_list:
+                seg_idx = np.concatenate(seg_idx_list)
+                iv_idx = np.concatenate(iv_idx_list)
+            else:
+                continue
 
-    if not result_rows:
+        if len(seg_idx) == 0:
+            continue
+
+        # Compute source coordinates vectorized
+        r_seg_starts = seg_starts[seg_idx]
+        r_seg_ends = seg_ends[seg_idx]
+        r_iv_strands = iv_strands[iv_idx]
+        r_orig_tgt_starts = iv_starts[iv_idx]
+        r_orig_src_starts = iv_src_starts[iv_idx]
+        r_orig_src_ends = iv_src_ends[iv_idx]
+
+        r_src_starts = np.empty_like(r_seg_starts)
+        r_src_ends = np.empty_like(r_seg_ends)
+
+        pos_mask = r_iv_strands == 0
+        neg_mask = ~pos_mask
+
+        if pos_mask.any():
+            r_src_starts[pos_mask] = (
+                r_orig_src_starts[pos_mask]
+                + (r_seg_starts[pos_mask] - r_orig_tgt_starts[pos_mask])
+            )
+            r_src_ends[pos_mask] = (
+                r_orig_src_starts[pos_mask]
+                + (r_seg_ends[pos_mask] - r_orig_tgt_starts[pos_mask])
+            )
+        if neg_mask.any():
+            r_src_starts[neg_mask] = (
+                r_orig_src_ends[neg_mask]
+                - (r_seg_ends[neg_mask] - r_orig_tgt_starts[neg_mask])
+            )
+            r_src_ends[neg_mask] = (
+                r_orig_src_ends[neg_mask]
+                - (r_seg_starts[neg_mask] - r_orig_tgt_starts[neg_mask])
+            )
+
+        part = pd.DataFrame({
+            "chrom": np.full(len(seg_idx), chrom, dtype=object),
+            "start": r_seg_starts,
+            "end": r_seg_ends,
+            "strand": r_iv_strands,
+            "chromsrc": iv_chromsrc[iv_idx],
+            "startsrc": r_src_starts,
+            "endsrc": r_src_ends,
+            "strandsrc": iv_strandsrc[iv_idx],
+            "chain_id": iv_chain_ids[iv_idx],
+            "score": iv_scores[iv_idx],
+        })
+        result_parts.append(part)
+
+    if not result_parts:
         return _empty_chain_df()
-    return pd.DataFrame(result_rows)[_EMPTY_CHAIN_COLS].reset_index(drop=True)
+    return pd.concat(result_parts, ignore_index=True)[_EMPTY_CHAIN_COLS]
 
 
 def _interval_union_length(starts, ends):
@@ -606,22 +877,28 @@ def _interval_union_length(starts, ends):
     starts = starts[order]
     ends = ends[order]
 
-    cur_start = int(starts[0])
-    cur_end = int(ends[0])
-    total = 0
+    # Vectorized union: propagate max end forward, then sum non-overlapping
+    # cluster breaks where start >= running max end.
+    n = len(starts)
+    if n == 1:
+        return float(ends[0] - starts[0])
 
-    for i in range(1, len(starts)):
-        s = int(starts[i])
-        e = int(ends[i])
-        if s < cur_end:
-            cur_end = max(cur_end, e)
-        else:
-            total += cur_end - cur_start
-            cur_start = s
-            cur_end = e
+    # Compute running max of ends
+    max_ends = np.maximum.accumulate(ends)
 
-    total += cur_end - cur_start
-    return float(total)
+    # A new cluster starts where starts[i] >= max_ends[i-1]
+    new_cluster = np.ones(n, dtype=bool)
+    new_cluster[1:] = starts[1:] >= max_ends[:-1]
+
+    # Each cluster: start = min(starts) = starts[first_in_cluster],
+    # end = max(ends) in cluster
+    cluster_starts_idx = np.flatnonzero(new_cluster)
+    cluster_starts = starts[cluster_starts_idx]
+
+    # For cluster ends: use maximum.reduceat
+    cluster_ends = np.maximum.reduceat(ends, cluster_starts_idx)
+
+    return float(np.sum(cluster_ends - cluster_starts))
 
 
 def _resolve_cluster_policy(df, policy):
@@ -652,21 +929,29 @@ def _resolve_cluster_policy(df, policy):
         starts = ordered["__src_start"].to_numpy(dtype=np.int64, copy=False)
         ends = ordered["__src_end"].to_numpy(dtype=np.int64, copy=False)
 
-        # Connected components in 1D interval graphs can be found by scanline.
-        # Touching intervals (start == previous_end) are separate clusters.
-        cluster_ids = np.zeros(len(ordered), dtype=np.int64)
-        cluster_id = 0
-        max_end = int(ends[0])
-        for i in range(1, len(ordered)):
-            s = int(starts[i])
-            e = int(ends[i])
-            if s < max_end:
-                max_end = max(max_end, e)
-            else:
-                cluster_id += 1
-                max_end = e
-            cluster_ids[i] = cluster_id
-        ordered["__cluster_id"] = cluster_ids
+        # Connected components in 1D interval graphs: a new cluster starts
+        # where start[i] >= running_max_end (touching = separate).
+        # We need the running max of ends computed only within each cluster,
+        # but cluster boundaries depend on the running max. This requires
+        # sequential propagation, but we can vectorize partially.
+        n_ord = len(ordered)
+        if n_ord == 1:
+            ordered["__cluster_id"] = np.zeros(1, dtype=np.int64)
+        else:
+            # Compute running max of ends — this needs a scan because max_end
+            # resets at cluster boundaries. Use a simple vectorized pass:
+            # First pass: check if start[i] >= max_end_so_far to find breaks.
+            # Since max_end propagation depends on breaks, we iterate but
+            # with numpy scalars (faster than .loc indexing).
+            max_end_arr = ends.copy()
+            new_cluster = np.zeros(n_ord, dtype=bool)
+            for i in range(1, n_ord):
+                if starts[i] >= max_end_arr[i - 1]:
+                    new_cluster[i] = True
+                else:
+                    max_end_arr[i] = max(max_end_arr[i], max_end_arr[i - 1])
+            cluster_ids = np.cumsum(new_cluster).astype(np.int64)
+            ordered["__cluster_id"] = cluster_ids
 
         best_cluster = None
         best_score = None
@@ -840,7 +1125,7 @@ def gintervals_load_chain(file, src_overlap_policy="error",
     db_chrom_sizes = _get_db_chrom_sizes()
     blocks = _parse_chain_file(file, db_chrom_sizes, min_score=min_score)
 
-    chain = _empty_chain_df() if not blocks else pd.DataFrame(blocks)[_EMPTY_CHAIN_COLS]
+    chain = _empty_chain_df() if blocks is None else pd.DataFrame(blocks)[_EMPTY_CHAIN_COLS]
 
     # Handle overlaps
     chain = _handle_src_overlaps(chain, src_overlap_policy)
@@ -958,6 +1243,268 @@ def gintervals_as_chain(intervals, src_overlap_policy="error",
         result.attrs["min_score"] = min_score
 
     return result
+
+
+# ===================================================================
+# Vectorized coordinate mapping
+# ===================================================================
+
+def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
+    """Map source intervals through chain blocks using vectorized numpy ops.
+
+    For each source interval, finds overlapping chain blocks and computes
+    target coordinates.  Returns a DataFrame with columns:
+        chrom, start, end, intervalID, chain_id, __src_start, __src_end
+    and optionally score (if include_metadata) and value_col.
+
+    The chain blocks are sorted by (chromsrc, startsrc) per source chromosome.
+    Overlap finding uses np.searchsorted on sorted arrays.  Coordinate
+    transformation is fully vectorized over all overlapping pairs.
+    """
+    empty_cols = ["chrom", "start", "end", "intervalID", "chain_id"]
+    if include_metadata:
+        empty_cols.append("score")
+    if value_col:
+        empty_cols.append(value_col)
+
+    def _empty_result():
+        return pd.DataFrame({
+            c: pd.Series(
+                dtype="object" if c == "chrom" else "int64" if c in (
+                    "start", "end", "intervalID", "chain_id"
+                ) else "float64"
+            ) for c in empty_cols
+        })
+
+    if chain_df.empty or len(intervals) == 0:
+        return _empty_result()
+
+    # Sort chain by (chromsrc, startsrc, endsrc) and extract numpy arrays
+    chain_sorted = chain_df.sort_values(
+        ["chromsrc", "startsrc", "endsrc"],
+    ).reset_index(drop=True)
+
+    ch_chromsrc = chain_sorted["chromsrc"].to_numpy()
+    ch_startsrc = chain_sorted["startsrc"].to_numpy(dtype=np.int64, copy=False)
+    ch_endsrc = chain_sorted["endsrc"].to_numpy(dtype=np.int64, copy=False)
+    ch_chrom = chain_sorted["chrom"].to_numpy()
+    ch_start = chain_sorted["start"].to_numpy(dtype=np.int64, copy=False)
+    ch_end = chain_sorted["end"].to_numpy(dtype=np.int64, copy=False)
+    ch_strand = chain_sorted["strand"].to_numpy(dtype=np.int64, copy=False)
+    ch_chain_id = chain_sorted["chain_id"].to_numpy(dtype=np.int64, copy=False)
+    ch_score = chain_sorted["score"].to_numpy(dtype=np.float64, copy=False)
+
+    # Build per-chrom slice boundaries and prefix-max of endsrc
+    # for efficient overlap search
+    chrom_slices = {}  # chromsrc -> (first_idx, last_idx_excl)
+    n_ch = len(chain_sorted)
+    pmax_endsrc = ch_endsrc.copy()
+
+    i = 0
+    while i < n_ch:
+        chrom = ch_chromsrc[i]
+        first = i
+        running_max = ch_endsrc[i]
+        pmax_endsrc[i] = running_max
+        i += 1
+        while i < n_ch and ch_chromsrc[i] == chrom:
+            running_max = max(running_max, ch_endsrc[i])
+            pmax_endsrc[i] = running_max
+            i += 1
+        chrom_slices[chrom] = (first, i)
+
+    # Extract source interval arrays
+    iv_chroms = intervals["chrom"].to_numpy()
+    iv_starts = intervals["start"].to_numpy(dtype=np.int64, copy=False)
+    iv_ends = intervals["end"].to_numpy(dtype=np.int64, copy=False)
+    n_iv = len(intervals)
+
+    has_value_col = value_col and value_col in intervals.columns
+    if has_value_col:
+        iv_values = intervals[value_col].to_numpy(dtype=np.float64, copy=False)
+
+    # Collect result arrays — process per source chromosome for cache locality
+    all_r_tgt_chrom = []
+    all_r_tgt_start = []
+    all_r_tgt_end = []
+    all_r_interval_id = []
+    all_r_chain_id = []
+    all_r_src_start = []
+    all_r_src_end = []
+    all_r_score = [] if include_metadata else None
+    all_r_value = [] if has_value_col else None
+
+    # Group source intervals by chrom for batch processing
+    # Use stable sort to preserve original ordering within each chrom
+    iv_order = np.argsort(iv_chroms, kind="mergesort")
+    iv_chroms_sorted = iv_chroms[iv_order]
+
+    # Find chrom group boundaries
+    if n_iv > 0:
+        iv_chrom_breaks = np.flatnonzero(
+            np.r_[True, iv_chroms_sorted[1:] != iv_chroms_sorted[:-1], True]
+        )
+    else:
+        iv_chrom_breaks = np.array([0], dtype=np.intp)
+
+    for g in range(len(iv_chrom_breaks) - 1):
+        g_start = iv_chrom_breaks[g]
+        g_end = iv_chrom_breaks[g + 1]
+        src_chrom = iv_chroms_sorted[g_start]
+
+        if src_chrom not in chrom_slices:
+            continue
+
+        ch_first, ch_last = chrom_slices[src_chrom]
+        n_chain = ch_last - ch_first
+
+        # Chain arrays for this source chrom (sliced views)
+        c_startsrc = ch_startsrc[ch_first:ch_last]
+        c_endsrc = ch_endsrc[ch_first:ch_last]
+        c_pmax = pmax_endsrc[ch_first:ch_last]
+        c_chrom = ch_chrom[ch_first:ch_last]
+        c_start = ch_start[ch_first:ch_last]
+        c_end = ch_end[ch_first:ch_last]
+        c_strand = ch_strand[ch_first:ch_last]
+        c_chain_id = ch_chain_id[ch_first:ch_last]
+        c_score = ch_score[ch_first:ch_last]
+
+        # Source interval indices and arrays for this chrom group
+        g_indices = iv_order[g_start:g_end]  # original interval IDs
+        g_starts = iv_starts[g_indices]
+        g_ends = iv_ends[g_indices]
+        n_src = len(g_indices)
+
+        # For each source interval, find the range of potentially overlapping
+        # chain blocks.
+        #
+        # Chain blocks are sorted by startsrc.  A chain block j overlaps
+        # source interval i iff:
+        #     c_startsrc[j] < g_ends[i]  AND  c_endsrc[j] > g_starts[i]
+        #
+        # Upper bound: first j where c_startsrc[j] >= g_ends[i]
+        #   => np.searchsorted(c_startsrc, g_ends, side='left')
+        #
+        # Lower bound: we need the first j that could overlap.  Since blocks
+        # are sorted by startsrc but endsrc can extend arbitrarily far, we
+        # use the prefix-max of endsrc.  The first j with
+        # pmax_endsrc[j] > g_starts[i] is our lower bound.
+        #   => np.searchsorted(c_pmax, g_starts, side='right')
+        #   (searchsorted 'right' gives first index where c_pmax > g_starts)
+        upper = np.searchsorted(c_startsrc, g_ends, side="left")  # (n_src,)
+        lower = np.searchsorted(c_pmax, g_starts, side="right")   # (n_src,)
+
+        # Clip to valid range
+        np.clip(upper, 0, n_chain, out=upper)
+        np.clip(lower, 0, n_chain, out=lower)
+
+        # Count candidate chain blocks per source interval
+        counts = np.maximum(upper - lower, 0)  # (n_src,)
+        total_candidates = int(counts.sum())
+
+        if total_candidates == 0:
+            continue
+
+        # Expand: for each source interval, enumerate all candidate chain
+        # block indices.  Build flat arrays of (src_idx, chain_idx) pairs.
+        # Use np.repeat + arange trick for expansion.
+        src_repeat = np.repeat(np.arange(n_src, dtype=np.intp), counts)
+        # Compute flat chain indices: for source i, chain indices are
+        # lower[i], lower[i]+1, ..., upper[i]-1
+        offsets_within = np.arange(total_candidates, dtype=np.intp)
+        group_offsets = np.repeat(np.cumsum(counts) - counts, counts)
+        chain_idx = np.asarray(
+            np.repeat(lower, counts) + (offsets_within - group_offsets),
+            dtype=np.intp,
+        )
+
+        # Gather chain and source values for all candidate pairs
+        p_src_start = g_starts[src_repeat]       # source interval starts
+        p_src_end = g_ends[src_repeat]            # source interval ends
+        p_ch_startsrc = c_startsrc[chain_idx]     # chain source starts
+        p_ch_endsrc = c_endsrc[chain_idx]         # chain source ends
+
+        # Compute overlap: common_start, common_end
+        common_start = np.maximum(p_src_start, p_ch_startsrc)
+        common_end = np.minimum(p_src_end, p_ch_endsrc)
+
+        # Filter to actual overlaps (common_start < common_end)
+        valid = common_start < common_end
+        if not valid.any():
+            continue
+
+        # Apply filter
+        common_start = common_start[valid]
+        common_end = common_end[valid]
+        v_chain_idx = chain_idx[valid]
+        v_src_repeat = src_repeat[valid]
+
+        # Gather chain target-side arrays
+        v_ch_chrom = c_chrom[v_chain_idx]
+        v_ch_start = c_start[v_chain_idx]
+        v_ch_end = c_end[v_chain_idx]
+        v_ch_strand = c_strand[v_chain_idx]
+        v_ch_chain_id = c_chain_id[v_chain_idx]
+        v_ch_startsrc = c_startsrc[v_chain_idx]
+
+        # Vectorized coordinate transformation
+        # offset from chain source start
+        offset_start = common_start - v_ch_startsrc
+        offset_end = common_end - v_ch_startsrc
+
+        # Positive strand: tgt = ch_start + offset
+        # Negative strand: tgt_start = ch_end - offset_end
+        #                   tgt_end   = ch_end - offset_start
+        pos_mask = v_ch_strand == 0
+
+        tgt_start = np.empty_like(common_start)
+        tgt_end = np.empty_like(common_end)
+
+        if pos_mask.any():
+            tgt_start[pos_mask] = v_ch_start[pos_mask] + offset_start[pos_mask]
+            tgt_end[pos_mask] = v_ch_start[pos_mask] + offset_end[pos_mask]
+
+        neg_mask = ~pos_mask
+        if neg_mask.any():
+            tgt_start[neg_mask] = v_ch_end[neg_mask] - offset_end[neg_mask]
+            tgt_end[neg_mask] = v_ch_end[neg_mask] - offset_start[neg_mask]
+
+        # Map src_repeat back to original interval IDs
+        v_interval_ids = g_indices[v_src_repeat]
+
+        all_r_tgt_chrom.append(v_ch_chrom)
+        all_r_tgt_start.append(tgt_start)
+        all_r_tgt_end.append(tgt_end)
+        all_r_interval_id.append(v_interval_ids)
+        all_r_chain_id.append(v_ch_chain_id)
+        all_r_src_start.append(common_start)
+        all_r_src_end.append(common_end)
+
+        if include_metadata:
+            all_r_score.append(c_score[v_chain_idx])
+
+        if has_value_col:
+            all_r_value.append(iv_values[v_interval_ids])
+
+    # Concatenate results from all chrom groups
+    if not all_r_tgt_chrom:
+        return _empty_result()
+
+    result_data = {
+        "chrom": np.concatenate(all_r_tgt_chrom),
+        "start": np.concatenate(all_r_tgt_start),
+        "end": np.concatenate(all_r_tgt_end),
+        "intervalID": np.concatenate(all_r_interval_id),
+        "chain_id": np.concatenate(all_r_chain_id),
+        "__src_start": np.concatenate(all_r_src_start),
+        "__src_end": np.concatenate(all_r_src_end),
+    }
+    if include_metadata:
+        result_data["score"] = np.concatenate(all_r_score)
+    if has_value_col:
+        result_data[value_col] = np.concatenate(all_r_value)
+
+    return pd.DataFrame(result_data)
 
 
 # ===================================================================
@@ -1113,97 +1660,13 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
             ) for c in cols
         })
 
-    # Build source-side index for efficient lookup
-    # Group chain blocks by source chrom
-    chain_by_src_chrom = {}
-    for _idx, row in chain_df.iterrows():
-        src_chrom = row["chromsrc"]
-        if src_chrom not in chain_by_src_chrom:
-            chain_by_src_chrom[src_chrom] = []
-        chain_by_src_chrom[src_chrom].append(row)
-
-    # Sort each group by source start for binary search
-    for chrom in chain_by_src_chrom:
-        chain_by_src_chrom[chrom].sort(key=lambda r: (r["startsrc"], r["endsrc"]))
-    chain_starts_by_src_chrom = {
-        chrom: [int(r["startsrc"]) for r in rows]
-        for chrom, rows in chain_by_src_chrom.items()
-    }
-
     effective_tgt_policy = chain_df.attrs.get("tgt_overlap_policy", tgt_overlap_policy)
     if effective_tgt_policy == "auto":
         effective_tgt_policy = "auto_score"
 
-    # Map each source interval
-    result_rows = []
-    for interval_id, (_, src_row) in enumerate(intervals.iterrows()):
-        src_chrom = src_row["chrom"]
-        src_start = src_row["start"]
-        src_end = src_row["end"]
-
-        if src_chrom not in chain_by_src_chrom:
-            continue
-
-        chain_blocks = chain_by_src_chrom[src_chrom]
-        chain_starts = chain_starts_by_src_chrom[src_chrom]
-        block_start = bisect_left(chain_starts, src_start)
-        while block_start > 0 and int(chain_blocks[block_start - 1]["endsrc"]) > src_start:
-            block_start -= 1
-        block_end = bisect_left(chain_starts, src_end)
-        if block_end <= block_start:
-            block_end = min(len(chain_blocks), block_start + 1)
-
-        for cb in chain_blocks[block_start:block_end]:
-            cb_src_start = cb["startsrc"]
-            cb_src_end = cb["endsrc"]
-
-            # Check overlap
-            common_start = max(src_start, cb_src_start)
-            common_end = min(src_end, cb_src_end)
-            if common_start >= common_end:
-                continue
-
-            # Map to target coordinates
-            if cb["strand"] == 0:
-                tgt_start = cb["start"] + (common_start - cb_src_start)
-                tgt_end = cb["start"] + (common_end - cb_src_start)
-            else:
-                tgt_start = cb["end"] - (common_end - cb_src_start)
-                tgt_end = cb["end"] - (common_start - cb_src_start)
-
-            row_dict = {
-                "chrom": cb["chrom"],
-                "start": int(tgt_start),
-                "end": int(tgt_end),
-                "intervalID": interval_id,
-                "chain_id": int(cb["chain_id"]),
-                "__src_start": int(common_start),
-                "__src_end": int(common_end),
-            }
-
-            if include_metadata:
-                row_dict["score"] = cb["score"]
-
-            if value_col and value_col in src_row.index:
-                row_dict[value_col] = src_row[value_col]
-
-            result_rows.append(row_dict)
-
-    if not result_rows:
-        cols = ["chrom", "start", "end", "intervalID", "chain_id"]
-        if include_metadata:
-            cols.append("score")
-        if value_col:
-            cols.append(value_col)
-        return pd.DataFrame({
-            c: pd.Series(
-                dtype="object" if c == "chrom" else "int64" if c in (
-                    "start", "end", "intervalID", "chain_id"
-                ) else "float64"
-            ) for c in cols
-        })
-
-    result = pd.DataFrame(result_rows)
+    result = _map_intervals_vectorized(
+        intervals, chain_df, include_metadata, value_col,
+    )
 
     if effective_tgt_policy in (
         "best_source_cluster", "best_cluster_union",
@@ -1225,31 +1688,48 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
 
 
 def _canonic_merge(df, include_metadata, value_col):
-    """Merge adjacent target blocks from same intervalID and chain_id."""
+    """Merge adjacent target blocks from same intervalID and chain_id.
+
+    Uses vectorized numpy operations for group detection and aggregation.
+    """
     if df.empty:
         return df
 
     # Sort by intervalID, chain_id, chrom, start
     df = df.sort_values(["intervalID", "chain_id", "chrom", "start"]).reset_index(drop=True)
+    n = len(df)
+    if n <= 1:
+        return df
 
-    merged = []
-    prev = None
-    for _, row in df.iterrows():
-        if (prev is not None and
-                prev["intervalID"] == row["intervalID"] and
-                prev["chain_id"] == row["chain_id"] and
-                prev["chrom"] == row["chrom"] and
-                prev["end"] == row["start"]):
-            # Merge: extend previous
-            prev["end"] = row["end"]
-        else:
-            if prev is not None:
-                merged.append(prev)
-            prev = dict(row)
-    if prev is not None:
-        merged.append(prev)
+    interval_ids = df["intervalID"].to_numpy()
+    chain_ids = df["chain_id"].to_numpy()
+    chroms = df["chrom"].to_numpy()
+    starts = df["start"].to_numpy(dtype=np.int64, copy=False)
+    ends = df["end"].to_numpy(dtype=np.int64, copy=False)
 
-    return pd.DataFrame(merged)
+    # A new merge group starts where any key changes or blocks aren't adjacent
+    new_group = np.ones(n, dtype=bool)
+    new_group[1:] = (
+        (interval_ids[1:] != interval_ids[:-1])
+        | (chain_ids[1:] != chain_ids[:-1])
+        | (chroms[1:] != chroms[:-1])
+        | (starts[1:] != ends[:-1])
+    )
+
+    group_starts_idx = np.flatnonzero(new_group)
+    n_groups = len(group_starts_idx)
+
+    # For each group: start = first block's start, end = last block's end
+    group_ends_idx = np.empty(n_groups, dtype=np.intp)
+    group_ends_idx[:-1] = group_starts_idx[1:] - 1
+    group_ends_idx[-1] = n - 1
+
+    # Build merged DataFrame — take all columns from first row of each group,
+    # then fix "end" from the last row.
+    merged = df.iloc[group_starts_idx].copy()
+    merged["end"] = ends[group_ends_idx]
+
+    return merged.reset_index(drop=True)
 
 
 # ===================================================================

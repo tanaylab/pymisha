@@ -160,10 +160,12 @@ def _resolve_filter_sources(filter_obj):
 def _filter_key(filter_df):
     if filter_df is None or len(filter_df) == 0:
         return None
-    h = hashlib.sha1()
-    for row in filter_df.itertuples(index=False):
-        h.update(f"{row.chrom}\t{int(row.start)}\t{int(row.end)}\n".encode())
-    return h.hexdigest()
+    # Vectorized hash: build byte string from arrays
+    chroms = filter_df["chrom"].astype(str).values
+    starts = filter_df["start"].astype(int).values
+    ends = filter_df["end"].astype(int).values
+    lines = [f"{c}\t{s}\t{e}\n" for c, s, e in zip(chroms, starts, ends, strict=False)]
+    return hashlib.sha1("".join(lines).encode()).hexdigest()
 
 
 def _filter_stats(filter_df):
@@ -208,13 +210,49 @@ def _build_unmasked_segments(intervals, payload, filter_df):
         str(chrom): int(end)
         for chrom, end in zip(chrom_sizes_df["chrom"], chrom_sizes_df["end"], strict=False)
     }
+
+    has_filter = filter_df is not None and len(filter_df) > 0
+
+    # --- Vectorized path (no mask) ---
+    if not has_filter:
+        chroms = intervals["chrom"].astype(str).values
+        starts = intervals["start"].to_numpy(dtype=_numpy.int64) + sshift
+        ends = intervals["end"].to_numpy(dtype=_numpy.int64) + eshift
+
+        # Map chroms to sizes
+        chrom_bound = _numpy.array(
+            [chrom_sizes.get(str(c), -1) for c in chroms], dtype=_numpy.int64
+        )
+        known = chrom_bound >= 0
+        starts = _numpy.maximum(starts, 0)
+        ends = _numpy.where(known, _numpy.minimum(ends, chrom_bound), ends)
+        valid = known & (ends > starts)
+
+        if not valid.any():
+            return None
+
+        idx = _numpy.flatnonzero(valid)
+        v_chroms = chroms[idx]
+        v_starts = starts[idx]
+        v_ends = ends[idx]
+        v_lens = v_ends - v_starts
+
+        return _pandas.DataFrame({
+            "chrom": v_chroms,
+            "start": v_starts,
+            "end": v_ends,
+            "orig_idx": idx,
+            "seg_len": v_lens,
+            "base_start": v_starts,
+        })
+
+    # --- Per-row path (with mask subtraction) ---
     mask_map = {}
-    if filter_df is not None and len(filter_df) > 0:
-        for row in filter_df.itertuples(index=False):
-            chrom = str(row.chrom)
-            mask_map.setdefault(chrom, []).append((int(row.start), int(row.end)))
-        for chrom in list(mask_map.keys()):
-            mask_map[chrom].sort()
+    for row in filter_df.itertuples(index=False):
+        chrom = str(row.chrom)
+        mask_map.setdefault(chrom, []).append((int(row.start), int(row.end)))
+    for chrom in list(mask_map.keys()):
+        mask_map[chrom].sort()
 
     seg_rows = []
     for idx, row in enumerate(intervals.itertuples(index=False)):
@@ -284,20 +322,32 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
             # nearest under filter uses only the first unmasked segment.
             segments = [segments[0]]
 
-        matched = []
+        # Vectorized overlap matching: compute overlaps between all source
+        # intervals and all query segments using numpy broadcasting.
+        src_starts = sgrp["start"].to_numpy(dtype=_numpy.int64)
+        src_ends = sgrp["end"].to_numpy(dtype=_numpy.int64)
+        src_vals = sgrp["value"].to_numpy(dtype=float)
+        n_src = len(src_starts)
+
+        total_ov = _numpy.zeros(n_src, dtype=_numpy.int64)
         overlaps_for_cov = []
-        for ridx, row in sgrp.iterrows():
-            rs = int(row["start"])
-            re = int(row["end"])
-            total_ov = 0
-            for ss, se, _bs, _sl in segments:
-                ov_s = max(rs, ss)
-                ov_e = min(re, se)
-                if ov_e > ov_s:
-                    total_ov += ov_e - ov_s
-                    overlaps_for_cov.append((ov_s, ov_e))
-            if total_ov > 0 and not _numpy.isnan(float(row["value"])):
-                matched.append((int(ridx), rs, re, float(row["value"]), total_ov))
+        for ss, se, _bs, _sl in segments:
+            ov_s = _numpy.maximum(src_starts, ss)
+            ov_e = _numpy.minimum(src_ends, se)
+            ov_len = _numpy.maximum(ov_e - ov_s, 0)
+            total_ov += ov_len
+            if func == "coverage":
+                for k in _numpy.flatnonzero(ov_len > 0):
+                    overlaps_for_cov.append((int(ov_s[k]), int(ov_e[k])))
+
+        has_ov = (total_ov > 0) & ~_numpy.isnan(src_vals)
+        m_idx = _numpy.flatnonzero(has_ov)
+        matched = [
+            (int(m_idx[j]), int(src_starts[m_idx[j]]),
+             int(src_ends[m_idx[j]]), float(src_vals[m_idx[j]]),
+             int(total_ov[m_idx[j]]))
+            for j in range(len(m_idx))
+        ]
 
         if func == "exists":
             out[oi] = 1.0 if matched else 0.0
@@ -372,7 +422,7 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
             pos = float(max(matched, key=lambda m: (m[3], -m[1], -m[0]))[1])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
 
-    # nearest fallback for non-overlap cases
+    # nearest fallback for non-overlap cases — vectorized distance computation
     if func == "nearest":
         for orig_idx, seg_group in seg_df.groupby("orig_idx", sort=False):
             oi = int(orig_idx)
@@ -384,26 +434,25 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
                 continue
             ss = int(seg_group.iloc[0]["start"])
             se = int(seg_group.iloc[0]["end"])
-            dists = []
-            vals = []
-            for row in sgrp.itertuples(index=False):
-                rs = int(row.start)
-                re = int(row.end)
-                if re <= ss:
-                    d = ss - re
-                elif rs >= se:
-                    d = rs - se
-                else:
-                    d = 0
-                if _numpy.isnan(float(row.value)):
-                    continue
-                dists.append(d)
-                vals.append(float(row.value))
-            if dists:
-                dmin = min(dists)
-                cand = [v for d, v in zip(dists, vals, strict=False) if d == dmin]
-                if cand:
-                    out[oi] = float(_numpy.mean(_numpy.asarray(cand, dtype=float)))
+
+            src_s = sgrp["start"].to_numpy(dtype=_numpy.int64)
+            src_e = sgrp["end"].to_numpy(dtype=_numpy.int64)
+            src_v = sgrp["value"].to_numpy(dtype=float)
+            valid = ~_numpy.isnan(src_v)
+            if not valid.any():
+                continue
+
+            # Vectorized distance: max(0, ss - src_e) for left, max(0, src_s - se) for right
+            d_left = _numpy.maximum(ss - src_e, 0)
+            d_right = _numpy.maximum(src_s - se, 0)
+            dists = d_left + d_right  # one of them is 0 when overlapping
+
+            dists_valid = dists[valid]
+            vals_valid = src_v[valid]
+            dmin = dists_valid.min()
+            cand = vals_valid[dists_valid == dmin]
+            if cand.size > 0:
+                out[oi] = float(cand.mean())
 
     return out
 
@@ -547,16 +596,35 @@ def _extract_raw_unmasked_values_with_positions(intervals, payload_eval, filter_
     mapped_vals = vals[valid_vals]
     mapped_starts = starts[valid_vals]
 
+    # Group (value, start) pairs by original interval index
+    # Sort by orig_idx for efficient grouping via numpy
+    order = _numpy.argsort(mapped_orig)
+    sorted_orig = mapped_orig[order]
+    sorted_vals = mapped_vals[order]
+    sorted_starts = mapped_starts[order]
+
     groups = {}
-    for oi, v, s in zip(mapped_orig, mapped_vals, mapped_starts, strict=False):
-        groups.setdefault(int(oi), []).append((float(v), int(s)))
+    uniq, first_idx, counts = _numpy.unique(
+        sorted_orig, return_index=True, return_counts=True
+    )
+    for k in range(len(uniq)):
+        oi = int(uniq[k])
+        fi = int(first_idx[k])
+        c = int(counts[k])
+        groups[oi] = list(zip(
+            sorted_vals[fi:fi + c].tolist(),
+            sorted_starts[fi:fi + c].tolist(),
+            strict=False,
+        ))
 
     # Collect base_start (shifted interval start) per original interval
-    base_starts = {}
-    for row in seg_df.itertuples(index=False):
-        oi = int(row.orig_idx)
-        if oi not in base_starts:
-            base_starts[oi] = int(row.base_start)
+    # Use groupby first() equivalent: take first occurrence per orig_idx
+    seg_oi = seg_df["orig_idx"].to_numpy(dtype=int)
+    seg_bs = seg_df["base_start"].to_numpy(dtype=int)
+    _, first_seg_idx = _numpy.unique(seg_oi, return_index=True)
+    base_starts = dict(zip(
+        seg_oi[first_seg_idx].tolist(), seg_bs[first_seg_idx].tolist(), strict=False
+    ))
 
     return groups, base_starts, out
 
@@ -873,6 +941,38 @@ def _compute_global_percentile_unfiltered(intervals, payload_eval, func):
     return _percentile_from_reference(stats, ref)
 
 
+def _project_intervals_by_dim(intervals, dim):
+    """Project 2D intervals to 1D by selecting a dimension.
+
+    Parameters
+    ----------
+    intervals : DataFrame
+        Intervals DataFrame, potentially with 2D columns
+        (chrom1/start1/end1/chrom2/start2/end2).
+    dim : int
+        Dimension to project onto: 1 for (chrom1, start1, end1),
+        2 for (chrom2, start2, end2).
+
+    Returns
+    -------
+    DataFrame
+        1D intervals with columns (chrom, start, end).
+    """
+    if dim == 1:
+        return _pandas.DataFrame({
+            "chrom": intervals["chrom1"].values,
+            "start": intervals["start1"].values,
+            "end": intervals["end1"].values,
+        })
+    if dim == 2:
+        return _pandas.DataFrame({
+            "chrom": intervals["chrom2"].values,
+            "start": intervals["start2"].values,
+            "end": intervals["end2"].values,
+        })
+    raise ValueError(f"dim must be 1 or 2, got {dim}")
+
+
 def _compute_vtrack_values(vtrack_name, intervals):
     """
     Compute values for a virtual track.
@@ -888,6 +988,11 @@ def _compute_vtrack_values(vtrack_name, intervals):
     vtrack_config = _shared._VTRACKS.get(vtrack_name)
     if vtrack_config is None:
         return None
+
+    # Handle dim parameter: project 2D intervals to 1D
+    dim = vtrack_config.get("dim")
+    if dim is not None and dim != 0 and "chrom1" in intervals.columns:
+        intervals = _project_intervals_by_dim(intervals, dim)
 
     payload = dict(vtrack_config)
     src = payload.get('src')
@@ -1124,7 +1229,9 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
           ``'min.pos.abs'``, ``'min.pos.relative'``,
           ``'max.pos.abs'``, ``'max.pos.relative'``,
           ``'sample.pos.abs'``, ``'sample.pos.relative'``
-        - **2D track**: ``'area'``, ``'weighted.sum'``
+        - **2D track**: ``'area'``, ``'weighted.sum'``, ``'exists'``,
+          ``'size'``, ``'first'``, ``'last'``, ``'sample'``,
+          ``'global.percentile'``
         - **Motif/PWM** (src=None): ``'pwm'``, ``'pwm.max'``,
           ``'pwm.max.pos'``, ``'pwm.count'``
         - **K-mer** (src=None): ``'kmer.count'``, ``'kmer.frac'``

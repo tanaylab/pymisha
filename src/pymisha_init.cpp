@@ -77,6 +77,9 @@ PyObject *pm_smooth(PyObject *self, PyObject *args);
 PyObject *pm_gsynth_train(PyObject *self, PyObject *args);
 PyObject *pm_gsynth_sample(PyObject *self, PyObject *args);
 PyObject *pm_gsynth_replace_kmer(PyObject *self, PyObject *args);
+PyObject *pm_quadtree_query_stats(PyObject *self, PyObject *args);
+PyObject *pm_quadtree_query_objects(PyObject *self, PyObject *args);
+PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -125,6 +128,9 @@ static PyMethodDef module_methods[] = {
     {"pm_gsynth_train", pm_gsynth_train, METH_VARARGS, "Train stratified Markov-5 model"},
     {"pm_gsynth_sample", pm_gsynth_sample, METH_VARARGS, "Sample synthetic genome"},
     {"pm_gsynth_replace_kmer", pm_gsynth_replace_kmer, METH_VARARGS, "Replace k-mers iteratively"},
+    {"pm_quadtree_query_stats", pm_quadtree_query_stats, METH_VARARGS, "Query quad-tree for aggregated stats"},
+    {"pm_quadtree_query_objects", pm_quadtree_query_objects, METH_VARARGS, "Query quad-tree for matching objects"},
+    {"pm_quadtree_query_stats_batch", pm_quadtree_query_stats_batch, METH_VARARGS, "Batch query quad-tree stats for N rectangles"},
     {NULL, NULL, 0, NULL}
 };
 
