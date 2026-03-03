@@ -3647,6 +3647,7 @@ def gintervals_annotate(intervals, annotation_intervals,
                          annotation_columns=None, column_names=None,
                          dist_column="dist", max_dist=float("inf"),
                          na_value=_numpy.nan, maxneighbors=1,
+                         tie_method="first",
                          overwrite=False, keep_order=True, **kwargs):
     """
     Annotate intervals with columns from the nearest annotation intervals.
@@ -3678,6 +3679,15 @@ def gintervals_annotate(intervals, annotation_intervals,
         values.
     maxneighbors : int, default 1
         Number of nearest neighbors to consider.
+    tie_method : str, default ``"first"``
+        Tie-breaking strategy when multiple neighbors are equidistant.
+        Only applies when ``maxneighbors > 1``.
+
+        - ``"first"`` -- arbitrary but stable order (default).
+        - ``"min.start"`` -- prefer the neighbor with the smaller start
+          coordinate.
+        - ``"min.end"`` -- prefer the neighbor with the smaller end
+          coordinate.
     overwrite : bool, default False
         If ``True``, allow annotation columns to overwrite existing columns
         in *intervals*.
@@ -3714,6 +3724,10 @@ def gintervals_annotate(intervals, annotation_intervals,
     >>> pm.gintervals_annotate(intervs, ann,
     ...     annotation_columns=["remark"],
     ...     max_dist=200, na_value="no_ann")  # doctest: +SKIP
+    >>> pm.gintervals_annotate(intervs, ann,
+    ...     annotation_columns=["remark"],
+    ...     maxneighbors=2,
+    ...     tie_method="min.start")  # doctest: +SKIP
 
     See Also
     --------
@@ -3722,6 +3736,12 @@ def gintervals_annotate(intervals, annotation_intervals,
     """
     if intervals is None or annotation_intervals is None:
         raise ValueError("intervals and annotation_intervals must not be None")
+
+    _valid_tie_methods = ("first", "min.start", "min.end")
+    if tie_method not in _valid_tie_methods:
+        raise ValueError(
+            f"tie_method must be one of {_valid_tie_methods}, got '{tie_method}'"
+        )
 
     _checkroot()
 
@@ -3792,6 +3812,19 @@ def gintervals_annotate(intervals, annotation_intervals,
         if keep_order and "_orig_order" in result.columns:
             result = result.drop(columns=["_orig_order"])
         return result
+
+    # Apply tie-breaking when maxneighbors > 1
+    if tie_method != "first" and maxneighbors > 1 and "_orig_order" in nbrs.columns:
+        # Determine neighbor coordinate column name
+        # C++ appends "1" suffix when column names collide with query columns
+        if tie_method == "min.start":
+            tie_col = "start1" if "start1" in nbrs.columns else "start"
+        else:  # min.end
+            tie_col = "end1" if "end1" in nbrs.columns else "end"
+        nbrs = nbrs.sort_values(
+            ["_orig_order", "dist", tie_col],
+            na_position="last",
+        ).reset_index(drop=True)
 
     # Map annotation columns from neighbor result to output
     # The neighbor result has columns from both intervals1 and intervals2

@@ -22,8 +22,9 @@ from ._shared import (
     _pymisha2df,
     gmax_processes,
 )
-from .analysis import gcis_decay, gsegment, gwilcox
+from .analysis import gcis_decay, gcompute_strands_autocorr, gsegment, gwilcox
 from .dataset import (
+    gdataset_example_path,
     gdataset_info,
     gdataset_load,
     gdataset_ls,
@@ -36,6 +37,7 @@ from .db import (
     gdb_info,
     gdb_init,
     gdb_init_examples,
+    gdb_mark_cache_dirty,
     gdb_reload,
     gdb_unload,
     gsetroot,
@@ -115,6 +117,7 @@ from .liftover import (
 )
 from .lookup import glookup, gtrack_lookup
 from .sequence import (
+    grevcomp,
     gseq_comp,
     gseq_extract,
     gseq_kmer,
@@ -198,6 +201,7 @@ __all__ = [
     'gdb_reload',
     'gdb_unload',
     'gdb_info',
+    'gdb_mark_cache_dirty',
     'gdb_export_fasta',
     'gdb_examples_path',
     'gdb_init_examples',
@@ -208,6 +212,7 @@ __all__ = [
     'gdb_convert_to_indexed',
     'gdb_get_readonly_attrs',
     'gdb_set_readonly_attrs',
+    'gdataset_example_path',
     'gdataset_load',
     'gdataset_unload',
     'gdataset_ls',
@@ -226,6 +231,7 @@ __all__ = [
     'gbins_summary',
     'gbins_quantiles',
     'gcis_decay',
+    'gcompute_strands_autocorr',
     'gsegment',
     'gwilcox',
     'gtrack_dbs',
@@ -322,6 +328,7 @@ __all__ = [
     'gvtrack_clear',
 
     # Sequence functions
+    'grevcomp',
     'gseq_extract',
     'gseq_rev',
     'gseq_comp',

@@ -1,4 +1,4 @@
-"""gsegment, gwilcox, and gcis_decay implementations."""
+"""gsegment, gwilcox, gcis_decay, and gcompute_strands_autocorr implementations."""
 
 import bisect
 import math
@@ -687,3 +687,264 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
             return "\n".join(lines)
 
     return CisDecayResult(result, breaks, bin_labels)
+
+
+# ---------------------------------------------------------------------------
+# gcompute_strands_autocorr
+# ---------------------------------------------------------------------------
+
+
+def gcompute_strands_autocorr(
+    file,
+    chrom,
+    binsize,
+    maxread=400,
+    cols_order=(9, 11, 13, 14),
+    min_coord=0,
+    max_coord=300_000_000,
+):
+    """
+    Compute auto-correlation between forward and reverse strands from a
+    mapped-reads file.
+
+    Reads a tab-delimited file of mapped sequences and computes the
+    cross-correlation between binned forward and reverse strand coverage
+    for a specified chromosome. This is useful for quality control of
+    ChIP-seq and related assays (strand shift analysis).
+
+    Each line in the file describes one read.  The file must contain
+    columns for sequence, chromosome, coordinate, and strand. Their
+    positions are specified by ``cols_order``.
+
+    Forward-strand reads (``+`` or ``F``) contribute to position
+    ``coord // binsize``.  Reverse-strand reads (``-`` or ``R``)
+    contribute to position ``(coord + len(sequence)) // binsize``.
+    Coverage per bin is capped at 10.
+
+    Correlation is computed for each offset ``d`` in
+    ``[-maxread/binsize, maxread/binsize)`` as Pearson correlation
+    between forward and shifted reverse coverage within the coordinate
+    range ``[min_coord, max_coord]``.
+
+    Parameters
+    ----------
+    file : str
+        Path to a tab-delimited file of mapped reads.
+    chrom : str
+        Chromosome name to compute autocorrelation for.
+    binsize : int
+        Bin size (bp) for coverage arrays and correlation offsets.
+    maxread : int, optional
+        Maximal read length used to set the correlation offset range.
+        Default 400.
+    cols_order : tuple of int, optional
+        1-based column indices for (sequence, chromosome, coordinate,
+        strand).  Default ``(9, 11, 13, 14)``.
+    min_coord : int, optional
+        Minimum coordinate for the analysis window. Default 0.
+    max_coord : int, optional
+        Maximum coordinate for the analysis window. Default 3e8.
+
+    Returns
+    -------
+    tuple of (dict, pandas.DataFrame)
+        A 2-element tuple:
+
+        - ``stats`` : dict with keys ``'forward_mean'``,
+          ``'forward_stdev'``, ``'reverse_mean'``, ``'reverse_stdev'``.
+        - ``bins`` : DataFrame with columns ``'bin'`` (integer offset
+          index) and ``'corr'`` (Pearson correlation at that offset).
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> stats, bins = pm.gcompute_strands_autocorr(
+    ...     "reads.tsv", "1", 50, maxread=300
+    ... )  # doctest: +SKIP
+    """
+    import os
+
+    import pandas as pd
+
+    from .intervals import _normalize_chroms
+
+    _checkroot()
+
+    if file is None or chrom is None or binsize is None:
+        raise ValueError(
+            "Usage: gcompute_strands_autocorr(file, chrom, binsize, "
+            "maxread=400, cols_order=(9, 11, 13, 14), "
+            "min_coord=0, max_coord=3e8)"
+        )
+
+    # --- validate parameters ---
+    file = str(file)
+    if not os.path.isfile(file):
+        raise FileNotFoundError(f"File not found: {file}")
+
+    binsize = int(binsize)
+    if binsize <= 0:
+        raise ValueError(f"Invalid binsize value {binsize}")
+
+    maxread = int(maxread)
+    if maxread <= 0:
+        raise ValueError(f"Invalid maxread value {maxread}")
+
+    cols_order = list(cols_order)
+    if len(cols_order) != 4:
+        raise ValueError("cols_order must have exactly 4 elements")
+    col_names = ["sequence", "chromosome", "coordinate", "strand"]
+    for i, c in enumerate(cols_order):
+        cols_order[i] = int(c)
+        if cols_order[i] <= 0:
+            raise ValueError(
+                f"Invalid columns order: {col_names[i]} column's order "
+                f"is {cols_order[i]}"
+            )
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if cols_order[i] == cols_order[j]:
+                raise ValueError(
+                    f"Invalid columns order: {col_names[i]} column has "
+                    f"the same order as {col_names[j]} column"
+                )
+
+    min_coord = int(min_coord)
+    max_coord = int(max_coord)
+
+    # Normalize chromosome name via DB aliases
+    chrom_norm = _normalize_chroms([str(chrom)])[0]
+
+    # Get chromosome size from ALLGENOME
+    from .intervals import gintervals_all
+
+    allgenome = gintervals_all()
+    chromsize = 0
+    for _, row in allgenome.iterrows():
+        if str(row["chrom"]) == chrom_norm:
+            chromsize = int(row["end"])
+            break
+
+    if chromsize == 0:
+        raise ValueError(f"Chromosome '{chrom}' not found in current database")
+
+    if min_coord < 0:
+        min_coord = 0
+    if max_coord < 0 or max_coord > chromsize:
+        max_coord = chromsize
+
+    # --- build coverage arrays ---
+    SEQ_COL, CHROM_COL, COORD_COL, STRAND_COL = 0, 1, 2, 3
+    n_bins_cov = int(math.ceil(chromsize / binsize))
+    forward = _numpy.zeros(n_bins_cov, dtype=_numpy.int32)
+    reverse = _numpy.zeros(n_bins_cov, dtype=_numpy.int32)
+
+    MAX_COV = 10
+
+    # Convert 1-based cols_order to 0-based indices
+    col_indices = [c - 1 for c in cols_order]
+
+    with open(file) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            fields = line.split("\t")
+            # Extract the 4 required columns
+            strs = [None] * 4
+            valid = True
+            for i in range(4):
+                idx = col_indices[i]
+                if idx < len(fields):
+                    strs[i] = fields[idx]
+                else:
+                    valid = False
+                    break
+
+            if not valid or any(s is None or s == "" for s in strs):
+                continue
+
+            # Check chromosome
+            if strs[CHROM_COL] != chrom_norm:
+                continue
+
+            # Parse coordinate
+            try:
+                coord = int(strs[COORD_COL])
+            except ValueError:
+                continue
+
+            if coord < 0 or coord >= chromsize:
+                continue
+            if coord < min_coord or coord > max_coord:
+                continue
+
+            seq = strs[SEQ_COL]
+            strand = strs[STRAND_COL]
+
+            if strand in ("+", "F"):
+                idx = coord // binsize
+                forward[idx] = min(MAX_COV, forward[idx] + 1)
+            elif strand in ("-", "R"):
+                idx = (coord + len(seq)) // binsize
+                if idx < n_bins_cov:
+                    reverse[idx] = min(MAX_COV, reverse[idx] + 1)
+
+    # --- compute autocorrelation ---
+    min_off = int(-maxread // binsize)
+    max_off = int(maxread // binsize)
+    min_idx = max_off + min_coord // binsize
+    max_idx = max_coord // binsize - max_off - 1
+
+    if min_idx >= len(forward) or max_idx < 0:
+        raise ValueError("Not enough data to calculate auto correlation.")
+
+    # Ensure indices are valid
+    min_idx = max(0, min_idx)
+    max_idx = min(len(forward), max_idx)
+
+    # Compute statistics over the valid range
+    fwd_slice = forward[min_idx:max_idx].astype(_numpy.float64)
+    rev_slice = reverse[min_idx:max_idx].astype(_numpy.float64)
+    count = len(fwd_slice)
+
+    if count == 0:
+        raise ValueError("Not enough data to calculate auto correlation.")
+
+    tot_f = fwd_slice.sum()
+    tot_r = rev_slice.sum()
+    tot_ff = (fwd_slice * fwd_slice).sum()
+    tot_rr = (rev_slice * rev_slice).sum()
+
+    mean_f = tot_f / count
+    mean_r = tot_r / count
+    std_f = math.sqrt(max(0.0, tot_ff / count - mean_f * mean_f))
+    std_r = math.sqrt(max(0.0, tot_rr / count - mean_r * mean_r))
+
+    # Cross-correlation at each offset
+    n_offsets = max_off - min_off
+    corr_values = _numpy.zeros(n_offsets, dtype=_numpy.float64)
+    bin_indices = _numpy.arange(min_off, max_off, dtype=_numpy.float64)
+
+    denom = std_f * std_r
+    if denom > 0:
+        for k, off in enumerate(range(min_off, max_off)):
+            # forward[min_idx:max_idx] correlated with
+            # reverse[min_idx+off:max_idx+off]
+            rev_shifted = reverse[min_idx + off: max_idx + off].astype(
+                _numpy.float64
+            )
+            tot_fr = (fwd_slice * rev_shifted).sum()
+            corr_values[k] = (tot_fr / count - mean_f * mean_r) / denom
+
+    stats = {
+        "forward_mean": mean_f,
+        "forward_stdev": std_f,
+        "reverse_mean": mean_r,
+        "reverse_stdev": std_r,
+    }
+
+    bins_df = pd.DataFrame({"bin": bin_indices, "corr": corr_values})
+
+    return stats, bins_df

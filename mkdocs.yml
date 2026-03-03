@@ -79,6 +79,7 @@ nav:
       - Creating Genome Databases: tutorials/genomes.md
   - Reference:
       - R Parity: guides/parity.md
+      - Changelog: changelog.md
       - Roadmap: roadmap.md
   - API Reference:
       - Overview: api/index.md

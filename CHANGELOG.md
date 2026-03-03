@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.13 (2026-03-03)
+
+### Features
+
+- **`gcompute_strands_autocorr`:** Strand autocorrelation for nascent transcription analysis, matching R misha's C++ `GenomeComputeStrandAutocorr` algorithm. Parses mapped reads files, builds binned strand coverage, computes Pearson cross-correlation at distance offsets.
+- **`gintervals_annotate` tie_method:** Added `tie_method` parameter (`"first"`, `"min.start"`, `"min.end"`) for controlling tie-breaking when multiple annotations are equidistant.
+- **`gtrack_2d_import` multi-file:** Accepts a list of file paths, reads and concatenates all before building the quad-tree.
+- **`grevcomp`:** Standalone reverse complement function for DNA strings.
+- **`gdb_mark_cache_dirty`:** Cache invalidation function (delegates to `gdb_reload`).
+- **`gdataset_example_path`:** Returns filesystem path to a bundled example dataset.
+- **COMPUTED track detection:** COMPUTED 2D tracks (Hi-C normalization) now raise an informative `NotImplementedError` in 7 API functions instead of failing silently.
+
+### Testing
+
+- **Multi-process hardening:** 18 new edge-case tests for `gmax_processes` / `_parallel_extract` covering parity, intervalID remapping, single-chrom, empty intervals, virtual track bypass, and stress scenarios.
+- **Test suite:** 2103 passed, 25 skipped (up from 1993).
+
+### Documentation
+
+- **Track arrays explicitly excluded:** GAP-025 marked NOT PLANNED — 5 `gtrack.array.*` functions permanently out of scope.
+- **Gap coverage:** 136/138 in-scope R misha functions (98.6%), up from 130/144 (90%).
+
 ## v0.1.12 (2026-03-02)
 
 ### Features

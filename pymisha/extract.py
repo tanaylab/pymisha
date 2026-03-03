@@ -1161,6 +1161,9 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     _checkroot()
     exprs = [expr] if isinstance(expr, str) else list(expr)
 
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(exprs)
+
     file = kwargs.get('file')
     intervals_set_out = kwargs.get('intervals_set_out')
 
@@ -1419,6 +1422,10 @@ def gscreen(expr, intervals=None, **kwargs):
     True
     """
     _checkroot()
+
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(expr)
+
     if intervals is None:
         from .intervals import gintervals_all
 

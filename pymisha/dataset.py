@@ -550,3 +550,81 @@ def gdataset_info(path: str) -> dict[str, Any]:
         "genome": genome,
         "is_loaded": path_norm in _shared._GDATASETS,
     }
+
+
+def gdataset_example_path() -> str:
+    """
+    Create and return the path to an example dataset.
+
+    Creates a small dataset in a temporary directory using the built-in
+    example database.  This mirrors R misha's ``gdataset.example_path()``
+    and is intended for use in examples and tests.
+
+    The function has side effects: it calls
+    :func:`~pymisha.gdb_init_examples` (which resets the working
+    database), creates temporary tracks and intervals in that database,
+    saves them into a dataset, and then removes the temporary objects.
+
+    Returns
+    -------
+    str
+        Absolute path to the created dataset directory (in a temporary
+        location).
+
+    See Also
+    --------
+    gdataset_save : Save tracks/intervals as a dataset.
+    gdataset_load : Load a dataset into the namespace.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> dataset_path = pm.gdataset_example_path()
+    >>> pm.gdataset_load(dataset_path)['tracks']
+    1
+    >>> pm.gdataset_unload(dataset_path)
+    """
+    import contextlib
+    import tempfile
+
+    from .db import gdb_init_examples
+    from .intervals import gintervals, gintervals_rm, gintervals_save
+    from .tracks import gtrack_create, gtrack_rm
+
+    gdb_init_examples()
+
+    _TRACK_NAME = "example_dataset_track"
+    _INTERV_NAME = "example_dataset_intervals"
+
+    # Remove leftovers from a previous call (idempotent)
+    with contextlib.suppress(Exception):
+        gtrack_rm(_TRACK_NAME, force=True)
+    with contextlib.suppress(Exception):
+        gintervals_rm(_INTERV_NAME, force=True)
+
+    # Create a small interval set and a derived track
+    example_intervs = gintervals("1", 0, 10000)
+    gintervals_save(example_intervs, _INTERV_NAME)
+    gtrack_create(
+        _TRACK_NAME,
+        "Example dataset track",
+        "dense_track",
+        iterator=10000,
+    )
+
+    # Save as a dataset in a temp dir.  gdataset_save requires a
+    # non-existent path, so we create the parent and let it make the leaf.
+    parent = tempfile.mkdtemp(prefix="pymisha_dataset_")
+    dataset_path = os.path.join(parent, "dataset")
+    gdataset_save(
+        path=dataset_path,
+        description="Example dataset created on the fly",
+        tracks=[_TRACK_NAME],
+        intervals=[_INTERV_NAME],
+    )
+
+    # Clean up the temporary objects from the example DB
+    gtrack_rm(_TRACK_NAME, force=True)
+    gintervals_rm(_INTERV_NAME, force=True)
+
+    return dataset_path

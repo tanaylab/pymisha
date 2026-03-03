@@ -104,6 +104,43 @@ def gdb_reload():
     _pymisha.pm_dbreload()
 
 
+def gdb_mark_cache_dirty():
+    """
+    Mark the database cache as dirty so the next reload forces a rescan.
+
+    In R misha, this writes a ``.db.cache.dirty`` sentinel file so that
+    the next ``gsetroot()`` or ``gdb.reload(rescan=FALSE)`` knows it must
+    re-scan the file system. In pymisha, :func:`gdb_reload` always
+    performs a full C++ rescan (there is no lazy cache), so calling this
+    function is equivalent to calling :func:`gdb_reload` directly.
+
+    This function is provided for API compatibility with R misha scripts
+    that call ``gdb.mark_cache_dirty()``.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If no database is currently initialized.
+
+    See Also
+    --------
+    gdb_reload : Immediately rescan the database.
+    gdb_init : Initialize a database connection.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gdb_mark_cache_dirty()   # forces rescan on next reload
+    """
+    _checkroot()
+    _pymisha.pm_dbreload()
+
+
 def gdb_unload():
     """
     Unload the database, clearing all state.

@@ -179,6 +179,39 @@ def gseq_revcomp(seq):
     return [s[::-1].translate(_COMPLEMENT) for s in seq]
 
 
+def grevcomp(seq):
+    """
+    Return reverse complement of a DNA string.
+
+    Standalone reverse-complement function matching R misha's ``grevcomp``.
+    Handles A/C/G/T and their lowercase equivalents; N and other IUPAC
+    characters are complemented according to the standard complement table.
+
+    Parameters
+    ----------
+    seq : str or list of str
+        DNA sequence(s) to reverse complement.
+
+    Returns
+    -------
+    str or list of str
+        Reverse complemented sequence(s), same type as input.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> pm.grevcomp("ACTG")
+    'CAGT'
+    >>> pm.grevcomp(["ACTG", "GGCC"])
+    ['CAGT', 'GGCC']
+
+    See Also
+    --------
+    gseq_revcomp, gseq_rev, gseq_comp
+    """
+    return gseq_revcomp(seq)
+
+
 def _count_str_occurrences(haystack: str, needle: str) -> int:
     """Count overlapping occurrences of needle in haystack using str.find."""
     count = 0

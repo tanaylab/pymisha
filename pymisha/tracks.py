@@ -67,6 +67,51 @@ def _load_track_attributes(track_name):
     return attrs
 
 
+def _check_computed_tracks(exprs):
+    """Check whether any track referenced in *exprs* is a COMPUTED track.
+
+    COMPUTED tracks are a Hi-C normalization feature (PotentialComputer2D,
+    TechnicalComputer2D) that is not yet implemented in pymisha.  This
+    function parses one or more track expressions, resolves the physical
+    track names they contain, and raises ``NotImplementedError`` if any of
+    them has type ``"computed"``.
+
+    Parameters
+    ----------
+    exprs : str or list of str
+        One or more track expressions to inspect.
+
+    Raises
+    ------
+    NotImplementedError
+        If any referenced track is of type ``"computed"``.
+    """
+    if isinstance(exprs, str):
+        exprs = [exprs]
+
+    from .expr import _parse_expr_vars
+
+    track_names = set(_pymisha.pm_track_names())
+    vtrack_names = set(_shared._VTRACKS.keys())
+
+    all_tracks = set()
+    for expr in exprs:
+        _, expr_tracks, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
+        all_tracks.update(expr_tracks)
+
+    for tname in sorted(all_tracks):
+        try:
+            info = _pymisha.pm_track_info(tname)
+        except Exception:
+            continue
+        if info.get("type") == "computed":
+            raise NotImplementedError(
+                f"COMPUTED tracks (Hi-C normalization) are not yet supported "
+                f"in pymisha. Track '{tname}' is a COMPUTED track. "
+                f"Consider using R misha for this workflow."
+            )
+
+
 def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
     """
     Return a list of track names in the Genomic Database.
@@ -3195,7 +3240,7 @@ def gtrack_2d_create(track, description, intervals, values):
 
 def gtrack_2d_import(track, description, file):
     """
-    Import a 2D track from a tab-delimited file.
+    Import a 2D track from one or more tab-delimited files.
 
     Parameters
     ----------
@@ -3203,9 +3248,11 @@ def gtrack_2d_import(track, description, file):
         Track name.
     description : str
         Track description.
-    file : str
-        Path to tab-delimited file with header:
-        chrom1, start1, end1, chrom2, start2, end2, <value_column>
+    file : str or list of str
+        Path(s) to tab-delimited file(s) with header:
+        chrom1, start1, end1, chrom2, start2, end2, <value_column>.
+        When multiple files are given, all are read and concatenated
+        before building the quad-tree.
 
     Returns
     -------
@@ -3214,8 +3261,8 @@ def gtrack_2d_import(track, description, file):
     Raises
     ------
     ValueError
-        If the track already exists, file is not found, or the file has
-        fewer than 7 columns.
+        If the track already exists, any file is not found, the file list
+        is empty, or a file has fewer than 7 columns.
 
     See Also
     --------
@@ -3233,28 +3280,47 @@ def gtrack_2d_import(track, description, file):
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
     >>> # pm.gtrack_2d_import("test_2d", "Test", "contacts.tsv")
+    >>> # pm.gtrack_2d_import("test_2d", "Test", ["a.tsv", "b.tsv"])
     """
     _checkroot()
     _validate_track_name(track)
     _ensure_track_absent(track)
 
-    if not os.path.exists(file):
-        raise ValueError(f"File not found: {file}")
+    # Accept a single file path or a list of file paths
+    files = [file] if isinstance(file, str) else list(file)
 
-    df = pd.read_csv(file, sep="\t")
-    if len(df.columns) < 7:
+    if not files:
         raise ValueError(
-            "File must have at least 7 columns: "
-            "chrom1, start1, end1, chrom2, start2, end2, value"
+            "At least one file must be provided. "
+            "Usage: gtrack_2d_import(track, description, file)"
         )
 
-    # Use first 6 columns as interval coords, 7th as value
-    cols = list(df.columns)
-    df = df.rename(columns={
-        cols[0]: "chrom1", cols[1]: "start1", cols[2]: "end1",
-        cols[3]: "chrom2", cols[4]: "start2", cols[5]: "end2",
-    })
-    value_col = cols[6]
+    # Validate all files exist before reading any
+    for f in files:
+        if not os.path.exists(f):
+            raise ValueError(f"File not found: {f}")
+
+    # Read and concatenate all files
+    dfs = []
+    value_col = None
+    for f in files:
+        df = pd.read_csv(f, sep="\t")
+        if len(df.columns) < 7:
+            raise ValueError(
+                f"File must have at least 7 columns: "
+                f"chrom1, start1, end1, chrom2, start2, end2, value "
+                f"(file: {f})"
+            )
+        cols = list(df.columns)
+        df = df.rename(columns={
+            cols[0]: "chrom1", cols[1]: "start1", cols[2]: "end1",
+            cols[3]: "chrom2", cols[4]: "start2", cols[5]: "end2",
+        })
+        if value_col is None:
+            value_col = cols[6]
+        dfs.append(df)
+
+    df = pd.concat(dfs, ignore_index=True)
     values = df[value_col].values
 
     gtrack_2d_create(track, description, df, values)

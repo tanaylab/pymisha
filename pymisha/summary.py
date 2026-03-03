@@ -146,6 +146,9 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
         exprs.append(expr)
         breaks_list.append(breaks.tolist())
 
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(exprs)
+
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
     for expr in exprs:
@@ -852,6 +855,10 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
     band = kwargs.get("band")
 
     _checkroot()
+
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(expr)
+
     if intervals is None:
         intervals = gintervals_all()
 
@@ -946,6 +953,10 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
     band = kwargs.get("band")
 
     _checkroot()
+
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(expr)
+
     if intervals is None:
         intervals = gintervals_all()
 
@@ -1477,6 +1488,10 @@ def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False,
         raise ValueError("gcor requires at least two track expressions")
     if len(expr_list) % 2 != 0:
         raise ValueError("gcor requires an even number of track expressions (pairs)")
+
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(expr_list)
+
     if method not in {"pearson", "spearman", "spearman.exact"}:
         raise ValueError("method must be one of: 'pearson', 'spearman', 'spearman.exact'")
 

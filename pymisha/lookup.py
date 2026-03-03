@@ -125,6 +125,9 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
         exprs.append(expr)
         breaks_list.append(breaks)
 
+    from .tracks import _check_computed_tracks
+    _check_computed_tracks(exprs)
+
     # Validate lookup_table dimensions match number of expr-breaks pairs
     expected_dims = len(exprs)
     if lookup_table.ndim != expected_dims:
