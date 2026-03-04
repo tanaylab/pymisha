@@ -80,7 +80,6 @@ nav:
   - Reference:
       - R Parity: guides/parity.md
       - Changelog: changelog.md
-      - Roadmap: roadmap.md
   - API Reference:
       - Overview: api/index.md
       - Database: api/database.md

@@ -318,6 +318,27 @@ def gtrack_info(track):
     if 'attributes_path' in info:
         del info['attributes_path']
 
+    # Check for 2D indexed format: the C++ engine may misidentify a 2D
+    # indexed track as 1D sparse because it doesn't know about the 2D
+    # index magic.  Read the track.idx header to detect this and override.
+    if info.get('format') == 'indexed':
+        track_path = _pymisha.pm_track_path(track)
+        idx_path = os.path.join(track_path, 'track.idx')
+        if os.path.exists(idx_path):
+            try:
+                with open(idx_path, 'rb') as f:
+                    magic = f.read(8)
+                if magic == b'MISHT2D\x00':
+                    # This is a 2D indexed track.  Read type from header.
+                    import struct
+                    with open(idx_path, 'rb') as f:
+                        f.seek(12)  # skip magic(8) + version(4)
+                        track_type_int = struct.unpack('<I', f.read(4))[0]
+                    info['type'] = 'points' if track_type_int == 1 else 'rectangles'
+                    info['dimensions'] = 2
+            except Exception:
+                pass
+
     attrs = _load_track_attributes(track)
     if attrs:
         info['attributes'] = attrs
@@ -2523,6 +2544,16 @@ def gtrack_convert_to_indexed(track, remove_old=False):
     if track is None:
         raise ValueError("track cannot be None")
     _checkroot()
+
+    # If this is a 2D track, dispatch to gtrack_2d_convert_to_indexed
+    if _track_exists(track):
+        info = gtrack_info(track)
+        track_type = info.get("type")
+        if track_type in ("rectangles", "points"):
+            return gtrack_2d_convert_to_indexed(
+                track, remove_old=remove_old, force=False
+            )
+
     return _pymisha.pm_track_convert_to_indexed(track, bool(remove_old))
 
 
@@ -2559,6 +2590,74 @@ def gtrack_create_empty_indexed(track):
         raise ValueError("track cannot be None")
     _checkroot()
     return _pymisha.pm_track_create_empty_indexed(track)
+
+
+def gtrack_2d_convert_to_indexed(track, remove_old=True, force=False):
+    """
+    Convert a 2D track to indexed format (track.dat + track.idx).
+
+    Consolidates per-chromosome-pair files into a single indexed format,
+    reducing file descriptor usage from O(N^2) to O(1).
+
+    Parameters
+    ----------
+    track : str
+        Track name.
+    remove_old : bool, default True
+        If True, remove old per-pair files after conversion.
+    force : bool, default False
+        If True, re-convert even if already in indexed format.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If the track does not exist, is not a 2D track, or conversion
+        fails.
+
+    See Also
+    --------
+    gtrack_convert_to_indexed : Convert a 1D track to indexed format.
+    gdb_convert_to_indexed : Convert an entire database.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> # pm.gtrack_2d_convert_to_indexed("my_2d_track")
+    """
+    from ._quadtree import clear_indexed_2d_cache
+
+    if track is None:
+        raise ValueError("track cannot be None")
+
+    _checkroot()
+
+    if not _track_exists(track):
+        raise ValueError(f"Track '{track}' does not exist")
+
+    info = gtrack_info(track)
+    track_type = info.get("type")
+    if track_type not in ("rectangles", "points"):
+        raise ValueError(
+            f"Track '{track}' is not a 2D track (type={track_type!r}). "
+            f"Use gtrack_convert_to_indexed() for 1D tracks."
+        )
+
+    track_path = _pymisha.pm_track_path(track)
+    idx_path = os.path.join(track_path, "track.idx")
+
+    if os.path.exists(idx_path) and not force:
+        return
+
+    # Clear any cached mmap handles for this track before conversion
+    clear_indexed_2d_cache()
+
+    track_type_int = 1 if track_type == "points" else 0
+    _pymisha.pm_track2d_convert_to_indexed(track_path, track_type_int)
 
 
 def gtrack_attr_set(track, attr, value):
@@ -3231,6 +3330,8 @@ def gtrack_2d_create(track, description, intervals, values):
             description,
             f'gtrack.2d.create("{track}", description, intervals, values)',
         )
+        if _db_is_indexed(_shared._GROOT):
+            gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)
@@ -3636,6 +3737,8 @@ def gtrack_2d_import_contacts(
             f'gtrack.2d.import_contacts("{track}", description, '
             f'c("{contacts_str}"), {fends_str}, {allow_duplicates})',
         )
+        if _db_is_indexed(_shared._GROOT):
+            gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)

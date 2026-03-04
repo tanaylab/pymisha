@@ -139,6 +139,7 @@ from .summary import (
     gsummary,
 )
 from .tracks import (
+    gtrack_2d_convert_to_indexed,
     gtrack_2d_create,
     gtrack_2d_import,
     gtrack_2d_import_contacts,
@@ -262,6 +263,7 @@ __all__ = [
     'gtrack_var_rm',
     'gtrack_modify',
     'gtrack_smooth',
+    'gtrack_2d_convert_to_indexed',
     'gtrack_2d_create',
     'gtrack_2d_import',
     'gtrack_2d_import_contacts',

@@ -12,7 +12,9 @@ Binary format (StatQuadTreeCached):
 Struct Stat (pack(8)): [int64 occupied_area] [double weighted_sum] [double min_val] [double max_val]
 """
 
+import contextlib
 import mmap
+import os
 import struct
 
 import numpy as np
@@ -1170,3 +1172,246 @@ def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):
                                      qx1, qy1, qx2, qy2)
     finally:
         data.close()
+
+
+# ---------------------------------------------------------------------------
+# Indexed 2D track support (track.idx + track.dat)
+# ---------------------------------------------------------------------------
+
+# Cache of IndexedTrack2DReader instances keyed by track directory path
+_indexed_2d_cache = {}
+
+
+class IndexedTrack2DReader:
+    """Reader for indexed 2D tracks (track.idx + track.dat format).
+
+    An indexed 2D track stores all chromosome-pair data in a single
+    concatenated file (``track.dat``), with a lookup index
+    (``track.idx``) that records the offset and length of each pair's
+    data within ``track.dat``.
+
+    This class mmaps ``track.dat`` once and provides per-pair buffer
+    slices that are compatible with the existing quad-tree query
+    functions (``query_2d_track_opened``, ``query_2d_track_stats``,
+    etc.).
+
+    Parameters
+    ----------
+    track_dir : str
+        Path to the track directory containing ``track.idx`` and
+        ``track.dat``.
+    """
+
+    __slots__ = ("_track_dir", "_dat_mmap", "_dat_file", "_pair_map",
+                 "_is_points", "_loaded")
+
+    def __init__(self, track_dir):
+        self._track_dir = track_dir
+        self._dat_mmap = None
+        self._dat_file = None
+        self._pair_map = {}  # (chrom1_id, chrom2_id) -> (offset, length)
+        self._is_points = False
+        self._loaded = False
+        self._load()
+
+    def _load(self):
+        """Load the index and mmap the data file."""
+        idx_path = os.path.join(self._track_dir, "track.idx")
+        dat_path = os.path.join(self._track_dir, "track.dat")
+
+        if not os.path.exists(idx_path) or not os.path.exists(dat_path):
+            return
+
+        if not _HAS_CPP_QUADTREE:
+            return
+
+        try:
+            info = _pymisha.pm_track2d_index_info(self._track_dir)
+        except Exception:
+            return
+
+        if not info.get("loaded"):
+            return
+
+        self._is_points = info["track_type"] == "POINTS"
+
+        for pair in info["pairs"]:
+            key = (int(pair["chrom1_id"]), int(pair["chrom2_id"]))
+            self._pair_map[key] = (int(pair["offset"]), int(pair["length"]))
+
+        # mmap track.dat
+        dat_size = os.path.getsize(dat_path)
+        if dat_size == 0:
+            return
+
+        self._dat_file = open(dat_path, "rb")  # noqa: SIM115
+        self._dat_mmap = mmap.mmap(
+            self._dat_file.fileno(), 0, access=mmap.ACCESS_READ
+        )
+        self._loaded = True
+
+    @property
+    def loaded(self):
+        """Whether the indexed track was successfully loaded."""
+        return self._loaded
+
+    @property
+    def is_points(self):
+        """Whether the track stores points (True) or rectangles (False)."""
+        return self._is_points
+
+    def get_pair_data(self, chrom1_id, chrom2_id):
+        """Return a buffer slice for a chromosome pair.
+
+        Parameters
+        ----------
+        chrom1_id, chrom2_id : int
+            Numeric chromosome IDs (0-based, matching the genome database
+            ordering).
+
+        Returns
+        -------
+        tuple of (is_points, num_objs, data, root_chunk_fpos) or None
+            Same format as what ``_read_file_header`` returns (plus
+            ``root_chunk_fpos``), suitable for passing directly to
+            ``query_2d_track_opened`` and friends.  Returns ``None`` if
+            the pair is not present in the index.
+        """
+        if not self._loaded:
+            return None
+
+        key = (chrom1_id, chrom2_id)
+        entry = self._pair_map.get(key)
+        if entry is None:
+            return None
+
+        offset, length = entry
+        if length == 0:
+            return None
+
+        # Create a bytes slice from the mmap. Using bytes() here
+        # creates a copy, but the per-pair data is typically small
+        # (KB to low MB) and this ensures the buffer is fully
+        # independent — no lifecycle coupling with the mmap.
+        pair_data = bytes(self._dat_mmap[offset:offset + length])
+
+        # Parse the signature + header from the pair data
+        if len(pair_data) < 12:
+            return None
+
+        signature = struct.unpack_from("<i", pair_data, 0)[0]
+        if signature == SIGNATURE_RECTS:
+            is_points = False
+        elif signature == SIGNATURE_POINTS:
+            is_points = True
+        else:
+            return None
+
+        num_objs = struct.unpack_from("<Q", pair_data, 4)[0]
+        if num_objs == 0:
+            return (is_points, 0, pair_data, 0)
+
+        root_chunk_fpos = struct.unpack_from("<q", pair_data, 12)[0]
+        return (is_points, num_objs, pair_data, root_chunk_fpos)
+
+    def close(self):
+        """Release the mmap and file handle."""
+        if self._dat_mmap is not None:
+            with contextlib.suppress(Exception):
+                self._dat_mmap.close()
+            self._dat_mmap = None
+        if self._dat_file is not None:
+            with contextlib.suppress(Exception):
+                self._dat_file.close()
+            self._dat_file = None
+        self._loaded = False
+
+    def __del__(self):
+        self.close()
+
+
+def _get_indexed_reader(track_dir):
+    """Get or create a cached IndexedTrack2DReader for a track directory.
+
+    Returns ``None`` if the track directory does not have an indexed
+    format (no ``track.idx``).
+    """
+    idx_path = os.path.join(track_dir, "track.idx")
+    if not os.path.exists(idx_path):
+        return None
+
+    reader = _indexed_2d_cache.get(track_dir)
+    if reader is not None and reader.loaded:
+        return reader
+
+    reader = IndexedTrack2DReader(track_dir)
+    if reader.loaded:
+        _indexed_2d_cache[track_dir] = reader
+        return reader
+
+    return None
+
+
+def clear_indexed_2d_cache():
+    """Clear all cached IndexedTrack2DReader instances."""
+    for reader in _indexed_2d_cache.values():
+        reader.close()
+    _indexed_2d_cache.clear()
+
+
+def open_2d_pair(track_path, c1, c2):
+    """Open a 2D track chromosome pair, supporting both per-pair files and
+    indexed format.
+
+    This is the unified entry point for opening 2D track data.  It
+    checks for indexed format first (``track.idx`` + ``track.dat``),
+    falling back to per-pair files.
+
+    Parameters
+    ----------
+    track_path : str
+        Path to the track directory (e.g., from ``pm_track_path``).
+    c1, c2 : str
+        Chromosome names (e.g., ``"1"``, ``"X"``).
+
+    Returns
+    -------
+    tuple of (is_points, num_objs, data, root_chunk_fpos, close_fn) or None
+        - *is_points*: whether the track stores points.
+        - *num_objs*: number of objects in this pair.
+        - *data*: buffer (mmap or bytes) for quad-tree queries.
+        - *root_chunk_fpos*: file position of the root chunk.
+        - *close_fn*: callable to release resources (call in a finally
+          block).  For indexed format this is a no-op; for per-pair
+          files it closes the mmap.
+        Returns ``None`` if no data exists for this pair.
+    """
+    # Try indexed format first
+    reader = _get_indexed_reader(track_path)
+    if reader is not None:
+        # Need chrom name -> ID mapping
+        from .intervals import _chrom_id_lookup, _chrom_id_map
+
+        cmap = _chrom_id_map()
+        c1_id = _chrom_id_lookup(cmap, str(c1))
+        c2_id = _chrom_id_lookup(cmap, str(c2))
+        if c1_id is not None and c2_id is not None:
+            result = reader.get_pair_data(c1_id, c2_id)
+            if result is not None:
+                is_points, num_objs, data, root_chunk_fpos = result
+                return (is_points, num_objs, data, root_chunk_fpos, _noop_close)
+
+    # Fall back to per-pair files
+    from .extract import _find_2d_track_file
+
+    filepath = _find_2d_track_file(track_path, c1, c2)
+    if filepath is None:
+        return None
+
+    file_is_points, num_objs, data = _read_file_header(filepath)
+    root_chunk_fpos = 0 if num_objs == 0 else struct.unpack_from("<q", data, 12)[0]
+    return (file_is_points, num_objs, data, root_chunk_fpos, data.close)
+
+
+def _noop_close():
+    """No-op close function for indexed pair data (bytes don't need closing)."""

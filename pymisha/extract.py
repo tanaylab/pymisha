@@ -89,9 +89,7 @@ def _obj_in_band(obj, is_points, band):
 
 def _gextract_2d_single(track, col_name, intervals, band):
     """Extract a single 2D track over 2D intervals."""
-    import struct
-
-    from ._quadtree import _read_file_header, query_2d_track_opened
+    from ._quadtree import open_2d_pair, query_2d_track_opened
     from .tracks import gtrack_info
 
     track_path = _pymisha.pm_track_path(track)
@@ -114,16 +112,14 @@ def _gextract_2d_single(track, col_name, intervals, band):
 
     rows = []
     for (c1, c2), interval_list in chrom_pair_intervals.items():
-        filepath = _find_2d_track_file(track_path, c1, c2)
-        if filepath is None:
+        pair = open_2d_pair(track_path, c1, c2)
+        if pair is None:
             continue
 
-        # Open/mmap the file once for all intervals on this chrom pair
-        file_is_points, num_objs, data = _read_file_header(filepath)
+        file_is_points, num_objs, data, root_chunk_fpos, close_fn = pair
         try:
             if num_objs == 0:
                 continue
-            root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
 
             for interval_idx, s1, e1, s2, e2 in interval_list:
                 objs = query_2d_track_opened(
@@ -138,7 +134,7 @@ def _gextract_2d_single(track, col_name, intervals, band):
                         ox1, oy1, ox2, oy2, val = obj
                         rows.append((c1, ox1, ox2, c2, oy1, oy2, float(val), interval_idx))
         finally:
-            data.close()
+            close_fn()
 
     if not rows:
         return None
@@ -295,9 +291,7 @@ def _gextract_2d_vtrack_agg(track, col_name, intervals, band, func):
         One row per query interval with columns: chrom1, start1, end1,
         chrom2, start2, end2, <col_name>, intervalID.
     """
-    import struct
-
-    from ._quadtree import _read_file_header, query_2d_track_stats_batch
+    from ._quadtree import open_2d_pair, query_2d_track_stats_batch
 
     track_path = _pymisha.pm_track_path(track)
 
@@ -319,16 +313,15 @@ def _gextract_2d_vtrack_agg(track, col_name, intervals, band, func):
         chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
 
     for (c1, c2), interval_list in chrom_pair_intervals.items():
-        filepath = _find_2d_track_file(track_path, c1, c2)
-        if filepath is None:
-            # No data file for this chrom pair — values stay NaN.
+        pair = open_2d_pair(track_path, c1, c2)
+        if pair is None:
+            # No data for this chrom pair — values stay NaN.
             continue
 
-        file_is_points, num_objs, data = _read_file_header(filepath)
+        file_is_points, num_objs, data, root_chunk_fpos, close_fn = pair
         try:
             if num_objs == 0:
                 continue
-            root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
 
             # Build batch query rectangles: (N, 4) int64 array
             # Query rect coords: (s1, s2, e1, e2) maps to (qx1, qy1, qx2, qy2)
@@ -363,7 +356,7 @@ def _gextract_2d_vtrack_agg(track, col_name, intervals, band, func):
                 elif func == "avg":
                     values[idx] = float(batch["weighted_sum"][j]) / float(occ[j])
         finally:
-            data.close()
+            close_fn()
 
     return _pandas.DataFrame({
         "chrom1": intervals["chrom1"].to_numpy(),
@@ -403,9 +396,8 @@ def _gextract_2d_vtrack_objects(track, col_name, intervals, band, func):
         chrom2, start2, end2, <col_name>, intervalID.
     """
     import random
-    import struct
 
-    from ._quadtree import _read_file_header, query_2d_track_opened
+    from ._quadtree import open_2d_pair, query_2d_track_opened
     from .tracks import gtrack_info
 
     track_path = _pymisha.pm_track_path(track)
@@ -436,15 +428,14 @@ def _gextract_2d_vtrack_objects(track, col_name, intervals, band, func):
         chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
 
     for (c1, c2), interval_list in chrom_pair_intervals.items():
-        filepath = _find_2d_track_file(track_path, c1, c2)
-        if filepath is None:
+        pair = open_2d_pair(track_path, c1, c2)
+        if pair is None:
             continue
 
-        file_is_points, num_objs, data = _read_file_header(filepath)
+        file_is_points, num_objs, data, root_chunk_fpos, close_fn = pair
         try:
             if num_objs == 0:
                 continue
-            root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
 
             for interval_idx, s1, e1, s2, e2 in interval_list:
                 objs = query_2d_track_opened(
@@ -470,7 +461,7 @@ def _gextract_2d_vtrack_objects(track, col_name, intervals, band, func):
                     val = chosen[2] if is_points else chosen[4]
                     values[interval_idx] = float(val)
         finally:
-            data.close()
+            close_fn()
 
     return _pandas.DataFrame({
         "chrom1": intervals["chrom1"].to_numpy(),

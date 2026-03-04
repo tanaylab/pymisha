@@ -14,4 +14,3 @@ The following R misha features are not implemented in PyMisha and are not planne
 
 - **Cluster Submission:** `gcluster.run` is an R-specific wrapper for submitting jobs to an SGE/PBS cluster. It has no equivalent in Python genomics workflows, where users typically use their own job schedulers (snakemake, nextflow, etc.).
 
-- **Strand Autocorrelation:** `gcompute_strands_autocorr` is a niche analysis function for computing strand-specific autocorrelation. It has very few users in practice.

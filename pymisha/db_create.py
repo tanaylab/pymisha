@@ -360,9 +360,15 @@ def _interval_set_is_2d(intervals_dir):
 
 
 def _convert_all_tracks_to_indexed(groot, verbose=False):
-    from .tracks import gtrack_convert_to_indexed, gtrack_info, gtrack_ls
+    from .tracks import (
+        gtrack_2d_convert_to_indexed,
+        gtrack_convert_to_indexed,
+        gtrack_info,
+        gtrack_ls,
+    )
 
-    converted = 0
+    converted_1d = 0
+    converted_2d = 0
     failed = 0
     tracks = gtrack_ls() or []
 
@@ -381,18 +387,29 @@ def _convert_all_tracks_to_indexed(groot, verbose=False):
             continue
 
         track_type = info.get("type")
-        if track_type not in {"dense", "sparse", "array"}:
-            continue
 
-        try:
-            gtrack_convert_to_indexed(track, remove_old=False)
-            converted += 1
-        except Exception as exc:
-            warnings.warn(f"Failed to convert track '{track}': {exc}", stacklevel=2)
-            failed += 1
+        # 1D tracks
+        if track_type in {"dense", "sparse", "array"}:
+            try:
+                gtrack_convert_to_indexed(track, remove_old=False)
+                converted_1d += 1
+            except Exception as exc:
+                warnings.warn(f"Failed to convert track '{track}': {exc}", stacklevel=2)
+                failed += 1
+        # 2D tracks
+        elif track_type in {"rectangles", "points"}:
+            try:
+                gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
+                converted_2d += 1
+            except Exception as exc:
+                warnings.warn(f"Failed to convert 2D track '{track}': {exc}", stacklevel=2)
+                failed += 1
 
     if verbose:
-        print(f"Converted tracks to indexed format: {converted} converted, {failed} failed")
+        print(
+            f"Converted tracks to indexed format: "
+            f"{converted_1d} 1D + {converted_2d} 2D converted, {failed} failed"
+        )
 
 
 def _convert_all_intervals_to_indexed(groot, remove_old_files=False, verbose=False):

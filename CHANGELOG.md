@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.14 (2026-03-04)
+
+### Features
+- **Indexed 2D track support:** `gtrack_2d_convert_to_indexed()` converts per-chromosome-pair 2D tracks to single-file indexed format (`track.dat` + `track.idx`), matching R misha 5.5.0.
+- Auto-conversion of 2D tracks to indexed format when database is indexed via `gdb_convert_to_indexed()`.
+- `gdb_convert_to_indexed()` now includes 2D tracks (rectangles and points) in batch conversion.
+- `gtrack_convert_to_indexed()` auto-dispatches to 2D conversion for 2D tracks.
+- 2D tracks created via `gtrack_2d_create()` and `gtrack_2d_import_contacts()` are automatically converted to indexed format when the database is in indexed mode.
+
+### Performance
+- Indexed 2D tracks reduce file descriptor usage from O(N^2) to O(1) per track.
+- Single mmap for indexed track.dat eliminates per-pair file open/close overhead.
+
 ## v0.1.13 (2026-03-03)
 
 ### Features
