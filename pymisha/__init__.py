@@ -109,6 +109,12 @@ from .intervals import (
     giterator_cartesian_grid,
     giterator_intervals,
 )
+from .intervals_attr import (
+    gintervals_attr_export,
+    gintervals_attr_get,
+    gintervals_attr_import,
+    gintervals_attr_set,
+)
 from .liftover import (
     gintervals_as_chain,
     gintervals_liftover,
@@ -310,6 +316,10 @@ __all__ = [
     'gintervals_update',
     'gintervals_mapply',
     'gintervals_rm',
+    'gintervals_attr_get',
+    'gintervals_attr_set',
+    'gintervals_attr_export',
+    'gintervals_attr_import',
     'giterator_cartesian_grid',
     'giterator_intervals',
     'giterator_intervals_2d',

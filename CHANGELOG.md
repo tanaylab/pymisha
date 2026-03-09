@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.15 (2026-03-09)
+
+### Features
+- **Interval set attributes:** `gintervals_attr_get()`, `gintervals_attr_set()`, `gintervals_attr_export()`, `gintervals_attr_import()` for managing interval set attributes stored as `.iattr` binary files next to `.interv` files. Matches R misha `gintervals.attr.*` API.
+- `gintervals_rm()` now cleans up companion `.iattr` files when deleting interval sets.
+
+### Testing
+- 24 new tests covering basic get/set, export/import, cleanup on deletion, bulk operations, and edge cases.
+
 ## v0.1.14 (2026-03-04)
 
 ### Features

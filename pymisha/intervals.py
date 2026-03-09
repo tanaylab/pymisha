@@ -4245,6 +4245,10 @@ def gintervals_rm(intervals_set, force=False):
         shutil.rmtree(interv_path)
     else:
         interv_path.unlink()
+        # Also remove companion .iattr file for small interval sets
+        iattr_path = interv_path.with_suffix(".iattr")
+        if iattr_path.exists():
+            iattr_path.unlink()
 
 
 def _open_genes_file(path_or_url):
