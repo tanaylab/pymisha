@@ -26,9 +26,11 @@ jobs:
           CIBW_BUILD_VERBOSITY: 1
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: wheels-${{ matrix.os }}
           path: ./wheelhouse/*.whl
+          if-no-files-found: ignore
 
   build_sdist:
     name: Build source distribution
@@ -47,6 +49,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [build_wheels, build_sdist]
+    if: always() && needs.build_sdist.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
