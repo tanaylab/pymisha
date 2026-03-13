@@ -55,6 +55,7 @@ from .gdir import (
 from .gsynth import (
     GsynthModel,
     gsynth_bin_map,
+    gsynth_convert,
     gsynth_load,
     gsynth_random,
     gsynth_replace_kmer,
@@ -375,6 +376,7 @@ __all__ = [
     'gsynth_replace_kmer',
     'gsynth_save',
     'gsynth_load',
+    'gsynth_convert',
 
     # Internal (shared)
     '_bound_colname',

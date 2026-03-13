@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.16 (2026-03-13)
+
+### Features
+- **Cross-platform `.gsm` format for gsynth models:** `gsynth_save()` and `gsynth_load()` now use a YAML metadata + binary arrays format readable by both Python and R misha. Legacy pickle files are still supported via automatic format detection.
+- Added `compress` parameter to `gsynth_save()` for optional ZIP archive output.
+- Added `gsynth_convert()` to migrate legacy pickle model files to `.gsm` format.
+- Added `min_obs` field to `GsynthModel` dataclass.
+- Added `pyyaml` as a dependency.
+
+### Testing
+- 9 new tests covering directory/ZIP round-trip, legacy pickle backward compatibility, conversion, and min_obs preservation.
+- Cross-platform compatibility verified with R misha (Python saves, R loads and vice versa).
+
 ## v0.1.15 (2026-03-09)
 
 ### Features

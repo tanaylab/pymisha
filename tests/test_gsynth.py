@@ -1,6 +1,8 @@
 """Tests for gsynth functions."""
 
 import os
+import pickle
+import shutil
 import tempfile
 
 import numpy as np
@@ -138,23 +140,64 @@ class TestGsynthTrain:
 
 
 class TestGsynthSaveLoad:
-    """Tests for gsynth_save and gsynth_load functions."""
+    """Tests for gsynth_save and gsynth_load functions (.gsm format)."""
 
-    def test_save_load_roundtrip(self):
-        """Saved and loaded model should match."""
+    def _train_1d_model(self):
+        """Helper: train a 1D model for save/load tests."""
+        return pm.gsynth_train(
+            {"expr": "test_vt", "breaks": [0, 0.5, 1.0]},
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+        )
+
+    def test_save_load_roundtrip_directory(self):
+        """Saved and loaded model should match (directory mode)."""
         pm.gvtrack_create("test_vt", "dense_track", "avg")
         try:
-            model = pm.gsynth_train(
-                {"expr": "test_vt", "breaks": [0, 0.5, 1.0]},
-                intervals=pm.gintervals("1", 0, 10000),
-                iterator=200,
-            )
-
-            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-                path = f.name
+            model = self._train_1d_model()
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
             try:
                 pm.gsynth_save(model, path)
-                assert os.path.exists(path)
+                assert os.path.isdir(path)
+                assert os.path.exists(os.path.join(path, "metadata.yaml"))
+                assert os.path.exists(os.path.join(path, "counts.bin"))
+                assert os.path.exists(os.path.join(path, "cdf.bin"))
+
+                loaded = pm.gsynth_load(path)
+                assert isinstance(loaded, pm.GsynthModel)
+                assert loaded.n_dims == model.n_dims
+                assert loaded.total_bins == model.total_bins
+                assert loaded.total_kmers == model.total_kmers
+                assert loaded.pseudocount == model.pseudocount
+                assert loaded.min_obs == model.min_obs
+                assert loaded.total_masked == model.total_masked
+                assert loaded.total_n == model.total_n
+                assert loaded.dim_sizes == model.dim_sizes
+                # Compare counts
+                for orig, load in zip(model.model_data["counts"],
+                                      loaded.model_data["counts"], strict=False):
+                    np.testing.assert_array_equal(orig, load)
+                # Compare CDFs
+                for orig, load in zip(model.model_data["cdf"],
+                                      loaded.model_data["cdf"], strict=False):
+                    np.testing.assert_array_almost_equal(orig, load)
+                # Compare per_bin_kmers
+                np.testing.assert_array_equal(model.per_bin_kmers, loaded.per_bin_kmers)
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            pm.gvtrack_rm("test_vt")
+
+    def test_save_load_roundtrip_zip(self):
+        """Saved and loaded model should match (ZIP/compress mode)."""
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            model = self._train_1d_model()
+            with tempfile.NamedTemporaryFile(suffix=".gsm.zip", delete=False) as f:
+                path = f.name
+            try:
+                pm.gsynth_save(model, path, compress=True)
+                assert os.path.isfile(path)
                 assert os.path.getsize(path) > 0
 
                 loaded = pm.gsynth_load(path)
@@ -163,10 +206,34 @@ class TestGsynthSaveLoad:
                 assert loaded.total_bins == model.total_bins
                 assert loaded.total_kmers == model.total_kmers
                 assert loaded.pseudocount == model.pseudocount
-                # Compare CDFs
                 for orig, load in zip(model.model_data["cdf"],
                                       loaded.model_data["cdf"], strict=False):
                     np.testing.assert_array_almost_equal(orig, load)
+                for orig, load in zip(model.model_data["counts"],
+                                      loaded.model_data["counts"], strict=False):
+                    np.testing.assert_array_equal(orig, load)
+            finally:
+                os.unlink(path)
+        finally:
+            pm.gvtrack_rm("test_vt")
+
+    def test_legacy_pickle_backward_compat(self):
+        """Loading a legacy pickle model should still work."""
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            model = self._train_1d_model()
+            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+                path = f.name
+            try:
+                # Save with old pickle format directly
+                with open(path, "wb") as f:
+                    pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                loaded = pm.gsynth_load(path)
+                assert isinstance(loaded, pm.GsynthModel)
+                assert loaded.n_dims == model.n_dims
+                assert loaded.total_bins == model.total_bins
+                assert loaded.total_kmers == model.total_kmers
             finally:
                 os.unlink(path)
         finally:
@@ -175,11 +242,10 @@ class TestGsynthSaveLoad:
     def test_save_non_model_raises(self):
         """Saving non-GsynthModel raises TypeError."""
         with pytest.raises(TypeError, match="GsynthModel"):
-            pm.gsynth_save("not_a_model", "/tmp/test.pkl")
+            pm.gsynth_save("not_a_model", "/tmp/test.gsm")
 
     def test_load_non_model_raises(self):
-        """Loading non-GsynthModel file raises TypeError."""
-        import pickle
+        """Loading non-GsynthModel pickle file raises TypeError."""
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             pickle.dump({"not": "a model"}, f)
             path = f.name
@@ -188,6 +254,107 @@ class TestGsynthSaveLoad:
                 pm.gsynth_load(path)
         finally:
             os.unlink(path)
+
+    def test_gsynth_convert(self):
+        """gsynth_convert converts legacy pickle to .gsm format."""
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            model = self._train_1d_model()
+            tmpdir = tempfile.mkdtemp()
+            pkl_path = os.path.join(tmpdir, "model.pkl")
+            gsm_path = os.path.join(tmpdir, "model.gsm")
+            try:
+                # Save as legacy pickle
+                with open(pkl_path, "wb") as f:
+                    pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                pm.gsynth_convert(pkl_path, gsm_path)
+                assert os.path.isdir(gsm_path)
+
+                loaded = pm.gsynth_load(gsm_path)
+                assert loaded.total_bins == model.total_bins
+                assert loaded.total_kmers == model.total_kmers
+                for orig, load in zip(model.model_data["cdf"],
+                                      loaded.model_data["cdf"], strict=False):
+                    np.testing.assert_array_almost_equal(orig, load)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        finally:
+            pm.gvtrack_rm("test_vt")
+
+    def test_min_obs_preserved_roundtrip(self):
+        """min_obs is preserved through save/load round-trip."""
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            model = pm.gsynth_train(
+                {"expr": "test_vt", "breaks": [0, 0.5, 1.0]},
+                intervals=pm.gintervals("1", 0, 10000),
+                iterator=200,
+                min_obs=42,
+            )
+            assert model.min_obs == 42
+
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
+            try:
+                pm.gsynth_save(model, path)
+                loaded = pm.gsynth_load(path)
+                assert loaded.min_obs == 42
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            pm.gvtrack_rm("test_vt")
+
+    def test_0d_model_roundtrip(self):
+        """0-dim (unstratified) model saves and loads correctly."""
+        model = pm.gsynth_train()
+        assert model.n_dims == 0
+        assert model.total_bins == 1
+        assert model.dim_sizes == [1]
+
+        path = os.path.join(tempfile.mkdtemp(), "model_0d.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            loaded = pm.gsynth_load(path)
+            assert loaded.n_dims == 0
+            assert loaded.total_bins == 1
+            assert loaded.dim_sizes == [1]
+            assert loaded.total_kmers == model.total_kmers
+            np.testing.assert_array_equal(
+                model.model_data["counts"][0], loaded.model_data["counts"][0]
+            )
+            np.testing.assert_array_almost_equal(
+                model.model_data["cdf"][0], loaded.model_data["cdf"][0]
+            )
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_dim_specs_preserved(self):
+        """dim_specs including bin_map are preserved through round-trip."""
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "test_vt",
+                    "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                    "bin_merge": [{"from": (0.8, float("inf")), "to": (0.6, 0.8)}],
+                },
+                intervals=pm.gintervals("1", 0, 10000),
+                iterator=200,
+            )
+            assert model.dim_specs[0]["bin_map"] is not None
+
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
+            try:
+                pm.gsynth_save(model, path)
+                loaded = pm.gsynth_load(path)
+                assert loaded.dim_specs[0]["expr"] == model.dim_specs[0]["expr"]
+                assert loaded.dim_specs[0]["num_bins"] == model.dim_specs[0]["num_bins"]
+                assert loaded.dim_specs[0]["breaks"] == model.dim_specs[0]["breaks"]
+                assert loaded.dim_specs[0]["bin_map"] == [int(x) for x in model.dim_specs[0]["bin_map"]]
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            pm.gvtrack_rm("test_vt")
 
 
 # ============================================================================
@@ -800,8 +967,7 @@ class TestGsynthSaveLoadAdvanced:
                 iterator=200,
             )
 
-            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-                path = f.name
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
             try:
                 pm.gsynth_save(model, path)
                 loaded = pm.gsynth_load(path)
@@ -843,7 +1009,7 @@ class TestGsynthSaveLoadAdvanced:
                     model.model_data["cdf"]
                 )
             finally:
-                os.unlink(path)
+                shutil.rmtree(path, ignore_errors=True)
         finally:
             pm.gvtrack_rm("g_frac")
             pm.gvtrack_rm("c_frac")
@@ -866,8 +1032,7 @@ class TestGsynthSaveLoadAdvanced:
                 iterator=200,
             )
 
-            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-                path = f.name
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
             try:
                 pm.gsynth_save(model, path)
                 loaded = pm.gsynth_load(path)
@@ -894,7 +1059,7 @@ class TestGsynthSaveLoadAdvanced:
                         model.dim_specs[d]["bin_map"],
                     )
             finally:
-                os.unlink(path)
+                shutil.rmtree(path, ignore_errors=True)
         finally:
             pm.gvtrack_rm("g_frac")
             pm.gvtrack_rm("c_frac")
@@ -910,8 +1075,7 @@ class TestGsynthSaveLoadAdvanced:
                 iterator=200,
             )
 
-            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-                path = f.name
+            path = os.path.join(tempfile.mkdtemp(), "model.gsm")
             try:
                 pm.gsynth_save(model, path)
                 loaded = pm.gsynth_load(path)
@@ -921,7 +1085,7 @@ class TestGsynthSaveLoadAdvanced:
                 s2 = pm.gsynth_sample(loaded, intervals=ivs, iterator=200, seed=42)
                 assert s1 == s2
             finally:
-                os.unlink(path)
+                shutil.rmtree(path, ignore_errors=True)
         finally:
             pm.gvtrack_rm("test_vt")
 
@@ -986,8 +1150,7 @@ class TestGsynth0D:
             intervals=pm.gintervals("1", 0, 50000),
             iterator=1000,
         )
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            path = f.name
+        path = os.path.join(tempfile.mkdtemp(), "model_0d.gsm")
         try:
             pm.gsynth_save(model, path)
             loaded = pm.gsynth_load(path)
@@ -999,7 +1162,7 @@ class TestGsynth0D:
                 loaded.per_bin_kmers, model.per_bin_kmers
             )
         finally:
-            os.unlink(path)
+            shutil.rmtree(path, ignore_errors=True)
 
     def test_0d_per_bin_kmers_equals_total(self):
         """Single bin should contain all k-mers."""

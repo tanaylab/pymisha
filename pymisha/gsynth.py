@@ -3,14 +3,15 @@
 import logging as _logging
 import multiprocessing as _multiprocessing
 import os as _os
-import pickle as _pickle
+import zipfile as _zipfile
 from dataclasses import dataclass as _dataclass
 from dataclasses import field as _field
 from typing import Any as _Any
 
 import numpy as _numpy
+import yaml as _yaml
 
-from ._safe_pickle import restricted_load, restricted_loads
+from ._safe_pickle import restricted_load
 from ._shared import _checkroot, _df2pymisha, _pymisha
 from .extract import _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
@@ -87,6 +88,7 @@ class GsynthModel:
     total_masked: int = 0
     total_n: int = 0
     pseudocount: float = 1.0
+    min_obs: int = 0
 
     def __repr__(self):
         lines = [
@@ -99,6 +101,8 @@ class GsynthModel:
             f"  N positions: {self.total_n:,}",
             f"  Pseudocount: {self.pseudocount}",
         ]
+        if self.min_obs > 0:
+            lines.append(f"  Min observations: {self.min_obs}")
         for i, spec in enumerate(self.dim_specs):
             lines.append(f"  Dim {i + 1}: expr='{spec.get('expr', '')}', "
                          f"bins={spec.get('num_bins', '?')}")
@@ -785,6 +789,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
             total_masked=int(result["total_masked"]),
             total_n=int(result["total_n"]),
             pseudocount=pseudocount,
+            min_obs=min_obs,
         )
 
     # --- Single-process path (original logic) ---
@@ -824,6 +829,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
         total_masked=int(result["total_masked"]),
         total_n=int(result["total_n"]),
         pseudocount=pseudocount,
+        min_obs=min_obs,
     )
 
 
@@ -1348,26 +1354,27 @@ def gsynth_replace_kmer(target, replacement, *, intervals=None, output=None,
 # gsynth_save / gsynth_load
 # ---------------------------------------------------------------------------
 
-def gsynth_save(model, path):
-    """Save a trained model to disk.
+def gsynth_save(model, path, *, compress=False):
+    """Save a trained model to disk in .gsm format.
 
-    Serialises a :class:`GsynthModel` to a binary file using Python's
-    ``pickle`` protocol.  The file can later be restored with
-    :func:`gsynth_load`.
+    Serialises a :class:`GsynthModel` to a cross-platform ``.gsm`` directory
+    (or ZIP archive when *compress=True*) containing YAML metadata and raw
+    binary arrays.  The file can later be restored with :func:`gsynth_load`.
 
-    .. note::
-
-       The on-disk format is Python ``pickle`` (not R ``RDS``).  Models
-       saved with this function cannot be loaded by the R ``misha`` package
-       and vice versa.
+    The ``.gsm`` format stores counts and CDFs as raw float64 arrays in
+    row-major (C) order, making them readable from both Python and R without
+    any language-specific serialisation quirks.
 
     Parameters
     ----------
     model : GsynthModel
         Trained model to save.
     path : str
-        Destination file path.  Parent directories are **not** created
-        automatically.
+        Destination path.  When *compress* is ``False`` (default), a directory
+        is created at this path.  When ``True``, a ZIP archive is written.
+        Parent directories are **not** created automatically.
+    compress : bool, default False
+        If ``True``, write a ZIP archive instead of a directory.
 
     Returns
     -------
@@ -1382,6 +1389,7 @@ def gsynth_save(model, path):
     --------
     gsynth_load : Restore a model saved by this function.
     gsynth_train : Create a model.
+    gsynth_convert : Convert legacy pickle models to ``.gsm`` format.
 
     Examples
     --------
@@ -1389,29 +1397,192 @@ def gsynth_save(model, path):
     >>> _ = pm.gdb_init_examples()
     >>> model = pm.gsynth_train()
     >>> import tempfile, os
-    >>> path = os.path.join(tempfile.mkdtemp(), "model.pkl")
+    >>> path = os.path.join(tempfile.mkdtemp(), "model.gsm")
     >>> pm.gsynth_save(model, path)
     """
     if not isinstance(model, GsynthModel):
         raise TypeError("model must be a GsynthModel")
 
-    payload = _pickle.dumps(model, protocol=_pickle.HIGHEST_PROTOCOL)
-    # Validate the payload against restricted loader before writing.
-    restricted_loads(payload, extra_allowed_globals={("pymisha.gsynth", "GsynthModel")})
-    with open(path, "wb") as f:
-        f.write(payload)
+    # Build metadata dict
+    total_bins = model.total_bins
+    per_bin_kmers = model.per_bin_kmers
+    per_bin_kmers_list = [int(x) for x in per_bin_kmers] if per_bin_kmers is not None else []
+
+    dim_specs_out = []
+    for spec in model.dim_specs:
+        ds = {
+            "expr": str(spec.get("expr", "")),
+            "breaks": [float(b) for b in spec.get("breaks", [])],
+            "num_bins": int(spec.get("num_bins", 0)),
+            "bin_map": (
+                [int(x) for x in spec["bin_map"]]
+                if spec.get("bin_map") is not None
+                else None
+            ),
+        }
+        dim_specs_out.append(ds)
+
+    metadata = {
+        "format": "gsynth_model",
+        "version": 1,
+        "markov_order": 5,
+        "n_dims": int(model.n_dims),
+        "dim_sizes": [int(x) for x in model.dim_sizes],
+        "total_bins": int(total_bins),
+        "pseudocount": float(model.pseudocount),
+        "min_obs": int(model.min_obs),
+        "total_kmers": int(model.total_kmers),
+        "total_masked": int(model.total_masked),
+        "total_n": int(model.total_n),
+        "per_bin_kmers": per_bin_kmers_list,
+        "dim_specs": dim_specs_out,
+        "data": {
+            "counts": {
+                "dtype": "float64",
+                "shape": [int(total_bins), 1024, 4],
+                "order": "C",
+                "file": "counts.bin",
+            },
+            "cdf": {
+                "dtype": "float64",
+                "shape": [int(total_bins), 1024, 4],
+                "order": "C",
+                "file": "cdf.bin",
+            },
+        },
+    }
+
+    # Stack arrays into contiguous float64
+    counts_arr = _numpy.stack(model.model_data["counts"]).astype(_numpy.float64)
+    cdf_arr = _numpy.stack(model.model_data["cdf"]).astype(_numpy.float64)
+
+    metadata_bytes = _yaml.dump(metadata, default_flow_style=False, sort_keys=False).encode("utf-8")
+    counts_bytes = counts_arr.tobytes()  # C order by default
+    cdf_bytes = cdf_arr.tobytes()
+
+    if compress:
+        with _zipfile.ZipFile(path, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("metadata.yaml", metadata_bytes)
+            zf.writestr("counts.bin", counts_bytes)
+            zf.writestr("cdf.bin", cdf_bytes)
+    else:
+        _os.makedirs(path, exist_ok=True)
+        with open(_os.path.join(path, "metadata.yaml"), "wb") as f:
+            f.write(metadata_bytes)
+        with open(_os.path.join(path, "counts.bin"), "wb") as f:
+            f.write(counts_bytes)
+        with open(_os.path.join(path, "cdf.bin"), "wb") as f:
+            f.write(cdf_bytes)
+
+
+def _load_legacy_pickle(path):
+    """Load a legacy pickle-format GsynthModel.
+
+    Parameters
+    ----------
+    path : str
+        Path to the pickle file.
+
+    Returns
+    -------
+    GsynthModel
+        The deserialised model.
+
+    Raises
+    ------
+    TypeError
+        If the deserialised object is not a :class:`GsynthModel`.
+    """
+    with open(path, "rb") as f:
+        model = restricted_load(
+            f, extra_allowed_globals={("pymisha.gsynth", "GsynthModel")}
+        )
+    if not isinstance(model, GsynthModel):
+        raise TypeError("Loaded object is not a GsynthModel")
+    # Backfill min_obs for models created before it was added
+    if not hasattr(model, "min_obs"):
+        model.min_obs = 0
+    return model
+
+
+def _load_gsm_from_meta_and_files(metadata, read_file):
+    """Build a GsynthModel from parsed metadata and a file-reader callable.
+
+    Parameters
+    ----------
+    metadata : dict
+        Parsed metadata.yaml content.
+    read_file : callable
+        ``read_file(name)`` returns bytes for the named file
+        (``"counts.bin"`` or ``"cdf.bin"``).
+
+    Returns
+    -------
+    GsynthModel
+    """
+    fmt = metadata.get("format")
+    version = metadata.get("version")
+    if fmt != "gsynth_model":
+        raise ValueError(f"Unknown format: {fmt!r}")
+    if version != 1:
+        raise ValueError(f"Unsupported version: {version}")
+
+    total_bins = int(metadata["total_bins"])
+    shape = (total_bins, 1024, 4)
+
+    counts_raw = _numpy.frombuffer(read_file("counts.bin"), dtype=_numpy.float64).reshape(shape)
+    cdf_raw = _numpy.frombuffer(read_file("cdf.bin"), dtype=_numpy.float64).reshape(shape)
+
+    # Split into per-bin arrays; counts back to uint64
+    counts_list = [counts_raw[i].astype(_numpy.uint64) for i in range(total_bins)]
+    cdf_list = [cdf_raw[i].copy() for i in range(total_bins)]
+
+    # Reconstruct dim_specs
+    dim_specs = []
+    for ds in metadata.get("dim_specs", []):
+        spec = {
+            "expr": ds["expr"],
+            "breaks": ds["breaks"],
+            "num_bins": ds["num_bins"],
+            "bin_map": ds.get("bin_map"),
+        }
+        dim_specs.append(spec)
+
+    per_bin_kmers_raw = metadata.get("per_bin_kmers", [])
+    if per_bin_kmers_raw is not None and not isinstance(per_bin_kmers_raw, list):
+        per_bin_kmers_raw = [per_bin_kmers_raw]  # YAML scalar → list
+    per_bin_kmers = (
+        _numpy.atleast_1d(_numpy.array(per_bin_kmers_raw, dtype=_numpy.int64))
+        if per_bin_kmers_raw
+        else None
+    )
+
+    return GsynthModel(
+        n_dims=int(metadata.get("n_dims", 0)),
+        dim_sizes=[int(x) for x in metadata.get("dim_sizes", [])],
+        dim_specs=dim_specs,
+        total_bins=total_bins,
+        model_data={"counts": counts_list, "cdf": cdf_list},
+        total_kmers=int(metadata.get("total_kmers", 0)),
+        per_bin_kmers=per_bin_kmers,
+        total_masked=int(metadata.get("total_masked", 0)),
+        total_n=int(metadata.get("total_n", 0)),
+        pseudocount=float(metadata.get("pseudocount", 1.0)),
+        min_obs=int(metadata.get("min_obs", 0)),
+    )
 
 
 def gsynth_load(path):
     """Load a trained model from disk.
 
-    Restores a :class:`GsynthModel` previously saved with
-    :func:`gsynth_save`.
+    Auto-detects the format: ``.gsm`` directory, ``.gsm`` ZIP archive, or
+    legacy pickle.
 
     Parameters
     ----------
     path : str
-        Path to the saved model file (pickle format).
+        Path to the saved model.  Can be a ``.gsm`` directory, a ZIP file,
+        or a legacy pickle file.
 
     Returns
     -------
@@ -1424,6 +1595,8 @@ def gsynth_load(path):
         If the deserialised object is not a :class:`GsynthModel`.
     FileNotFoundError
         If *path* does not exist.
+    ValueError
+        If the format or version is unrecognised.
 
     See Also
     --------
@@ -1437,18 +1610,64 @@ def gsynth_load(path):
     >>> _ = pm.gdb_init_examples()
     >>> model = pm.gsynth_train()
     >>> import tempfile, os
-    >>> path = os.path.join(tempfile.mkdtemp(), "model.pkl")
+    >>> path = os.path.join(tempfile.mkdtemp(), "model.gsm")
     >>> pm.gsynth_save(model, path)
     >>> restored = pm.gsynth_load(path)
     >>> restored.total_bins == model.total_bins
     True
     """
-    with open(path, "rb") as f:
-        model = restricted_load(
-            f, extra_allowed_globals={("pymisha.gsynth", "GsynthModel")}
-        )
+    # Directory-based .gsm
+    if _os.path.isdir(path):
+        meta_path = _os.path.join(path, "metadata.yaml")
+        if not _os.path.exists(meta_path):
+            raise FileNotFoundError(f"metadata.yaml not found in {path}")
+        with open(meta_path) as f:
+            metadata = _yaml.safe_load(f)
 
-    if not isinstance(model, GsynthModel):
-        raise TypeError("Loaded object is not a GsynthModel")
+        def read_file(name):
+            with open(_os.path.join(path, name), "rb") as fh:
+                return fh.read()
 
-    return model
+        return _load_gsm_from_meta_and_files(metadata, read_file)
+
+    # File-based: try ZIP first, then legacy pickle
+    if _os.path.isfile(path):
+        if _zipfile.is_zipfile(path):
+            with _zipfile.ZipFile(path, "r") as zf:
+                names = zf.namelist()
+                if "metadata.yaml" in names:
+                    metadata = _yaml.safe_load(zf.read("metadata.yaml"))
+                    return _load_gsm_from_meta_and_files(metadata, zf.read)
+        # Fall back to legacy pickle
+        return _load_legacy_pickle(path)
+
+    raise FileNotFoundError(f"Path not found: {path}")
+
+
+def gsynth_convert(input_path, output_path, *, compress=False):
+    """Convert a legacy pickle model to ``.gsm`` format.
+
+    Reads a model from *input_path* (any supported format, including legacy
+    pickle) and writes it to *output_path* in the cross-platform ``.gsm``
+    format.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to the source model (pickle, ``.gsm`` directory, or ZIP).
+    output_path : str
+        Destination path for the ``.gsm`` output.
+    compress : bool, default False
+        If ``True``, write a ZIP archive instead of a directory.
+
+    Returns
+    -------
+    None
+
+    See Also
+    --------
+    gsynth_save : Save a model in ``.gsm`` format.
+    gsynth_load : Load a model from any supported format.
+    """
+    model = gsynth_load(input_path)
+    gsynth_save(model, output_path, compress=compress)
