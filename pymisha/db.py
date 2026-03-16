@@ -67,6 +67,10 @@ def gdb_init(path: str, userpath: str = None):
     _shared._GDATASETS = []
     _shared._VTRACKS = {}
 
+    # Clear interval scan cache from previous session
+    from .dataset import _clear_dataset_scan_cache
+    _clear_dataset_scan_cache()
+
     _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _pymisha.pm_dbsetdatasets([])
 
@@ -171,6 +175,9 @@ def gdb_unload():
     _shared._GWD = None
     _shared._GDATASETS = []
     _shared._VTRACKS = {}
+
+    from .dataset import _clear_dataset_scan_cache
+    _clear_dataset_scan_cache()
 
 
 def gdb_examples_path():

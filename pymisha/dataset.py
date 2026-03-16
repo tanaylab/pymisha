@@ -88,9 +88,17 @@ def _scan_intervals(root: str) -> set[str]:
 _DATASET_SCAN_CACHE: dict[str, tuple[set[str], set[str]]] = {}
 
 
+def _clear_dataset_scan_cache() -> None:
+    _DATASET_SCAN_CACHE.clear()
+
+
 def _sync_dataset_scan_cache() -> None:
-    loaded = set(_shared._GDATASETS)
-    stale = [p for p in _DATASET_SCAN_CACHE if p not in loaded]
+    keep = set(_shared._GDATASETS)
+    if _shared._GROOT:
+        keep.add(_normalize_path(_shared._GROOT))
+    if _shared._UROOT:
+        keep.add(_normalize_path(_shared._UROOT))
+    stale = [p for p in _DATASET_SCAN_CACHE if p not in keep]
     for path in stale:
         _DATASET_SCAN_CACHE.pop(path, None)
 
@@ -270,18 +278,18 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     dataset_tracks = _scan_tracks(path_norm)
     dataset_intervals = _scan_intervals(path_norm)
 
-    existing_tracks = _scan_tracks(groot)
-    existing_intervals = _scan_intervals(groot)
-    if _shared._UROOT:
-        existing_tracks |= _scan_tracks(_shared._UROOT)
-        existing_intervals |= _scan_intervals(_shared._UROOT)
+    # Use C++ track cache for existing tracks (avoids redundant Python
+    # filesystem scans of the working db, user root, and loaded datasets).
+    existing_tracks = set(_pymisha.pm_track_names())
+
+    # For intervals, use cached scans (C++ backend doesn't cache intervals).
+    existing_intervals: set[str] = set()
     _sync_dataset_scan_cache()
-    for ds in _shared._GDATASETS:
-        cached = _DATASET_SCAN_CACHE.get(ds)
+    for db in [groot] + ([_shared._UROOT] if _shared._UROOT else []) + list(_shared._GDATASETS):
+        cached = _DATASET_SCAN_CACHE.get(db)
         if cached is None:
-            cached = (_scan_tracks(ds), _scan_intervals(ds))
-            _DATASET_SCAN_CACHE[ds] = cached
-        existing_tracks |= cached[0]
+            cached = (_scan_tracks(db), _scan_intervals(db))
+            _DATASET_SCAN_CACHE[db] = cached
         existing_intervals |= cached[1]
 
     track_collisions = dataset_tracks & existing_tracks
