@@ -1161,10 +1161,7 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
     _checkroot()
 
     # Capture caller namespace for user variable resolution
-    if vars is not None:
-        caller_ns = dict(vars)
-    else:
-        caller_ns = _caller_namespace(depth=1)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
 
@@ -1442,10 +1439,7 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
     _checkroot()
 
     # Capture caller namespace for user variable resolution
-    if vars is not None:
-        caller_ns = dict(vars)
-    else:
-        caller_ns = _caller_namespace(depth=1)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)

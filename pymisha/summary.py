@@ -123,10 +123,7 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     _checkroot()
 
     # Capture caller namespace for user variable resolution
-    if vars is not None:
-        caller_ns = dict(vars)
-    else:
-        caller_ns = _caller_namespace(depth=1)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     if intervals is None:
         intervals = gintervals_all()
@@ -901,10 +898,7 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
     _checkroot()
 
     # Capture caller namespace for user variable resolution
-    if vars is not None:
-        caller_ns = dict(vars)
-    else:
-        caller_ns = _caller_namespace(depth=1)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)
@@ -1014,10 +1008,7 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
     _checkroot()
 
     # Capture caller namespace for user variable resolution
-    if vars is not None:
-        caller_ns = dict(vars)
-    else:
-        caller_ns = _caller_namespace(depth=1)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)

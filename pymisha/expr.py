@@ -113,9 +113,12 @@ def _caller_namespace(depth=1):
     """Capture the caller's local and global variables.
 
     Starts at the caller's frame and walks up through frames that share
-    the same ``f_globals`` (i.e. the same module).  This covers closure
-    variables defined in enclosing functions within the same module
-    without leaking into unrelated framework frames (pytest, etc.).
+    the same ``f_globals`` (i.e. the same module).  This covers variables
+    defined in enclosing functions — necessary because Python only creates
+    closure cells for variables directly referenced in inner bytecode, not
+    for variables that appear only inside string expressions.  Limiting the
+    walk to same-module frames avoids leaking names from unrelated framework
+    frames (pytest, etc.).
     """
     frame = sys._getframe(depth + 1)
     try:
