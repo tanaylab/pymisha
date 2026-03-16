@@ -27,6 +27,7 @@ requirements:
     - python
     - {{ pin_compatible("numpy") }}
     - pandas >=1.3
+    - pyyaml
 
 test:
   imports:
