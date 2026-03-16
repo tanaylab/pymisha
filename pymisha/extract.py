@@ -17,7 +17,7 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
 )
-from .expr import _expr_safe_name, _parse_expr_vars
+from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
 
 
@@ -526,7 +526,7 @@ def _gextract_2d_vtrack_global_percentile(track, col_name, intervals, band):
     return agg_df
 
 
-def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
+def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None, caller_ns=None):
     """
     Extract values from 2D tracks for 2D intervals.
 
@@ -682,10 +682,12 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
         for out_col, (orig_expr, expr_eval, _expr_tracks, expr_vtracks) in zip(
             out_cols, parsed, strict=False
         ):
+            user_vars = _resolve_user_vars(expr_eval, caller_ns) if caller_ns else {}
             allowed_names = {
                 "np",
                 "numpy",
                 *(_expr_safe_name(vt) for vt in expr_vtracks),
+                *user_vars.keys(),
             }
             try:
                 code_obj = compile_safe_expression(expr_eval, allowed_names)
@@ -693,6 +695,7 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
                 raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
 
             local_ns = {"np": _numpy, "numpy": _numpy}
+            local_ns.update(user_vars)
             for vt_name in expr_vtracks:
                 safe_col = _expr_safe_name(vt_name)
                 local_ns[safe_col] = result[safe_col].to_numpy(dtype=float, copy=False)
@@ -825,11 +828,13 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
     for out_col, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in zip(
         out_cols, parsed, strict=False
     ):
+        user_vars = _resolve_user_vars(expr_eval, caller_ns) if caller_ns else {}
         allowed_names = {
             "np",
             "numpy",
             *(_expr_safe_name(t) for t in expr_tracks),
             *(_expr_safe_name(vt) for vt in expr_vtracks),
+            *user_vars.keys(),
         }
         try:
             code_obj = compile_safe_expression(expr_eval, allowed_names)
@@ -837,6 +842,7 @@ def _gextract_2d(exprs, intervals, iterator=None, colnames=None, band=None):
             raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
 
         local_ns = {"np": _numpy, "numpy": _numpy}
+        local_ns.update(user_vars)
         for tname in expr_tracks:
             local_ns[_expr_safe_name(tname)] = result[track_cols[tname]].to_numpy(
                 dtype=float, copy=False
@@ -1080,7 +1086,7 @@ def _parallel_extract(exprs, intervals, iterator, config):
     return _pandas.concat(dfs, ignore_index=True)
 
 
-def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kwargs):
+def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars=None, **kwargs):
     """Return evaluated track expression values for each iterator interval.
 
     For each interval in the iterator, evaluates one or more track expressions
@@ -1109,6 +1115,9 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     band : tuple of (int, int), optional
         Diagonal band for 2D track extraction as ``(d1, d2)``. Only
         applicable with 2D intervals.
+    vars : dict, optional
+        Explicit variable bindings for the expression.  When provided,
+        these are used instead of auto-capturing the caller's namespace.
     **kwargs
         Additional keyword arguments:
 
@@ -1150,6 +1159,13 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     5
     """
     _checkroot()
+
+    # Capture caller namespace for user variable resolution
+    if vars is not None:
+        caller_ns = dict(vars)
+    else:
+        caller_ns = _caller_namespace(depth=1)
+
     exprs = [expr] if isinstance(expr, str) else list(expr)
 
     from .tracks import _check_computed_tracks
@@ -1174,7 +1190,8 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
                 f"expressions ({len(exprs)})"
             )
         df = _gextract_2d(
-            exprs, intervals, iterator=iterator, colnames=colnames, band=band
+            exprs, intervals, iterator=iterator, colnames=colnames, band=band,
+            caller_ns=caller_ns,
         )
         return _apply_extract_output(df, file, intervals_set_out, is_2d=True)
 
@@ -1196,11 +1213,15 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     parsed = []
     used_tracks = set()
     used_vtracks = set()
+    all_user_vars = {}
     for e in exprs:
         new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(e, track_names, vtrack_names)
         used_tracks.update(expr_tracks)
         used_vtracks.update(expr_vtracks)
         parsed.append((e, new_expr, expr_tracks, expr_vtracks))
+        # Resolve user variables from the caller's namespace
+        user_vars = _resolve_user_vars(new_expr, caller_ns)
+        all_user_vars.update(user_vars)
 
     for orig_expr, expr_eval, expr_tracks, expr_vtracks in parsed:
         allowed_names = {
@@ -1212,12 +1233,13 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
             *(_expr_safe_name(t) for t in expr_tracks),
             *(_expr_safe_name(vt) for vt in expr_vtracks),
         }
+        allowed_names |= set(all_user_vars.keys())
         try:
             compile_safe_expression(expr_eval, allowed_names)
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
 
-    if not used_vtracks:
+    if not used_vtracks and not all_user_vars:
         # Try parallel extraction if max_processes > 1.
         # Skip when a custom progress callback is provided (not compatible
         # with forked workers) or when file output is requested.
@@ -1302,6 +1324,7 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
             *(_expr_safe_name(t) for t in expr_tracks),
             *(_expr_safe_name(vt) for vt in expr_vtracks),
         }
+        allowed_names |= set(all_user_vars.keys())
         try:
             code_obj = compile_safe_expression(expr_eval, allowed_names)
         except UnsafeExpressionError as exc:
@@ -1342,6 +1365,8 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
             for vt, arr in precomputed_vtracks.items():
                 local_ns[_expr_safe_name(vt)] = arr[sl]
 
+            local_ns.update(all_user_vars)
+
             for colname, code_obj, _expr_tracks, _expr_vtracks in compiled:
                 result_values = eval(code_obj, {'__builtins__': {}}, local_ns)
                 if _numpy.isscalar(result_values):
@@ -1368,7 +1393,7 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, **kw
     return _apply_extract_output(result_df, file, intervals_set_out, is_2d=False)
 
 
-def gscreen(expr, intervals=None, **kwargs):
+def gscreen(expr, intervals=None, vars=None, **kwargs):
     """Find intervals where a logical track expression is True.
 
     Evaluates a logical track expression and returns all intervals where
@@ -1382,6 +1407,8 @@ def gscreen(expr, intervals=None, **kwargs):
     intervals : DataFrame or str, optional
         Genomic scope (chrom/start/end DataFrame or intervals set name).
         If None, uses ALLGENOME.
+    vars : dict, optional
+        Explicit variable bindings for the expression.
     **kwargs
         Additional keyword arguments:
 
@@ -1414,6 +1441,12 @@ def gscreen(expr, intervals=None, **kwargs):
     """
     _checkroot()
 
+    # Capture caller namespace for user variable resolution
+    if vars is not None:
+        caller_ns = dict(vars)
+    else:
+        caller_ns = _caller_namespace(depth=1)
+
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)
 
@@ -1436,6 +1469,7 @@ def gscreen(expr, intervals=None, **kwargs):
             intervals=intervals,
             iterator=iterator,
             band=band,
+            vars=caller_ns,
             progress=progress,
             progress_desc=progress_desc,
         )
@@ -1467,6 +1501,9 @@ def gscreen(expr, intervals=None, **kwargs):
     vtrack_names = set(_shared._VTRACKS.keys())
     expr_eval, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
 
+    # Resolve user variables from the caller's namespace
+    user_vars = _resolve_user_vars(expr_eval, caller_ns)
+
     allowed_names = {
         "np",
         "numpy",
@@ -1476,12 +1513,13 @@ def gscreen(expr, intervals=None, **kwargs):
         *(_expr_safe_name(t) for t in expr_tracks),
         *(_expr_safe_name(vt) for vt in expr_vtracks),
     }
+    allowed_names |= set(user_vars.keys())
     try:
         compile_safe_expression(expr_eval, allowed_names)
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
-    if not expr_vtracks:
+    if not expr_vtracks and not user_vars:
         with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_screen(
                 expr,
@@ -1558,6 +1596,8 @@ def gscreen(expr, intervals=None, **kwargs):
                 for vt in expr_vtracks:
                     vtrack_arrays[vt] = _compute_vtrack_values(vt, chunk_intervals)
                     local_ns[_expr_safe_name(vt)] = vtrack_arrays[vt]
+
+            local_ns.update(user_vars)
 
             chunk_mask = eval(code_obj, {'__builtins__': {}}, local_ns)
             chunk_mask = _numpy.asarray(chunk_mask, dtype=bool)

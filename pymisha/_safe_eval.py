@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 
+from .expr import _ALWAYS_ALLOWED_NAMES
+
 
 class UnsafeExpressionError(ValueError):
     """Raised when an expression fails security validation."""
@@ -110,7 +112,7 @@ def validate_expression_ast(expr, allowed_names):
                 f"Unsupported expression construct: {type(node).__name__}"
             )
 
-        if isinstance(node, ast.Name) and node.id not in allowed_names:
+        if isinstance(node, ast.Name) and node.id not in allowed_names and node.id not in _ALWAYS_ALLOWED_NAMES:
             raise UnsafeExpressionError(f"Unknown identifier '{node.id}' in expression")
 
         if isinstance(node, ast.Attribute):

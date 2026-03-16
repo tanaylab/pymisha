@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.18 (2026-03-16)
+
+### Features
+- **User variables in expressions:** Python variables from the caller's scope can now be used in expression strings passed to `gextract()`, `gscreen()`, `gdist()`, `gsummary()`, and `gquantiles()`. Variables are resolved via frame introspection at the API boundary. An optional `vars=` parameter allows explicit control. Track names and coordinates (`CHROM`, `START`, `END`) take priority over user variables. The AST-validated security sandbox is preserved.
+
+### Testing
+- 16 new tests covering module-level variables, function locals, closures, explicit `vars=`, virtual track integration, priority/shadowing, error handling, and numpy operations.
+
 ## v0.1.17 (2026-03-16)
 
 ### Features

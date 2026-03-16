@@ -1,8 +1,13 @@
 """Expression parsing helpers."""
 
+import ast
 import re
+import sys
 
 from . import _shared
+
+_BUILTIN_EXPR_NAMES = {"np", "numpy", "CHROM", "START", "END", "True", "False", "None"}
+_ALWAYS_ALLOWED_NAMES = _BUILTIN_EXPR_NAMES | {"abs", "min", "max", "round", "float", "int", "bool"}
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
@@ -102,3 +107,45 @@ def _parse_expr_vars(expr, track_names, vtrack_names):
         out.append(token)
 
     return ''.join(out), used_tracks, used_vtracks, var_map
+
+
+def _caller_namespace(depth=1):
+    """Capture the caller's local and global variables.
+
+    Starts at the caller's frame and walks up through frames that share
+    the same ``f_globals`` (i.e. the same module).  This covers closure
+    variables defined in enclosing functions within the same module
+    without leaking into unrelated framework frames (pytest, etc.).
+    """
+    frame = sys._getframe(depth + 1)
+    try:
+        caller_globals = frame.f_globals
+        ns = dict(caller_globals)
+        # Walk frames within the same module (same f_globals).
+        f = frame
+        chain = []
+        while f is not None and f.f_globals is caller_globals:
+            chain.append(f.f_locals)
+            f = f.f_back
+        # Apply outermost to innermost so inner scopes shadow outer ones.
+        for locals_dict in reversed(chain):
+            ns.update(locals_dict)
+        return ns
+    finally:
+        del frame
+
+
+def _resolve_user_vars(expr_eval, caller_ns):
+    """Find non-track identifiers in the parsed expression and resolve from caller namespace."""
+    tree = ast.parse(expr_eval, mode="eval")
+    user_vars = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            name = node.id
+            if name.startswith("__pmv_"):
+                continue
+            if name in _ALWAYS_ALLOWED_NAMES:
+                continue
+            if name in caller_ns:
+                user_vars[name] = caller_ns[name]
+    return user_vars

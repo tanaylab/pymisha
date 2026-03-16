@@ -14,7 +14,7 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
 )
-from .expr import _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars
+from .expr import _caller_namespace, _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars, _resolve_user_vars
 from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 from .vtracks import _compute_vtrack_values
@@ -27,7 +27,7 @@ def _interval_coord_cols(intervals):
     return ["chrom", "start", "end"]
 
 
-def _validate_expr_security(expr, track_names=None, vtrack_names=None):
+def _validate_expr_security(expr, track_names=None, vtrack_names=None, user_vars=None):
     if track_names is None:
         track_names = set(_pymisha.pm_track_names())
     if vtrack_names is None:
@@ -45,11 +45,13 @@ def _validate_expr_security(expr, track_names=None, vtrack_names=None):
         *(_expr_safe_name(t) for t in expr_tracks),
         *(_expr_safe_name(vt) for vt in expr_vtracks),
     }
+    if user_vars:
+        allowed_names |= set(user_vars.keys())
     compile_safe_expression(expr_eval, allowed_names)
 
 
 def gdist(*args, intervals=None, include_lowest=False, iterator=None,
-          band=None, dataframe=False, names=None, **kwargs):
+          band=None, dataframe=False, names=None, vars=None, **kwargs):
     """
     Calculate distribution of track expressions over bins.
 
@@ -78,6 +80,8 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     names : list of str, optional
         Column names for the expressions in the returned DataFrame
         (only relevant when dataframe=True).
+    vars : dict, optional
+        Explicit variable bindings for the expression.
 
     Returns
     -------
@@ -117,6 +121,13 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
         raise ValueError("gdist requires pairs of (expression, breaks) arguments")
 
     _checkroot()
+
+    # Capture caller namespace for user variable resolution
+    if vars is not None:
+        caller_ns = dict(vars)
+    else:
+        caller_ns = _caller_namespace(depth=1)
+
     if intervals is None:
         intervals = gintervals_all()
 
@@ -151,9 +162,18 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
+
+    # Resolve user variables across all expressions
+    all_user_vars = {}
+    for expr in exprs:
+        expr_eval, _, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
+        uv = _resolve_user_vars(expr_eval, caller_ns)
+        all_user_vars.update(uv)
+
     for expr in exprs:
         try:
-            _validate_expr_security(expr, track_names=track_names, vtrack_names=vtrack_names)
+            _validate_expr_security(expr, track_names=track_names, vtrack_names=vtrack_names,
+                                    user_vars=all_user_vars)
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
@@ -177,7 +197,7 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     # If so, fall back to Python implementation (virtual tracks not supported in pm_dist yet)
     has_vtracks = any(_find_vtracks_in_expr(e) for e in exprs)
 
-    if not has_vtracks:
+    if not has_vtracks and not all_user_vars:
         # Use C++ streaming implementation
         config = dict(CONFIG)
         if progress is not None:
@@ -203,6 +223,7 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     result = _gdist_vtrack_streaming(
         exprs, breaks_list, n_bins, intervals, include_lowest,
         iterator=iterator, progress=progress, progress_desc=progress_desc,
+        user_vars=all_user_vars,
     )
 
     if dataframe:
@@ -280,7 +301,8 @@ def _bin_values(values, breaks, include_lowest):
 
 def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
                             include_lowest, *, iterator=None,
-                            progress=None, progress_desc=None):
+                            progress=None, progress_desc=None,
+                            user_vars=None):
     """Streaming gdist for expressions containing virtual tracks.
 
     Instead of materializing all expression values and then binning, this
@@ -288,6 +310,9 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
     This keeps peak memory proportional to chunk_size rather than total
     number of iterated intervals.
     """
+    if user_vars is None:
+        user_vars = {}
+
     # Parse all expressions to find physical tracks and vtracks
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
@@ -342,6 +367,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
             *(_expr_safe_name(t) for t in expr_tracks),
             *(_expr_safe_name(vt) for vt in expr_vtracks),
         }
+        allowed_names |= set(user_vars.keys())
         try:
             compiled.append(compile_safe_expression(expr_eval, allowed_names))
         except UnsafeExpressionError as exc:
@@ -378,6 +404,8 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
                     local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(
                         vt, chunk_intervals
                     )
+
+            local_ns.update(user_vars)
 
             # Evaluate each expression and bin
             chunk_indices = []
@@ -446,8 +474,12 @@ def _array_to_dataframe(result, breaks_list, exprs, names, include_lowest=False)
     return df
 
 
-def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, progress_desc=None):
+def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, progress_desc=None,
+                               user_vars=None):
     """Streaming gsummary for expressions containing virtual tracks."""
+    if user_vars is None:
+        user_vars = {}
+
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
 
@@ -496,6 +528,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
         *(_expr_safe_name(t) for t in expr_tracks),
         *(_expr_safe_name(vt) for vt in expr_vtracks),
     }
+    allowed_names |= set(user_vars.keys())
     try:
         code_obj = compile_safe_expression(new_expr, allowed_names)
     except UnsafeExpressionError as exc:
@@ -538,6 +571,8 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
                     local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(
                         vt, chunk_intervals
                     )
+
+            local_ns.update(user_vars)
 
             vals = eval(code_obj, {'__builtins__': {}}, local_ns)
             if _numpy.isscalar(vals):
@@ -635,12 +670,16 @@ def _reservoir_merge_chunk(samples, sample_size, stream_count, chunk_values, sam
     return sample_cap, new_total
 
 
-def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=None, progress_desc=None):
+def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=None, progress_desc=None,
+                                  user_vars=None):
     """Streaming gquantiles for expressions containing virtual tracks.
 
     Uses chunked expression evaluation and bounded reservoir sampling to keep
     memory proportional to ``CONFIG['max_data_size']``.
     """
+    if user_vars is None:
+        user_vars = {}
+
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
 
@@ -686,6 +725,7 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
         *(_expr_safe_name(t) for t in expr_tracks),
         *(_expr_safe_name(vt) for vt in expr_vtracks),
     }
+    allowed_names |= set(user_vars.keys())
     try:
         code_obj = compile_safe_expression(new_expr, allowed_names)
     except UnsafeExpressionError as exc:
@@ -719,6 +759,8 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
                 chunk_intervals = iter_df.iloc[start_idx:end_idx][["chrom", "start", "end"]]
                 for vt in expr_vtracks:
                     local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(vt, chunk_intervals)
+
+            local_ns.update(user_vars)
 
             vals = eval(code_obj, {'__builtins__': {}}, local_ns)
             if _numpy.isscalar(vals):
@@ -815,7 +857,7 @@ def _gsummary_from_values(values):
     )
 
 
-def gsummary(expr, intervals=None, iterator=None, **kwargs):
+def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
     """
     Calculate summary statistics of a track expression.
 
@@ -830,6 +872,8 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
         Genomic scope. If None, uses ALLGENOME.
     iterator : int or str, optional
         Track expression iterator. If None, determined from expression.
+    vars : dict, optional
+        Explicit variable bindings for the expression.
     band : tuple of (int, int), optional
         Diagonal band for 2D tracks as ``(d1, d2)``.
 
@@ -856,6 +900,12 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
 
     _checkroot()
 
+    # Capture caller namespace for user variable resolution
+    if vars is not None:
+        caller_ns = dict(vars)
+    else:
+        caller_ns = _caller_namespace(depth=1)
+
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)
 
@@ -865,8 +915,14 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
+    # Resolve user variables
+    track_names = set(_pymisha.pm_track_names())
+    vtrack_names = set(_shared._VTRACKS.keys())
+    expr_eval, _, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
+    user_vars = _resolve_user_vars(expr_eval, caller_ns)
+
     try:
-        _validate_expr_security(expr)
+        _validate_expr_security(expr, user_vars=user_vars)
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
@@ -880,7 +936,7 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
         return _gsummary_from_values(values)
 
     vtracks_used = _find_vtracks_in_expr(expr)
-    if not vtracks_used:
+    if not vtracks_used and not user_vars:
         with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
@@ -902,14 +958,15 @@ def gsummary(expr, intervals=None, iterator=None, **kwargs):
             return result
         raise TypeError("Unexpected pm_summary result type")
 
-    # Streaming path for vtracks
+    # Streaming path for vtracks / user vars
     return _gsummary_vtrack_streaming(
         expr, intervals, iterator=iterator,
-        progress=progress, progress_desc=progress_desc
+        progress=progress, progress_desc=progress_desc,
+        user_vars=user_vars,
     )
 
 
-def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
+def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, **kwargs):
     """
     Calculate quantiles of a track expression.
 
@@ -926,6 +983,8 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
         Genomic scope. If None, uses ALLGENOME.
     iterator : int or str, optional
         Track expression iterator. If None, determined from expression.
+    vars : dict, optional
+        Explicit variable bindings for the expression.
     band : tuple of (int, int), optional
         Diagonal band for 2D tracks.
 
@@ -954,6 +1013,12 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
 
     _checkroot()
 
+    # Capture caller namespace for user variable resolution
+    if vars is not None:
+        caller_ns = dict(vars)
+    else:
+        caller_ns = _caller_namespace(depth=1)
+
     from .tracks import _check_computed_tracks
     _check_computed_tracks(expr)
 
@@ -963,8 +1028,14 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
+    # Resolve user variables
+    track_names = set(_pymisha.pm_track_names())
+    vtrack_names = set(_shared._VTRACKS.keys())
+    expr_eval, _, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
+    user_vars = _resolve_user_vars(expr_eval, caller_ns)
+
     try:
-        _validate_expr_security(expr)
+        _validate_expr_security(expr, user_vars=user_vars)
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
@@ -988,7 +1059,7 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
         return _pandas.Series(quantiles, index=pct)
 
     vtracks_used = _find_vtracks_in_expr(expr)
-    if not vtracks_used:
+    if not vtracks_used and not user_vars:
         with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
@@ -998,7 +1069,8 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
         return _pandas.Series(quantiles, index=pct)
 
     quantiles, estimated = _gquantiles_vtrack_streaming(
-        expr, pct, intervals, iterator=iterator, progress=progress, progress_desc=progress_desc
+        expr, pct, intervals, iterator=iterator, progress=progress, progress_desc=progress_desc,
+        user_vars=user_vars,
     )
     if estimated:
         import warnings
