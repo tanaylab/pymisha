@@ -124,7 +124,6 @@ from .liftover import (
 )
 from .lookup import glookup, gtrack_lookup
 from .motif_import import gseq_read_homer, gseq_read_jaspar, gseq_read_meme
-from .track_export import gtrack_export_bedgraph, gtrack_export_bigwig
 from .sequence import (
     grevcomp,
     gseq_comp,
@@ -147,6 +146,7 @@ from .summary import (
     gsample,
     gsummary,
 )
+from .track_export import gtrack_export_bedgraph, gtrack_export_bigwig
 from .tracks import (
     gtrack_2d_convert_to_indexed,
     gtrack_2d_create,
