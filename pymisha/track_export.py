@@ -7,7 +7,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
 
 import pandas as pd
 
@@ -19,9 +18,9 @@ from .intervals import gintervals_all
 def gtrack_export_bedgraph(
     track: str,
     file: str,
-    intervals: Optional[pd.DataFrame] = None,
-    iterator: Optional[int] = None,
-    name: Optional[str] = None,
+    intervals: pd.DataFrame | None = None,
+    iterator: int | None = None,
+    name: str | None = None,
 ) -> None:
     """Export a track or track expression to bedGraph format.
 
@@ -177,8 +176,8 @@ def gtrack_export_bedgraph(
 def gtrack_export_bigwig(
     track: str,
     file: str,
-    intervals: Optional[pd.DataFrame] = None,
-    iterator: Optional[int] = None,
+    intervals: pd.DataFrame | None = None,
+    iterator: int | None = None,
 ) -> None:
     """Export a track or track expression to BigWig format.
 
@@ -262,7 +261,7 @@ def gtrack_export_bigwig(
         )
 
         # bedGraphToBigWig doesn't accept headers, so strip the first line
-        with open(tmp_bedgraph, "r") as f:
+        with open(tmp_bedgraph) as f:
             lines = f.readlines()
 
         with open(tmp_bedgraph, "w") as f:

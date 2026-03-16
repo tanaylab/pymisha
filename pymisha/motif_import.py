@@ -14,7 +14,6 @@ import warnings
 import numpy as _numpy
 import pandas as _pandas
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -29,7 +28,7 @@ def _dedup_motif_ids(ids: list[str]) -> list[str]:
     dups = {k for k, v in seen.items() if v > 1}
     if not dups:
         return ids
-    warnings.warn("Duplicate motif IDs found; appending numeric suffixes to disambiguate")
+    warnings.warn("Duplicate motif IDs found; appending numeric suffixes to disambiguate", stacklevel=2)
     counters: dict[str, int] = {}
     result: list[str] = []
     for mid in ids:
@@ -49,7 +48,7 @@ def _renormalize_rows(mat: _numpy.ndarray, tol: float = 1e-4,
     if len(bad) > 0:
         warnings.warn(
             f"Row sums deviate from 1.0 in {context}; re-normalizing "
-            f"{len(bad)} row(s)"
+            f"{len(bad)} row(s)", stacklevel=2
         )
         for i in bad:
             if rsums[i] == 0:
@@ -108,7 +107,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
     if not os.path.isfile(file):
         raise FileNotFoundError(f"File not found: {file}")
 
-    with open(file, "r") as fh:
+    with open(file) as fh:
         lines = fh.read().splitlines()
 
     # Strip Windows line endings
@@ -147,7 +146,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
                 bg_names = bg_tokens[0::2][:4]
                 try:
                     bg_vals = [float(x) for x in bg_tokens[1::2][:4]]
-                    background = dict(zip(bg_names, bg_vals))
+                    background = dict(zip(bg_names, bg_vals, strict=False))
                 except ValueError:
                     pass
             break
@@ -186,7 +185,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
                         "Log-odds matrices not supported; use letter-probability "
                         "matrix format"
                     )
-            warnings.warn(f"Motif '{motif_id}' has no matrix data; skipping")
+            warnings.warn(f"Motif '{motif_id}' has no matrix data; skipping", stacklevel=2)
             continue
 
         # Parse metadata from the matrix header line
@@ -214,7 +213,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
             mat_lines.append(ln)
 
         if not mat_lines:
-            warnings.warn(f"Motif '{motif_id}' has no matrix data; skipping")
+            warnings.warn(f"Motif '{motif_id}' has no matrix data; skipping", stacklevel=2)
             continue
 
         # Check w consistency
@@ -235,11 +234,11 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
                 )
             try:
                 row = [float(v) for v in vals]
-            except ValueError:
+            except ValueError as err:
                 raise ValueError(
                     f"Non-numeric value in probability matrix for "
                     f"motif '{motif_id}'"
-                )
+                ) from err
             rows.append(row)
 
         mat = _numpy.array(rows, dtype=float)
@@ -280,7 +279,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped):
+    for orig_id, new_id in zip(ids, deduped, strict=False):
         df = results[orig_id]
         final[new_id] = df
     return final
@@ -320,7 +319,7 @@ def gseq_read_jaspar(file: str) -> dict[str, _pandas.DataFrame]:
     if not os.path.isfile(file):
         raise FileNotFoundError(f"File not found: {file}")
 
-    with open(file, "r") as fh:
+    with open(file) as fh:
         lines = fh.read().splitlines()
 
     lines = [ln.rstrip("\r") for ln in lines]
@@ -333,8 +332,7 @@ def gseq_read_jaspar(file: str) -> dict[str, _pandas.DataFrame]:
 
     if has_header:
         return _parse_jaspar_header(nonempty, file)
-    else:
-        return _parse_jaspar_simple(nonempty, file)
+    return _parse_jaspar_simple(nonempty, file)
 
 
 def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataFrame]:
@@ -367,7 +365,7 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
         expected_bases = {"A", "C", "G", "T"}
         count_rows: dict[str, list[float]] = {}
 
-        for ri, dl in enumerate(data_lines):
+        for _ri, dl in enumerate(data_lines):
             # Strip brackets
             dl = dl.replace("[", "").replace("]", "")
             parts = dl.split()
@@ -383,10 +381,10 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
 
             try:
                 vals = [float(x) for x in parts[1:]]
-            except ValueError:
+            except ValueError as err:
                 raise ValueError(
                     f"Non-numeric count value in motif '{motif_id}'"
-                )
+                ) from err
 
             if any(v < 0 for v in vals):
                 raise ValueError(
@@ -413,7 +411,7 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
         if len(zero_cols) > 0:
             warnings.warn(
                 f"Position(s) {', '.join(str(c + 1) for c in zero_cols)} "
-                f"have zero total counts; using uniform probability"
+                f"have zero total counts; using uniform probability", stacklevel=2
             )
 
         prob_mat = count_mat.copy()
@@ -439,7 +437,7 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped):
+    for orig_id, new_id in zip(ids, deduped, strict=False):
         final[new_id] = results[orig_id]
     return final
 
@@ -468,11 +466,11 @@ def _parse_jaspar_simple(lines: list[str], file: str) -> dict[str, _pandas.DataF
             ln = ln.replace("[", "").replace("]", "")
             try:
                 vals = [float(x) for x in ln.split()]
-            except ValueError:
+            except ValueError as err:
                 raise ValueError(
                     f"Non-numeric count value in motif at rows "
                     f"{row_start + 1}-{row_start + 4}"
-                )
+                ) from err
             if any(v < 0 for v in vals):
                 raise ValueError(
                     "Negative count values not allowed in JASPAR format"
@@ -493,7 +491,7 @@ def _parse_jaspar_simple(lines: list[str], file: str) -> dict[str, _pandas.DataF
         if len(zero_cols) > 0:
             warnings.warn(
                 f"Position(s) {', '.join(str(c + 1) for c in zero_cols)} "
-                f"have zero total counts; using uniform probability"
+                f"have zero total counts; using uniform probability", stacklevel=2
             )
 
         prob_mat = count_mat.copy()
@@ -519,7 +517,7 @@ def _parse_jaspar_simple(lines: list[str], file: str) -> dict[str, _pandas.DataF
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped):
+    for orig_id, new_id in zip(ids, deduped, strict=False):
         final[new_id] = results[orig_id]
     return final
 
@@ -557,7 +555,7 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
     if not os.path.isfile(file):
         raise FileNotFoundError(f"File not found: {file}")
 
-    with open(file, "r") as fh:
+    with open(file) as fh:
         lines = fh.read().splitlines()
 
     lines = [ln.rstrip("\r") for ln in lines]
@@ -590,11 +588,11 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
             log_p_value = None
 
         if len(fields) < 2:
-            warnings.warn(f"Incomplete HOMER header at line {start + 1}")
+            warnings.warn(f"Incomplete HOMER header at line {start + 1}", stacklevel=2)
 
         # Parse matrix rows
         if start >= end:
-            warnings.warn(f"Motif '{consensus}' has no matrix data; skipping")
+            warnings.warn(f"Motif '{consensus}' has no matrix data; skipping", stacklevel=2)
             continue
 
         mat_lines = [
@@ -602,7 +600,7 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
         ]
 
         if not mat_lines:
-            warnings.warn(f"Motif '{consensus}' has no matrix data; skipping")
+            warnings.warn(f"Motif '{consensus}' has no matrix data; skipping", stacklevel=2)
             continue
 
         rows: list[list[float]] = []
@@ -614,11 +612,11 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
                 )
             try:
                 row = [float(v) for v in vals_str]
-            except ValueError:
+            except ValueError as err:
                 raise ValueError(
                     f"Non-numeric probability value at line {start + i + 2} "
                     f"of HOMER file"
-                )
+                ) from err
             rows.append(row)
 
         mat = _numpy.array(rows, dtype=float)
@@ -648,6 +646,6 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped):
+    for orig_id, new_id in zip(ids, deduped, strict=False):
         final[new_id] = results[orig_id]
     return final
