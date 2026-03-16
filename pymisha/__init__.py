@@ -123,6 +123,8 @@ from .liftover import (
     gtrack_liftover,
 )
 from .lookup import glookup, gtrack_lookup
+from .motif_import import gseq_read_homer, gseq_read_jaspar, gseq_read_meme
+from .track_export import gtrack_export_bedgraph, gtrack_export_bigwig
 from .sequence import (
     grevcomp,
     gseq_comp,
@@ -275,6 +277,8 @@ __all__ = [
     'gtrack_2d_import',
     'gtrack_2d_import_contacts',
     'gtrack_create_pwm_energy',
+    'gtrack_export_bedgraph',
+    'gtrack_export_bigwig',
 
     # Interval functions
     'gintervals',
@@ -349,6 +353,9 @@ __all__ = [
     'gseq_kmer',
     'gseq_kmer_dist',
     'gseq_pwm',
+    'gseq_read_meme',
+    'gseq_read_jaspar',
+    'gseq_read_homer',
 
     # Lookup functions
     'glookup',

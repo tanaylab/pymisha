@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.17 (2026-03-16)
+
+### Features
+- **Motif format import:** `gseq_read_meme()`, `gseq_read_jaspar()`, and `gseq_read_homer()` for reading MEME, JASPAR PFM, and HOMER motif formats. Returns `dict[str, pd.DataFrame]` with A/C/G/T probability columns directly usable with `gseq_pwm()`. All parsers are native (no new dependencies).
+- **Track export:** `gtrack_export_bedgraph()` and `gtrack_export_bigwig()` for exporting tracks and track expressions to standard bedGraph and BigWig formats. Supports gzip compression, virtual tracks, track expressions, and custom iterators.
+
+### Testing
+- 69 motif import tests covering MEME, JASPAR (header + simple PFM), HOMER parsing, error handling, and integration with `gseq_pwm()`.
+- 14 track export tests covering bedGraph format, gzip compression, NaN exclusion, sparse tracks, track expressions, and BigWig conversion.
+- Cross-validated with R misha: all 7 parsed matrices identical (max diff: 3.3e-16).
+
 ## v0.1.16 (2026-03-13)
 
 ### Features

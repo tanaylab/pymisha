@@ -11,5 +11,5 @@ Complete API reference for pymisha. Functions are organized by category.
 | [Intervals](intervals.md) | Create, manipulate, and query genomic intervals |
 | [Data Operations](data-operations.md) | Extract, summarize, and analyze track data |
 | [Liftover](liftover.md) | Convert coordinates between genome assemblies |
-| [Sequence Analysis](sequence.md) | Extract and analyze DNA sequences |
+| [Sequence Analysis](sequence.md) | Extract and analyze DNA sequences, import motif matrices |
 | [Genome Synthesis](synthesis.md) | Train generative models and sample synthetic genomes |

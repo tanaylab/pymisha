@@ -36,3 +36,22 @@ Functions for extracting and analyzing DNA sequences, including reverse compleme
     options:
       show_root_heading: true
       heading_level: 3
+
+## Motif Import
+
+Functions to import motifs from standard motif format files (MEME, JASPAR, HOMER).
+
+::: pymisha.gseq_read_meme
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_read_jaspar
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_read_homer
+    options:
+      show_root_heading: true
+      heading_level: 3

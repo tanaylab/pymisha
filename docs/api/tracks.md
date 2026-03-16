@@ -151,3 +151,17 @@ Functions for creating, importing, modifying, and managing genomic tracks, inclu
     options:
       show_root_heading: true
       heading_level: 3
+
+## Track Export
+
+Functions to export tracks to standard genomic file formats.
+
+::: pymisha.gtrack_export_bedgraph
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gtrack_export_bigwig
+    options:
+      show_root_heading: true
+      heading_level: 3
