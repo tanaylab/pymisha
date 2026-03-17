@@ -2,12 +2,14 @@
 
 from . import _shared
 from ._shared import (
-    CONFIG,
     _checkroot,
+    _config_no_mt,
     _df2pymisha,
     _numpy,
+    _preprocess_intervals_iterator,
     _pymisha,
     _pymisha2df,
+    _remap_interval_ids,
 )
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
 from .extract import _is_2d_intervals, _maybe_load_intervals_set, gextract
@@ -95,6 +97,9 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
 
     intervals = _maybe_load_intervals_set(intervals)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     if len(intervals) == 0:
         return None
 
@@ -151,31 +156,33 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
 
     if not use_python:
         # Use C++ streaming implementation
-        config = dict(CONFIG)
-        if progress is not None:
-            config['progress'] = progress
-        if progress_desc:
-            config['progress_desc'] = progress_desc
+        with _config_no_mt(_itr_id_map) as _base_cfg:
+            config = dict(_base_cfg)
+            if progress is not None:
+                config['progress'] = progress
+            if progress_desc:
+                config['progress_desc'] = progress_desc
 
-        # Flatten lookup table in Fortran (column-major) order to match
-        # BinsManager::vals2idx flat index convention
-        flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order='F'))
+            # Flatten lookup table in Fortran (column-major) order to match
+            # BinsManager::vals2idx flat index convention
+            flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order='F'))
 
-        result = _pymisha.pm_lookup(
-            exprs,
-            [b.tolist() for b in breaks_list],
-            flat_table,
-            _df2pymisha(intervals),
-            iterator,
-            include_lowest,
-            force_binning,
-            config,
-        )
+            result = _pymisha.pm_lookup(
+                exprs,
+                [b.tolist() for b in breaks_list],
+                flat_table,
+                _df2pymisha(intervals),
+                iterator,
+                include_lowest,
+                force_binning,
+                config,
+            )
 
         if result is None:
             return None
 
         df = _pymisha2df(result)
+        df = _remap_interval_ids(df, _itr_id_map)
         if intervals_set_out is not None:
             from .intervals import gintervals_save
             gintervals_save(df[["chrom", "start", "end"]], intervals_set_out)

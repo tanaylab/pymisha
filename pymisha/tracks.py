@@ -26,7 +26,14 @@ import pandas as pd
 from . import _shared
 from ._name_validation import validate_dotted_name
 from ._safe_pickle import restricted_load, restricted_loads
-from ._shared import _apply_gwd_to_names, _checkroot, _df2pymisha, _pymisha
+from ._shared import (
+    _apply_gwd_to_names,
+    _checkroot,
+    _config_no_mt,
+    _df2pymisha,
+    _preprocess_intervals_iterator,
+    _pymisha,
+)
 
 
 def _load_track_attributes(track_name):
@@ -1279,8 +1286,6 @@ def gtrack_smooth(track, description, expr, winsize, weight_thr=0, smooth_nans=F
     _ensure_track_absent(track)
 
     all_intervs = gintervals_all()
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
 
     # Determine iterator: if None, infer from the expression (use track name as iterator)
     iter_val = iterator
@@ -1288,6 +1293,12 @@ def gtrack_smooth(track, description, expr, winsize, weight_thr=0, smooth_nans=F
         # Try to infer from expression - use expr as iterator policy
         # The C++ scanner will resolve the track's bin size
         iter_val = 0  # Let C++ determine from expression
+
+    # Handle DataFrame-as-iterator
+    all_intervs, iter_val, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iter_val)
+
+    track_dir = _track_dir_for_create(track)
+    created_new = not track_dir.exists()
 
     try:
         _pymisha.pm_smooth(
@@ -1338,8 +1349,8 @@ def gtrack_create(track, description, expr, iterator=None, band=None):
         Fixed-bin iterator bin size. If None, the iterator is determined
         implicitly from the track expression.
     band : tuple or None, optional
-        Track expression band. Currently not supported in pymisha and
-        raises ``ValueError`` if provided.
+        Diagonal band ``(d1, d2)`` for 2D track creation.  When provided,
+        only contacts where ``d1 <= (x - y) < d2`` are stored.
 
     Returns
     -------
@@ -1368,9 +1379,7 @@ def gtrack_create(track, description, expr, iterator=None, band=None):
     >>> pm.gtrack_info("mixed")  # doctest: +SKIP
     >>> pm.gtrack_rm("mixed", force=True)  # doctest: +SKIP
     """
-    if band is not None:
-        raise ValueError("band is not supported in pymisha gtrack_create yet")
-    from .intervals import gintervals_all
+    from .intervals import gintervals_2d_all, gintervals_all
 
     _checkroot()
     if expr is None:
@@ -1378,11 +1387,41 @@ def gtrack_create(track, description, expr, iterator=None, band=None):
     _validate_track_name(track)
     _ensure_track_absent(track)
 
-    all_intervs = gintervals_all()
+    if band is not None:
+        from .extract import _validate_band
+        band = _validate_band(band)
+        all_intervs = gintervals_2d_all()
+        if all_intervs is None or len(all_intervs) == 0:
+            raise ValueError(
+                "band requires a genome with 2D intervals "
+                "(no 2D intervals available)"
+            )
+        from .intervals import gintervals_2d_band_intersect
+        banded = gintervals_2d_band_intersect(all_intervs, band)
+        if banded is None or len(banded) == 0:
+            raise ValueError("band filter produced no 2D intervals")
+        import pandas as _pd
+        axis1 = banded[["chrom1", "start1", "end1"]].rename(
+            columns={"chrom1": "chrom", "start1": "start", "end1": "end"}
+        )
+        axis2 = banded[["chrom2", "start2", "end2"]].rename(
+            columns={"chrom2": "chrom", "start2": "start", "end2": "end"}
+        )
+        from .intervals import gintervals_canonic
+        all_intervs = gintervals_canonic(
+            _pd.concat([axis1, axis2], ignore_index=True)
+        )
+    else:
+        all_intervs = gintervals_all()
+
+    # Handle DataFrame-as-iterator
+    all_intervs, iterator, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iterator)
+
     track_dir = _track_dir_for_create(track)
     created_new = not track_dir.exists()
     try:
-        _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _shared.CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg:
+            _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _cfg)
         _pymisha.pm_dbreload()
         _set_created_attrs(
             track,

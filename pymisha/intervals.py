@@ -24,12 +24,15 @@ from ._name_validation import validate_dotted_name
 from ._shared import (
     CONFIG,
     _checkroot,
+    _config_no_mt,
     _df2pymisha,
     _numpy,
     _pandas,
+    _preprocess_intervals_iterator,
     _progress_context,
     _pymisha,
     _pymisha2df,
+    _remap_interval_ids,
 )
 
 
@@ -39,6 +42,13 @@ def _normalize_chroms(chroms):
     if isinstance(chroms, (str, int)):
         chroms = [chroms]
     return list(_pymisha.pm_normalize_chroms(list(chroms)))
+
+
+def _resolve_intervals(intervals):
+    """Transparently load a named interval set if *intervals* is a string."""
+    if isinstance(intervals, str) and gintervals_exists(intervals):
+        return gintervals_load(intervals)
+    return intervals
 
 
 def gintervals_all():
@@ -1115,6 +1125,7 @@ def gintervals_force_range(intervals, intervals_set_out=None):
     ... })
     >>> pm.gintervals_force_range(intervs)  # doctest: +SKIP
     """
+    intervals = _resolve_intervals(intervals)
     _checkroot()
 
     if intervals is None:
@@ -1322,6 +1333,8 @@ def gintervals_union(intervals1, intervals2, intervals_set_out=None):
     >>> intervs2 = pm.gintervals("1", [200, 700], [400, 900])
     >>> pm.gintervals_union(intervs1, intervs2)  # doctest: +SKIP
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     if intervals1 is None or intervals2 is None:
         raise ValueError("intervals1 and intervals2 cannot be None")
 
@@ -1382,6 +1395,8 @@ def gintervals_intersect(intervals1, intervals2, intervals_set_out=None):
     >>> intervs2 = pm.gintervals("1", 300, 800)
     >>> pm.gintervals_intersect(intervs1, intervs2)  # doctest: +SKIP
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     if intervals1 is None or intervals2 is None:
         raise ValueError("intervals1 and intervals2 cannot be None")
 
@@ -1437,6 +1452,8 @@ def gintervals_diff(intervals1, intervals2, intervals_set_out=None):
     >>> intervs2 = pm.gintervals("1", 200, 300)
     >>> pm.gintervals_diff(intervs1, intervs2)  # doctest: +SKIP
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     if intervals1 is None or intervals2 is None:
         raise ValueError("intervals1 and intervals2 cannot be None")
 
@@ -1501,6 +1518,7 @@ def gintervals_canonic(intervals, unify_touching_intervals=True):
     >>> result  # doctest: +SKIP
     >>> result.attrs['mapping']  # doctest: +SKIP
     """
+    intervals = _resolve_intervals(intervals)
     if intervals is None:
         raise ValueError("intervals cannot be None")
     if len(intervals) == 0:
@@ -1527,16 +1545,22 @@ def gintervals_canonic(intervals, unify_touching_intervals=True):
     return result
 
 
-def gintervals_covered_bp(intervals):
+def gintervals_covered_bp(intervals, src=None):
     """
     Compute total basepairs covered by intervals.
 
     Overlapping intervals are merged before counting to avoid double-counting.
+    When *src* is provided, only the portion of *intervals* that overlaps
+    *src* is counted.
 
     Parameters
     ----------
-    intervals : DataFrame
-        Interval set with columns: chrom, start, end
+    intervals : DataFrame or str
+        Interval set with columns: chrom, start, end.  A string is
+        interpreted as a saved interval-set name.
+    src : DataFrame, str, or None, default None
+        If provided, restrict counting to the intersection of *intervals*
+        with *src*.
 
     Returns
     -------
@@ -1557,6 +1581,12 @@ def gintervals_covered_bp(intervals):
     gintervals_canonic : Merge overlapping intervals.
     gintervals : Create a set of 1D intervals.
     """
+    intervals = _resolve_intervals(intervals)
+    if src is not None:
+        src = _resolve_intervals(src)
+        intervals = gintervals_intersect(intervals, src)
+        if intervals is None:
+            return 0
     if intervals is None:
         raise ValueError("intervals cannot be None")
     if len(intervals) == 0:
@@ -1605,6 +1635,9 @@ def gintervals_coverage_fraction(intervals1, intervals2=None):
     >>> pm.gintervals_coverage_fraction(intervs1, intervs2)  # doctest: +SKIP
     >>> pm.gintervals_coverage_fraction(intervs1)  # doctest: +SKIP
     """
+    intervals1 = _resolve_intervals(intervals1)
+    if intervals2 is not None:
+        intervals2 = _resolve_intervals(intervals2)
     if intervals1 is None:
         raise ValueError("intervals1 cannot be None")
     if len(intervals1) == 0:
@@ -1678,6 +1711,8 @@ def gintervals_neighbors(intervals1, intervals2, maxneighbors=1,
     gintervals_neighbors_directional : Find both upstream and downstream.
     gintervals_annotate : Annotate intervals with nearest-neighbor columns.
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     _checkroot()
 
     if intervals1 is None:
@@ -1753,6 +1788,8 @@ def gintervals_neighbors_upstream(intervals1, intervals2, maxneighbors=1,
     gintervals_neighbors_downstream : Find downstream neighbors.
     gintervals_neighbors_directional : Find both upstream and downstream.
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     # Upstream: mindist=-maxdist, maxdist=0, use_intervals1_strand=True
     return gintervals_neighbors(
         intervals1, intervals2,
@@ -1807,6 +1844,8 @@ def gintervals_neighbors_downstream(intervals1, intervals2, maxneighbors=1,
     gintervals_neighbors_upstream : Find upstream neighbors.
     gintervals_neighbors_directional : Find both upstream and downstream.
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     # Downstream: mindist=0, maxdist=maxdist, use_intervals1_strand=True
     return gintervals_neighbors(
         intervals1, intervals2,
@@ -1866,6 +1905,8 @@ def gintervals_neighbors_directional(intervals1, intervals2,
     gintervals_neighbors_upstream : Find upstream neighbors only.
     gintervals_neighbors_downstream : Find downstream neighbors only.
     """
+    intervals1 = _resolve_intervals(intervals1)
+    intervals2 = _resolve_intervals(intervals2)
     upstream = gintervals_neighbors_upstream(
         intervals1, intervals2,
         maxneighbors=maxneighbors_upstream,
@@ -3367,7 +3408,7 @@ def giterator_cartesian_grid(
 
 
 def giterator_intervals(expr=None, intervals=None, iterator=None,
-                        interval_relative=False):
+                        interval_relative=False, partial_bins="clip"):
     """
     Return the iterator intervals grid without evaluating track expressions.
 
@@ -3388,6 +3429,14 @@ def giterator_intervals(expr=None, intervals=None, iterator=None,
         When ``True``, bins are aligned to each input interval's start
         rather than to chromosome position 0.  Requires a numeric
         *iterator*.
+    partial_bins : str, default ``"clip"``
+        How to handle bins that do not fit entirely within an interval.
+
+        * ``"clip"`` — truncate the last bin at the interval boundary
+          (default, current behavior).
+        * ``"drop"`` — discard bins whose size is smaller than the full
+          bin size.
+        * ``"exact"`` — same as ``"drop"``.
 
     Returns
     -------
@@ -3410,6 +3459,13 @@ def giterator_intervals(expr=None, intervals=None, iterator=None,
     --------
     gintervals_mapply : Apply a function to track values per interval.
     """
+    _valid_partial_bins = ("clip", "drop", "exact")
+    if partial_bins not in _valid_partial_bins:
+        raise ValueError(
+            f"partial_bins must be one of {_valid_partial_bins}, "
+            f"got {partial_bins!r}"
+        )
+
     if expr is None and iterator is None:
         raise ValueError(
             "At least one of 'expr' or 'iterator' must be provided."
@@ -3473,18 +3529,37 @@ def giterator_intervals(expr=None, intervals=None, iterator=None,
     if len(intervals) == 0:
         return None
 
-    if interval_relative:
-        if isinstance(itr, bool) or not isinstance(itr, (int, float)):
-            raise ValueError(
-                "interval_relative=True requires a numeric iterator."
-            )
-        cfg = dict(CONFIG)
-        cfg["interval_relative"] = True
-    else:
-        cfg = CONFIG
+    # Handle DataFrame-as-iterator
+    intervals, itr, _itr_id_map = _preprocess_intervals_iterator(intervals, itr)
+    if isinstance(intervals, _pandas.DataFrame) and len(intervals) == 0:
+        return None
 
-    result = _pymisha.pm_iterate(_df2pymisha(intervals), itr, cfg)
-    return _pymisha2df(result)
+    with _config_no_mt(_itr_id_map) as _cfg:
+        if interval_relative:
+            if isinstance(itr, bool) or not isinstance(itr, (int, float)):
+                raise ValueError(
+                    "interval_relative=True requires a numeric iterator."
+                )
+            cfg = dict(_cfg)
+            cfg["interval_relative"] = True
+        else:
+            cfg = _cfg
+
+        result = _pymisha.pm_iterate(_df2pymisha(intervals), itr, cfg)
+    df = _pymisha2df(result)
+    df = _remap_interval_ids(df, _itr_id_map)
+
+    if (
+        partial_bins in ("drop", "exact")
+        and df is not None
+        and len(df) > 0
+        and isinstance(itr, (int, float))
+    ):
+        bin_size = int(itr)
+        sizes = df["end"] - df["start"]
+        df = df[sizes >= bin_size].reset_index(drop=True)
+
+    return df
 
 
 def gintervals_rbind(*intervals, intervals_set_out=None):
@@ -3612,6 +3687,7 @@ def gintervals_mark_overlaps(intervals, group_col="overlap_group",
     gintervals_intersect : Intersection of two interval sets.
     gintervals_annotate : Annotate intervals with nearest-neighbor columns.
     """
+    intervals = _resolve_intervals(intervals)
     if intervals is None or len(intervals) == 0:
         raise ValueError("intervals cannot be None or empty")
 
@@ -3734,6 +3810,8 @@ def gintervals_annotate(intervals, annotation_intervals,
     gintervals_neighbors : Find nearest neighbors between interval sets.
     gintervals_mark_overlaps : Mark groups of overlapping intervals.
     """
+    intervals = _resolve_intervals(intervals)
+    annotation_intervals = _resolve_intervals(annotation_intervals)
     if intervals is None or annotation_intervals is None:
         raise ValueError("intervals and annotation_intervals must not be None")
 

@@ -9,13 +9,16 @@ from ._shared import (
     _bound_colname,
     _checkroot,
     _chunk_slices,
+    _config_no_mt,
     _df2pymisha,
     _iterated_intervals,
     _numpy,
     _pandas,
+    _preprocess_intervals_iterator,
     _progress_context,
     _pymisha,
     _pymisha2df,
+    _remap_interval_ids,
 )
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
@@ -1179,6 +1182,9 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
+    # Handle DataFrame-as-iterator: intersect scope with iterator intervals
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     # Route to 2D extraction if intervals are 2D
     if _is_2d_intervals(intervals):
         if colnames is not None and len(colnames) != len(exprs):
@@ -1240,25 +1246,27 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
         # Try parallel extraction if max_processes > 1.
         # Skip when a custom progress callback is provided (not compatible
         # with forked workers) or when file output is requested.
-        df = None
-        use_parallel = (
-            CONFIG.get("multitasking")
-            and int(CONFIG.get("max_processes", 1)) > 1
-            and not callable(progress)
-            and file is None
-        )
-        if use_parallel:
-            df = _parallel_extract(exprs, intervals, iterator, CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg:
+            df = None
+            use_parallel = (
+                _cfg.get("multitasking")
+                and int(_cfg.get("max_processes", 1)) > 1
+                and not callable(progress)
+                and file is None
+            )
+            if use_parallel:
+                df = _parallel_extract(exprs, intervals, iterator, _cfg)
 
-        if df is None:
-            with _progress_context(progress, desc=progress_desc):
-                result = _pymisha.pm_extract(
-                    exprs,
-                    _df2pymisha(intervals),
-                    iterator,
-                    CONFIG
-                )
-            df = _pymisha2df(result)
+            if df is None:
+                with _progress_context(progress, desc=progress_desc):
+                    result = _pymisha.pm_extract(
+                        exprs,
+                        _df2pymisha(intervals),
+                        iterator,
+                        _cfg
+                    )
+                df = _pymisha2df(result)
+        df = _remap_interval_ids(df, _itr_id_map)
         if colnames is not None and df is not None and isinstance(df, _pandas.DataFrame):
             # Build rename map: old expression columns -> new names
             # The C++ path names columns after the expression strings
@@ -1274,15 +1282,17 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
 
     if used_tracks:
         track_exprs = list(used_tracks)
-        base_result = _pymisha.pm_extract(
-            track_exprs,
-            _df2pymisha(intervals),
-            iterator,
-            CONFIG
-        )
+        with _config_no_mt(_itr_id_map) as _cfg:
+            base_result = _pymisha.pm_extract(
+                track_exprs,
+                _df2pymisha(intervals),
+                iterator,
+                _cfg
+            )
         base_df = _pymisha2df(base_result)
         if base_df is None:
             raise RuntimeError("Failed to extract physical track values for mixed expression")
+        base_df = _remap_interval_ids(base_df, _itr_id_map)
         for tname in track_exprs:
             col = tname if tname in base_df.columns else _bound_colname(tname, 40)
             if col not in base_df.columns:
@@ -1491,6 +1501,9 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
             return None
         return result_2d
 
+    # Handle DataFrame-as-iterator for 1D gscreen
+    intervals, iterator, _scr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
     expr_eval, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
@@ -1514,12 +1527,12 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
     if not expr_vtracks and not user_vars:
-        with _progress_context(progress, desc=progress_desc):
+        with _config_no_mt(_scr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_screen(
                 expr,
                 _df2pymisha(intervals),
-                kwargs.get('iterator'),
-                CONFIG
+                iterator,
+                _cfg
             )
         df = _pymisha2df(result)
         intervals_set_out = kwargs.get("intervals_set_out")
@@ -1535,12 +1548,13 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
 
     if expr_tracks:
         track_exprs = list(expr_tracks)
-        base_result = _pymisha.pm_extract(
-            track_exprs,
-            _df2pymisha(intervals),
-            kwargs.get('iterator'),
-            CONFIG
-        )
+        with _config_no_mt(_scr_id_map) as _cfg:
+            base_result = _pymisha.pm_extract(
+                track_exprs,
+                _df2pymisha(intervals),
+                iterator,
+                _cfg
+            )
         base_df = _pymisha2df(base_result)
         if base_df is None:
             raise RuntimeError("Failed to extract physical track values for mixed expression")
@@ -1551,12 +1565,12 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
         iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
     else:
-        if kwargs.get('iterator') is None:
+        if iterator is None:
             raise ValueError(
                 f"Cannot implicitly determine iterator policy:\n"
                 f"track expression \"{expr}\" does not contain any tracks."
             )
-        iter_df = _iterated_intervals(intervals, kwargs.get('iterator'))
+        iter_df = _iterated_intervals(intervals, iterator)
 
     if iter_df is None or len(iter_df) == 0:
         return None

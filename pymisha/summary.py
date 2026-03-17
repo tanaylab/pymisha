@@ -7,9 +7,11 @@ from ._shared import (
     _bound_colname,
     _checkroot,
     _chunk_slices,
+    _config_no_mt,
     _df2pymisha,
     _numpy,
     _pandas,
+    _preprocess_intervals_iterator,
     _progress_context,
     _pymisha,
     _pymisha2df,
@@ -180,6 +182,9 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     # Band or 2D intervals require extract-then-bin path
     if band is not None or _is_2d_intervals(intervals):
         result = _gdist_band_path(
@@ -196,20 +201,21 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
     if not has_vtracks and not all_user_vars:
         # Use C++ streaming implementation
-        config = dict(CONFIG)
-        if progress is not None:
-            config['progress'] = progress
-        if progress_desc:
-            config['progress_desc'] = progress_desc
+        with _config_no_mt(_itr_id_map) as _base_cfg:
+            config = dict(_base_cfg)
+            if progress is not None:
+                config['progress'] = progress
+            if progress_desc:
+                config['progress_desc'] = progress_desc
 
-        result = _pymisha.pm_dist(
-            exprs,
-            breaks_list,
-            _df2pymisha(intervals),
-            iterator,
-            include_lowest,
-            config
-        )
+            result = _pymisha.pm_dist(
+                exprs,
+                breaks_list,
+                _df2pymisha(intervals),
+                iterator,
+                include_lowest,
+                config
+            )
 
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -909,6 +915,9 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     # Resolve user variables
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
@@ -931,8 +940,8 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
 
     vtracks_used = _find_vtracks_in_expr(expr)
     if not vtracks_used and not user_vars:
-        with _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, _cfg)
         if result is None:
             return _pandas.Series(
                 [0.0, 0.0, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan],
@@ -1019,6 +1028,9 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     # Resolve user variables
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
@@ -1051,8 +1063,8 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
 
     vtracks_used = _find_vtracks_in_expr(expr)
     if not vtracks_used and not user_vars:
-        with _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
         if result is None:
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
         else:
@@ -1116,14 +1128,17 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
 
     intervals = _maybe_load_intervals_set(intervals)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_summary")
 
     vtracks_used = _find_vtracks_in_expr(expr)
     use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals)
     if not use_extract_path:
-        with _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, _cfg)
         if result is None:
             out = intervals[_interval_coord_cols(intervals)].copy()
             out["Total intervals"] = 0.0
@@ -1236,6 +1251,9 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
 
     intervals = _maybe_load_intervals_set(intervals)
 
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_quantiles")
 
@@ -1248,8 +1266,8 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
     vtracks_used = _find_vtracks_in_expr(expr)
     use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals)
     if not use_extract_path:
-        with _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG)
+        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
         if result is None:
             out = intervals[_interval_coord_cols(intervals)].copy()
             for p in pct:
@@ -1384,14 +1402,18 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    result = _pymisha.pm_partition(
-        expr,
-        breaks_list,
-        _df2pymisha(intervals),
-        iterator,
-        include_lowest,
-        CONFIG
-    )
+    # Handle DataFrame-as-iterator
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+
+    with _config_no_mt(_itr_id_map) as _cfg:
+        result = _pymisha.pm_partition(
+            expr,
+            breaks_list,
+            _df2pymisha(intervals),
+            iterator,
+            include_lowest,
+            _cfg
+        )
 
     if result is None:
         return None

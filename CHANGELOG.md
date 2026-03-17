@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.19 (2026-03-17)
+
+### Features
+- **DataFrame intervals as iterator:** `gextract()`, `gscreen()`, `gsummary()`, `gquantiles()`, `gdist()`, `gpartition()`, `giterator_intervals()`, `gtrack_create()`, `gtrack_smooth()`, and `glookup()` now accept a pandas DataFrame of intervals as the `iterator` parameter, matching R misha behavior. Iterator intervals are intersected with the scope in Python and passed to C++ with `iterator=-1`.
+- **Interval set names as iterator:** All iterator-accepting functions now also accept a string naming a saved interval set as the `iterator` parameter.
+- **String interval set names in set operations:** `gintervals_intersect()`, `gintervals_union()`, `gintervals_diff()`, `gintervals_canonic()`, `gintervals_neighbors()`, `gintervals_covered_bp()`, `gintervals_coverage_fraction()`, `gintervals_force_range()`, `gintervals_mark_overlaps()`, and `gintervals_annotate()` now accept string interval set names in addition to DataFrames.
+- **`partial_bins` parameter:** `giterator_intervals()` gained a `partial_bins` parameter (`"clip"`, `"drop"`, or `"exact"`) controlling how bins that don't fit entirely within an interval are handled.
+- **`gintervals_covered_bp()` src parameter:** Optional `src` parameter restricts counting to the intersection of `intervals` with `src`.
+- **`gtrack_create()` band support:** The `band` parameter is now wired through for 2D track creation instead of raising `ValueError`.
+
+### Testing
+- 21 new tests for API type gap fixes (string names, partial_bins, band, covered_bp src).
+- Tests for DataFrame and interval-set-name iterators across all affected functions.
+
 ## v0.1.18 (2026-03-16)
 
 ### Features
