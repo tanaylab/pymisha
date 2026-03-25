@@ -20,6 +20,8 @@
 #include "GenomeTrackSparse.h"
 #include "GenomeSeqFetch.h"
 #include "PWMScorer.h"
+#include "PWMEditDistanceScorer.h"
+#include "PWMLseEditDistanceScorer.h"
 #include "KmerCounter.h"
 #include "MaskedBpCounter.h"
 #include "pmutils.h"
@@ -512,6 +514,9 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
         // Sequence-based vtracks
         if (func == "pwm" || func == "pwm.max" || func == "pwm.max.pos" || func == "pwm.count" ||
+            func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
+            func == "pwm.max.edit_distance" ||
+            func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos" ||
             func == "kmer.count" || func == "kmer.frac" ||
             func == "masked.count" || func == "masked.frac") {
 
@@ -530,6 +535,71 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     score_thresh = obj_to_double(alt, score_thresh);
                 }
 
+                DnaPSSM pssm;
+                if (!parse_pssm(py_pssm, pssm, prior)) {
+                    TGLError("pwm functions require a numeric pssm matrix (shape Lx4)");
+                }
+                pssm.set_bidirect(bidirect);
+                char strand = bidirect ? 0 : (char)strand_mode;
+
+                // PWM edit distance functions
+                bool is_edit_dist = (func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
+                                     func == "pwm.max.edit_distance");
+                bool is_lse_edit_dist = (func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos");
+
+                if (is_edit_dist || is_lse_edit_dist) {
+                    int max_edits = (int)obj_to_int64(dict_get(py_spec, "max_edits"), -1);
+                    float score_min_f = std::numeric_limits<float>::quiet_NaN();
+                    float score_max_f = std::numeric_limits<float>::quiet_NaN();
+                    bool found_smin = false, found_smax = false;
+                    double smin_d = obj_to_double(dict_get(py_spec, "score_min"), 0.0, &found_smin);
+                    double smax_d = obj_to_double(dict_get(py_spec, "score_max"), 0.0, &found_smax);
+                    if (found_smin) score_min_f = (float)smin_d;
+                    if (found_smax) score_max_f = (float)smax_d;
+
+                    GenomeSeqFetch shared_seq;
+                    shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
+
+                    if (is_edit_dist) {
+                        int max_indels = (int)obj_to_int64(dict_get(py_spec, "max_indels"), 0);
+
+                        PWMEditDistanceScorer::Mode mode = PWMEditDistanceScorer::Mode::MIN_EDITS;
+                        if (func == "pwm.edit_distance.pos") mode = PWMEditDistanceScorer::Mode::MIN_EDITS_POSITION;
+                        else if (func == "pwm.max.edit_distance") mode = PWMEditDistanceScorer::Mode::PWM_MAX_EDITS;
+
+                        PWMEditDistanceScorer scorer(pssm, &shared_seq, (float)score_thresh,
+                                                     max_edits, extend, strand, mode,
+                                                     score_min_f, max_indels, score_max_f);
+
+                        for (size_t i = 0; i < intervals.size(); ++i) {
+                            GInterval eval;
+                            if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
+                                set_nan(i);
+                                continue;
+                            }
+                            out[i] = scorer.score_interval(eval, chromkey);
+                        }
+                    } else {
+                        PWMLseEditDistanceScorer::Mode mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE;
+                        if (func == "pwm.edit_distance.lse.pos") mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE_POS;
+
+                        PWMLseEditDistanceScorer scorer(pssm, &shared_seq, (float)score_thresh,
+                                                        max_edits, extend, strand, mode,
+                                                        score_min_f, score_max_f);
+
+                        for (size_t i = 0; i < intervals.size(); ++i) {
+                            GInterval eval;
+                            if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
+                                set_nan(i);
+                                continue;
+                            }
+                            out[i] = scorer.score_interval(eval, chromkey);
+                        }
+                    }
+                    return_py(py_vals);
+                }
+
+                // Standard PWM scoring functions (pwm, pwm.max, pwm.max.pos, pwm.count)
                 std::vector<float> spat_factor;
                 int spat_bin = (int)obj_to_int64(dict_get(py_spec, "spat_bin"), 1);
                 bool has_spat = false;
@@ -548,25 +618,18 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                 int64_t spat_min = obj_to_int64(dict_get(py_spec, "spat_min"), 0);
                 int64_t spat_max = obj_to_int64(dict_get(py_spec, "spat_max"), 0);
-
-                DnaPSSM pssm;
-                if (!parse_pssm(py_pssm, pssm, prior)) {
-                    TGLError("pwm functions require a numeric pssm matrix (shape Lx4)");
-                }
-                pssm.set_bidirect(bidirect);
                 if (has_spat && spat_max > spat_min) {
                     pssm.set_range((int)spat_min, (int)spat_max);
                 }
 
-                PWMScorer::ScoringMode mode = PWMScorer::TOTAL_LIKELIHOOD;
-                if (func == "pwm.max") mode = PWMScorer::MAX_LIKELIHOOD;
-                else if (func == "pwm.max.pos") mode = PWMScorer::MAX_LIKELIHOOD_POS;
-                else if (func == "pwm.count") mode = PWMScorer::MOTIF_COUNT;
+                PWMScorer::ScoringMode pwm_mode = PWMScorer::TOTAL_LIKELIHOOD;
+                if (func == "pwm.max") pwm_mode = PWMScorer::MAX_LIKELIHOOD;
+                else if (func == "pwm.max.pos") pwm_mode = PWMScorer::MAX_LIKELIHOOD_POS;
+                else if (func == "pwm.count") pwm_mode = PWMScorer::MOTIF_COUNT;
 
-                char strand = bidirect ? 0 : (char)strand_mode;
                 GenomeSeqFetch shared_seq;
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
-                PWMScorer scorer(pssm, &shared_seq, extend, mode, strand, spat_factor, spat_bin, (float)score_thresh);
+                PWMScorer scorer(pssm, &shared_seq, extend, pwm_mode, strand, spat_factor, spat_bin, (float)score_thresh);
 
                 for (size_t i = 0; i < intervals.size(); ++i) {
                     GInterval eval;

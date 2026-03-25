@@ -23,6 +23,87 @@ from ._shared import (
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
 
+# Functions eligible for C++ inline vtrack evaluation (no filter required)
+_CPP_SEQ_FUNCS = {
+    "pwm", "pwm.max", "pwm.max.pos", "pwm.count",
+    "pwm.edit_distance", "pwm.edit_distance.pos", "pwm.max.edit_distance",
+    "pwm.edit_distance.lse", "pwm.edit_distance.lse.pos",
+    "kmer.count", "kmer.frac",
+    "masked.count", "masked.frac",
+}
+_CPP_VALUE_FUNCS = {
+    "avg", "mean", "sum", "min", "max", "first", "last", "size", "exists",
+    "stddev", "std", "quantile", "sample", "nearest", "lse",
+    "first.pos.abs", "first.pos.relative",
+    "last.pos.abs", "last.pos.relative",
+    "min.pos.abs", "min.pos.relative",
+    "max.pos.abs", "max.pos.relative",
+    "sample.pos.abs", "sample.pos.relative",
+}
+
+
+def _can_vtracks_use_cpp(vtrack_names):
+    """Check whether all listed vtracks can be evaluated in the C++ scanner.
+
+    Returns True if every vtrack is eligible for inline C++ evaluation.
+    A vtrack is eligible when:
+      - It has no filter attached.
+      - Its source is None (sequence-based) or a string (physical track name).
+      - Its function is in the supported set.
+    """
+    for name in vtrack_names:
+        cfg = _shared._VTRACKS.get(name)
+        if cfg is None:
+            return False
+        # Filter vtracks must go through Python
+        filt = cfg.get("filter")
+        if filt is not None and not (isinstance(filt, _pandas.DataFrame) and len(filt) == 0):
+            return False
+        src = cfg.get("src")
+        func = str(cfg.get("func", "avg")).lower()
+        if src is None:
+            # Sequence-based
+            if func not in _CPP_SEQ_FUNCS:
+                return False
+        elif isinstance(src, str):
+            # Physical track source
+            if func not in _CPP_VALUE_FUNCS:
+                return False
+        elif isinstance(src, _pandas.DataFrame):
+            # DataFrame source — must go to Python for now
+            return False
+        else:
+            return False
+    return True
+
+
+def _build_vtracks_dict(vtrack_names):
+    """Build a Python dict of vtrack specs to pass to C++.
+
+    The dict maps vtrack_name -> spec dict.  PSSM DataFrames are converted
+    to numpy arrays so the C++ side can parse them.
+    """
+    result = {}
+    for name in vtrack_names:
+        cfg = _shared._VTRACKS.get(name)
+        if cfg is None:
+            continue
+        spec = dict(cfg)
+        # Ensure pssm is a numpy array
+        pssm = spec.get("pssm")
+        if pssm is not None and isinstance(pssm, _pandas.DataFrame):
+            spec["pssm"] = pssm.to_numpy(dtype=float, copy=True)
+        # Strip filter-related keys (shouldn't be present but be safe)
+        spec.pop("filter", None)
+        spec.pop("filter_key", None)
+        spec.pop("filter_stats", None)
+        # Strip DataFrame src (shouldn't happen on this path)
+        src = spec.get("src")
+        if isinstance(src, _pandas.DataFrame):
+            spec.pop("src_df", None)
+        result[name] = spec
+    return result
+
 
 def _is_2d_intervals(intervals):
     """Check if intervals DataFrame has 2D columns."""
@@ -1017,18 +1098,23 @@ def _apply_extract_output(df, file, intervals_set_out, *, is_2d=False):
 
 def _worker_extract_chunk(args):
     """Worker function for parallel gextract (runs in forked subprocess)."""
-    (chunk_dict, exprs, iterator_val, config_dict) = args
+    if len(args) == 5:
+        (chunk_dict, exprs, iterator_val, config_dict, vtracks_dict) = args
+    else:
+        (chunk_dict, exprs, iterator_val, config_dict) = args
+        vtracks_dict = None
     chunk_intervals = _pandas.DataFrame(chunk_dict)
     result = _pymisha.pm_extract(
         exprs,
         _df2pymisha(chunk_intervals),
         iterator_val,
         config_dict,
+        vtracks_dict,
     )
     return _pymisha2df(result)
 
 
-def _parallel_extract(exprs, intervals, iterator, config):
+def _parallel_extract(exprs, intervals, iterator, config, vtracks_dict=None):
     """Split intervals by chromosome and extract in parallel.
 
     Returns a merged DataFrame with globally consistent intervalIDs that
@@ -1063,7 +1149,7 @@ def _parallel_extract(exprs, intervals, iterator, config):
         original_indices.append(orig_idx)
 
     worker_args = [
-        (chunk_dict, exprs, iterator, worker_config)
+        (chunk_dict, exprs, iterator, worker_config, vtracks_dict)
         for chunk_dict in chunks
     ]
 
@@ -1242,7 +1328,11 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
 
-    if not used_vtracks and not all_user_vars:
+    # Check if vtracks can go through C++ path
+    cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars
+
+    if (not used_vtracks and not all_user_vars) or cpp_vtracks_extract:
+        vtracks_dict = _build_vtracks_dict(used_vtracks) if cpp_vtracks_extract else None
         # Try parallel extraction if max_processes > 1.
         # Skip when a custom progress callback is provided (not compatible
         # with forked workers) or when file output is requested.
@@ -1255,7 +1345,8 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
                 and file is None
             )
             if use_parallel:
-                df = _parallel_extract(exprs, intervals, iterator, _cfg)
+                df = _parallel_extract(exprs, intervals, iterator, _cfg,
+                                       vtracks_dict=vtracks_dict)
 
             if df is None:
                 with _progress_context(progress, desc=progress_desc):
@@ -1263,7 +1354,8 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
                         exprs,
                         _df2pymisha(intervals),
                         iterator,
-                        _cfg
+                        _cfg,
+                        vtracks_dict,
                     )
                 df = _pymisha2df(result)
         df = _remap_interval_ids(df, _itr_id_map)
@@ -1526,13 +1618,18 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
-    if not expr_vtracks and not user_vars:
+    # Check if vtracks can go through C++ path
+    cpp_vtracks = expr_vtracks and _can_vtracks_use_cpp(expr_vtracks) and not user_vars
+
+    if (not expr_vtracks and not user_vars) or cpp_vtracks:
+        vtracks_dict = _build_vtracks_dict(expr_vtracks) if cpp_vtracks else None
         with _config_no_mt(_scr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_screen(
                 expr,
                 _df2pymisha(intervals),
                 iterator,
-                _cfg
+                _cfg,
+                vtracks_dict,
             )
         df = _pymisha2df(result)
         intervals_set_out = kwargs.get("intervals_set_out")

@@ -131,6 +131,7 @@ from .sequence import (
     gseq_kmer,
     gseq_kmer_dist,
     gseq_pwm,
+    gseq_pwm_edits,
     gseq_rev,
     gseq_revcomp,
 )
@@ -353,6 +354,7 @@ __all__ = [
     'gseq_kmer',
     'gseq_kmer_dist',
     'gseq_pwm',
+    'gseq_pwm_edits',
     'gseq_read_meme',
     'gseq_read_jaspar',
     'gseq_read_homer',

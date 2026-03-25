@@ -426,6 +426,160 @@ PyObject *pm_dbunload(PyObject *self, PyObject *args)
     return Py_None;
 }
 
+// ---------------------------------------------------------------------------
+//  Range-based interval splitting for intra-chromosome parallelization
+// ---------------------------------------------------------------------------
+
+struct SplitInterval {
+    GInterval interval;
+    uint64_t original_idx;  // 0-based index into original intervals vector
+};
+
+// Port of R misha's split_intervals_1d_by_range: walk intervals linearly,
+// accumulate range per worker, split individual intervals at bin-aligned
+// boundaries.
+static void split_intervals_by_range(const std::vector<GInterval> &intervals,
+                                     int desired_kids,
+                                     int64_t split_align,
+                                     std::vector<std::vector<SplitInterval>> &out_kids)
+{
+    out_kids.clear();
+    if (intervals.empty())
+        return;
+
+    int64_t total_range = 0;
+    for (const auto &iv : intervals)
+        total_range += iv.end - iv.start;
+
+    if (total_range <= 0)
+        return;
+
+    desired_kids = std::max(1, desired_kids);
+    if ((int64_t)desired_kids > total_range)
+        desired_kids = (int)total_range;
+
+    int kids_left = desired_kids;
+    int64_t range_left = total_range;
+    int64_t kid_range = 0;
+
+    out_kids.emplace_back();  // first worker bucket
+
+    for (uint64_t idx = 0; idx < intervals.size(); ++idx) {
+        const GInterval &iinterv = intervals[idx];
+        int64_t seg_start = iinterv.start;
+        const int64_t seg_end_total = iinterv.end;
+
+        while (seg_start < seg_end_total) {
+            if (kids_left <= 1) {
+                // Last worker: absorb everything remaining
+                SplitInterval si;
+                si.interval = GInterval(iinterv.chromid, seg_start, seg_end_total, iinterv.strand, iinterv.udata);
+                si.original_idx = idx;
+                out_kids.back().push_back(si);
+
+                int64_t seg_range = seg_end_total - seg_start;
+                kid_range += seg_range;
+                range_left -= seg_range;
+                seg_start = seg_end_total;
+                continue;
+            }
+
+            int64_t target_kid_range = (range_left + kids_left - 1) / kids_left;
+            int64_t need = target_kid_range - kid_range;
+
+            if (need <= 0 && !out_kids.back().empty()) {
+                --kids_left;
+                out_kids.emplace_back();
+                kid_range = 0;
+                continue;
+            }
+
+            int64_t chunk_end = seg_end_total;
+            if (need > 0 && seg_start + need < seg_end_total)
+                chunk_end = seg_start + need;
+
+            if (split_align > 0 && chunk_end < seg_end_total) {
+                int64_t aligned_end = (chunk_end / split_align) * split_align;
+                if (aligned_end <= seg_start)
+                    aligned_end = ((seg_start / split_align) + 1) * split_align;
+                if (aligned_end < seg_end_total)
+                    chunk_end = aligned_end;
+            }
+
+            if (chunk_end <= seg_start)
+                chunk_end = seg_start + 1;
+
+            SplitInterval si;
+            si.interval = GInterval(iinterv.chromid, seg_start, chunk_end, iinterv.strand, iinterv.udata);
+            si.original_idx = idx;
+            out_kids.back().push_back(si);
+
+            int64_t seg_range = chunk_end - seg_start;
+            kid_range += seg_range;
+            range_left -= seg_range;
+            seg_start = chunk_end;
+
+            if (kid_range >= target_kid_range && kids_left > 1) {
+                --kids_left;
+                out_kids.emplace_back();
+                kid_range = 0;
+            }
+        }
+    }
+
+    // Trim trailing empty workers
+    while (!out_kids.empty() && out_kids.back().empty())
+        out_kids.pop_back();
+}
+
+static void extract_sub_intervals(
+    const std::vector<SplitInterval> &split,
+    std::vector<GInterval> &sub,
+    std::vector<uint64_t> *id_remap = nullptr)
+{
+    sub.clear();
+    sub.reserve(split.size());
+    if (id_remap) {
+        id_remap->clear();
+        id_remap->reserve(split.size());
+    }
+    for (const auto &si : split) {
+        sub.push_back(si.interval);
+        if (id_remap)
+            id_remap->push_back(si.original_idx);
+    }
+}
+
+// Forward declaration (defined later)
+static int choose_num_kids(uint64_t num_intervals);
+
+static int choose_num_kids_for_range(size_t num_intervals, int64_t total_range, int64_t bin_size)
+{
+    if (!g_pymisha->multitasking_avail())
+        return 0;
+
+    int hw = std::thread::hardware_concurrency();
+    int max_p = g_pymisha->max_processes();
+    int min_p = g_pymisha->min_processes();
+    int target = std::clamp(hw ? hw : max_p, min_p, max_p);
+
+    // Range-based: at least 50000 bins per worker
+    int64_t total_bins = (total_range + bin_size - 1) / bin_size;
+    int64_t min_bins_per_kid = 50000;
+    int desired = std::min((int64_t)target, (total_bins + min_bins_per_kid - 1) / min_bins_per_kid);
+    if (desired < 1) desired = 1;
+
+    // Also consider count-based (existing logic)
+    int count_based = choose_num_kids(num_intervals);
+
+    int result = std::max(count_based, (int)desired);
+    if (result < 2)
+        return 0;
+    return std::min(result, target);
+}
+
+// ---------------------------------------------------------------------------
+
 struct ExtractResult {
     std::vector<GInterval> intervals;
     std::vector<std::vector<double>> values;
@@ -508,7 +662,9 @@ static ExtractResult run_extract(const std::vector<std::string> &exprs,
                                  const std::vector<GInterval> &intervals,
                                  long iterator_policy,
                                  uint64_t interval_id_offset,
-                                 PyObject *progress_cb)
+                                 PyObject *progress_cb,
+                                 const std::vector<uint64_t> *id_remap = nullptr,
+                                 PyObject *py_vtracks = nullptr)
 {
     ExtractResult result;
     if (intervals.empty()) {
@@ -520,7 +676,7 @@ static ExtractResult run_extract(const std::vector<std::string> &exprs,
         scanner.set_progress_callback(progress_cb);
         scanner.report_progress(false);
     }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
     result.values.assign(exprs.size(), {});
 
@@ -540,7 +696,16 @@ static ExtractResult run_extract(const std::vector<std::string> &exprs,
             result.values[iexpr].push_back(scanner.vdouble(iexpr));
         }
 
-        result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
+        if (id_remap) {
+            uint64_t local_id = scanner.last_interval_id();
+            if (local_id >= 1 && local_id <= (uint64_t)id_remap->size()) {
+                result.interval_ids.push_back((*id_remap)[local_id - 1] + 1);
+            } else {
+                result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
+            }
+        } else {
+            result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
+        }
 
         g_pymisha->verify_max_data_size(result.intervals.size(), "Result");
         check_interrupt();
@@ -615,7 +780,8 @@ static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
 static std::vector<GInterval> compute_screen(const std::string &expr,
                                              const std::vector<GInterval> &intervals,
                                              long iterator_policy,
-                                             PyObject *progress_cb)
+                                             PyObject *progress_cb,
+                                             PyObject *py_vtracks = nullptr)
 {
     std::vector<GInterval> out_intervals;
     if (intervals.empty())
@@ -627,7 +793,7 @@ static std::vector<GInterval> compute_screen(const std::string &expr,
         scanner.set_progress_callback(progress_cb);
         scanner.report_progress(false);
     }
-    scanner.begin(exprs, PMTrackExprScanner::LOGICAL_T, intervals, iterator_policy);
+    scanner.begin(exprs, PMTrackExprScanner::LOGICAL_T, intervals, iterator_policy, py_vtracks);
 
     GInterval prev_interval(-1, -1, -1);
     bool have_prev = false;
@@ -689,8 +855,6 @@ static void merge_adjacent(std::vector<GInterval> &intervals)
     intervals.swap(merged);
 }
 
-static int choose_num_kids(uint64_t num_intervals);
-
 static void sort_extract_result(ExtractResult &result)
 {
     const size_t n = result.intervals.size();
@@ -744,7 +908,7 @@ static void sort_extract_result(ExtractResult &result)
 }
 
 // Track extraction - main function
-// Called from Python as: pm_extract(exprs, intervals, iterator, config)
+// Called from Python as: pm_extract(exprs, intervals, iterator, config[, vtracks])
 PyObject *pm_extract(PyObject *self, PyObject *args)
 {
     try {
@@ -754,8 +918,9 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
         PyObject *py_intervals = NULL;
         PyObject *py_iterator = NULL;
         PyObject *py_config = NULL;
+        PyObject *py_vtracks = NULL;
 
-        if (!PyArg_ParseTuple(args, "OO|OO", &py_exprs, &py_intervals, &py_iterator, &py_config)) {
+        if (!PyArg_ParseTuple(args, "OO|OOO", &py_exprs, &py_intervals, &py_iterator, &py_config, &py_vtracks)) {
             verror("Invalid arguments to pm_extract");
         }
 
@@ -799,7 +964,24 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                exprs.size(), intervals.size(), iterator_policy);
 
         ExtractResult result;
-        int num_kids = choose_num_kids(intervals.size());
+
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
+
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
             progress_cb = NULL;
@@ -816,10 +998,19 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
-                    ExtractResult kid_result = run_extract(exprs, sub, iterator_policy, start, progress_cb);
+                    std::vector<GInterval> sub;
+                    std::vector<uint64_t> id_remap;
+                    uint64_t id_offset = 0;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub, &id_remap);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                        id_offset = start;
+                    }
+                    ExtractResult kid_result = run_extract(exprs, sub, iterator_policy, id_offset, progress_cb,
+                                                           !id_remap.empty() ? &id_remap : nullptr, py_vtracks);
 
                     ExtractHeader header{kid_result.intervals.size(), exprs.size()};
                     std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 + sizeof(uint64_t) +
@@ -911,7 +1102,8 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
             while (PyMisha::wait_for_kids(100))
                 ;
         } else {
-            result = run_extract(exprs, intervals, iterator_policy, 0, progress_cb);
+            result = run_extract(exprs, intervals, iterator_policy, 0, progress_cb,
+                                 nullptr, py_vtracks);
         }
 
         if (result.intervals.empty()) {
@@ -1000,6 +1192,7 @@ PyObject *pm_iterate(PyObject *self, PyObject *args)
 }
 
 // Screen intervals by expression - keep intervals where expression evaluates to True
+// Called from Python as: pm_screen(expr, intervals[, iterator, config, vtracks])
 PyObject *pm_screen(PyObject *self, PyObject *args)
 {
     try {
@@ -1009,8 +1202,9 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
         PyObject *py_intervals = NULL;
         PyObject *py_iterator = NULL;
         PyObject *py_config = NULL;
+        PyObject *py_vtracks = NULL;
 
-        if (!PyArg_ParseTuple(args, "OO|OO", &py_expr, &py_intervals, &py_iterator, &py_config)) {
+        if (!PyArg_ParseTuple(args, "OO|OOO", &py_expr, &py_intervals, &py_iterator, &py_config, &py_vtracks)) {
             verror("Invalid arguments to pm_screen");
         }
 
@@ -1037,7 +1231,23 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
                expr.c_str(), intervals.size(), iterator_policy);
 
         std::vector<GInterval> out_intervals;
-        int num_kids = choose_num_kids(intervals.size());
+
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_screen = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_screen) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -1054,10 +1264,15 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
-                    std::vector<GInterval> kid_intervals = compute_screen(expr, sub, iterator_policy, progress_cb);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
+                    std::vector<GInterval> kid_intervals = compute_screen(expr, sub, iterator_policy, progress_cb, py_vtracks);
 
                     ScreenHeader header{kid_intervals.size()};
                     std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2);
@@ -1122,7 +1337,7 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
             while (PyMisha::wait_for_kids(100))
                 ;
         } else {
-            out_intervals = compute_screen(expr, intervals, iterator_policy, progress_cb);
+            out_intervals = compute_screen(expr, intervals, iterator_policy, progress_cb, py_vtracks);
         }
 
         if (out_intervals.empty()) {
@@ -1336,7 +1551,22 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
 
         SummaryStats summary;
 
-        int num_kids = choose_num_kids(intervals.size());
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_sum = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_sum) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -1348,9 +1578,14 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
                     SummaryStats kid_summary = compute_summary(expr, sub, iterator_policy, progress_cb);
                     PyMisha::write_multitask_fifo(&kid_summary, sizeof(kid_summary));
                     _exit(0);
@@ -1619,7 +1854,22 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
 
         std::vector<double> quantiles(n, std::numeric_limits<double>::quiet_NaN());
 
-        int num_kids = choose_num_kids(intervals.size());
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_q = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_q) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -1633,9 +1883,14 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
 
                     StreamPercentiler<double> sp(kid_sampling_buf_size, 0, 0);
                     fill_stream_percentiler(expr, sub, iterator_policy, sp, progress_cb);
@@ -2775,7 +3030,22 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
 
         std::vector<PartitionInterval> result;
 
-        int num_kids = choose_num_kids(intervals.size());
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_part = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_part) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -2788,9 +3058,14 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
                     std::vector<PartitionInterval> kid_result =
                         compute_partition(expr, sub, bin_finder, iterator_policy, progress_cb);
 
@@ -3577,7 +3852,22 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
 
         std::vector<uint64_t> distribution;
 
-        int num_kids = choose_num_kids(intervals.size());
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_dist = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_dist) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -3590,9 +3880,14 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
                     std::vector<uint64_t> kid_dist =
                         compute_dist(exprs, sub, bins_manager, iterator_policy, progress_cb);
 
@@ -3913,7 +4208,23 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
 
         LookupResult result;
 
-        int num_kids = choose_num_kids(intervals.size());
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_lk = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (use_range_split_lk) {
+            int64_t total_range = 0;
+            for (const auto &iv : intervals) total_range += iv.end - iv.start;
+            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+            if (num_kids > 0) {
+                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                num_kids = (int)range_kids.size();
+            }
+        } else {
+            num_kids = choose_num_kids(intervals.size());
+        }
+
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
             progress_cb = NULL;
@@ -3929,12 +4240,19 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    uint64_t lk_id_offset = 0;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                        lk_id_offset = start;
+                    }
                     LookupResult kid_result =
                         compute_lookup(exprs, sub, bins_manager, lookup_table,
-                                       force_binning != 0, iterator_policy, start, progress_cb);
+                                       force_binning != 0, iterator_policy, lk_id_offset, progress_cb);
 
                     LookupHeader header{kid_result.intervals.size()};
 
@@ -4676,9 +4994,27 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
         std::vector<CorSummary> summaries(num_pairs);
         std::vector<SpearmanSummary> spearman_summaries(num_pairs);
 
-        int num_kids = (method == CorMethod::PEARSON || method == CorMethod::SPEARMAN_EXACT)
-                           ? choose_num_kids(intervals.size())
-                           : 0;
+        // Range-based splitting for fixed-bin iterators
+        bool use_range_split_cor = (iterator_policy > 0);
+        int num_kids;
+        std::vector<std::vector<SplitInterval>> range_kids;
+
+        if (method == CorMethod::PEARSON || method == CorMethod::SPEARMAN_EXACT) {
+            if (use_range_split_cor) {
+                int64_t total_range = 0;
+                for (const auto &iv : intervals) total_range += iv.end - iv.start;
+                num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
+                if (num_kids > 0) {
+                    split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
+                    num_kids = (int)range_kids.size();
+                }
+            } else {
+                num_kids = choose_num_kids(intervals.size());
+            }
+        } else {
+            num_kids = 0;
+        }
+
         uint64_t sample_size = g_pymisha->max_data_size();
         if (sample_size < 1)
             sample_size = 1;
@@ -4689,9 +5025,14 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
                 if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
+                    std::vector<GInterval> sub;
+                    if (!range_kids.empty()) {
+                        extract_sub_intervals(range_kids[kid], sub);
+                    } else {
+                        size_t start = (intervals.size() * kid) / num_kids;
+                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
+                        sub.assign(intervals.begin() + start, intervals.begin() + end);
+                    }
 
                     for (size_t p = 0; p < num_pairs; ++p) {
                         if (method == CorMethod::PEARSON) {

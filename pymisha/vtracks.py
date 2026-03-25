@@ -42,6 +42,13 @@ _FILTER_GLOBAL_PERCENTILE_FUNCS = {
     "global.percentile.max",
 }
 _FILTER_PWM_MAX_POS_FUNCS = {"pwm.max.pos"}
+_FILTER_EDIT_DISTANCE_FUNCS = {
+    "pwm.edit_distance",
+    "pwm.edit_distance.pos",
+    "pwm.max.edit_distance",
+    "pwm.edit_distance.lse",
+    "pwm.edit_distance.lse.pos",
+}
 _DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
 _VALUE_DF_PY_FUNCS = {
     "avg", "mean", "sum", "min", "max", "first", "last", "size", "exists",
@@ -78,6 +85,7 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_LOGSUMEXP_FUNCS
     | _FILTER_GLOBAL_PERCENTILE_FUNCS
     | _FILTER_PWM_MAX_POS_FUNCS
+    | _FILTER_EDIT_DISTANCE_FUNCS
 )
 
 _GLOBAL_PERCENTILE_CACHE = {}
@@ -1234,6 +1242,9 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
           ``'global.percentile'``
         - **Motif/PWM** (src=None): ``'pwm'``, ``'pwm.max'``,
           ``'pwm.max.pos'``, ``'pwm.count'``
+        - **Edit distance** (src=None): ``'pwm.edit_distance'``,
+          ``'pwm.edit_distance.pos'``, ``'pwm.max.edit_distance'``,
+          ``'pwm.edit_distance.lse'``, ``'pwm.edit_distance.lse.pos'``
         - **K-mer** (src=None): ``'kmer.count'``, ``'kmer.frac'``
         - **Masked sequence** (src=None): ``'masked.count'``,
           ``'masked.frac'``
@@ -1257,7 +1268,17 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
         - ``bidirect`` (bool) -- If True, score both DNA strands (PWM).
         - ``extend`` (bool) -- If True (default), extend the scanned
           sequence so boundary-anchored motifs retain full context.
-        - ``score_thresh`` (float) -- Score threshold for ``'pwm.count'``.
+        - ``score_thresh`` (float) -- Score threshold for ``'pwm.count'``
+          and edit distance functions.
+        - ``max_edits`` (int or None) -- Maximum number of edits for edit
+          distance functions. None (default) uses exact computation.
+        - ``max_indels`` (int) -- Maximum insertions+deletions for
+          ``'pwm.edit_distance'``, ``'pwm.edit_distance.pos'``,
+          ``'pwm.max.edit_distance'``. Default 0 (substitutions only).
+        - ``score_min`` (float or None) -- Minimum PWM score filter for
+          edit distance functions. Windows below this are skipped.
+        - ``score_max`` (float or None) -- Maximum PWM score filter for
+          edit distance functions. Windows above this are skipped.
         - ``strand`` (int) -- Strand selection: 1 (forward), -1 (reverse),
           0 (both). Used by kmer and single-strand PWM modes.
         - ``kmer`` (str) -- DNA k-mer sequence for kmer functions.

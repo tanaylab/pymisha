@@ -19,6 +19,7 @@
 #include "GenomeTrack.h"
 #include "GenomeTrackFixedBin.h"
 #include "GenomeTrackSparse.h"
+#include "GenomeSeqScorer.h"
 
 class PMTrackExpressionVars {
 public:
@@ -37,12 +38,59 @@ public:
         bool cur_chromid_valid;     // Whether current chromosome data is valid
     };
 
+    // Virtual track variable — evaluated inline during scanning
+    struct VTrackVar {
+        std::string name;           // original vtrack name
+        std::string var_name;       // Python-safe variable name
+
+        // Value buffer (same pattern as TrackVar)
+        PMPY py_var;                // Python array ref
+        std::vector<double> cpp_values;
+        double *values{nullptr};    // pointer into array data
+
+        // Borrowed reference to the Python spec dict (kept alive by caller)
+        PyObject *py_spec{nullptr};
+
+        // Iterator shift modifiers
+        int64_t sshift{0};
+        int64_t eshift{0};
+
+        // Scorer (for sequence-based vtracks) — polymorphic
+        std::unique_ptr<GenomeSeqScorer> scorer;
+
+        // Per-vtrack sequence fetcher (fork-safe: each vtrack owns its own)
+        std::unique_ptr<GenomeSeqFetch> seqfetch;
+
+        // For value-based vtracks with a physical track source
+        std::string src_track_name;
+        std::string src_track_path;
+        GenomeTrack::Type src_track_type{GenomeTrack::NUM_TYPES};
+        std::unique_ptr<GenomeTrack> src_track;
+        std::string func;
+        double param{0.0};  // function-specific parameter (quantile, distance)
+        int src_cur_chromid{-1};
+        bool src_cur_chromid_valid{false};
+
+        // Sparse fast-reduce state
+        const std::vector<GInterval> *sp_intervals_ptr{nullptr};
+        const std::vector<float> *sp_vals_ptr{nullptr};
+        size_t sp_scan_idx{0};
+        int64_t sp_last_start{0};
+        bool sp_scan_ready{false};
+
+        // For value-based vtracks with interval/DataFrame source
+        // (These are computed by pm_vtrack_compute via Python, so we keep the spec)
+        bool use_pm_vtrack_compute{false};
+    };
+
     PMTrackExpressionVars();
     ~PMTrackExpressionVars();
 
     // Parse expressions to find track names and prepare variable mappings
+    // py_vtracks: optional Python dict mapping vtrack_name -> spec dict
     void parse_exprs(const std::vector<std::string> &track_exprs,
-                     std::vector<std::string> &exprs4compile);
+                     std::vector<std::string> &exprs4compile,
+                     PyObject *py_vtracks = nullptr);
 
     // Define Python variables in the local dictionary
     void define_py_vars(unsigned size, PMPY &ldict, bool use_python);
@@ -52,6 +100,9 @@ public:
 
     // Get number of track variables
     unsigned get_num_track_vars() const { return m_track_vars.size(); }
+
+    // Get number of vtrack variables
+    unsigned get_num_vtrack_vars() const { return m_vtrack_vars.size(); }
 
     // Get track name for a variable
     const std::string &get_track_name(unsigned ivar) const {
@@ -63,8 +114,11 @@ public:
         return m_track_vars[ivar].track.get();
     }
 
-    // Look up a variable by name
+    // Look up a variable by name (checks both track vars and vtrack vars)
     const TrackVar *var(const char *name) const;
+
+    // Look up a vtrack variable by name
+    const VTrackVar *vtrack_var(const char *name) const;
 
     // Get the bin size used by tracks (0 if not uniform)
     int64_t get_bin_size() const { return m_bin_size; }
@@ -83,7 +137,9 @@ public:
 
 private:
     std::vector<TrackVar> m_track_vars;
+    std::vector<VTrackVar> m_vtrack_vars;
     std::unordered_map<std::string, size_t> m_var_map;  // track_name -> index in m_track_vars
+    std::unordered_map<std::string, size_t> m_vtrack_var_map;  // vtrack_name -> index in m_vtrack_vars
     std::unordered_map<std::string, std::string> m_varname_to_track;  // var_name -> track_name (for collision detection)
     int64_t m_bin_size;  // Uniform bin size (0 if mixed)
     GenomeTrack::Type m_common_track_type{GenomeTrack::NUM_TYPES};
@@ -100,6 +156,22 @@ private:
 
     // Add a track variable
     TrackVar &add_track_var(const std::string &track_name);
+
+    // Add a virtual track variable from spec dict
+    VTrackVar &add_vtrack_var(const std::string &vtrack_name, PyObject *spec);
+
+    // Build scorer for sequence-based vtrack
+    void build_vtrack_scorer(VTrackVar &vvar, PyObject *spec);
+
+    // Set up value-based vtrack from physical track source
+    void setup_value_based_vtrack(VTrackVar &vvar, PyObject *spec, const std::string &func);
+
+    // Evaluate a value-based vtrack for a single interval
+    double eval_value_based_vtrack(VTrackVar &vvar, const GInterval &interval);
+
+    // Apply shift to interval, clamping to chromosome bounds
+    static bool apply_shift(const GInterval &in, int64_t sshift, int64_t eshift,
+                            const GenomeChromKey &chromkey, GInterval &out);
 };
 
 #endif /* PMTRACKEXPRESSIONVARS_H_ */

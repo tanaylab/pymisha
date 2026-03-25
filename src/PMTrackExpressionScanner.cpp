@@ -76,14 +76,15 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
 
 void PMTrackExprScanner::check(const std::vector<std::string> &exprs,
                                const std::vector<GInterval> &intervals,
-                               int64_t iterator_policy, ValType valtype)
+                               int64_t iterator_policy, ValType valtype,
+                               PyObject *py_vtracks)
 {
     m_track_exprs = exprs;
     m_valtype = valtype;
 
-    // Parse expressions to find track variables
+    // Parse expressions to find track variables (and vtrack variables if provided)
     std::vector<std::string> exprs4compile;
-    m_expr_vars.parse_exprs(m_track_exprs, exprs4compile);
+    m_expr_vars.parse_exprs(m_track_exprs, exprs4compile, py_vtracks);
 
     // Create the iterator
     m_itr = create_expr_iterator(intervals, iterator_policy);
@@ -95,9 +96,10 @@ void PMTrackExprScanner::check(const std::vector<std::string> &exprs,
     m_eval_bools.resize(m_track_exprs.size(), nullptr);
 
     for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
-        // Check if expression is just a track variable name
+        // Check if expression is just a track or vtrack variable name
         const PMTrackExpressionVars::TrackVar *var = m_expr_vars.var(m_track_exprs[iexpr].c_str());
-        if (!var) {
+        const PMTrackExpressionVars::VTrackVar *vvar = m_expr_vars.vtrack_var(m_track_exprs[iexpr].c_str());
+        if (!var && !vvar) {
             // Need to compile: not a simple track name
             m_py_compiled_exprs[iexpr].assign(
                 Py_CompileString(exprs4compile[iexpr].c_str(), "<string>", Py_eval_input), true);
@@ -191,24 +193,30 @@ void PMTrackExprScanner::define_py_vars(unsigned eval_buf_limit)
         }
     }
 
-    // For expressions that are just track variable references, point directly to the array
+    // For expressions that are just track/vtrack variable references, point directly to the array
     // Note: Only do this for REAL_T mode. For LOGICAL_T, we need to go through
     // the compilation path to get proper boolean conversion.
     for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
         const PMTrackExpressionVars::TrackVar *var = m_expr_vars.var(m_track_exprs[iexpr].c_str());
         if (var && m_valtype == REAL_T) {
             m_eval_doubles[iexpr] = var->values;
+        } else {
+            const PMTrackExpressionVars::VTrackVar *vvar = m_expr_vars.vtrack_var(m_track_exprs[iexpr].c_str());
+            if (vvar && m_valtype == REAL_T) {
+                m_eval_doubles[iexpr] = vvar->values;
+            }
         }
     }
 }
 
 bool PMTrackExprScanner::begin(const std::vector<std::string> &exprs, ValType valtype,
-                               const std::vector<GInterval> &intervals, int64_t iterator_policy)
+                               const std::vector<GInterval> &intervals, int64_t iterator_policy,
+                               PyObject *py_vtracks)
 {
     vdebug("PMTrackExprScanner::begin with %lu expressions, %lu intervals\n",
            exprs.size(), intervals.size());
 
-    check(exprs, intervals, iterator_policy, valtype);
+    check(exprs, intervals, iterator_policy, valtype, py_vtracks);
 
     // Define Python variables with buffer size from config
     unsigned buf_size = g_pymisha ? g_pymisha->eval_buf_size() : 1000;

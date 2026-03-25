@@ -1338,3 +1338,173 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
         return _pandas.DataFrame({"pos": results, "strand": strand_results})
 
     return _numpy.array(results, dtype=float)
+
+
+def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
+                    max_indels=None, bidirect=True,
+                    prior=0.01, score_min=None, score_max=None, extend=True,
+                    strand=1):
+    """
+    Show optimal edits to reach a PWM score threshold.
+
+    For each input sequence (or genomic interval), finds the optimal motif
+    window and the specific base changes needed to reach *score_thresh*.
+    Returns a long-format DataFrame with one row per edit.
+
+    This is an investigation tool: use it on a small set of sequences to
+    see what mutations would create or strengthen binding sites.
+
+    Parameters
+    ----------
+    seqs : list of str, or pandas.DataFrame
+        DNA sequences to analyse.  If a DataFrame with columns ``chrom``,
+        ``start``, ``end`` is provided, sequences are automatically
+        extracted via ``gseq_extract``.
+    pssm : numpy.ndarray or pandas.DataFrame
+        Position-specific scoring matrix.  If ndarray, shape ``(w, 4)``
+        with columns [A, C, G, T].  If DataFrame, must have columns
+        ``A``, ``C``, ``G``, ``T``.
+    score_thresh : float
+        Target PWM log-likelihood score to reach.
+    max_edits : int or None, default None
+        Maximum number of edits to consider.  ``None`` means no cap.
+    max_indels : int or None, default None
+        Maximum number of insertions/deletions to allow.  ``None`` or
+        ``0`` means substitutions only.  When > 0, a banded
+        Needleman-Wunsch DP is used to find the optimal alignment
+        between the motif and each candidate window, allowing up to
+        *max_indels* insertions or deletions.  The ``edit_type`` column
+        distinguishes ``"sub"``, ``"ins"``, and ``"del"`` edits.
+    bidirect : bool, default True
+        Scan both DNA strands.
+    prior : float, default 0.01
+        Pseudocount added to PSSM frequencies.
+    score_min : float or None, default None
+        Skip windows whose PWM score is below this value.
+    score_max : float or None, default None
+        Skip windows whose PWM score is above this value.
+    extend : bool or int, default True
+        Extend sequence for boundary motifs.  ``True`` = ``w - 1``,
+        ``False`` = 0, or an explicit integer.
+    strand : int, default 1
+        When ``bidirect=False``: ``1`` = forward, ``-1`` = reverse.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Long-format DataFrame with one row per edit:
+
+        - ``seq_idx``: 1-based index into input sequences.
+        - ``strand``: +1 (forward) or -1 (reverse).
+        - ``window_start``: 1-based position of optimal window.
+        - ``score_before``: PWM score before edits.
+        - ``score_after``: PWM score after all edits.
+        - ``n_edits``: total edits needed.
+        - ``edit_num``: which edit this row represents.
+        - ``motif_col``: 1-based position within the motif.
+        - ``ref``: current base (``None`` for insertions).
+        - ``alt``: suggested replacement base (``None`` for deletions).
+        - ``gain``: score improvement from this edit.
+        - ``edit_type``: ``"sub"`` (substitution), ``"ins"`` (insertion),
+          or ``"del"`` (deletion).  ``None`` for rows with ``n_edits == 0``.
+        - ``window_seq``: motif-length sequence at the window.
+        - ``mutated_seq``: sequence with all edits applied.
+
+        When intervals are provided, additional columns ``chrom``,
+        ``start``, ``end`` are included.
+
+    See Also
+    --------
+    gseq_pwm : Score sequences with a PWM.
+    gvtrack_create : Create virtual tracks with edit distance functions.
+    """
+    # Handle interval input
+    is_intervals = (isinstance(seqs, _pandas.DataFrame)
+                    and {"chrom", "start", "end"}.issubset(seqs.columns))
+    intervals_df = None
+    if is_intervals:
+        intervals_df = seqs
+        # Normalize PSSM to get motif width
+        if isinstance(pssm, _pandas.DataFrame):
+            w = len(pssm)
+        else:
+            pssm_tmp = _numpy.asarray(pssm)
+            w = pssm_tmp.shape[0] if pssm_tmp.shape[1] == 4 else pssm_tmp.shape[1]
+
+        ext = (w - 1) if extend is True else (0 if extend is False else int(extend))
+        extended = intervals_df.copy()
+        extended["end"] = extended["end"] + ext
+        # Clamp to chromosome bounds
+        from .intervals import gintervals_all
+        chrom_sizes = gintervals_all()
+        cs_map = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=False))
+        for i in range(len(extended)):
+            c = str(extended.iloc[i]["chrom"])
+            if c in cs_map:
+                extended.iloc[i, extended.columns.get_loc("end")] = min(
+                    extended.iloc[i]["end"], cs_map[c]
+                )
+        seqs = gseq_extract(extended)
+        extend = False  # already extended
+
+    # Validate PSSM
+    if isinstance(pssm, _pandas.DataFrame):
+        for col in ('A', 'C', 'G', 'T'):
+            if col not in pssm.columns:
+                raise KeyError(f"PSSM DataFrame missing column '{col}'")
+        pssm_arr = pssm[['A', 'C', 'G', 'T']].values.astype(_numpy.float64)
+    elif isinstance(pssm, _numpy.ndarray):
+        if pssm.ndim != 2 or pssm.shape[1] != 4:
+            raise ValueError("PSSM array must have shape (w, 4)")
+        pssm_arr = pssm.astype(_numpy.float64).copy()
+    else:
+        raise ValueError("PSSM must be a numpy array or pandas DataFrame")
+
+    # Ensure contiguous C order for C++
+    pssm_arr = _numpy.ascontiguousarray(pssm_arr, dtype=_numpy.float64)
+
+    # Ensure seqs is a list of strings
+    if isinstance(seqs, str):
+        seqs = [seqs]
+    seqs = [str(s) if s is not None else "" for s in seqs]
+
+    # Validate max_indels
+    if max_indels is not None:
+        max_indels = int(max_indels)
+        if max_indels < 0:
+            raise ValueError("max_indels must be >= 0")
+    else:
+        max_indels = 0
+
+    # Resolve strand mode
+    strand_mode = 0 if bidirect else int(strand)
+
+    # Call C++ binding
+    result = _pymisha.pm_gseq_pwm_edits(
+        seqs, pssm_arr, float(score_thresh),
+        max_edits, int(bidirect), strand_mode,
+        float(prior), extend,
+        score_min, score_max,
+        max_indels,
+    )
+
+    df = _pandas.DataFrame(result)
+
+    # Add interval columns if input was intervals
+    if is_intervals and len(df) > 0:
+        df["chrom"] = intervals_df["chrom"].values[
+            _numpy.array(df["seq_idx"]) - 1
+        ]
+        df["start"] = intervals_df["start"].values[
+            _numpy.array(df["seq_idx"]) - 1
+        ]
+        df["end"] = intervals_df["end"].values[
+            _numpy.array(df["seq_idx"]) - 1
+        ]
+        # Reorder columns
+        cols = ["seq_idx", "chrom", "start", "end"] + [
+            c for c in df.columns if c not in ("seq_idx", "chrom", "start", "end")
+        ]
+        df = df[cols]
+
+    return df

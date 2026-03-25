@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.20 (2026-03-25)
+
+### Features
+- **PWM edit distance optimizations:** Ported all R misha performance enhancements — flat PSSM lookup tables, precomputed base index arrays, pigeonhole pre-filter, suffix-bound early-abandon, quick deficit check, and specialized exact solvers for `max_indels=1` and `max_indels=2`. Mandatory edit handling fixes for log-zero PSSM entries.
+- **`gseq_pwm_edits()` indel support:** New `max_indels` parameter enables insertion/deletion detection via banded 3D Needleman-Wunsch DP with alignment traceback. Output includes `edit_type` column (`"sub"`, `"ins"`, `"del"`) and gap characters in `window_seq`/`mutated_seq`.
+- **Intra-chromosome parallelization:** Large chromosomes are now split across multiple workers by genomic range with bin-aligned boundaries (ported from R misha's `split_intervals_1d_by_range`). Affects `gscreen`, `gextract`, `gsummary`, `gquantiles`, `gdist`, `gpartition`, `gcor`. Minimum 50,000 bins per worker.
+- **Vtrack C++ scanner integration:** Virtual track expressions (PWM, edit_distance, kmer, masked, and value-based aggregations like avg/sum/min/max) now evaluate inline in the C++ scanner loop instead of falling back to a serial Python eval path. This enables full fork/FIFO parallelism and intra-chromosome splitting for vtrack-heavy workloads.
+
+### Performance
+- Edit distance genome scans: **19x speedup** with parallelism (76.5s → 4.0s serial → parallel on chr1:0-10Mb, CTCF D=2 K=2).
+- Single-threaded edit distance throughput matches R misha (8.78 vs 7.32 sec/Mb for D=2 K=2).
+- Hit counts match R misha exactly across all benchmark configurations.
+
+### Testing
+- 72 new tests (2453 total): 55 edit distance tests (adversarial, indel, optimization consistency), 7 intra-chromosome parallelization tests, 10 vtrack C++ path tests.
+- Adversarial test suite validates specialized vs generic DP solvers, exhaustive L=2 enumeration, mandatory edit handling, and known bug regressions.
+
 ## v0.1.19 (2026-03-17)
 
 ### Features

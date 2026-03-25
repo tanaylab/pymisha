@@ -82,6 +82,7 @@ PyObject *pm_quadtree_query_objects(PyObject *self, PyObject *args);
 PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args);
 PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
+PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -135,6 +136,7 @@ static PyMethodDef module_methods[] = {
     {"pm_quadtree_query_stats_batch", pm_quadtree_query_stats_batch, METH_VARARGS, "Batch query quad-tree stats for N rectangles"},
     {"pm_track2d_convert_to_indexed", pm_track2d_convert_to_indexed, METH_VARARGS, "Convert 2D track per-pair files to indexed format"},
     {"pm_track2d_index_info", pm_track2d_index_info, METH_VARARGS, "Get 2D track index info"},
+    {"pm_gseq_pwm_edits", pm_gseq_pwm_edits, METH_VARARGS, "Get detailed PWM edit distance information"},
     {NULL, NULL, 0, NULL}
 };
 

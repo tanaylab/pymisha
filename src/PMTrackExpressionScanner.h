@@ -26,8 +26,10 @@ public:
     ~PMTrackExprScanner();
 
     // Begin scanning with given expressions and intervals
+    // py_vtracks: optional Python dict mapping vtrack_name -> spec dict
     bool begin(const std::vector<std::string> &exprs, ValType valtype,
-               const std::vector<GInterval> &intervals, int64_t iterator_policy);
+               const std::vector<GInterval> &intervals, int64_t iterator_policy,
+               PyObject *py_vtracks = nullptr);
 
     // Advance to next value
     bool next();
@@ -145,7 +147,7 @@ private:
 
     // Internal methods
     void check(const std::vector<std::string> &exprs, const std::vector<GInterval> &intervals,
-               int64_t iterator_policy, ValType valtype);
+               int64_t iterator_policy, ValType valtype, PyObject *py_vtracks = nullptr);
     void define_py_vars(unsigned eval_buf_limit);
     bool eval_next();
     void report_progress_impl();
