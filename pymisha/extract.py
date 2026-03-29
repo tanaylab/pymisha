@@ -23,6 +23,29 @@ from ._shared import (
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
 
+
+def _group_intervals_by_chrom_pair(intervals):
+    """Group 2D intervals by (chrom1, chrom2) using column arrays.
+
+    Returns dict mapping (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...].
+    """
+    c1_arr = intervals["chrom1"].astype(str).values
+    c2_arr = intervals["chrom2"].astype(str).values
+    s1_arr = intervals["start1"].values
+    e1_arr = intervals["end1"].values
+    s2_arr = intervals["start2"].values
+    e2_arr = intervals["end2"].values
+    chrom_pair_intervals = {}
+    for i in range(len(intervals)):
+        key = (c1_arr[i], c2_arr[i])
+        if key not in chrom_pair_intervals:
+            chrom_pair_intervals[key] = []
+        chrom_pair_intervals[key].append(
+            (i, int(s1_arr[i]), int(e1_arr[i]), int(s2_arr[i]), int(e2_arr[i]))
+        )
+    return chrom_pair_intervals
+
+
 # Functions eligible for C++ inline vtrack evaluation (no filter required)
 _CPP_SEQ_FUNCS = {
     "pwm", "pwm.max", "pwm.max.pos", "pwm.count",
@@ -92,7 +115,7 @@ def _build_vtracks_dict(vtrack_names):
         # Ensure pssm is a numpy array
         pssm = spec.get("pssm")
         if pssm is not None and isinstance(pssm, _pandas.DataFrame):
-            spec["pssm"] = pssm.to_numpy(dtype=float, copy=True)
+            spec["pssm"] = pssm.to_numpy(dtype=float, copy=False)
         # Strip filter-related keys (shouldn't be present but be safe)
         spec.pop("filter", None)
         spec.pop("filter_key", None)
@@ -181,18 +204,7 @@ def _gextract_2d_single(track, col_name, intervals, band):
     is_points = info.get("type") == "points"
 
     # Group intervals by (chrom1, chrom2) to open each file only once.
-    chrom_pair_intervals = {}  # (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...]
-    for interval_idx, qrow in enumerate(intervals.itertuples(index=False)):
-        c1 = str(qrow.chrom1)
-        c2 = str(qrow.chrom2)
-        s1 = int(qrow.start1)
-        e1 = int(qrow.end1)
-        s2 = int(qrow.start2)
-        e2 = int(qrow.end2)
-        key = (c1, c2)
-        if key not in chrom_pair_intervals:
-            chrom_pair_intervals[key] = []
-        chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
+    chrom_pair_intervals = _group_intervals_by_chrom_pair(intervals)
 
     rows = []
     for (c1, c2), interval_list in chrom_pair_intervals.items():
@@ -383,18 +395,7 @@ def _gextract_2d_vtrack_agg(track, col_name, intervals, band, func):
     values = _numpy.full(n, _numpy.nan, dtype=float)
 
     # Group intervals by (chrom1, chrom2) to open each file only once.
-    chrom_pair_intervals = {}  # (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...]
-    for interval_idx, qrow in enumerate(intervals.itertuples(index=False)):
-        c1 = str(qrow.chrom1)
-        c2 = str(qrow.chrom2)
-        s1 = int(qrow.start1)
-        e1 = int(qrow.end1)
-        s2 = int(qrow.start2)
-        e2 = int(qrow.end2)
-        key = (c1, c2)
-        if key not in chrom_pair_intervals:
-            chrom_pair_intervals[key] = []
-        chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
+    chrom_pair_intervals = _group_intervals_by_chrom_pair(intervals)
 
     for (c1, c2), interval_list in chrom_pair_intervals.items():
         pair = open_2d_pair(track_path, c1, c2)
@@ -498,18 +499,7 @@ def _gextract_2d_vtrack_objects(track, col_name, intervals, band, func):
     )
 
     # Group intervals by (chrom1, chrom2) to open each file only once.
-    chrom_pair_intervals = {}
-    for interval_idx, qrow in enumerate(intervals.itertuples(index=False)):
-        c1 = str(qrow.chrom1)
-        c2 = str(qrow.chrom2)
-        s1 = int(qrow.start1)
-        e1 = int(qrow.end1)
-        s2 = int(qrow.start2)
-        e2 = int(qrow.end2)
-        key = (c1, c2)
-        if key not in chrom_pair_intervals:
-            chrom_pair_intervals[key] = []
-        chrom_pair_intervals[key].append((interval_idx, s1, e1, s2, e2))
+    chrom_pair_intervals = _group_intervals_by_chrom_pair(intervals)
 
     for (c1, c2), interval_list in chrom_pair_intervals.items():
         pair = open_2d_pair(track_path, c1, c2)
@@ -587,7 +577,7 @@ def _gextract_2d_vtrack_global_percentile(track, col_name, intervals, band):
     """
     # Pass 1: get raw aggregated values (avg = weighted_sum / area) for each interval.
     agg_df = _gextract_2d_vtrack_agg(track, col_name, intervals, band, "avg")
-    raw_values = agg_df[col_name].to_numpy(dtype=float, copy=True)
+    raw_values = agg_df[col_name].to_numpy(dtype=float, copy=False)
 
     # Pass 2: compute percentile rank among all non-NaN values.
     n = len(raw_values)
@@ -1143,7 +1133,7 @@ def _parallel_extract(exprs, intervals, iterator, config, vtracks_dict=None):
     original_indices = []  # list of arrays: original 0-based positions
     for chrom in sorted(chroms):
         mask = intervals["chrom"] == chrom
-        chunk = intervals[mask].copy()
+        chunk = intervals[mask]
         orig_idx = _numpy.where(mask)[0]  # 0-based positions in parent
         chunks.append(chunk.to_dict(orient="list"))
         original_indices.append(orig_idx)
@@ -1391,7 +1381,7 @@ def gextract(expr, intervals=None, iterator=None, colnames=None, band=None, vars
                 raise KeyError(f"Track column not found for '{tname}'")
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
 
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
+        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         if iterator is None:
             if len(exprs) == 1:
@@ -1660,7 +1650,7 @@ def gscreen(expr, intervals=None, vars=None, **kwargs):
             if col not in base_df.columns:
                 raise KeyError(f"Track column not found for '{tname}'")
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
+        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         if iterator is None:
             raise ValueError(

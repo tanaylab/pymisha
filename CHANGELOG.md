@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.21 (2026-03-29)
+
+### Performance
+- **C++ data structure optimizations (ported from R misha):** Bitmask replacement for `m_functions` (`vector<bool>` → `uint32_t`), `vector<uint8_t>` in PWMEditDistanceScorer, golden-ratio multiplicative hashing, StreamPercentiler template comparators for compiler inlining.
+- **C++ I/O optimizations:** MmapFile RAII utility, coalesced packed-struct I/O in TrackIndex2D/TrackIndex/GenomeIndex/PMTrackIndexedFormat, mmap-backed fixed-bin reads in GenomeTrackFixedBin.
+- **C++ safety:** SegmentFinder overflow-safe midpoint and iterative destructor.
+- **PyMisha-specific C++ optimizations:** CHROM string interning at scanner init, NumPy array reuse across evaluation batches, sparse interval vector adaptive pre-allocation.
+- **Direct-to-NumPy accumulation:** New PMDirectAccumulator writes gextract scan results directly into pre-allocated NumPy arrays, bypassing intermediate C++ vector storage.
+- **Python vectorization:** Replaced `iterrows()`/`itertuples()` with vectorized groupby in analysis.py/extract.py/vtracks.py, NumPy advanced indexing in `_compute_value_df_vtrack()`, removed 7 unnecessary DataFrame `.copy()` calls, batch filter resolution with `pd.concat`.
+- Real hg38 benchmarks: **gsummary +87%**, sparse extract +10%, dense extract +2-4%.
+
 ## v0.1.20 (2026-03-25)
 
 ### Features

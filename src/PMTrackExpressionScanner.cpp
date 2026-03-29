@@ -193,6 +193,33 @@ void PMTrackExprScanner::define_py_vars(unsigned eval_buf_limit)
         }
     }
 
+    // Pre-allocate persistent output arrays for compiled expression results.
+    // This avoids re-allocating output buffers every batch — we memcpy eval
+    // results into these stable arrays instead.
+    if (m_use_python) {
+        npy_intp dims[1] = {(npy_intp)eval_buf_limit};
+        m_py_eval_out_double.resize(m_track_exprs.size());
+        m_py_eval_out_bool.resize(m_track_exprs.size());
+
+        for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
+            if (m_py_compiled_exprs[iexpr]) {
+                if (m_valtype == LOGICAL_T) {
+                    // For LOGICAL_T, we need both a double buffer (for numeric exprs
+                    // interpreted via vlogical) and a bool buffer (for boolean exprs).
+                    // We allocate both; only one will be used per expression per batch.
+                    m_py_eval_out_double[iexpr].assign(
+                        PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+                    m_py_eval_out_bool[iexpr].assign(
+                        PyArray_SimpleNew(1, dims, NPY_BOOL), true);
+                } else {
+                    // REAL_T: only need double output
+                    m_py_eval_out_double[iexpr].assign(
+                        PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+                }
+            }
+        }
+    }
+
     // For expressions that are just track/vtrack variable references, point directly to the array
     // Note: Only do this for REAL_T mode. For LOGICAL_T, we need to go through
     // the compilation path to get proper boolean conversion.
@@ -222,6 +249,12 @@ bool PMTrackExprScanner::begin(const std::vector<std::string> &exprs, ValType va
     unsigned buf_size = g_pymisha ? g_pymisha->eval_buf_size() : 1000;
     define_py_vars(buf_size);
 
+    // Pre-populate chrom string cache with all unique chromids from scope
+    // to avoid per-element PyUnicode_FromString + hash lookup misses in the hot path
+    if (m_use_python && m_need_chrom) {
+        prepopulate_chrom_cache(intervals);
+    }
+
     // Initialize iteration state
     m_num_evals = 0;
     m_last_progress_reported = -1;
@@ -235,6 +268,24 @@ bool PMTrackExprScanner::begin(const std::vector<std::string> &exprs, ValType va
     m_itr->begin();
 
     return next();
+}
+
+void PMTrackExprScanner::prepopulate_chrom_cache(const std::vector<GInterval> &intervals)
+{
+    // Collect unique chromids from scope intervals
+    std::unordered_map<int, bool> seen;
+    for (const auto &interval : intervals) {
+        if (seen.find(interval.chromid) == seen.end()) {
+            seen[interval.chromid] = true;
+            // Pre-create and cache the PyUnicode string if not already cached
+            if (m_chrom_str_cache.find(interval.chromid) == m_chrom_str_cache.end()) {
+                const std::string &chrom = g_pmdb->chromkey().id2chrom(interval.chromid);
+                PyObject *chrom_str = PyUnicode_FromString(chrom.c_str());
+                m_chrom_str_cache[interval.chromid] = chrom_str;
+            }
+        }
+    }
+    vdebug("Pre-populated chrom string cache with %lu unique chromosomes\n", seen.size());
 }
 
 bool PMTrackExprScanner::next()
@@ -370,51 +421,38 @@ bool PMTrackExprScanner::eval_next()
                     PyArray_Descr *t = PyArray_DTYPE((PyArrayObject *)*m_py_eval_bufs[iexpr]);
 
                     if (PyTypeNum_ISBOOL(t->type_num)) {
-                        // Boolean result - for LOGICAL_T, use directly as bool
-                        // For REAL_T, convert to double (0.0/1.0)
+                        // Boolean result
                         if (m_valtype == LOGICAL_T) {
-                            m_py_eval_bufs[iexpr].assign(
-                                PyArray_FROM_OTF(m_py_eval_bufs[iexpr], NPY_BOOL, NPY_ARRAY_FORCECAST), true);
-                            if (!m_py_eval_bufs[iexpr]) {
-                                TGLError("Failed to convert result of expression '%s' to boolean array",
+                            // Copy into pre-allocated bool output array
+                            if (PyArray_CopyInto((PyArrayObject *)*m_py_eval_out_bool[iexpr],
+                                                 (PyArrayObject *)*m_py_eval_bufs[iexpr]) < 0) {
+                                TGLError("Failed to copy result of expression '%s' to boolean array",
                                          m_track_exprs[iexpr].c_str());
                             }
-                            m_eval_bools[iexpr] = (bool *)PyArray_DATA((PyArrayObject *)*m_py_eval_bufs[iexpr]);
+                            m_eval_bools[iexpr] = (bool *)PyArray_DATA((PyArrayObject *)*m_py_eval_out_bool[iexpr]);
                         } else {
-                            // Convert bool to double for REAL_T
-                            m_py_eval_bufs[iexpr].assign(
-                                PyArray_FROM_OTF(m_py_eval_bufs[iexpr], NPY_DOUBLE, NPY_ARRAY_FORCECAST), true);
-                            if (!m_py_eval_bufs[iexpr]) {
-                                TGLError("Failed to convert result of expression '%s' to double array",
+                            // Convert bool to double into pre-allocated double output array
+                            if (PyArray_CopyInto((PyArrayObject *)*m_py_eval_out_double[iexpr],
+                                                 (PyArrayObject *)*m_py_eval_bufs[iexpr]) < 0) {
+                                TGLError("Failed to copy result of expression '%s' to double array",
                                          m_track_exprs[iexpr].c_str());
                             }
-                            m_eval_doubles[iexpr] = (double *)PyArray_DATA((PyArrayObject *)*m_py_eval_bufs[iexpr]);
+                            m_eval_doubles[iexpr] = (double *)PyArray_DATA((PyArrayObject *)*m_py_eval_out_double[iexpr]);
                         }
                     } else if (PyDataType_ISNUMBER(t)) {
-                        // Numeric result - for REAL_T, use as double
-                        // For LOGICAL_T, convert to bool (0 = false, else = true, NaN = false)
-                        if (m_valtype == LOGICAL_T) {
-                            // First convert to double, then we'll interpret as boolean in vlogical()
-                            m_py_eval_bufs[iexpr].assign(
-                                PyArray_FROM_OTF(m_py_eval_bufs[iexpr], NPY_DOUBLE, NPY_ARRAY_FORCECAST), true);
-                            if (!m_py_eval_bufs[iexpr]) {
-                                TGLError("Failed to convert result of expression '%s' to double array",
-                                         m_track_exprs[iexpr].c_str());
-                            }
-                            m_eval_doubles[iexpr] = (double *)PyArray_DATA((PyArrayObject *)*m_py_eval_bufs[iexpr]);
-                        } else {
-                            m_py_eval_bufs[iexpr].assign(
-                                PyArray_FROM_OTF(m_py_eval_bufs[iexpr], NPY_DOUBLE, NPY_ARRAY_FORCECAST), true);
-                            if (!m_py_eval_bufs[iexpr]) {
-                                TGLError("Failed to convert result of expression '%s' to double array",
-                                         m_track_exprs[iexpr].c_str());
-                            }
-                            m_eval_doubles[iexpr] = (double *)PyArray_DATA((PyArrayObject *)*m_py_eval_bufs[iexpr]);
+                        // Numeric result — copy into pre-allocated double output array
+                        if (PyArray_CopyInto((PyArrayObject *)*m_py_eval_out_double[iexpr],
+                                             (PyArrayObject *)*m_py_eval_bufs[iexpr]) < 0) {
+                            TGLError("Failed to copy result of expression '%s' to double array",
+                                     m_track_exprs[iexpr].c_str());
                         }
+                        m_eval_doubles[iexpr] = (double *)PyArray_DATA((PyArrayObject *)*m_py_eval_out_double[iexpr]);
                     } else {
                         TGLError("Evaluation of expression '%s' produces array of unsupported type %c",
                                  m_track_exprs[iexpr].c_str(), t->type);
                     }
+                    // Release the temporary eval result immediately
+                    m_py_eval_bufs[iexpr].assign(NULL, false);
                 }
             }
         }

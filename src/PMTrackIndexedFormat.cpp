@@ -5,6 +5,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -34,29 +35,31 @@ static const size_t IDX_HEADER_SIZE_TO_CHECKSUM =
     sizeof(uint32_t) +     // Num contigs
     sizeof(uint64_t);      // Flags
 
+// Packed header struct for 1D track index (36 bytes)
+#pragma pack(push, 1)
+struct TrackIdxHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t track_type_raw;
+    uint32_t num_contigs;
+    uint64_t flags;
+    uint64_t checksum;
+};
+#pragma pack(pop)
+
 static void write_index_header(FILE *fp, MishaTrackType track_type, uint32_t num_contigs, uint64_t checksum)
 {
+    TrackIdxHeader hdr;
     const char magic[8] = {'M','I','S','H','A','T','D','X'};
-    if (fwrite(magic, 1, 8, fp) != 8)
+    memcpy(hdr.magic, magic, 8);
+    hdr.version = 1;
+    hdr.track_type_raw = static_cast<uint32_t>(track_type);
+    hdr.num_contigs = num_contigs;
+    hdr.flags = 0x01; // IS_LITTLE_ENDIAN
+    hdr.checksum = checksum;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1)
         TGLError<GenomeTrack>("Failed to write index header");
-
-    uint32_t version = 1;
-    if (fwrite(&version, sizeof(version), 1, fp) != 1)
-        TGLError<GenomeTrack>("Failed to write index version");
-
-    uint32_t track_type_raw = static_cast<uint32_t>(track_type);
-    if (fwrite(&track_type_raw, sizeof(track_type_raw), 1, fp) != 1)
-        TGLError<GenomeTrack>("Failed to write track type");
-
-    if (fwrite(&num_contigs, sizeof(num_contigs), 1, fp) != 1)
-        TGLError<GenomeTrack>("Failed to write number of contigs");
-
-    uint64_t flags = 0x01; // IS_LITTLE_ENDIAN
-    if (fwrite(&flags, sizeof(flags), 1, fp) != 1)
-        TGLError<GenomeTrack>("Failed to write flags");
-
-    if (fwrite(&checksum, sizeof(checksum), 1, fp) != 1)
-        TGLError<GenomeTrack>("Failed to write checksum");
 }
 
 static bool copy_file_contents(const string &src, FILE *dest, uint64_t &bytes_written)
@@ -226,10 +229,22 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
                 chr_files_to_remove.push_back(chr_file);
             }
 
-            if (fwrite(&entry.chrom_id, sizeof(entry.chrom_id), 1, idx_fp) != 1 ||
-                fwrite(&entry.offset, sizeof(entry.offset), 1, idx_fp) != 1 ||
-                fwrite(&entry.length, sizeof(entry.length), 1, idx_fp) != 1 ||
-                fwrite(&entry.reserved, sizeof(entry.reserved), 1, idx_fp) != 1) {
+            // Write entry to index in one call (24 bytes)
+#pragma pack(push, 1)
+            struct DiskContigEntry {
+                uint32_t chrom_id;
+                uint64_t offset;
+                uint64_t length;
+                uint32_t reserved;
+            };
+#pragma pack(pop)
+            DiskContigEntry disk_entry;
+            disk_entry.chrom_id = entry.chrom_id;
+            disk_entry.offset = entry.offset;
+            disk_entry.length = entry.length;
+            disk_entry.reserved = entry.reserved;
+
+            if (fwrite(&disk_entry, sizeof(disk_entry), 1, idx_fp) != 1) {
                 fclose(dat_fp);
                 fclose(idx_fp);
                 TGLError<GenomeTrack>("Failed to write index entry for chromosome %s", chrom_name.c_str());

@@ -153,25 +153,25 @@ void GenomeTrackSparse::read_file_into_mem()
 void GenomeTrackSparse::read_interval(const GInterval &interval)
 {
     m_last_avg = m_last_nearest = m_last_min = m_last_max = m_last_stddev = m_last_sum = std::numeric_limits<float>::quiet_NaN();
-    if (m_functions[MAX_POS])
+    if (has_function(MAX_POS))
         m_last_max_pos = std::numeric_limits<double>::quiet_NaN();
-    if (m_functions[MIN_POS])
+    if (has_function(MIN_POS))
         m_last_min_pos = std::numeric_limits<double>::quiet_NaN();
-    if (m_functions[EXISTS])
+    if (has_function(EXISTS))
         m_last_exists = 0;
-    if (m_functions[SIZE])
+    if (has_function(SIZE))
         m_last_size = 0;
-    if (m_functions[SAMPLE])
+    if (has_function(SAMPLE))
         m_last_sample = std::numeric_limits<float>::quiet_NaN();
-    if (m_functions[SAMPLE_POS])
+    if (has_function(SAMPLE_POS))
         m_last_sample_pos = std::numeric_limits<double>::quiet_NaN();
-    if (m_functions[FIRST])
+    if (has_function(FIRST))
         m_last_first = std::numeric_limits<float>::quiet_NaN();
-    if (m_functions[FIRST_POS])
+    if (has_function(FIRST_POS))
         m_last_first_pos = std::numeric_limits<double>::quiet_NaN();
-    if (m_functions[LAST])
+    if (has_function(LAST))
         m_last_last = std::numeric_limits<float>::quiet_NaN();
-    if (m_functions[LAST_POS])
+    if (has_function(LAST_POS))
         m_last_last_pos = std::numeric_limits<double>::quiet_NaN();
 
     if (m_use_quantile)

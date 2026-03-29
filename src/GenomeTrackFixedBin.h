@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "GenomeTrack1D.h"
+#include "MmapFile.h"
 
 // !!!!!!!!! IN CASE OF ERROR THIS CLASS THROWS TGLException  !!!!!!!!!!!!!!!!
 
@@ -62,6 +63,13 @@ protected:
 	std::string m_dat_mode;
 	bool        m_dat_open{false};
 
+	// mmap-backed read path (naryn pattern): pointer dereference instead of fread
+	MmapFile m_mmap;
+	std::string m_mmap_path;  // track which file is mmap'd (avoid re-mmap on chrom switch)
+	const float *m_mmap_data{nullptr};  // points to first bin value in mmap'd region
+	int64_t m_mmap_num_bins{0};
+	int64_t m_cur_bin{0};  // current bin index for mmap path
+
 	void init_read(const char *filename, const char *mode, int chromid);
 
 	// Helper to parse header at current file position
@@ -73,15 +81,29 @@ protected:
 
 inline void GenomeTrackFixedBin::goto_bin(uint64_t bin)
 {
-	// Add m_base_offset to the absolute seek for indexed format support
-	if (m_bfile.seek((long)(m_base_offset + sizeof(m_bin_size) + (uint64_t)bin * sizeof(float)), SEEK_SET))
-		TGLError<GenomeTrackFixedBin>("Failed to seek a dense track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
+	if (m_mmap_data) {
+		m_cur_bin = bin;
+	} else {
+		// Add m_base_offset to the absolute seek for indexed format support
+		if (m_bfile.seek((long)(m_base_offset + sizeof(m_bin_size) + (uint64_t)bin * sizeof(float)), SEEK_SET))
+			TGLError<GenomeTrackFixedBin>("Failed to seek a dense track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
+	}
 	m_cur_coord = bin * m_bin_size;
 }
 
 
 inline bool GenomeTrackFixedBin::read_next_bin(float &val)
 {
+	if (m_mmap_data) {
+		if (m_cur_bin >= m_mmap_num_bins)
+			return false;
+		val = m_mmap_data[m_cur_bin++];
+		if (isinf(val))
+			val = numeric_limits<float>::quiet_NaN();
+		m_cur_coord += m_bin_size;
+		return true;
+	}
+
 	if (m_bfile.read(&val, sizeof(val)) != sizeof(val)) {
 		if (m_bfile.error())
 			TGLError<GenomeTrackFixedBin>("Failed to read a dense track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));

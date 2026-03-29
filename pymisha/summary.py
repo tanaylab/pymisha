@@ -346,7 +346,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
         for tname in track_exprs:
             col = tname if tname in base_df.columns else _bound_colname(tname, 40)
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
+        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
         iter_df = _iterated_intervals(intervals, iterator)
@@ -507,7 +507,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
         for tname in track_exprs:
             col = tname if tname in base_df.columns else _bound_colname(tname, 40)
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
+        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
         iter_df = _iterated_intervals(intervals, iterator)
@@ -704,7 +704,7 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
         for tname in track_exprs:
             col = tname if tname in base_df.columns else _bound_colname(tname, 40)
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]].copy()
+        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
         iter_df = _iterated_intervals(intervals, iterator)

@@ -3,6 +3,7 @@
 
 #include "pymisha.h"
 #include "PMDataFrame.h"
+#include "PMDirectAccumulator.h"
 #include "PMDb.h"
 #include "PMTrackExpressionScanner.h"
 #include "PMTrackExpressionIterator.h"
@@ -714,6 +715,126 @@ static ExtractResult run_extract(const std::vector<std::string> &exprs,
     return result;
 }
 
+// Direct-to-NumPy extract: scans directly into PMDirectAccumulator,
+// bypassing intermediate std::vector storage and the PMDataFrame copy.
+static void run_extract_direct(PMDirectAccumulator &acc,
+                               const std::vector<std::string> &exprs,
+                               const std::vector<std::string> &colnames,
+                               const std::vector<GInterval> &intervals,
+                               long iterator_policy,
+                               uint64_t interval_id_offset,
+                               PyObject *progress_cb,
+                               const std::vector<uint64_t> *id_remap = nullptr,
+                               PyObject *py_vtracks = nullptr)
+{
+    if (intervals.empty()) {
+        return;
+    }
+
+    PMTrackExprScanner scanner;
+    if (progress_cb && !PyMisha::is_kid()) {
+        scanner.set_progress_callback(progress_cb);
+        scanner.report_progress(false);
+    }
+    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
+
+    uint64_t est_size = scanner.get_iterator()->size();
+    acc.init(est_size, colnames);
+
+    // Temporary buffer for per-row expression values
+    std::vector<double> row_values(exprs.size());
+
+    for (; !scanner.isend(); scanner.next()) {
+        const GInterval &interval = scanner.last_interval();
+
+        for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
+            row_values[iexpr] = scanner.vdouble(iexpr);
+        }
+
+        uint64_t interval_id;
+        if (id_remap) {
+            uint64_t local_id = scanner.last_interval_id();
+            if (local_id >= 1 && local_id <= (uint64_t)id_remap->size()) {
+                interval_id = (*id_remap)[local_id - 1] + 1;
+            } else {
+                interval_id = scanner.last_interval_id() + interval_id_offset;
+            }
+        } else {
+            interval_id = scanner.last_interval_id() + interval_id_offset;
+        }
+
+        acc.write_row(interval.chromid, interval.start, interval.end,
+                      row_values.data(), interval_id);
+
+        g_pymisha->verify_max_data_size(acc.size(), "Result");
+        check_interrupt();
+    }
+}
+
+// Sort accumulator in-place by (intervalID, chromid, start, end)
+static void sort_accumulator(PMDirectAccumulator &acc)
+{
+    const size_t n = acc.num_rows();
+    if (n <= 1) return;
+
+    int32_t *chromids = acc.chromids();
+    int64_t *starts = acc.starts();
+    int64_t *ends = acc.ends();
+    long *ids = acc.interval_ids();
+    size_t num_expr = acc.num_expr_cols();
+
+    // Build sort order
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = i;
+
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (ids[a] != ids[b]) return ids[a] < ids[b];
+        if (chromids[a] != chromids[b]) return chromids[a] < chromids[b];
+        if (starts[a] != starts[b]) return starts[a] < starts[b];
+        return ends[a] < ends[b];
+    });
+
+    // Check if already sorted
+    bool already_sorted = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (order[i] != i) { already_sorted = false; break; }
+    }
+    if (already_sorted) return;
+
+    // Apply permutation in-place using temporary buffers
+    // Chromids
+    {
+        std::vector<int32_t> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = chromids[order[i]];
+        std::memcpy(chromids, tmp.data(), n * sizeof(int32_t));
+    }
+    // Starts
+    {
+        std::vector<int64_t> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = starts[order[i]];
+        std::memcpy(starts, tmp.data(), n * sizeof(int64_t));
+    }
+    // Ends
+    {
+        std::vector<int64_t> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = ends[order[i]];
+        std::memcpy(ends, tmp.data(), n * sizeof(int64_t));
+    }
+    // Values
+    for (size_t iexpr = 0; iexpr < num_expr; ++iexpr) {
+        double *vals = acc.values(iexpr);
+        std::vector<double> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = vals[order[i]];
+        std::memcpy(vals, tmp.data(), n * sizeof(double));
+    }
+    // IntervalIDs
+    {
+        std::vector<long> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = ids[order[i]];
+        std::memcpy(ids, tmp.data(), n * sizeof(long));
+    }
+}
+
 static PMPY build_extract_df(const std::vector<std::string> &exprs,
                              const std::vector<std::string> &colnames,
                              const ExtractResult &result)
@@ -963,7 +1084,7 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
         vdebug("pm_extract: %lu expressions, %lu intervals, iterator=%ld\n",
                exprs.size(), intervals.size(), iterator_policy);
 
-        ExtractResult result;
+        PMDirectAccumulator acc;
 
         // Range-based splitting for fixed-bin iterators
         bool use_range_split = (iterator_policy > 0);
@@ -1050,7 +1171,16 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                 }
             }
 
-            result.values.assign(exprs.size(), {});
+            // Parent: read FIFO data directly into accumulator.
+            // Each kid writes [header][rows...] atomically under the FIFO lock,
+            // so we read header+rows for each kid sequentially.
+            // We don't know total rows upfront, so init with a reasonable estimate
+            // and let the accumulator grow as needed.
+            acc.init(intervals.size(), colnames);
+
+            std::vector<double> row_values(exprs.size());
+            std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 + sizeof(uint64_t) +
+                                     sizeof(double) * exprs.size());
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 ExtractHeader header{0, 0};
@@ -1060,14 +1190,6 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                     verror("Multitask extract returned mismatched expression count");
                 }
 
-                result.intervals.reserve(result.intervals.size() + header.nrows);
-                for (auto &v : result.values) {
-                    v.reserve(v.size() + header.nrows);
-                }
-                result.interval_ids.reserve(result.interval_ids.size() + header.nrows);
-
-                std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 + sizeof(uint64_t) +
-                                         sizeof(double) * exprs.size());
                 for (uint64_t i = 0; i < header.nrows; ++i) {
                     PyMisha::read_multitask_fifo(rowbuf.data(), rowbuf.size());
 
@@ -1085,37 +1207,35 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                     memcpy(&interval_id, rowbuf.data() + offset, sizeof(uint64_t));
                     offset += sizeof(uint64_t);
 
-                    result.intervals.emplace_back(chromid, start, end);
-                    result.interval_ids.push_back(interval_id);
-
                     for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
-                        double value = 0.0;
-                        memcpy(&value, rowbuf.data() + offset, sizeof(double));
+                        memcpy(&row_values[iexpr], rowbuf.data() + offset, sizeof(double));
                         offset += sizeof(double);
-                        result.values[iexpr].push_back(value);
                     }
+
+                    acc.write_row(chromid, start, end, row_values.data(), interval_id);
                 }
             }
 
-            sort_extract_result(result);
+            sort_accumulator(acc);
 
             while (PyMisha::wait_for_kids(100))
                 ;
         } else {
-            result = run_extract(exprs, intervals, iterator_policy, 0, progress_cb,
-                                 nullptr, py_vtracks);
+            // Single-process path: scan directly into NumPy arrays
+            run_extract_direct(acc, exprs, colnames, intervals, iterator_policy, 0,
+                               progress_cb, nullptr, py_vtracks);
         }
 
-        if (result.intervals.empty()) {
+        if (acc.size() == 0) {
             Py_INCREF(Py_None);
             return Py_None;
         }
 
-        g_pymisha->verify_max_data_size(result.intervals.size(), "Result");
+        g_pymisha->verify_max_data_size(acc.size(), "Result");
 
-        vdebug("pm_extract: collected %lu results\n", result.intervals.size());
+        vdebug("pm_extract: collected %lu results\n", acc.size());
 
-        PMPY result_df = build_extract_df(exprs, colnames, result);
+        PMPY result_df = acc.finalize(true);
         result_df.to_be_stolen();
         return (PyObject *)result_df;
 

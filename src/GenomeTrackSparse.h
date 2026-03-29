@@ -43,6 +43,11 @@ protected:
     size_t m_cur_idx;
     double m_last_min_pos;
 
+    // Adaptive pre-allocation hint for overlap vectors in calc_vals.
+    // Tracks the high-water mark of overlaps seen so far to avoid
+    // repeated small re-allocations.
+    size_t m_max_overlaps{100};
+
     // State for indexed "smart handle"
     std::string m_dat_path;
     std::string m_dat_mode;
@@ -72,11 +77,11 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
     // Fast path: when only basic reducers (avg/sum/min/max/nearest) are needed
     // (no position tracking, stddev, quantile, sample, exists, first/last, size)
     const bool basic_only =
-        !m_functions[MIN_POS] && !m_functions[MAX_POS] &&
-        !m_functions[STDDEV] && !m_use_quantile &&
-        !m_functions[EXISTS] && !m_functions[FIRST] && !m_functions[FIRST_POS] &&
-        !m_functions[LAST] && !m_functions[LAST_POS] &&
-        !m_functions[SAMPLE] && !m_functions[SAMPLE_POS] && !m_functions[SIZE];
+        !has_function(MIN_POS) && !has_function(MAX_POS) &&
+        !has_function(STDDEV) && !m_use_quantile &&
+        !has_function(EXISTS) && !has_function(FIRST) && !has_function(FIRST_POS) &&
+        !has_function(LAST) && !has_function(LAST_POS) &&
+        !has_function(SAMPLE) && !has_function(SAMPLE_POS) && !has_function(SIZE);
 
     if (basic_only) {
         float num_vs = 0;
@@ -112,17 +117,17 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 
     std::vector<float> all_values;
     std::vector<double> all_positions;
-    if (m_functions[SAMPLE] || m_functions[SAMPLE_POS])
-        all_values.reserve(100);
-    if (m_functions[SAMPLE_POS])
-        all_positions.reserve(100);
+    if (has_function(SAMPLE) || has_function(SAMPLE_POS))
+        all_values.reserve(m_max_overlaps);
+    if (has_function(SAMPLE_POS))
+        all_positions.reserve(m_max_overlaps);
 
     m_last_sum = 0;
     m_last_min = std::numeric_limits<float>::max();
     m_last_max = -std::numeric_limits<float>::max();
-    if (m_functions[MAX_POS])
+    if (has_function(MAX_POS))
         m_last_max_pos = std::numeric_limits<double>::quiet_NaN();
-    if (m_functions[MIN_POS])
+    if (has_function(MIN_POS))
         m_last_min_pos = std::numeric_limits<double>::quiet_NaN();
 
     for (size_t i = m_cur_idx; i < m_intervals.size(); ++i) {
@@ -135,52 +140,57 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
             m_last_sum += v;
             if (v < m_last_min) {
                 m_last_min = v;
-                if (m_functions[MIN_POS])
+                if (has_function(MIN_POS))
                     m_last_min_pos = cur.start;
-            } else if (m_functions[MIN_POS] && v == m_last_min) {
+            } else if (has_function(MIN_POS) && v == m_last_min) {
                 if (std::isnan(m_last_min_pos) || cur.start < m_last_min_pos)
                     m_last_min_pos = cur.start;
             }
             if (v > m_last_max) {
                 m_last_max = v;
-                if (m_functions[MAX_POS])
+                if (has_function(MAX_POS))
                     m_last_max_pos = cur.start;
             }
 
-            if (m_functions[STDDEV])
+            if (has_function(STDDEV))
                 mean_square_sum += v * v;
 
             if (m_use_quantile)
                 m_sp.add(v, s_rnd_func);
 
-            if (m_functions[EXISTS])
+            if (has_function(EXISTS))
                 m_last_exists = 1;
 
-            if (m_functions[FIRST] && std::isnan(m_last_first))
+            if (has_function(FIRST) && std::isnan(m_last_first))
                 m_last_first = v;
 
-            if (m_functions[FIRST_POS] && std::isnan(m_last_first_pos))
+            if (has_function(FIRST_POS) && std::isnan(m_last_first_pos))
                 m_last_first_pos = cur.start;
 
-            if (m_functions[LAST])
+            if (has_function(LAST))
                 m_last_last = v;
 
-            if (m_functions[LAST_POS])
+            if (has_function(LAST_POS))
                 m_last_last_pos = cur.start;
 
-            if (m_functions[SAMPLE])
+            if (has_function(SAMPLE))
                 all_values.push_back(v);
-            if (m_functions[SAMPLE_POS])
+            if (has_function(SAMPLE_POS))
                 all_positions.push_back(cur.start);
 
             ++num_vs;
         }
     }
 
-    if (m_functions[SIZE])
+    if (has_function(SIZE))
         m_last_size = num_vs;
 
-    if (m_functions[SAMPLE] && !all_values.empty()) {
+    // Update adaptive pre-allocation hint with high-water mark
+    size_t overlap_count = (size_t)num_vs;
+    if (overlap_count > m_max_overlaps)
+        m_max_overlaps = overlap_count;
+
+    if (has_function(SAMPLE) && !all_values.empty()) {
         int idx = (int)(s_rnd_func() * all_values.size());
         if (idx >= (int)all_values.size())
             idx = (int)all_values.size() - 1;
@@ -189,7 +199,7 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
         m_last_sample = all_values[idx];
     }
 
-    if (m_functions[SAMPLE_POS] && !all_positions.empty()) {
+    if (has_function(SAMPLE_POS) && !all_positions.empty()) {
         int idx = (int)(s_rnd_func() * all_positions.size());
         if (idx >= (int)all_positions.size())
             idx = (int)all_positions.size() - 1;
@@ -202,11 +212,11 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
         m_last_avg = m_last_nearest = m_last_sum / num_vs;
     else {
         m_last_avg = m_last_nearest = m_last_min = m_last_max = m_last_sum = std::numeric_limits<float>::quiet_NaN();
-        if (m_functions[MIN_POS])
+        if (has_function(MIN_POS))
             m_last_min_pos = std::numeric_limits<double>::quiet_NaN();
     }
 
-    if (m_functions[STDDEV])
+    if (has_function(STDDEV))
         m_last_stddev = num_vs > 1
             ? std::sqrt(mean_square_sum / (num_vs - 1) - (m_last_avg * (double)m_last_avg) * (num_vs / (num_vs - 1)))
             : std::numeric_limits<float>::quiet_NaN();

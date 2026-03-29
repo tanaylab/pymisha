@@ -544,10 +544,7 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
     # Build chrom -> max_end mapping from intervals (ALLGENOME gives full chrom sizes)
     chrom_sizes = {}
     if intervals is not None and len(intervals) > 0:
-        for _, row in intervals.iterrows():
-            c = str(row["chrom"])
-            e = int(row["end"])
-            chrom_sizes[c] = max(chrom_sizes.get(c, 0), e)
+        chrom_sizes = intervals.groupby("chrom")["end"].max().to_dict()
 
     chroms = list(chrom_sizes.keys())
 

@@ -119,7 +119,7 @@ def _canonicalize_filter_df(df):
 
 def _resolve_filter_sources(filter_obj):
     from .extract import gextract
-    from .intervals import gintervals_all, gintervals_load, gintervals_ls, gintervals_union
+    from .intervals import gintervals_all, gintervals_load, gintervals_ls
     from .tracks import gtrack_info
 
     if filter_obj is None:
@@ -131,14 +131,18 @@ def _resolve_filter_sources(filter_obj):
     if isinstance(filter_obj, list | tuple):
         if len(filter_obj) == 0:
             return _pandas.DataFrame(columns=["chrom", "start", "end"])
-        merged = None
+        # Collect all resolved parts, then union once via concat + single union
+        parts = []
         for part in filter_obj:
             part_df = _resolve_filter_sources(part)
-            if part_df is None or len(part_df) == 0:
-                continue
-            merged = part_df if merged is None else gintervals_union(merged, part_df)
-        if merged is None:
+            if part_df is not None and len(part_df) > 0:
+                parts.append(part_df[["chrom", "start", "end"]])
+        if not parts:
             return _pandas.DataFrame(columns=["chrom", "start", "end"])
+        if len(parts) == 1:
+            return _canonicalize_filter_df(parts[0])
+        # Concat all parts and canonicalize (which internally unions/merges)
+        merged = _pandas.concat(parts, ignore_index=True)
         return _canonicalize_filter_df(merged)
 
     if isinstance(filter_obj, str):
@@ -256,9 +260,14 @@ def _build_unmasked_segments(intervals, payload, filter_df):
 
     # --- Per-row path (with mask subtraction) ---
     mask_map = {}
-    for row in filter_df.itertuples(index=False):
-        chrom = str(row.chrom)
-        mask_map.setdefault(chrom, []).append((int(row.start), int(row.end)))
+    _f_chroms = filter_df["chrom"].astype(str).values
+    _f_starts = filter_df["start"].values
+    _f_ends = filter_df["end"].values
+    for _fi in range(len(filter_df)):
+        _fc = _f_chroms[_fi]
+        if _fc not in mask_map:
+            mask_map[_fc] = []
+        mask_map[_fc].append((int(_f_starts[_fi]), int(_f_ends[_fi])))
     for chrom in list(mask_map.keys()):
         mask_map[chrom].sort()
 
@@ -350,15 +359,10 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
 
         has_ov = (total_ov > 0) & ~_numpy.isnan(src_vals)
         m_idx = _numpy.flatnonzero(has_ov)
-        matched = [
-            (int(m_idx[j]), int(src_starts[m_idx[j]]),
-             int(src_ends[m_idx[j]]), float(src_vals[m_idx[j]]),
-             int(total_ov[m_idx[j]]))
-            for j in range(len(m_idx))
-        ]
+        n_matched = len(m_idx)
 
         if func == "exists":
-            out[oi] = 1.0 if matched else 0.0
+            out[oi] = 1.0 if n_matched > 0 else 0.0
             continue
         if func == "coverage":
             if unmasked_len <= 0:
@@ -379,55 +383,65 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
             out[oi] = float(cov) / float(unmasked_len)
             continue
 
-        vals = _numpy.asarray([m[3] for m in matched], dtype=float)
-
-        if vals.size == 0:
+        if n_matched == 0:
             if func == "size":
                 out[oi] = 0.0
             continue
 
+        # Extract matched arrays directly via advanced indexing (no list-of-tuples)
+        m_starts = src_starts[m_idx]
+        m_vals = src_vals[m_idx]
+        m_overlaps = total_ov[m_idx]
+
         if func in {"avg", "mean"}:
             if has_filter:
-                weights = _numpy.asarray([m[4] for m in matched], dtype=float)
+                weights = m_overlaps.astype(float)
                 wsum = float(weights.sum())
                 if wsum > 0:
-                    out[oi] = float((vals * weights).sum() / wsum)
+                    out[oi] = float((m_vals * weights).sum() / wsum)
             else:
-                out[oi] = float(vals.mean())
+                out[oi] = float(m_vals.mean())
         elif func == "nearest":
             # If no overlap, nearest falls back to minimum distance.
-            out[oi] = float(vals.mean())
+            out[oi] = float(m_vals.mean())
         elif func == "sum":
-            out[oi] = float(vals.sum())
+            out[oi] = float(m_vals.sum())
         elif func == "min":
-            out[oi] = float(vals.min())
+            out[oi] = float(m_vals.min())
         elif func == "max":
-            out[oi] = float(vals.max())
+            out[oi] = float(m_vals.max())
         elif func == "size":
-            out[oi] = float(vals.size)
+            out[oi] = float(n_matched)
         elif func in {"stddev", "std"}:
-            if vals.size >= 2:
-                out[oi] = float(_numpy.std(vals, ddof=1))
+            if n_matched >= 2:
+                out[oi] = float(_numpy.std(m_vals, ddof=1))
         elif func == "quantile":
             q = float(payload_eval.get("params", 0.5) or 0.5)
-            out[oi] = float(_numpy.quantile(vals, q))
+            out[oi] = float(_numpy.quantile(m_vals, q))
         elif func == "first":
-            first_row = min(matched, key=lambda m: (m[1], m[0]))
-            out[oi] = float(first_row[3])
+            # min by (start, index) — use lexsort (sorts by last key first)
+            order = _numpy.lexsort((m_idx, m_starts))
+            out[oi] = float(m_vals[order[0]])
         elif func == "last":
-            last_row = max(matched, key=lambda m: (m[1], m[0]))
-            out[oi] = float(last_row[3])
+            order = _numpy.lexsort((m_idx, m_starts))
+            out[oi] = float(m_vals[order[-1]])
         elif func in {"first.pos.abs", "first.pos.relative"}:
-            pos = float(min(matched, key=lambda m: (m[1], m[0]))[1])
+            order = _numpy.lexsort((m_idx, m_starts))
+            pos = float(m_starts[order[0]])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
         elif func in {"last.pos.abs", "last.pos.relative"}:
-            pos = float(max(matched, key=lambda m: (m[1], m[0]))[1])
+            order = _numpy.lexsort((m_idx, m_starts))
+            pos = float(m_starts[order[-1]])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
         elif func in {"min.pos.abs", "min.pos.relative"}:
-            pos = float(min(matched, key=lambda m: (m[3], m[1], m[0]))[1])
+            # min by (value, start, index)
+            order = _numpy.lexsort((m_idx, m_starts, m_vals))
+            pos = float(m_starts[order[0]])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
         elif func in {"max.pos.abs", "max.pos.relative"}:
-            pos = float(max(matched, key=lambda m: (m[3], -m[1], -m[0]))[1])
+            # max by (value, -start, -index) — negate start/index for descending
+            order = _numpy.lexsort((-m_idx, -m_starts, m_vals))
+            pos = float(m_starts[order[-1]])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
 
     # nearest fallback for non-overlap cases — vectorized distance computation
@@ -1010,7 +1024,7 @@ def _compute_vtrack_values(vtrack_name, intervals):
 
     # Ensure pssm is passed as a numpy array with correct ordering
     if 'pssm' in payload and isinstance(payload['pssm'], _pandas.DataFrame):
-        payload['pssm'] = payload['pssm'].to_numpy(dtype=float, copy=True)
+        payload['pssm'] = payload['pssm'].to_numpy(dtype=float, copy=False)
 
     func = str(payload.get("func", "avg")).lower()
 

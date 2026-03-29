@@ -102,6 +102,10 @@ private:
     std::vector<double *> m_eval_doubles;
     std::vector<bool *> m_eval_bools;
 
+    // Pre-allocated persistent output arrays for eval results (avoids per-batch allocation)
+    std::vector<PMPY> m_py_eval_out_double;   // persistent NPY_DOUBLE arrays
+    std::vector<PMPY> m_py_eval_out_bool;     // persistent NPY_BOOL arrays
+
     // Iterator intervals buffer
     std::vector<GInterval> m_expr_itr_intervals;
     std::vector<uint64_t> m_expr_itr_interval_ids;  // 1-based original interval indices
@@ -149,6 +153,7 @@ private:
     void check(const std::vector<std::string> &exprs, const std::vector<GInterval> &intervals,
                int64_t iterator_policy, ValType valtype, PyObject *py_vtracks = nullptr);
     void define_py_vars(unsigned eval_buf_limit);
+    void prepopulate_chrom_cache(const std::vector<GInterval> &intervals);
     bool eval_next();
     void report_progress_impl();
     void call_progress_callback(int progress, bool final);

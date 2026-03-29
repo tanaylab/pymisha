@@ -42,49 +42,50 @@ bool TrackIndex::load(const string &index_path) {
             "Failed to open index file %s: %s", index_path.c_str(), strerror(errno));
     }
 
-    // Read and validate magic header
-    char header[8];
-    if (fread(header, 1, 8, fp) != 8 || memcmp(header, MAGIC_HEADER, 8) != 0) {
+    // Read entire fixed header in one call (36 bytes)
+#pragma pack(push, 1)
+    struct TrackIndexHeader {
+        char magic[8];
+        uint32_t version;
+        uint32_t track_type_raw;
+        uint32_t num_contigs;
+        uint64_t flags;
+        uint64_t stored_checksum;
+    };
+#pragma pack(pop)
+
+    TrackIndexHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, fp) != 1) {
+        fclose(fp);
+        TGLError<TrackIndex>(FILE_READ_FAILED,
+            "Failed to read index header from %s", index_path.c_str());
+    }
+
+    // Validate magic header
+    if (memcmp(hdr.magic, MAGIC_HEADER, 8) != 0) {
         fclose(fp);
         TGLError<TrackIndex>(INVALID_FORMAT,
             "Invalid index file header in %s (expected MISHATDX magic)", index_path.c_str());
     }
 
-    // Read version
-    uint32_t version;
-    if (fread(&version, sizeof(version), 1, fp) != 1) {
-        fclose(fp);
-        TGLError<TrackIndex>(FILE_READ_FAILED,
-            "Failed to read index version from %s", index_path.c_str());
-    }
-    if (version != INDEX_VERSION) {
+    // Validate version
+    if (hdr.version != INDEX_VERSION) {
         fclose(fp);
         TGLError<TrackIndex>(VERSION_MISMATCH,
             "Index version %u not supported (expected %u) in %s",
-            version, INDEX_VERSION, index_path.c_str());
+            hdr.version, INDEX_VERSION, index_path.c_str());
     }
 
-    // Read track type
-    uint32_t track_type_raw;
-    if (fread(&track_type_raw, sizeof(track_type_raw), 1, fp) != 1) {
-        fclose(fp);
-        TGLError<TrackIndex>(FILE_READ_FAILED,
-            "Failed to read track type from %s", index_path.c_str());
-    }
-    if (track_type_raw > 2) {
+    // Validate track type
+    if (hdr.track_type_raw > 2) {
         fclose(fp);
         TGLError<TrackIndex>(INVALID_FORMAT,
-            "Invalid track type %u in %s (expected 0-2)", track_type_raw, index_path.c_str());
+            "Invalid track type %u in %s (expected 0-2)", hdr.track_type_raw, index_path.c_str());
     }
-    m_track_type = static_cast<MishaTrackType>(track_type_raw);
+    m_track_type = static_cast<MishaTrackType>(hdr.track_type_raw);
 
-    // Read number of contigs
-    uint32_t num_contigs;
-    if (fread(&num_contigs, sizeof(num_contigs), 1, fp) != 1) {
-        fclose(fp);
-        TGLError<TrackIndex>(FILE_READ_FAILED,
-            "Failed to read contig count from %s", index_path.c_str());
-    }
+    uint32_t num_contigs = hdr.num_contigs;
+    uint64_t stored_checksum = hdr.stored_checksum;
 
     // Sanity check: 20 million contigs should be more than enough for any genome
     if (num_contigs > 20000000) {
@@ -93,28 +94,12 @@ bool TrackIndex::load(const string &index_path) {
             "Number of contigs %u exceeds maximum (20000000) in %s", num_contigs, index_path.c_str());
     }
 
-    // Read flags
-    uint64_t flags;
-    if (fread(&flags, sizeof(flags), 1, fp) != 1) {
-        fclose(fp);
-        TGLError<TrackIndex>(FILE_READ_FAILED,
-            "Failed to read flags from %s", index_path.c_str());
-    }
-
     // Check endianness
-    bool index_is_little_endian = (flags & FLAG_LITTLE_ENDIAN) != 0;
+    bool index_is_little_endian = (hdr.flags & FLAG_LITTLE_ENDIAN) != 0;
     if (index_is_little_endian != is_little_endian()) {
         fclose(fp);
         TGLError<TrackIndex>(ENDIAN_MISMATCH,
             "Index file %s has incompatible endianness", index_path.c_str());
-    }
-
-    // Read stored checksum (will validate later)
-    uint64_t stored_checksum;
-    if (fread(&stored_checksum, sizeof(stored_checksum), 1, fp) != 1) {
-        fclose(fp);
-        TGLError<TrackIndex>(FILE_READ_FAILED,
-            "Failed to read checksum from %s", index_path.c_str());
     }
 
     // Read contig entries
@@ -122,18 +107,30 @@ bool TrackIndex::load(const string &index_path) {
     m_entries.reserve(num_contigs);
     m_chromid_to_index.clear();
 
-    for (uint32_t i = 0; i < num_contigs; ++i) {
-        TrackContigEntry entry;
+    // Packed struct matching the on-disk per-entry layout (24 bytes)
+#pragma pack(push, 1)
+    struct DiskContigEntry {
+        uint32_t chrom_id;
+        uint64_t offset;
+        uint64_t length;
+        uint32_t reserved;
+    };
+#pragma pack(pop)
 
-        // Read chrom_id, offset, length, reserved (24 bytes total)
-        if (fread(&entry.chrom_id, sizeof(entry.chrom_id), 1, fp) != 1 ||
-            fread(&entry.offset, sizeof(entry.offset), 1, fp) != 1 ||
-            fread(&entry.length, sizeof(entry.length), 1, fp) != 1 ||
-            fread(&entry.reserved, sizeof(entry.reserved), 1, fp) != 1) {
+    for (uint32_t i = 0; i < num_contigs; ++i) {
+        // Read all entry fields in one call (24 bytes)
+        DiskContigEntry disk_entry;
+        if (fread(&disk_entry, sizeof(disk_entry), 1, fp) != 1) {
             fclose(fp);
             TGLError<TrackIndex>(FILE_READ_FAILED,
                 "Failed to read entry %u in %s", i, index_path.c_str());
         }
+
+        TrackContigEntry entry;
+        entry.chrom_id = disk_entry.chrom_id;
+        entry.offset = disk_entry.offset;
+        entry.length = disk_entry.length;
+        entry.reserved = disk_entry.reserved;
 
         // Validate offset+length for overflow
         if (entry.offset + entry.length < entry.offset) {
