@@ -73,7 +73,7 @@ struct Rectangle {
 };
 
 struct NodeBase {
-    bool      is_leaf;    // 1 byte + 7 padding
+    uint8_t   is_leaf;    // 1 byte + 7 padding (uint8_t avoids UB when reinterpret_cast'd from disk bytes)
     Stat      stat;       // 32 bytes
     Rectangle arena;      // 32 bytes
     // Total: 72 bytes

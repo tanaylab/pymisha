@@ -27,17 +27,19 @@ GSYNTH_MAX_CHUNK_SIZE = int(1e9)
 
 @_dataclass
 class GsynthModel:
-    """Trained stratified Markov-5 model for genome synthesis.
+    """Trained stratified Markov model for genome synthesis.
 
-    Stores the transition probabilities (as CDFs) for a 5th-order Markov chain,
-    optionally stratified by one or more genomic track dimensions. Each of the
-    1024 possible 5-mer contexts maps to a probability distribution over the
-    four nucleotides (A, C, G, T), independently for every flat bin in the
-    stratification grid. The model is created by :func:`gsynth_train` and
-    consumed by :func:`gsynth_sample`.
+    Stores the transition probabilities (as CDFs) for a k-th order Markov
+    chain, optionally stratified by one or more genomic track dimensions.
+    Each of the ``4^k`` possible k-mer contexts maps to a probability
+    distribution over the four nucleotides (A, C, G, T), independently for
+    every flat bin in the stratification grid.  The model is created by
+    :func:`gsynth_train` and consumed by :func:`gsynth_sample`.
 
     Attributes
     ----------
+    k : int
+        Markov order (context length).  Default 5 for backward compatibility.
     n_dims : int
         Number of stratification dimensions.
     dim_sizes : list of int
@@ -48,7 +50,7 @@ class GsynthModel:
         Product of all dim_sizes (total flat bins).
     model_data : dict
         Contains ``'counts'`` (list of 2-D arrays, one per flat bin, shape
-        ``(1024, 4)``) and ``'cdf'`` (same layout, cumulative probabilities).
+        ``(4^k, 4)``) and ``'cdf'`` (same layout, cumulative probabilities).
     total_kmers : int
         Total k-mers counted during training.
     per_bin_kmers : numpy.ndarray
@@ -78,6 +80,7 @@ class GsynthModel:
     1
     """
 
+    k: int = 5
     n_dims: int = 0
     dim_sizes: list[int] = _field(default_factory=list)
     dim_specs: list[dict[str, _Any]] = _field(default_factory=list)
@@ -90,9 +93,15 @@ class GsynthModel:
     pseudocount: float = 1.0
     min_obs: int = 0
 
+    @property
+    def num_kmers(self):
+        """Number of k-mer contexts (4^k)."""
+        return 4 ** self.k
+
     def __repr__(self):
         lines = [
-            "Synthetic Genome Markov-5 Model",
+            f"Synthetic Genome Markov-{self.k} Model",
+            f"  Markov order: {self.k}",
             f"  Dimensions: {self.n_dims}",
             f"  Total bins: {self.total_bins}",
             f"  Dim sizes:  {self.dim_sizes}",
@@ -420,7 +429,7 @@ def _worker_train_chunk(args):
     ----------
     args : tuple
         (chunk_intervals_dict, dim_specs_dicts, mask_dict,
-         iterator, pseudocount, total_bins, parsed_specs)
+         iterator, pseudocount, total_bins, parsed_specs, k)
 
     Returns
     -------
@@ -429,7 +438,7 @@ def _worker_train_chunk(args):
         'total_masked', 'total_n'.
     """
     (chunk_intervals_dict, dim_specs_dicts, mask_dict,
-     iterator, pseudocount, total_bins, parsed_specs_data) = args
+     iterator, pseudocount, total_bins, parsed_specs_data, k) = args
 
     import pandas as pd
     chunk_intervals = pd.DataFrame(chunk_intervals_dict)
@@ -462,6 +471,7 @@ def _worker_train_chunk(args):
         bin_map,
         py_mask,
         float(pseudocount),
+        int(k),
     )
 
     # Return only what we need for merging (numpy arrays + scalars)
@@ -474,7 +484,7 @@ def _worker_train_chunk(args):
     }
 
 
-def _merge_train_results(chunk_results, total_bins, pseudocount):
+def _merge_train_results(chunk_results, total_bins, pseudocount, k=5):
     """Merge training results from multiple chunks.
 
     Sums count arrays across chunks and recomputes CDFs.
@@ -488,6 +498,8 @@ def _merge_train_results(chunk_results, total_bins, pseudocount):
         Total number of flat bins.
     pseudocount : float
         Pseudocount for CDF computation.
+    k : int
+        Markov order.
 
     Returns
     -------
@@ -495,8 +507,10 @@ def _merge_train_results(chunk_results, total_bins, pseudocount):
         Merged result with 'counts', 'cdf', 'total_kmers',
         'per_bin_kmers', 'total_masked', 'total_n'.
     """
+    num_kmers = 4 ** k
+
     # Initialize with zeros
-    merged_counts = [_numpy.zeros((1024, 4), dtype=_numpy.float64)
+    merged_counts = [_numpy.zeros((num_kmers, 4), dtype=_numpy.float64)
                      for _ in range(total_bins)]
     merged_total_kmers = 0
     merged_per_bin_kmers = _numpy.zeros(total_bins, dtype=_numpy.float64)
@@ -543,7 +557,7 @@ def _worker_sample_chunk(args):
     ----------
     args : tuple
         (chunk_intervals_dict, dim_specs_list, cdf_list,
-         iterator, mask_copy_dict, n_samples, chunk_seed, bin_merge)
+         iterator, mask_copy_dict, n_samples, chunk_seed, bin_merge, k)
 
     Returns
     -------
@@ -552,7 +566,7 @@ def _worker_sample_chunk(args):
     """
     (chunk_intervals_dict, dim_specs_list, cdf_list_data,
      iterator, mask_copy_dict, n_samples, chunk_seed,
-     sample_bin_merge) = args
+     sample_bin_merge, k) = args
 
     import pandas as pd
     chunk_intervals = pd.DataFrame(chunk_intervals_dict)
@@ -593,6 +607,7 @@ def _worker_sample_chunk(args):
         2,    # fmt_code = vector
         int(n_samples),
         chunk_seed,
+        int(k),
     )
 
 
@@ -601,21 +616,21 @@ def _worker_sample_chunk(args):
 # ---------------------------------------------------------------------------
 
 def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
-                 pseudocount=1.0, min_obs=0,
+                 pseudocount=1.0, min_obs=0, k=5,
                  allow_parallel=True, num_cores=None,
                  max_chunk_size=None):
-    """Train a stratified Markov-5 model from genome sequences.
+    """Train a stratified Markov model from genome sequences.
 
-    Computes a 5th-order Markov model optionally stratified by bins of one or
+    Computes a k-th order Markov model optionally stratified by bins of one or
     more track expressions (e.g., GC content and CpG dinucleotide frequency).
     The resulting :class:`GsynthModel` can be used with :func:`gsynth_sample`
     to generate synthetic genomes that preserve the k-mer statistics of the
     original genome within each stratification bin.
 
-    Both the forward-strand 6-mer and its reverse complement are counted for
-    every valid position, ensuring strand-symmetric transition probabilities.
-    Positions containing N bases are skipped and counted separately in the
-    returned model's ``total_n`` attribute.
+    Both the forward-strand (k+1)-mer and its reverse complement are counted
+    for every valid position, ensuring strand-symmetric transition
+    probabilities.  Positions containing N bases are skipped and counted
+    separately in the returned model's ``total_n`` attribute.
 
     When called with no dimension specifications, trains a single unstratified
     (0-D) model.
@@ -649,8 +664,12 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
         Pseudocount added to all k-mer counts to avoid zero probabilities
         in the CDF.
     min_obs : int, default 0
-        Minimum number of 6-mer observations required per bin.  Reserved
+        Minimum number of (k+1)-mer observations required per bin.  Reserved
         for future use.
+    k : int, default 5
+        Markov order (context length).  Must be in ``[1, 10]``.  The model
+        stores ``4^k`` context states; higher values capture longer-range
+        dependencies but require more training data and memory.
     allow_parallel : bool, default True
         Whether to enable parallel chunking for large genomes.  When
         ``True`` and the total bases exceed *max_chunk_size*, intervals
@@ -677,7 +696,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
     ValueError
         If a dimension spec is missing ``"expr"`` or ``"breaks"``, or if
         *breaks* has fewer than 2 elements, or if no data is extracted for
-        a given expression.
+        a given expression, or if *k* is not in ``[1, 10]``.
 
     See Also
     --------
@@ -699,6 +718,13 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
     0
     """
     _checkroot()
+
+    # Validate k
+    if not isinstance(k, int) and isinstance(k, float) and k != int(k):
+        raise ValueError(f"k must be an integer, got {k}")
+    k = int(k)
+    if k < 1 or k > 10:
+        raise ValueError(f"Markov order k must be in [1, 10], got {k}")
 
     # Validate dimension specs
     parsed_specs = []
@@ -764,7 +790,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
         worker_args = [
             (chunk.to_dict(orient="list"), parsed_specs_data,
              mask_dict, iterator, pseudocount, total_bins,
-             parsed_specs_data)
+             parsed_specs_data, k)
             for chunk in chunks
         ]
 
@@ -773,9 +799,10 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
             chunk_results = pool.map(_worker_train_chunk, worker_args)
 
         # Merge results from all chunks
-        result = _merge_train_results(chunk_results, total_bins, pseudocount)
+        result = _merge_train_results(chunk_results, total_bins, pseudocount, k=k)
 
         return GsynthModel(
+            k=k,
             n_dims=len(parsed_specs),
             dim_sizes=dim_sizes,
             dim_specs=parsed_specs,
@@ -808,6 +835,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
         bin_map,
         py_mask,
         float(pseudocount),
+        int(k),
     )
 
     # Build model
@@ -816,6 +844,7 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
         total_bins *= int(dim_size)
 
     return GsynthModel(
+        k=k,
         n_dims=len(parsed_specs),
         dim_sizes=dim_sizes,
         dim_specs=parsed_specs,
@@ -846,12 +875,12 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
     """Sample synthetic genome sequences from a trained model.
 
     Generates a synthetic genome by sampling from a trained stratified
-    Markov-5 model.  For each genomic position the sampler looks up the
-    current 5-mer context and the position's stratification bin, then draws
+    Markov model.  For each genomic position the sampler looks up the
+    current k-mer context and the position's stratification bin, then draws
     the next nucleotide from the corresponding CDF.  The result preserves
     the k-mer statistics of the original genome within each bin.
 
-    When the sampler needs to initialise the first 5-mer context and
+    When the sampler needs to initialise the first k-mer context and
     encounters regions with only N bases, it falls back to uniform random
     base selection until a valid context is established.
 
@@ -956,6 +985,8 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
             "(one per dimension)"
         )
 
+    model_k = model.k
+
     if intervals is None:
         intervals = gintervals_all()
 
@@ -988,7 +1019,7 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
         worker_args = [
             (chunk.to_dict(orient="list"), dim_specs_list,
              cdf_list, iterator, mask_copy_dict, n_samples,
-             chunk_seeds[i], bin_merge)
+             chunk_seeds[i], bin_merge, model_k)
             for i, chunk in enumerate(chunks)
         ]
 
@@ -1063,6 +1094,7 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
         fmt_code,
         int(n_samples),
         seed,
+        int(model_k),
     )
 
 
@@ -1169,6 +1201,12 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
 
     intervals = _maybe_load_intervals_set(intervals)
 
+    # gsynth_random always uses k=5 (context doesn't matter since all
+    # contexts share the same distribution, but the CDF matrix size and
+    # the C++ context window must agree).
+    random_k = 5
+    num_kmers = 4 ** random_k  # 1024
+
     # Build uniform/custom CDF for a single bin
     if nuc_probs is None:
         probs = _numpy.array([0.25, 0.25, 0.25, 0.25])
@@ -1184,8 +1222,8 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
     cdf = _numpy.cumsum(probs)
     cdf[-1] = 1.0  # Ensure exact 1.0
 
-    # Create CDF matrix for all 1024 contexts (same CDF for all)
-    cdf_mat = _numpy.tile(cdf, (1024, 1))  # 1024 x 4
+    # Create CDF matrix for all contexts (same CDF for all)
+    cdf_mat = _numpy.tile(cdf, (num_kmers, 1))  # num_kmers x 4
     cdf_list = [cdf_mat]  # Single bin
 
     # Single bin: all positions map to bin 0
@@ -1229,6 +1267,7 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
         fmt_code,
         int(n_samples),
         seed,
+        int(random_k),
     )
 
 
@@ -1403,6 +1442,9 @@ def gsynth_save(model, path, *, compress=False):
     if not isinstance(model, GsynthModel):
         raise TypeError("model must be a GsynthModel")
 
+    model_k = model.k
+    num_kmers = 4 ** model_k
+
     # Build metadata dict
     total_bins = model.total_bins
     per_bin_kmers = model.per_bin_kmers
@@ -1422,10 +1464,13 @@ def gsynth_save(model, path, *, compress=False):
         }
         dim_specs_out.append(ds)
 
+    # Use version 2 when k != 5 (non-default); version 1 for backward compat
+    file_version = 2 if model_k != 5 else 1
+
     metadata = {
         "format": "gsynth_model",
-        "version": 1,
-        "markov_order": 5,
+        "version": file_version,
+        "markov_order": int(model_k),
         "n_dims": int(model.n_dims),
         "dim_sizes": [int(x) for x in model.dim_sizes],
         "total_bins": int(total_bins),
@@ -1439,13 +1484,13 @@ def gsynth_save(model, path, *, compress=False):
         "data": {
             "counts": {
                 "dtype": "float64",
-                "shape": [int(total_bins), 1024, 4],
+                "shape": [int(total_bins), int(num_kmers), 4],
                 "order": "C",
                 "file": "counts.bin",
             },
             "cdf": {
                 "dtype": "float64",
-                "shape": [int(total_bins), 1024, 4],
+                "shape": [int(total_bins), int(num_kmers), 4],
                 "order": "C",
                 "file": "cdf.bin",
             },
@@ -1502,6 +1547,9 @@ def _load_legacy_pickle(path):
     # Backfill min_obs for models created before it was added
     if not hasattr(model, "min_obs"):
         model.min_obs = 0
+    # Backfill k for models created before variable k was added
+    if not hasattr(model, "k"):
+        model.k = 5
     return model
 
 
@@ -1524,11 +1572,17 @@ def _load_gsm_from_meta_and_files(metadata, read_file):
     version = metadata.get("version")
     if fmt != "gsynth_model":
         raise ValueError(f"Unknown format: {fmt!r}")
-    if version != 1:
+    if version not in (1, 2):
         raise ValueError(f"Unsupported version: {version}")
 
+    # Read k from metadata (default 5 for version 1 / legacy)
+    model_k = int(metadata.get("markov_order", 5))
+    if model_k < 1 or model_k > 10:
+        raise ValueError(f"Invalid markov_order: {model_k}")
+    num_kmers = 4 ** model_k
+
     total_bins = int(metadata["total_bins"])
-    shape = (total_bins, 1024, 4)
+    shape = (total_bins, num_kmers, 4)
 
     counts_raw = _numpy.frombuffer(read_file("counts.bin"), dtype=_numpy.float64).reshape(shape)
     cdf_raw = _numpy.frombuffer(read_file("cdf.bin"), dtype=_numpy.float64).reshape(shape)
@@ -1550,7 +1604,7 @@ def _load_gsm_from_meta_and_files(metadata, read_file):
 
     per_bin_kmers_raw = metadata.get("per_bin_kmers", [])
     if per_bin_kmers_raw is not None and not isinstance(per_bin_kmers_raw, list):
-        per_bin_kmers_raw = [per_bin_kmers_raw]  # YAML scalar → list
+        per_bin_kmers_raw = [per_bin_kmers_raw]  # YAML scalar -> list
     per_bin_kmers = (
         _numpy.atleast_1d(_numpy.array(per_bin_kmers_raw, dtype=_numpy.int64))
         if per_bin_kmers_raw
@@ -1558,6 +1612,7 @@ def _load_gsm_from_meta_and_files(metadata, read_file):
     )
 
     return GsynthModel(
+        k=model_k,
         n_dims=int(metadata.get("n_dims", 0)),
         dim_sizes=[int(x) for x in metadata.get("dim_sizes", [])],
         dim_specs=dim_specs,

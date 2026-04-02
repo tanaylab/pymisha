@@ -1896,14 +1896,12 @@ class TestAdversarialEditDistance:
         assert result_heur3["n_edits"].iloc[0] == 3, \
             "TTT with max_edits=3 should match exact mode"
 
-        # Known bug: max_edits=2 returns 3 instead of NA
-        # (mandatory-only edits skip max_edits check in C++)
+        # max_edits=2 cannot accommodate 3 mandatory edits -> unreachable (empty result)
         result_heur2 = pm.gseq_pwm_edits("TTT", pssm,
                                            score_thresh=threshold,
                                            max_edits=2, prior=0, bidirect=False)
-        # Document the known bug behavior
-        assert result_heur2["n_edits"].iloc[0] == 3, \
-            "BUG: TTT returns 3 edits even with max_edits=2 (should be NA)"
+        assert len(result_heur2) == 0, \
+            "TTT with max_edits=2 should be unreachable (3 mandatory edits needed)"
 
         # "ACT" -- 1 mandatory edit (pos 3: T not in {G})
         result_act = pm.gseq_pwm_edits("ACT", pssm,
@@ -3552,3 +3550,2012 @@ class TestVtrackIndelCombinations:
         # Strict filter should return NaN or >= no-filter result
         if not np.isnan(hf) and not np.isnan(nf):
             assert hf >= nf - 1e-6
+
+
+# ===========================================================================
+# direction="below" — helper
+# ===========================================================================
+
+
+def _manual_pwm_edit_distance_below(seq, pssm, threshold, max_edits=None, scan_all=True):
+    """Compute minimum edits to bring the best window's score BELOW threshold.
+
+    Returns the minimum number of substitutions to push the score to
+    ``<= threshold``.  When *scan_all* is True every start position is
+    examined and the minimum edit count is returned.
+    """
+    motif_len = pssm.shape[0]
+    if len(seq) < motif_len:
+        return np.nan
+
+    log_pssm = np.log(pssm, where=(pssm > 0), out=np.full_like(pssm, -np.inf))
+    col_min = log_pssm.min(axis=1)
+
+    base_map = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+    def _score_window(window_seq):
+        current_score = 0.0
+        has_neg_inf = False
+        losses = []
+
+        for i in range(motif_len):
+            base = window_seq[i]
+            idx = base_map.get(base)
+            base_score = log_pssm[i].min() if idx is None else log_pssm[i, idx]
+
+            if not np.isfinite(base_score):
+                # Score is -Inf → already below any finite threshold
+                has_neg_inf = True
+                break
+
+            current_score += base_score
+            losses.append(base_score - col_min[i])
+
+        if has_neg_inf:
+            return 0
+
+        # surplus = how much the current score exceeds the threshold
+        surplus = current_score - threshold
+        if surplus <= 0:
+            return 0  # already at or below threshold
+
+        # Check if switching all positions to worst can cover the surplus
+        total_possible_loss = sum(losses)
+        if total_possible_loss < surplus - 1e-12:
+            return np.nan
+
+        losses_sorted = sorted(losses, reverse=True)
+        if max_edits is not None:
+            losses_sorted = losses_sorted[:max_edits]
+
+        acc = 0.0
+        edits = 0
+        for loss in losses_sorted:
+            edits += 1
+            acc += loss
+            if acc >= surplus:
+                return edits
+
+        return np.nan
+
+    if not scan_all:
+        return _score_window(seq)
+
+    best = np.nan
+    for start in range(len(seq) - motif_len + 1):
+        window = seq[start:start + motif_len]
+        cand = _score_window(window)
+        if np.isnan(best) or (not np.isnan(cand) and cand < best):
+            best = cand
+    return best
+
+
+# ===========================================================================
+# C. gseq_pwm_edits() with direction="below"
+# ===========================================================================
+
+
+class TestGseqPwmEditsDirectionBelowStructure:
+    """Output structure for direction='below'."""
+
+    def test_returns_dataframe_with_expected_columns(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert isinstance(result, pd.DataFrame)
+        expected_cols = {
+            "seq_idx", "strand", "window_start", "score_before",
+            "score_after", "n_edits", "edit_num", "motif_col",
+            "ref", "alt", "gain", "window_seq", "mutated_seq",
+        }
+        assert expected_cols.issubset(set(result.columns))
+        assert len(result) > 0
+        # "ACGT" is a perfect match — needs edits to go below threshold
+        assert any(result["n_edits"] > 0)
+
+
+class TestGseqPwmEditsDirectionBelow:
+    """Core edit logic for direction='below'."""
+
+    def test_already_below_threshold_zero_edits(self):
+        """When the best window already scores below the threshold, n_edits=0."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        # "TT" scores very low against AC-preferring PSSM
+        result = pm.gseq_pwm_edits(
+            "TT", pssm, score_thresh=-0.5,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert result["n_edits"].iloc[0] == 0
+        assert result["edit_num"].iloc[0] == 0
+        assert pd.isna(result["motif_col"].iloc[0])
+
+    def test_score_before_above_score_after_below_threshold(self):
+        """Edits must bring score from above to at/below threshold."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        threshold = -1.0
+        result = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="below",
+        )
+        rows_with_edits = result[result["n_edits"] > 0]
+        assert len(rows_with_edits) > 0, "Should need edits to bring score below threshold"
+        assert all(rows_with_edits["score_before"] > threshold), \
+            "score_before should be above threshold for below direction"
+        assert all(rows_with_edits["score_after"] <= threshold + 1e-9), \
+            "score_after should be at or below threshold for below direction"
+
+    def test_edits_ref_matches_window_seq(self):
+        """Edit ref bases should match the corresponding position in window_seq."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACG", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        edit_rows = result[result["edit_num"] > 0]
+        assert len(edit_rows) > 0
+        for _, row in edit_rows.iterrows():
+            if not pd.isna(row.get("edit_type")) and row.get("edit_type") == "sub":
+                mc = int(row["motif_col"])
+                assert row["window_seq"][mc - 1] == row["ref"], \
+                    f"ref should match window_seq at motif_col {mc}"
+
+    def test_applying_edits_produces_mutated_seq(self):
+        """Applying all substitution edits to window_seq yields mutated_seq."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACG", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        edit_rows = result[result["edit_num"] > 0]
+        ws = result["window_seq"].iloc[0]
+        ms = result["mutated_seq"].iloc[0]
+        ws_chars = list(ws)
+        for _, row in edit_rows.iterrows():
+            et = row.get("edit_type")
+            if pd.isna(et) or et == "sub":
+                mc = int(row["motif_col"])
+                ws_chars[mc - 1] = row["alt"]
+        assert "".join(ws_chars) == ms, \
+            "Applying all edits to window_seq should produce mutated_seq"
+
+    def test_gain_negative_for_below_direction(self):
+        """In below direction, gains should be negative (score is being reduced)."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        real_edits = result[result["edit_num"] > 0]
+        assert len(real_edits) > 0
+        sub_edits = real_edits[
+            real_edits["edit_type"].isna() | (real_edits["edit_type"] == "sub")
+        ] if "edit_type" in real_edits.columns else real_edits
+        if len(sub_edits) > 0:
+            assert all(sub_edits["gain"] < 0), \
+                "gain should be negative for below direction"
+
+    def test_score_after_equals_score_before_plus_gains(self):
+        """score_after == score_before + sum(gains) for substitution edits."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        sub_rows = result[result["edit_num"] > 0]
+        if "edit_type" in sub_rows.columns:
+            sub_rows = sub_rows[
+                sub_rows["edit_type"].isna() | (sub_rows["edit_type"] == "sub")
+            ]
+        if len(sub_rows) > 0:
+            total_gain = sub_rows["gain"].sum()
+            npt.assert_allclose(
+                result["score_after"].iloc[0],
+                result["score_before"].iloc[0] + total_gain,
+                atol=1e-3,
+            )
+
+    def test_multiple_sequences(self):
+        """Multiple sequences: one above, one below threshold."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        result = pm.gseq_pwm_edits(
+            ["AC", "TT"], pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        # "AC" is perfect match → needs edits to bring below
+        ac_rows = result[result["seq_idx"] == 1]
+        assert any(ac_rows["n_edits"] > 0), \
+            "AC should need edits to bring score below threshold"
+        # "TT" is poor match → already below threshold
+        tt_rows = result[result["seq_idx"] == 2]
+        assert any(tt_rows["n_edits"] == 0), \
+            "TT should already be below threshold"
+
+    def test_matches_manual_reference(self):
+        """gseq_pwm_edits should match the manual reference implementation."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        seqs = ["ACGT", "TCGT", "TTTT", "ACGA"]
+        threshold = -5.0
+
+        for i, seq in enumerate(seqs):
+            result = pm.gseq_pwm_edits(
+                seq, pssm, score_thresh=threshold,
+                prior=0, bidirect=False, direction="below",
+            )
+            expected = _manual_pwm_edit_distance_below(seq, pssm, threshold, scan_all=True)
+            if len(result) > 0:
+                actual = result["n_edits"].iloc[0]
+                if not np.isnan(expected):
+                    assert actual == expected, \
+                        f"Seq '{seq}': n_edits={actual} should match manual={expected}"
+
+
+class TestGseqPwmEditsDirectionBelowBidirect:
+    """Bidirectional scanning with direction='below'."""
+
+    def test_bidirect_picks_fewer_edits_strand(self):
+        """Bidirectional should pick the strand requiring fewer edits."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        # "GT": forward scores low (already below), revcomp "AC" scores high
+        result = pm.gseq_pwm_edits(
+            "GT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=True, direction="below",
+        )
+        assert len(result) > 0
+        # Forward strand is already below threshold → 0 edits
+        assert result["n_edits"].iloc[0] == 0
+        assert result["strand"].iloc[0] == 1
+
+    def test_bidirect_when_both_above(self):
+        """When both strands are above threshold, pick the one needing fewer edits."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        # "AC" forward is high, revcomp "GT" is low (already below -0.01)
+        result = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=-0.01,
+            prior=0, bidirect=True, direction="below",
+        )
+        assert len(result) > 0
+        # Reverse strand "GT" is already below -0.01 → 0 edits
+        assert result["n_edits"].iloc[0] == 0
+
+
+class TestGseqPwmEditsDirectionBelowMaxEdits:
+    """max_edits cap with direction='below'."""
+
+    def test_max_edits_caps_results(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        # Use a moderate threshold that needs 1 edit (not too extreme)
+        r_unlim = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+        )
+        r_max1 = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            max_edits=1, prior=0, bidirect=False, direction="below",
+        )
+        # Both should have results for this threshold
+        assert len(r_unlim) > 0
+        # Capped result should not have more edit rows than unlimited
+        unlim_edit_rows = len(r_unlim[r_unlim["edit_num"] > 0])
+        max1_edit_rows = len(r_max1[r_max1["edit_num"] > 0])
+        assert max1_edit_rows <= max(1, unlim_edit_rows)
+
+
+class TestGseqPwmEditsDirectionBelowAboveComplementary:
+    """Direction above and below should be complementary."""
+
+    def test_above_vs_below_complementary(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        threshold = -1.0
+
+        # "AC" is a perfect match → above: 0 edits, below: needs edits
+        r_above = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="above",
+        )
+        r_below = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert r_above["n_edits"].iloc[0] == 0, \
+            "AC is already above threshold, direction=above should need 0 edits"
+        assert r_below["n_edits"].iloc[0] > 0, \
+            "AC is above threshold, direction=below should need edits"
+
+        # "TT" is well below threshold → above: needs edits, below: 0 edits
+        r_above_tt = pm.gseq_pwm_edits(
+            "TT", pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="above",
+        )
+        r_below_tt = pm.gseq_pwm_edits(
+            "TT", pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert r_above_tt["n_edits"].iloc[0] > 0, \
+            "TT is below threshold, direction=above should need edits"
+        assert r_below_tt["n_edits"].iloc[0] == 0, \
+            "TT is already below threshold, direction=below should need 0 edits"
+
+
+class TestGseqPwmEditsDirectionBelowLongerSeq:
+    """direction='below' picks best window in longer sequences."""
+
+    def test_longer_seq_best_window(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        seq = "TTTTACGTTTTT"
+        threshold = -1.0
+        result = pm.gseq_pwm_edits(
+            seq, pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert len(result) > 0
+        rows_with_edits = result[result["n_edits"] > 0]
+        if len(rows_with_edits) > 0:
+            # The best window's score should be above the threshold
+            assert rows_with_edits["score_before"].iloc[0] > threshold
+
+
+class TestGseqPwmEditsDirectionBelowInformative:
+    """Highly informative PSSM with direction='below'."""
+
+    def test_one_edit_suffices_for_near_perfect_match(self):
+        pssm = np.array([
+            [0.99, 0.003, 0.003, 0.004],
+            [0.003, 0.99, 0.003, 0.004],
+        ])
+        result = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=-0.5,
+            prior=0, bidirect=False, direction="below",
+        )
+        assert len(result) > 0
+        rows_with_edits = result[result["n_edits"] > 0]
+        assert len(rows_with_edits) > 0
+        assert rows_with_edits["n_edits"].iloc[0] == 1, \
+            "One edit should suffice to bring score below threshold"
+        assert rows_with_edits["score_after"].iloc[0] <= -0.5 + 1e-9
+
+
+class TestGseqPwmEditsDirectionBelowIndels:
+    """direction='below' combined with indels."""
+
+    def test_indels_with_direction_below(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        result = pm.gseq_pwm_edits(
+            "ACGT", pssm, score_thresh=-1.0,
+            max_indels=1, prior=0, bidirect=False, direction="below",
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+        assert "edit_type" in result.columns
+        rows_with_edits = result[result["n_edits"] > 0]
+        assert len(rows_with_edits) > 0
+        assert all(rows_with_edits["score_after"] <= -1.0 + 1e-9)
+
+
+class TestGseqPwmEditsDirectionValidation:
+    """direction parameter validation."""
+
+    def test_invalid_direction_raises(self):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="direction must be"):
+            pm.gseq_pwm_edits(
+                "AC", pssm, score_thresh=-1.0,
+                direction="sideways",
+            )
+
+    def test_above_is_default(self):
+        pssm = _create_test_pssm()
+        r_default = pm.gseq_pwm_edits(
+            "TT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False,
+        )
+        r_above = pm.gseq_pwm_edits(
+            "TT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="above",
+        )
+        assert r_default["n_edits"].iloc[0] == r_above["n_edits"].iloc[0]
+
+
+# ===========================================================================
+# D. Virtual tracks with direction="below"
+# ===========================================================================
+
+
+class TestVtrackDirectionBelowBasic:
+    """pwm.edit_distance with direction='below' — basic functionality."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_basic_edit_distance_below(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+
+        threshold = -5.0
+        pm.gvtrack_create("edist_below", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("edist_below", test_interval, iterator=test_interval)
+        expected = _manual_pwm_edit_distance_below(seq, pssm, threshold)
+        if np.isnan(expected):
+            assert np.isnan(result["edist_below"].iloc[0])
+        else:
+            npt.assert_allclose(result["edist_below"].iloc[0], expected, atol=1e-6)
+
+    def test_already_below_returns_zero(self):
+        """Very high threshold: all windows score below it → 0 edits."""
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        pm.gvtrack_create("edist_below_easy", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=100.0,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("edist_below_easy", test_interval, iterator=test_interval)
+        npt.assert_allclose(result["edist_below_easy"].iloc[0], 0, atol=1e-6)
+
+    def test_unreachable_threshold_returns_nan(self):
+        """Uniform PSSM with impossibly low threshold → NA."""
+        pssm = np.array([
+            [0.25, 0.25, 0.25, 0.25],
+            [0.25, 0.25, 0.25, 0.25],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        pm.gvtrack_create("edist_below_imp", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=-100.0,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("edist_below_imp", test_interval, iterator=test_interval)
+        assert np.isnan(result["edist_below_imp"].iloc[0])
+
+    def test_matches_reference_multiple_intervals(self):
+        """Check against manual reference on multiple intervals."""
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        intervals = pm.gintervals(
+            ["1", "1", "1"],
+            [200, 300, 400],
+            [230, 330, 430],
+        )
+        threshold = -3.5
+
+        pm.gvtrack_create("edist_below_ref", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("edist_below_ref", intervals, iterator=intervals)
+
+        for i in range(len(intervals)):
+            seq = pm.gseq_extract(intervals.iloc[[i]])[0].upper()
+            expected = _manual_pwm_edit_distance_below(seq, pssm, threshold)
+            actual = result["edist_below_ref"].iloc[i]
+            if np.isnan(expected):
+                assert np.isnan(actual), f"Interval {i}: expected NaN"
+            else:
+                npt.assert_allclose(actual, expected, atol=1e-6,
+                                    err_msg=f"Interval {i}")
+
+
+class TestVtrackDirectionBelowMaxEdits:
+    """max_edits cap with direction='below' on virtual tracks."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_max_edits_cap(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+        threshold = -5.0
+
+        # Without cap
+        pm.gvtrack_create("edist_below_exact", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        # With max_edits=1
+        pm.gvtrack_create("edist_below_max1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold, max_edits=1,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["edist_below_exact", "edist_below_max1"],
+            test_interval, iterator=test_interval,
+        )
+
+        exact = result["edist_below_exact"].iloc[0]
+        max1 = result["edist_below_max1"].iloc[0]
+
+        # If exact needs > 1 edit, max1 should be NaN
+        if not np.isnan(exact) and exact > 1:
+            assert np.isnan(max1)
+        # If exact needs <= 1 edit, they should match
+        if not np.isnan(exact) and exact <= 1:
+            npt.assert_allclose(max1, exact, atol=1e-6)
+
+    def test_max_edits_consistency(self):
+        """Max_edits 1/2/3 consistent with unlimited."""
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_exact", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        for k in range(1, 4):
+            pm.gvtrack_create(f"ed_b_max{k}", None,
+                              func="pwm.edit_distance",
+                              pssm=pssm, score_thresh=threshold, max_edits=k,
+                              direction="below",
+                              bidirect=False, extend=False, prior=0)
+
+        vnames = ["ed_b_exact"] + [f"ed_b_max{k}" for k in range(1, 4)]
+        result = pm.gextract(vnames, test_interval, iterator=test_interval)
+        exact = result["ed_b_exact"].iloc[0]
+
+        for k in range(1, 4):
+            capped = result[f"ed_b_max{k}"].iloc[0]
+            if not np.isnan(exact) and exact <= k:
+                npt.assert_allclose(capped, exact, atol=1e-6,
+                                    err_msg=f"max_edits={k} should match exact={exact}")
+            if not np.isnan(exact) and exact > k:
+                assert np.isnan(capped), \
+                    f"max_edits={k} should be NaN when exact={exact}"
+
+
+class TestVtrackDirectionBelowBidirectional:
+    """Bidirectional scanning with direction='below' on virtual tracks."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_bidirectional_min_of_strands(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_fwd", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, strand=1, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_rev", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, strand=-1, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_bidi", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=True, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_fwd", "ed_b_rev", "ed_b_bidi"],
+            test_interval, iterator=test_interval,
+        )
+
+        fwd = result["ed_b_fwd"].iloc[0]
+        rev = result["ed_b_rev"].iloc[0]
+        bidi = result["ed_b_bidi"].iloc[0]
+
+        # Bidirectional should be minimum of strands
+        if not np.isnan(fwd) and not np.isnan(rev):
+            npt.assert_allclose(bidi, min(fwd, rev), atol=1e-6)
+        elif not np.isnan(fwd):
+            npt.assert_allclose(bidi, fwd, atol=1e-6)
+        elif not np.isnan(rev):
+            npt.assert_allclose(bidi, rev, atol=1e-6)
+
+
+class TestVtrackDirectionBelowComplementary:
+    """above vs below are complementary on virtual tracks."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_above_vs_below_complementary(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+        threshold = -3.0
+
+        pm.gvtrack_create("edist_above", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="above",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("edist_below", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["edist_above", "edist_below"],
+            test_interval, iterator=test_interval,
+        )
+
+        above_val = result["edist_above"].iloc[0]
+        below_val = result["edist_below"].iloc[0]
+
+        # They can't both be 0 unless score is exactly at threshold
+        if not np.isnan(above_val) and above_val == 0 and not np.isnan(below_val):
+            assert below_val >= 0
+        if not np.isnan(below_val) and below_val == 0 and not np.isnan(above_val):
+            assert above_val >= 0
+        # Both non-negative when not NaN
+        if not np.isnan(above_val):
+            assert above_val >= 0
+        if not np.isnan(below_val):
+            assert below_val >= 0
+
+
+class TestVtrackDirectionBelowPosAndMax:
+    """pwm.edit_distance.pos and pwm.max.edit_distance with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_pos_and_max_edit_distance(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        motif_len = pssm.shape[0]
+        test_interval = pm.gintervals(["1"], [200], [250])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+        threshold = -4.0
+
+        pm.gvtrack_create("ed_b_min", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_pos", None,
+                          func="pwm.edit_distance.pos",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_max", None,
+                          func="pwm.max.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("pwm_max_pos", None,
+                          func="pwm.max.pos",
+                          pssm=pssm,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_min", "ed_b_pos", "ed_b_max", "pwm_max_pos"],
+            test_interval, iterator=test_interval,
+        )
+
+        # Check min edit distance against manual reference
+        expected_min = _manual_pwm_edit_distance_below(seq, pssm, threshold)
+        actual_min = result["ed_b_min"].iloc[0]
+        if np.isnan(expected_min):
+            assert np.isnan(actual_min)
+        else:
+            npt.assert_allclose(actual_min, expected_min, atol=1e-6)
+
+        # Check position — find the first window that achieves the minimum
+        if not np.isnan(expected_min):
+            best_pos = None
+            for s in range(len(seq) - motif_len + 1):
+                w = seq[s:s + motif_len]
+                cand = _manual_pwm_edit_distance_below(w, pssm, threshold, scan_all=False)
+                if not np.isnan(cand) and abs(cand - expected_min) < 1e-6:
+                    best_pos = s + 1  # 1-based
+                    break
+            assert best_pos is not None
+            npt.assert_allclose(result["ed_b_pos"].iloc[0], best_pos, atol=1e-6)
+
+        # Check pwm.max.edit_distance (edits at the max-scoring window)
+        pwm_pos = result["pwm_max_pos"].iloc[0]
+        if not np.isnan(pwm_pos):
+            pwm_offset = int(round(pwm_pos)) - 1
+            assert pwm_offset >= 0
+            pwm_window_int = pm.gintervals(
+                [str(test_interval["chrom"].iloc[0])],
+                [int(test_interval["start"].iloc[0]) + pwm_offset],
+                [int(test_interval["start"].iloc[0]) + pwm_offset + motif_len],
+            )
+            pwm_seq = pm.gseq_extract(pwm_window_int)[0].upper()
+            expected_max = _manual_pwm_edit_distance_below(
+                pwm_seq, pssm, threshold, scan_all=False,
+            )
+            actual_max = result["ed_b_max"].iloc[0]
+            if np.isnan(expected_max):
+                assert np.isnan(actual_max)
+            else:
+                npt.assert_allclose(actual_max, expected_max, atol=1e-6)
+
+
+class TestVtrackDirectionBelowScoreFilters:
+    """score_min/score_max filters with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_score_filters(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_nofilt", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_lowfilt", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          score_min=-np.inf,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_highfilt", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          score_min=0.0,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_nofilt", "ed_b_lowfilt", "ed_b_highfilt"],
+            test_interval, iterator=test_interval,
+        )
+
+        nf = result["ed_b_nofilt"].iloc[0]
+        lf = result["ed_b_lowfilt"].iloc[0]
+        hf = result["ed_b_highfilt"].iloc[0]
+
+        # Lenient filter matches no-filter
+        if np.isnan(nf):
+            assert np.isnan(lf)
+        else:
+            npt.assert_allclose(nf, lf, atol=1e-6)
+
+        # Strict filter should return NaN or >= no-filter
+        if not np.isnan(hf) and not np.isnan(nf):
+            assert hf >= nf - 1e-6
+
+
+class TestVtrackDirectionBelow1bpIterator:
+    """1bp iterator with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_1bp_iterator_matches_reference(self):
+        pssm = _create_test_pssm()
+        motif_len = pssm.shape[0]
+        test_interval = pm.gintervals(["1"], [200], [210])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_1bp", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=True, prior=0)
+
+        result = pm.gextract("ed_b_1bp", test_interval, iterator=1)
+        assert len(result) > 0
+
+        # Check a few positions
+        for idx in range(min(3, len(result))):
+            pos = int(result["start"].iloc[idx])
+            seq_window = pm.gseq_extract(
+                pm.gintervals(["1"], [pos], [pos + motif_len])
+            )[0].upper()
+            expected = _manual_pwm_edit_distance_below(seq_window, pssm, threshold)
+            actual = result["ed_b_1bp"].iloc[idx]
+            if np.isnan(expected):
+                assert np.isnan(actual), f"Position {pos}: expected NaN"
+            else:
+                npt.assert_allclose(actual, expected, atol=1e-6,
+                                    err_msg=f"Position {pos}")
+
+
+class TestVtrackDirectionBelowThresholdMonotonicity:
+    """Lower thresholds require more edits in below direction."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_threshold_monotonicity(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+
+        thresholds = [-10.0, -5.0, -2.0, 0.0]
+        vnames = [f"ed_b_t{i}" for i in range(len(thresholds))]
+
+        for i, thresh in enumerate(thresholds):
+            pm.gvtrack_create(vnames[i], None,
+                              func="pwm.edit_distance",
+                              pssm=pssm, score_thresh=thresh,
+                              direction="below",
+                              bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(vnames, test_interval, iterator=test_interval)
+
+        edits = [result[v].iloc[0] for v in vnames]
+        finite_edits = [e for e in edits if not np.isnan(e)]
+        if len(finite_edits) > 1:
+            # As threshold increases (low→high), edits should decrease
+            for i in range(1, len(finite_edits)):
+                assert finite_edits[i] <= finite_edits[i - 1] + 1e-6, \
+                    f"Edits should decrease with increasing threshold: {finite_edits}"
+
+        # Verify each against manual reference
+        for i, thresh in enumerate(thresholds):
+            expected = _manual_pwm_edit_distance_below(seq, pssm, thresh)
+            actual = edits[i]
+            if np.isnan(expected):
+                assert np.isnan(actual)
+            else:
+                npt.assert_allclose(actual, expected, atol=1e-6)
+
+
+class TestVtrackDirectionBelowLongerMotif:
+    """Longer motifs with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_6bp_motif(self):
+        pssm = np.array([
+            [0.9, 0.03, 0.03, 0.04],
+            [0.03, 0.9, 0.03, 0.04],
+            [0.03, 0.03, 0.9, 0.04],
+            [0.04, 0.03, 0.03, 0.9],
+            [0.9, 0.03, 0.03, 0.04],
+            [0.03, 0.9, 0.03, 0.04],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_6bp", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("ed_b_6bp", test_interval, iterator=test_interval)
+        expected = _manual_pwm_edit_distance_below(seq, pssm, threshold)
+        actual = result["ed_b_6bp"].iloc[0]
+        if np.isnan(expected):
+            assert np.isnan(actual)
+        else:
+            npt.assert_allclose(actual, expected, atol=1e-6)
+
+
+class TestVtrackDirectionBelowExtend:
+    """extend flag with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_extend_flag(self):
+        pssm = _create_test_pssm()
+        motif_len = pssm.shape[0]
+        test_interval = pm.gintervals(["1"], [200], [202])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_ext", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=True, prior=0)
+
+        pm.gvtrack_create("ed_b_noext", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_ext", "ed_b_noext"],
+            test_interval, iterator=test_interval,
+        )
+
+        # With extend=TRUE the window is expanded to fit the full motif
+        seq_ext = pm.gseq_extract(
+            pm.gintervals(["1"], [200], [200 + motif_len])
+        )[0].upper()
+        expected_ext = _manual_pwm_edit_distance_below(seq_ext, pssm, threshold)
+
+        # With extend=FALSE, window stays as-is (may be < motif)
+        seq_noext = pm.gseq_extract(test_interval)[0].upper()
+        expected_noext = _manual_pwm_edit_distance_below(seq_noext, pssm, threshold)
+
+        actual_ext = result["ed_b_ext"].iloc[0]
+        actual_noext = result["ed_b_noext"].iloc[0]
+
+        if np.isnan(expected_ext):
+            assert np.isnan(actual_ext)
+        else:
+            npt.assert_allclose(actual_ext, expected_ext, atol=1e-6)
+
+        if np.isnan(expected_noext):
+            assert np.isnan(actual_noext)
+        else:
+            npt.assert_allclose(actual_noext, expected_noext, atol=1e-6)
+
+
+class TestVtrackDirectionBelowZeroProbability:
+    """Zero-probability columns with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_zero_prob_columns(self):
+        pssm = np.array([
+            [1.0, 0.0, 0.0, 0.0],  # Only A
+            [0.0, 1.0, 0.0, 0.0],  # Only C
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_zeros", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("ed_b_zeros", test_interval, iterator=test_interval)
+        expected = _manual_pwm_edit_distance_below(seq, pssm, threshold)
+        actual = result["ed_b_zeros"].iloc[0]
+        if np.isnan(expected):
+            assert np.isnan(actual)
+        else:
+            npt.assert_allclose(actual, expected, atol=1e-6)
+
+
+class TestVtrackDirectionBelowGscreen:
+    """gscreen with direction='below' virtual tracks."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_gscreen_with_below(self):
+        pssm = _create_test_pssm()
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_screen", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        test_intervals = pm.gintervals(["1"], [200], [300])
+        result = pm.gscreen("~np.isnan(ed_b_screen)", test_intervals, iterator=10)
+
+        if result is not None and isinstance(result, pd.DataFrame) and len(result) > 0:
+            assert {"chrom", "start", "end"}.issubset(set(result.columns))
+
+
+class TestVtrackDirectionBelowComparison:
+    """gseq_pwm_edits vs vtrack should match for direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_gseq_pwm_edits_matches_vtrack(self):
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [210])
+        seq = pm.gseq_extract(test_interval)[0].upper()
+        threshold = -5.0
+
+        # gseq_pwm_edits
+        gseq_result = pm.gseq_pwm_edits(
+            seq, pssm, score_thresh=threshold,
+            prior=0, bidirect=False, direction="below",
+        )
+
+        # vtrack
+        pm.gvtrack_create("ed_b_cmp", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+        vt_result = pm.gextract("ed_b_cmp", test_interval, iterator=test_interval)
+
+        if len(gseq_result) > 0 and not np.isnan(vt_result["ed_b_cmp"].iloc[0]):
+            assert gseq_result["n_edits"].iloc[0] == int(vt_result["ed_b_cmp"].iloc[0]), \
+                "n_edits from gseq_pwm_edits should match vtrack"
+
+
+# ===========================================================================
+# E. Indels with direction="below" — virtual tracks
+# ===========================================================================
+
+
+class TestVtrackDirectionBelowIndels:
+    """max_indels with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_indels_can_reduce_total_edits(self):
+        """With indels, the total edit count should be <= substitution-only."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        intervals = pm.gintervals(
+            ["1", "1", "1"],
+            [200, 500, 1000],
+            [260, 560, 1060],
+        )
+        threshold = -3.0
+
+        pm.gvtrack_create("ed_b_sub", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=0,
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_sub", "ed_b_ind1"],
+            intervals, iterator=intervals,
+        )
+
+        for i in range(len(result)):
+            sub_val = result["ed_b_sub"].iloc[i]
+            ind_val = result["ed_b_ind1"].iloc[i]
+            if not np.isnan(sub_val) and not np.isnan(ind_val):
+                assert ind_val <= sub_val + 1e-6, \
+                    f"Row {i}: indel={ind_val} should be <= sub-only={sub_val}"
+            if not np.isnan(sub_val):
+                assert not np.isnan(ind_val), \
+                    f"Row {i}: indel should not be NaN when sub-only={sub_val}"
+
+    def test_more_indels_reduce_or_equal(self):
+        """max_indels=2 should give <= max_indels=1 <= max_indels=0."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        intervals = pm.gintervals(
+            ["1", "1", "1"],
+            [200, 500, 1000],
+            [260, 560, 1060],
+        )
+        threshold = -3.0
+
+        for d in range(3):
+            pm.gvtrack_create(f"ed_b_d{d}", None,
+                              func="pwm.edit_distance",
+                              pssm=pssm, score_thresh=threshold,
+                              direction="below", max_indels=d,
+                              bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            [f"ed_b_d{d}" for d in range(3)],
+            intervals, iterator=intervals,
+        )
+
+        for i in range(len(result)):
+            d0 = result["ed_b_d0"].iloc[i]
+            d1 = result["ed_b_d1"].iloc[i]
+            d2 = result["ed_b_d2"].iloc[i]
+
+            if not np.isnan(d0) and not np.isnan(d1):
+                assert d1 <= d0 + 1e-6, f"Row {i}: d1={d1} <= d0={d0}"
+            if not np.isnan(d1) and not np.isnan(d2):
+                assert d2 <= d1 + 1e-6, f"Row {i}: d2={d2} <= d1={d1}"
+            if not np.isnan(d0):
+                assert not np.isnan(d1), f"Row {i}: d1 should not be NaN if d0={d0}"
+                assert not np.isnan(d2), f"Row {i}: d2 should not be NaN if d0={d0}"
+
+    def test_longer_motif_sub_vs_indels(self):
+        """Longer motif: indels should never return more than sub-only."""
+        pssm = np.array([
+            [0.9, 0.03, 0.03, 0.04],
+            [0.03, 0.9, 0.03, 0.04],
+            [0.03, 0.03, 0.9, 0.04],
+            [0.04, 0.03, 0.03, 0.9],
+            [0.9, 0.03, 0.03, 0.04],
+            [0.03, 0.9, 0.03, 0.04],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [280])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_noind", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_1ind", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_2ind", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=2,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_noind", "ed_b_1ind", "ed_b_2ind"],
+            test_interval, iterator=test_interval,
+        )
+
+        ni = result["ed_b_noind"].iloc[0]
+        i1 = result["ed_b_1ind"].iloc[0]
+        i2 = result["ed_b_2ind"].iloc[0]
+
+        if not np.isnan(ni) and not np.isnan(i1):
+            assert i1 <= ni + 1e-6
+        if not np.isnan(ni) and not np.isnan(i2):
+            assert i2 <= ni + 1e-6
+        if not np.isnan(i1) and not np.isnan(i2):
+            assert i2 <= i1 + 1e-6
+        if not np.isnan(ni):
+            assert not np.isnan(i1)
+            assert not np.isnan(i2)
+
+    def test_max_indels_zero_matches_default(self):
+        """max_indels=0 should match default (no indels)."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        intervals = pm.gintervals(
+            ["1", "1", "1", "1"],
+            [200, 500, 1000, 2000],
+            [260, 560, 1060, 2060],
+        )
+        threshold = -3.0
+
+        pm.gvtrack_create("ed_b_default", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_cap0", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=0,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_default", "ed_b_cap0"],
+            intervals, iterator=intervals,
+        )
+
+        for i in range(len(result)):
+            d = result["ed_b_default"].iloc[i]
+            c = result["ed_b_cap0"].iloc[i]
+            if np.isnan(d):
+                assert np.isnan(c), f"Row {i}: both should be NaN"
+            else:
+                npt.assert_allclose(d, c, atol=1e-6,
+                                    err_msg=f"Row {i}: default and max_indels=0 should match")
+
+    def test_already_below_with_indels_returns_zero(self):
+        """All indel settings return 0 when already below threshold."""
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        for d in range(3):
+            pm.gvtrack_create(f"ed_b_easy{d}", None,
+                              func="pwm.edit_distance",
+                              pssm=pssm, score_thresh=100.0,
+                              direction="below", max_indels=d,
+                              bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            [f"ed_b_easy{d}" for d in range(3)],
+            test_interval, iterator=test_interval,
+        )
+
+        for d in range(3):
+            npt.assert_allclose(result[f"ed_b_easy{d}"].iloc[0], 0, atol=1e-6)
+
+    def test_indels_bidirectional(self):
+        """Bidirectional with indels should return min of strands."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+            [0.01, 0.01, 0.01, 0.97],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [260])
+        threshold = -3.0
+
+        pm.gvtrack_create("ed_b_ind_fwd", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, strand=1, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind_rev", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, strand=-1, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind_bidi", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=True, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_ind_fwd", "ed_b_ind_rev", "ed_b_ind_bidi"],
+            test_interval, iterator=test_interval,
+        )
+
+        fwd = result["ed_b_ind_fwd"].iloc[0]
+        rev = result["ed_b_ind_rev"].iloc[0]
+        bidi = result["ed_b_ind_bidi"].iloc[0]
+
+        if not np.isnan(fwd) and not np.isnan(rev):
+            npt.assert_allclose(bidi, min(fwd, rev), atol=1e-6)
+        elif not np.isnan(fwd):
+            npt.assert_allclose(bidi, fwd, atol=1e-6)
+        elif not np.isnan(rev):
+            npt.assert_allclose(bidi, rev, atol=1e-6)
+
+    def test_max_edits_and_max_indels_interaction(self):
+        """max_edits cap interacts correctly with max_indels in below direction."""
+        pssm = np.array([
+            [0.9, 0.03, 0.03, 0.04],
+            [0.03, 0.9, 0.03, 0.04],
+            [0.03, 0.03, 0.9, 0.04],
+            [0.04, 0.03, 0.03, 0.9],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [260])
+        threshold = -5.0
+
+        pm.gvtrack_create("ed_b_ind_unlim", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind_max1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1, max_edits=1,
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind_max3", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1, max_edits=3,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_ind_unlim", "ed_b_ind_max1", "ed_b_ind_max3"],
+            test_interval, iterator=test_interval,
+        )
+
+        unlim = result["ed_b_ind_unlim"].iloc[0]
+        max1 = result["ed_b_ind_max1"].iloc[0]
+        max3 = result["ed_b_ind_max3"].iloc[0]
+
+        if not np.isnan(unlim):
+            if unlim <= 1:
+                npt.assert_allclose(max1, unlim, atol=1e-6)
+            else:
+                assert np.isnan(max1), \
+                    f"max_edits=1 should be NaN when unlimited needs {unlim}"
+            if unlim <= 3:
+                npt.assert_allclose(max3, unlim, atol=1e-6)
+            else:
+                assert np.isnan(max3), \
+                    f"max_edits=3 should be NaN when unlimited needs {unlim}"
+
+    def test_indels_consistency_across_intervals(self):
+        """Indels consistently <= sub-only across many intervals."""
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+            [0.04, 0.03, 0.03, 0.9],
+        ])
+        intervals = pm.gintervals(
+            ["1"] * 8,
+            list(range(200, 1000, 100)),
+            list(range(260, 1060, 100)),
+        )
+        threshold = -4.0
+
+        pm.gvtrack_create("ed_b_con_sub", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=0,
+                          bidirect=False, extend=False, prior=0)
+        pm.gvtrack_create("ed_b_con_ind1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=False, prior=0)
+        pm.gvtrack_create("ed_b_con_ind2", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=2,
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["ed_b_con_sub", "ed_b_con_ind1", "ed_b_con_ind2"],
+            intervals, iterator=intervals,
+        )
+
+        for i in range(len(result)):
+            s = result["ed_b_con_sub"].iloc[i]
+            i1 = result["ed_b_con_ind1"].iloc[i]
+            i2 = result["ed_b_con_ind2"].iloc[i]
+
+            if not np.isnan(s) and not np.isnan(i1):
+                assert i1 <= s + 1e-6, f"Row {i}: indel1 should be <= sub-only"
+            if not np.isnan(s) and not np.isnan(i2):
+                assert i2 <= s + 1e-6, f"Row {i}: indel2 should be <= sub-only"
+            if not np.isnan(i1) and not np.isnan(i2):
+                assert i2 <= i1 + 1e-6, f"Row {i}: indel2 should be <= indel1"
+            if not np.isnan(s):
+                assert not np.isnan(i1), f"Row {i}: indel1 NaN but sub-only={s}"
+                assert not np.isnan(i2), f"Row {i}: indel2 NaN but sub-only={s}"
+
+    def test_1bp_iterator_with_indels(self):
+        """1bp iterator with indels should match interval-level minimum."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+            [0.01, 0.01, 0.97, 0.01],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [210])
+        threshold = -4.0
+
+        pm.gvtrack_create("ed_b_ind_int", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("ed_b_ind_1bp", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below", max_indels=1,
+                          bidirect=False, extend=True, prior=0)
+
+        result_int = pm.gextract("ed_b_ind_int", test_interval, iterator=test_interval)
+        result_1bp = pm.gextract("ed_b_ind_1bp", test_interval, iterator=1)
+
+        if len(result_1bp) > 0:
+            vals = result_1bp["ed_b_ind_1bp"].values
+            finite_vals = vals[~np.isnan(vals)]
+            if len(finite_vals) > 0:
+                min_1bp = finite_vals.min()
+                int_val = result_int["ed_b_ind_int"].iloc[0]
+                if not np.isnan(int_val):
+                    npt.assert_allclose(int_val, min_1bp, atol=1e-6)
+
+
+# ===========================================================================
+# F. LSE edit distance with direction="below"
+# ===========================================================================
+
+
+class TestVtrackLseDirectionBelow:
+    """pwm.edit_distance.lse with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_basic_lse_below(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get the actual LSE score
+        pm.gvtrack_create("v_lse_score", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        lse_result = pm.gextract("v_lse_score", test_interval, iterator=test_interval)
+        lse_score = lse_result["v_lse_score"].iloc[0]
+
+        # Set threshold above the LSE score → already below → 0 edits
+        high_thresh = lse_score + 5.0
+        pm.gvtrack_create("v_lse_b_easy", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=high_thresh,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("v_lse_b_easy", test_interval, iterator=test_interval)
+        npt.assert_allclose(result["v_lse_b_easy"].iloc[0], 0, atol=1e-6)
+
+    def test_lse_below_needs_edits(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get the actual LSE score
+        pm.gvtrack_create("v_lse_score", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        lse_result = pm.gextract("v_lse_score", test_interval, iterator=test_interval)
+        lse_score = lse_result["v_lse_score"].iloc[0]
+
+        # Set threshold well below → needs edits
+        low_thresh = lse_score - 10.0
+        pm.gvtrack_create("v_lse_b_hard", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=low_thresh,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("v_lse_b_hard", test_interval, iterator=test_interval)
+        val = result["v_lse_b_hard"].iloc[0]
+        if not np.isnan(val):
+            assert val >= 1, \
+                f"LSE score {lse_score} above threshold {low_thresh} should need edits"
+
+    def test_lse_below_returns_zero_when_already_below(self):
+        pssm = _create_test_pssm()
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        pm.gvtrack_create("v_lse_b_al", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=100.0,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("v_lse_b_al", test_interval, iterator=test_interval)
+        npt.assert_allclose(result["v_lse_b_al"].iloc[0], 0, atol=1e-6)
+
+    def test_lse_below_unreachable_returns_nan(self):
+        """Uniform PSSM with impossibly low threshold → NA."""
+        pssm = np.array([
+            [0.25, 0.25, 0.25, 0.25],
+            [0.25, 0.25, 0.25, 0.25],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        pm.gvtrack_create("v_lse_b_imp", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=-1000.0,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract("v_lse_b_imp", test_interval, iterator=test_interval)
+        assert np.isnan(result["v_lse_b_imp"].iloc[0])
+
+    def test_lse_below_vs_above_complementary(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        # Get the actual LSE score
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        sc_result = pm.gextract("v_lse_sc", test_interval, iterator=test_interval)
+        lse_score = sc_result["v_lse_sc"].iloc[0]
+
+        # Threshold below current score
+        low_thresh = lse_score - 5.0
+        pm.gvtrack_create("v_lse_a_low", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=low_thresh,
+                          direction="above",
+                          bidirect=False, extend=False, prior=0)
+        pm.gvtrack_create("v_lse_b_low", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=low_thresh,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["v_lse_a_low", "v_lse_b_low"],
+            test_interval, iterator=test_interval,
+        )
+
+        # Score > threshold → above=0, below>=1
+        npt.assert_allclose(result["v_lse_a_low"].iloc[0], 0, atol=1e-6)
+        below_val = result["v_lse_b_low"].iloc[0]
+        if not np.isnan(below_val):
+            assert below_val >= 1
+
+        # Threshold above current score
+        high_thresh = lse_score + 5.0
+        pm.gvtrack_create("v_lse_a_hi", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=high_thresh,
+                          direction="above",
+                          bidirect=False, extend=False, prior=0)
+        pm.gvtrack_create("v_lse_b_hi", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=high_thresh,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result2 = pm.gextract(
+            ["v_lse_a_hi", "v_lse_b_hi"],
+            test_interval, iterator=test_interval,
+        )
+
+        # Score < threshold → below=0, above>=1
+        npt.assert_allclose(result2["v_lse_b_hi"].iloc[0], 0, atol=1e-6)
+        above_val = result2["v_lse_a_hi"].iloc[0]
+        if not np.isnan(above_val):
+            assert above_val >= 1
+
+
+class TestVtrackLseDirectionBelowPos:
+    """pwm.edit_distance.lse.pos with direction='below'."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_lse_below_pos_valid(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get LSE score for meaningful threshold
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        sc_result = pm.gextract("v_lse_sc", test_interval, iterator=test_interval)
+        threshold = sc_result["v_lse_sc"].iloc[0] - 5.0
+
+        pm.gvtrack_create("v_lse_b_ed", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("v_lse_b_pos", None,
+                          func="pwm.edit_distance.lse.pos",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["v_lse_b_ed", "v_lse_b_pos"],
+            test_interval, iterator=test_interval,
+        )
+
+        edist_val = result["v_lse_b_ed"].iloc[0]
+        pos_val = result["v_lse_b_pos"].iloc[0]
+
+        if not np.isnan(edist_val) and edist_val >= 1:
+            assert not np.isnan(pos_val), \
+                "Position should be defined when edits are needed"
+            interval_len = int(test_interval["end"].iloc[0]) - int(test_interval["start"].iloc[0])
+            assert pos_val >= 1, f"Position {pos_val} should be >= 1"
+            assert pos_val <= interval_len, \
+                f"Position {pos_val} should be within interval length {interval_len}"
+
+        if not np.isnan(edist_val) and edist_val == 0:
+            assert np.isnan(pos_val), \
+                "Position should be NA when no edits are needed"
+
+
+class TestVtrackLseDirectionBelowConsistency:
+    """LSE below consistency with max-mode below."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_lse_below_ge_max_below(self):
+        """LSE below edits should be >= max below edits for the same threshold."""
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get both scores
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        pm.gvtrack_create("v_max_sc", None, func="pwm.max",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+
+        scores = pm.gextract(
+            ["v_lse_sc", "v_max_sc"],
+            test_interval, iterator=test_interval,
+        )
+        max_score = scores["v_max_sc"].iloc[0]
+        threshold = max_score - 2.0
+
+        pm.gvtrack_create("v_lse_b_ed", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("v_max_b_ed", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["v_lse_b_ed", "v_max_b_ed"],
+            test_interval, iterator=test_interval,
+        )
+
+        lse_edits = result["v_lse_b_ed"].iloc[0]
+        max_edits = result["v_max_b_ed"].iloc[0]
+
+        # LSE >= max → pushing LSE down is at least as hard
+        if not np.isnan(lse_edits) and not np.isnan(max_edits):
+            assert lse_edits >= max_edits - 1e-6, \
+                f"LSE below edits ({lse_edits}) should be >= max below edits ({max_edits})"
+
+        if not np.isnan(lse_edits):
+            assert lse_edits >= 0
+        if not np.isnan(max_edits):
+            assert max_edits >= 0
+
+
+class TestVtrackLseDirectionBelowThresholdMonotonicity:
+    """LSE below threshold monotonicity."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_threshold_monotonicity(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [240])
+
+        # Get actual LSE score
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        sc_result = pm.gextract("v_lse_sc", test_interval, iterator=test_interval)
+        lse_score = sc_result["v_lse_sc"].iloc[0]
+
+        thresholds = [
+            lse_score - 15, lse_score - 10, lse_score - 5,
+            lse_score, lse_score + 5,
+        ]
+        vnames = [f"v_lse_b_t{i}" for i in range(len(thresholds))]
+
+        for i, thresh in enumerate(thresholds):
+            pm.gvtrack_create(vnames[i], None,
+                              func="pwm.edit_distance.lse",
+                              pssm=pssm, score_thresh=thresh,
+                              direction="below",
+                              bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(vnames, test_interval, iterator=test_interval)
+        edits = [result[v].iloc[0] for v in vnames]
+
+        # As threshold increases, edits should decrease (non-increasing)
+        for i in range(1, len(edits)):
+            if not np.isnan(edits[i - 1]) and not np.isnan(edits[i]):
+                assert edits[i] <= edits[i - 1] + 1e-6, \
+                    (f"Edits at threshold {thresholds[i]}={edits[i]} should be "
+                     f"<= edits at threshold {thresholds[i-1]}={edits[i-1]}")
+            # If a lower threshold is reachable, the higher one must also be
+            if not np.isnan(edits[i - 1]):
+                assert not np.isnan(edits[i]), \
+                    (f"Threshold {thresholds[i]} should be reachable since "
+                     f"lower threshold {thresholds[i-1]} is reachable")
+
+
+class TestVtrackLseDirectionBelowBidirectional:
+    """LSE below with bidirectional scanning."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_lse_below_bidirectional(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get LSE score for meaningful threshold
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        sc_result = pm.gextract("v_lse_sc", test_interval, iterator=test_interval)
+        threshold = sc_result["v_lse_sc"].iloc[0] - 3.0
+
+        pm.gvtrack_create("v_lse_b_fwd", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, strand=1, extend=False, prior=0)
+
+        pm.gvtrack_create("v_lse_b_rev", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, strand=-1, extend=False, prior=0)
+
+        pm.gvtrack_create("v_lse_b_bidi", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=True, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["v_lse_b_fwd", "v_lse_b_rev", "v_lse_b_bidi"],
+            test_interval, iterator=test_interval,
+        )
+
+        fwd = result["v_lse_b_fwd"].iloc[0]
+        rev = result["v_lse_b_rev"].iloc[0]
+        bidi = result["v_lse_b_bidi"].iloc[0]
+
+        # All should be non-negative when not NaN
+        if not np.isnan(fwd):
+            assert fwd >= 0
+        if not np.isnan(rev):
+            assert rev >= 0
+        if not np.isnan(bidi):
+            assert bidi >= 0
+
+        # If at least one strand reachable, bidi should be too
+        if not np.isnan(fwd) or not np.isnan(rev):
+            assert not np.isnan(bidi), \
+                "Bidirectional should be reachable when at least one strand is"
+
+
+class TestVtrackLseDirectionBelowMaxEdits:
+    """LSE below with max_edits cap."""
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_lse_below_max_edits(self):
+        pssm = np.array([
+            [0.8, 0.1, 0.05, 0.05],
+            [0.1, 0.8, 0.05, 0.05],
+            [0.1, 0.05, 0.8, 0.05],
+        ])
+        test_interval = pm.gintervals(["1"], [200], [250])
+
+        # Get LSE score for meaningful threshold
+        pm.gvtrack_create("v_lse_sc", None, func="pwm",
+                          pssm=pssm, bidirect=False, extend=False, prior=0)
+        sc_result = pm.gextract("v_lse_sc", test_interval, iterator=test_interval)
+        threshold = sc_result["v_lse_sc"].iloc[0] - 8.0
+
+        pm.gvtrack_create("v_lse_b_unlim", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("v_lse_b_max1", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold, max_edits=1,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        pm.gvtrack_create("v_lse_b_max5", None,
+                          func="pwm.edit_distance.lse",
+                          pssm=pssm, score_thresh=threshold, max_edits=5,
+                          direction="below",
+                          bidirect=False, extend=False, prior=0)
+
+        result = pm.gextract(
+            ["v_lse_b_unlim", "v_lse_b_max1", "v_lse_b_max5"],
+            test_interval, iterator=test_interval,
+        )
+
+        unlim = result["v_lse_b_unlim"].iloc[0]
+        max1 = result["v_lse_b_max1"].iloc[0]
+        max5 = result["v_lse_b_max5"].iloc[0]
+
+        if not np.isnan(unlim):
+            if unlim <= 1:
+                npt.assert_allclose(max1, unlim, atol=1e-6)
+            else:
+                assert np.isnan(max1), \
+                    f"max_edits=1 should be NaN when unlimited needs {unlim}"
+            if unlim <= 5:
+                npt.assert_allclose(max5, unlim, atol=1e-6)
+            else:
+                assert np.isnan(max5), \
+                    f"max_edits=5 should be NaN when unlimited needs {unlim}"
+
+        # Non-negative when not NaN
+        if not np.isnan(unlim):
+            assert unlim >= 0
+        if not np.isnan(max1):
+            assert max1 >= 0
+        if not np.isnan(max5):
+            assert max5 >= 0

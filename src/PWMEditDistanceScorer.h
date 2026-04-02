@@ -39,6 +39,11 @@ public:
         PWM_MAX_EDITS
     };
 
+    enum class Direction {
+        ABOVE,  // minimum edits to bring score >= threshold (default)
+        BELOW   // minimum edits to bring score <= threshold
+    };
+
     /**
      * Constructor
      * @param pssm The Position-Specific Scoring Matrix
@@ -51,6 +56,8 @@ public:
      * @param score_min Minimum PWM score filter (NaN = no filter)
      * @param max_indels Maximum number of insertions+deletions allowed (0 = substitutions only)
      * @param score_max Maximum PWM score filter (NaN = no filter)
+     * @param direction ABOVE = min edits to reach score >= threshold;
+     *                  BELOW = min edits to bring score <= threshold
      */
     PWMEditDistanceScorer(const DnaPSSM& pssm,
                           GenomeSeqFetch* shared_seqfetch,
@@ -61,7 +68,8 @@ public:
                           Mode mode = Mode::MIN_EDITS,
                           float score_min = std::numeric_limits<float>::quiet_NaN(),
                           int max_indels = 0,
-                          float score_max = std::numeric_limits<float>::quiet_NaN());
+                          float score_max = std::numeric_limits<float>::quiet_NaN(),
+                          Direction direction = Direction::ABOVE);
 
     /**
      * Score a genomic interval - returns minimum edits needed
@@ -95,23 +103,34 @@ private:
     int m_max_edits;  // -1 = exact computation, >=1 = fast heuristic
     int m_max_indels; // 0 = substitutions only, >=1 = allow insertions/deletions via banded NW DP
     Mode m_mode;
+    Direction m_direction;  // ABOVE = edits to raise score >= threshold; BELOW = edits to lower score <= threshold
     float m_score_min; // NaN = no filter; otherwise skip windows with PWM score < this
     float m_score_max; // NaN = no filter; otherwise skip windows with PWM score > this
     ScanMetrics m_last_metrics;
 
     // Precomputed tables for exact mode
     std::vector<float> m_col_max_scores;     // s_max[i] - max score per column
-    std::vector<float> m_gain_values;        // V[1..M] - sorted descending
+    std::vector<float> m_col_min_scores;     // s_min[i] - min score per column (for BELOW direction)
+    std::vector<float> m_gain_values;        // V[1..M] - sorted descending (gains for ABOVE, losses for BELOW)
     std::vector<std::vector<uint8_t>> m_bin_index;  // bin[i][b] - lookup table
     float m_S_max;                           // sum of column maxima
+    float m_S_min;                           // sum of column minima (for BELOW direction)
     std::vector<float> m_max_suffix_score;   // m_max_suffix_score[i] = sum of col maxima from i to L-1
-    std::vector<float> m_max_gain_budget;    // m_max_gain_budget[k] = max total gain from k substitutions (per-PSSM)
+    std::vector<float> m_max_gain_budget;    // m_max_gain_budget[k] = max total gain/loss from k substitutions (per-PSSM)
 
     // Flat precomputed PSSM lookup tables for cache-friendly access
     static constexpr int MAX_MOTIF_LEN_OPT = 64;
     float m_score_table[MAX_MOTIF_LEN_OPT][5];    // [motif_pos][base_index 0-3, 4=N]
     float m_gain_table[MAX_MOTIF_LEN_OPT][5];     // col_max - score
     bool m_mandatory_table[MAX_MOTIF_LEN_OPT][5];  // true if score is log-zero or non-finite
+
+    // IC-ordered column processing for early-abandon in compute_heuristic (subs-only)
+    int m_ic_col_order[MAX_MOTIF_LEN_OPT];         // columns sorted by IC descending
+    float m_ic_suffix_target[MAX_MOTIF_LEN_OPT + 1]; // suffix target scores in IC order
+    bool m_use_ic_order;                              // true when subs-only and L <= MAX_MOTIF_LEN_OPT
+
+    // Reusable vectors for compute_heuristic (avoid per-call heap allocation)
+    std::vector<float> m_heur_deltas;
 
     // Reusable count vector for compute_exact (PERF-1: touched-list cleanup)
     std::vector<int> m_exact_count;
@@ -121,13 +140,61 @@ private:
     // with at most K total edits, at least one block must match exactly (zero edits)
     // at some shift in {-D, ..., +D}.
     struct PrefilterBlock {
-        int start;         // start column in motif
-        int len;           // block length (number of columns)
-        int num_entries;   // 4^len (size of viable bitset)
-        std::vector<uint8_t> viable;  // viable[hash] = true if B-mer can match block with 0 edits
+        std::vector<int> columns;  // column indices in this block (non-contiguous for subs-only)
+        int num_entries;            // 4^len (size of viable table)
+        std::vector<uint8_t> viable;
+        float avg_ic;              // average IC of columns in this block (for sorting)
     };
     std::vector<PrefilterBlock> m_prefilter_blocks;
     bool m_use_prefilter;
+
+    // Direction-aware helper methods — avoid scattered if/else throughout the code
+    inline bool is_below() const { return m_direction == Direction::BELOW; }
+
+    /** Compute the deficit: how much score must change to satisfy the threshold. */
+    inline double compute_deficit(double score) const {
+        return is_below() ? (score - static_cast<double>(m_threshold))
+                          : (static_cast<double>(m_threshold) - score);
+    }
+
+    /** Check whether the score already satisfies the threshold. */
+    inline bool threshold_satisfied(double score) const {
+        return is_below() ? (score <= static_cast<double>(m_threshold))
+                          : (score >= static_cast<double>(m_threshold));
+    }
+
+    /** Max possible delta achievable from the given score (using all optimal edits). */
+    inline double max_possible_delta(double score) const {
+        return is_below() ? (score - static_cast<double>(m_S_min))
+                          : (static_cast<double>(m_S_max) - score);
+    }
+
+    /** Global reachability: can the threshold ever be reached from any sequence? */
+    inline bool is_globally_reachable() const {
+        return is_below() ? (static_cast<double>(m_S_min) <= static_cast<double>(m_threshold))
+                          : (static_cast<double>(m_S_max) >= static_cast<double>(m_threshold));
+    }
+
+    /** Compute per-position delta value (gain for ABOVE, loss for BELOW). */
+    inline float compute_position_delta(float score, int col_idx) const {
+        if (is_below()) {
+            bool is_logzero = (score <= -1e30f || !std::isfinite(score));
+            return is_logzero ? 0.0f : (score - m_col_min_scores[col_idx]);
+        } else {
+            return m_col_max_scores[col_idx] - score;
+        }
+    }
+
+    /** Target score for a position after editing (col_max for ABOVE, col_min for BELOW). */
+    inline float target_score(int col_idx) const {
+        return is_below() ? m_col_min_scores[col_idx] : m_col_max_scores[col_idx];
+    }
+
+    /**
+     * Compute information content (IC) of a single PSSM column.
+     * IC = log2(4) - Shannon entropy = 2 - H(column)
+     */
+    float compute_column_ic(int col) const;
 
     /**
      * Precompute gain value bins and lookup tables (called once in constructor)

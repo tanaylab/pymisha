@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.22 (2026-04-03)
+
+### Features
+- **Direction parameter for edit distance:** New `direction="above"/"below"` parameter in `gseq_pwm_edits()`, virtual tracks (`pwm.edit_distance`, `pwm.edit_distance.lse`), and all edit distance scorers. `"above"` (default) finds min edits to reach threshold; `"below"` finds min edits to disrupt score below threshold. Ported from R misha.
+- **Variable Markov order k:** `gsynth_train()` now accepts `k=1..10` (default 5) for configurable Markov order. Includes format v2 for `.gsm` files with v1 backward compatibility, non-integer k rejection, and full propagation through parallel train/sample.
+
+### Performance
+- **Edit distance 1.5x speedup** (subs-only genome scans on hg38): IC-ordered column processing, score-aware pigeonhole viable tables, sliding-window N-count skip, persistent allocation in heuristic, inline pigeonhole prefilter. Benchmarked on hg38 chr1 (249Mb): 10.6s → 7.0s.
+
+### Testing
+- 98 new tests (2551 total): 54 direction=below tests (subs, indels, LSE, vtracks, edge cases), 44 variable-k tests (k=1/3/5/7/10 training, validation, save/load, parallel).
+
 ## v0.1.21 (2026-03-29)
 
 ### Performance

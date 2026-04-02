@@ -1289,6 +1289,10 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
         - ``max_indels`` (int) -- Maximum insertions+deletions for
           ``'pwm.edit_distance'``, ``'pwm.edit_distance.pos'``,
           ``'pwm.max.edit_distance'``. Default 0 (substitutions only).
+        - ``direction`` (str) -- Score direction for edit distance
+          functions: ``'above'`` (default) finds minimum edits to raise
+          score above threshold; ``'below'`` finds minimum edits to
+          lower score below threshold.
         - ``score_min`` (float or None) -- Minimum PWM score filter for
           edit distance functions. Windows below this are skipped.
         - ``score_max`` (float or None) -- Maximum PWM score filter for
@@ -1434,6 +1438,15 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
             if spat_bin <= 0:
                 raise ValueError("spat_bin must be a positive integer")
             config["spat_bin"] = spat_bin
+
+    # Validate direction parameter for edit distance functions
+    if func_lc in _FILTER_EDIT_DISTANCE_FUNCS:
+        direction = config.get("direction", "above")
+        if direction is not None:
+            direction = str(direction).lower()
+            if direction not in ("above", "below"):
+                raise ValueError("direction must be 'above' or 'below'")
+            config["direction"] = direction
 
     # For PWM virtual tracks, if pssm is a DataFrame, ensure column order A, C, G, T
     if config.get('func', '').startswith('pwm'):

@@ -1343,7 +1343,7 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
 def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
                     max_indels=None, bidirect=True,
                     prior=0.01, score_min=None, score_max=None, extend=True,
-                    strand=1):
+                    strand=1, direction="above"):
     """
     Show optimal edits to reach a PWM score threshold.
 
@@ -1388,6 +1388,13 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
         ``False`` = 0, or an explicit integer.
     strand : int, default 1
         When ``bidirect=False``: ``1`` = forward, ``-1`` = reverse.
+    direction : str, default "above"
+        Score direction for edit distance computation:
+
+        - ``"above"``: find minimum edits to raise score **above**
+          *score_thresh* (create/strengthen binding site).
+        - ``"below"``: find minimum edits to lower score **below**
+          *score_thresh* (disrupt/weaken binding site).
 
     Returns
     -------
@@ -1476,6 +1483,11 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
     else:
         max_indels = 0
 
+    # Validate direction
+    direction = str(direction).lower()
+    if direction not in ("above", "below"):
+        raise ValueError("direction must be 'above' or 'below'")
+
     # Resolve strand mode
     strand_mode = 0 if bidirect else int(strand)
 
@@ -1485,7 +1497,7 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
         max_edits, int(bidirect), strand_mode,
         float(prior), extend,
         score_min, score_max,
-        max_indels,
+        max_indels, direction,
     )
 
     df = _pandas.DataFrame(result)

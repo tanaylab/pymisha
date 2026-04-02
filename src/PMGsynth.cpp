@@ -2,7 +2,7 @@
  * PMGsynth.cpp
  *
  * Python C API wrappers for genome synthesis functions:
- *   pm_gsynth_train       - Train stratified Markov-5 model
+ *   pm_gsynth_train       - Train stratified Markov model (variable order k)
  *   pm_gsynth_sample      - Sample synthetic genome from trained model
  *   pm_gsynth_replace_kmer - Iterative k-mer replacement
  */
@@ -31,7 +31,7 @@ extern void convert_py_intervals(PyObject *py_intervals,
 // ============================================================================
 
 /*
- * Train a stratified Markov-5 model from genome sequence data.
+ * Train a stratified Markov model from genome sequence data.
  *
  * Python args:
  *   intervals      - DataFrame (internal list format) of genomic intervals
@@ -42,11 +42,12 @@ extern void convert_py_intervals(PyObject *py_intervals,
  *   bin_map        - numpy int32 array or None, bin mapping for merging sparse bins
  *   mask           - DataFrame or None, intervals to exclude
  *   pseudocount    - float, pseudocount for CDF normalization
+ *   k              - int, Markov order (1..10, default 5)
  *
  * Returns:
  *   dict with keys: 'counts' (list of 2D numpy arrays), 'cdf' (list of 2D numpy),
  *   'per_bin_kmers' (numpy int64), 'total_kmers' (int), 'total_masked' (int),
- *   'total_n' (int)
+ *   'total_n' (int), 'k' (int), 'num_kmers' (int)
  */
 PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
 {
@@ -61,14 +62,23 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PyObject *py_bin_map = NULL;
         PyObject *py_mask = NULL;
         double pseudocount = 1.0;
+        int k = 5;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOd",
+        if (!PyArg_ParseTuple(args, "OOOOOOOdi",
                               &py_intervals, &py_bin_indices,
                               &py_iter_starts, &py_iter_chroms,
                               &py_breaks, &py_bin_map, &py_mask,
-                              &pseudocount)) {
+                              &pseudocount, &k)) {
             verror("Invalid arguments to pm_gsynth_train");
         }
+
+        // Validate k
+        if (k < 1 || k > StratifiedMarkovModel::MAX_K) {
+            verror("Markov order k must be in [1, %d], got %d",
+                   StratifiedMarkovModel::MAX_K, k);
+        }
+
+        int num_kmers = 1 << (2 * k);  // 4^k
 
         // --- Parse breaks ---
         if (!PyList_Check(py_breaks)) {
@@ -168,7 +178,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
 
         // --- Initialize model ---
         StratifiedMarkovModel model;
-        model.init(num_bins, breaks_vec);
+        model.init(num_bins, breaks_vec, k);
 
         // --- Set up sequence fetcher ---
         GenomeSeqFetch seqfetch;
@@ -199,6 +209,8 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         }
 
         // --- Train model ---
+        // Window size is k+1: k bases for context + 1 for next base
+        int window_size = k + 1;
         uint64_t total_masked = 0;
         uint64_t total_n = 0;
         std::vector<char> seq_buf;
@@ -236,7 +248,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
                 }
 
                 // Process each position in the interval
-                for (int64_t pos = interval_start; pos + 5 < interval_end; ++pos) {
+                for (int64_t pos = interval_start; pos + k < interval_end; ++pos) {
                     int64_t rel = pos - interval_start;
 
                     // Check mask
@@ -245,10 +257,10 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
                         continue;
                     }
 
-                    // Check for N in the 6-mer window
+                    // Check for N in the (k+1)-mer window
                     bool has_n = false;
-                    for (int k = 0; k < 6; ++k) {
-                        char c = seq_buf[rel + k];
+                    for (int w = 0; w < window_size; ++w) {
+                        char c = seq_buf[rel + w];
                         if (c != 'A' && c != 'C' && c != 'G' && c != 'T' &&
                             c != 'a' && c != 'c' && c != 'g' && c != 't') {
                             has_n = true;
@@ -275,9 +287,9 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
 
                     if (bin_idx < 0 || bin_idx >= num_bins) continue;
 
-                    // Encode forward 5-mer context and next base
-                    int context_idx = StratifiedMarkovModel::encode_5mer(&seq_buf[rel]);
-                    int next_base = StratifiedMarkovModel::encode_base(seq_buf[rel + 5]);
+                    // Encode forward k-mer context and next base
+                    int context_idx = StratifiedMarkovModel::encode_kmer(&seq_buf[rel], k);
+                    int next_base = StratifiedMarkovModel::encode_base(seq_buf[rel + k]);
 
                     if (context_idx < 0 || next_base < 0) continue;
 
@@ -286,7 +298,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
 
                     // Count reverse complement
                     int rc_context, rc_next;
-                    StratifiedMarkovModel::revcomp_6mer(context_idx, next_base,
+                    StratifiedMarkovModel::revcomp_kmer(context_idx, next_base, k,
                                                         rc_context, rc_next);
                     model.increment_count(bin_idx, rc_context, rc_next);
                 }
@@ -307,17 +319,17 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PMPY result(PyDict_New(), true);
         if (!result) verror("Failed to create result dict");
 
-        // counts: list of 2D numpy arrays (num_bins x [1024, 4])
+        // counts: list of 2D numpy arrays (num_bins x [num_kmers, 4])
         PMPY py_counts_list(PyList_New(num_bins), true);
         PMPY py_cdf_list(PyList_New(num_bins), true);
 
         for (int b = 0; b < num_bins; ++b) {
-            // Counts array: 1024 x 4 (uint64)
-            npy_intp count_dims[2] = {NUM_5MERS, NUM_BASES};
+            // Counts array: num_kmers x 4 (uint64)
+            npy_intp count_dims[2] = {num_kmers, NUM_BASES};
             PMPY py_count_mat(PyArray_SimpleNew(2, count_dims, NPY_UINT64), true);
             uint64_t *count_data = (uint64_t *)PyArray_DATA(
                 (PyArrayObject *)(PyObject *)py_count_mat);
-            for (int ctx = 0; ctx < NUM_5MERS; ++ctx) {
+            for (int ctx = 0; ctx < num_kmers; ++ctx) {
                 for (int base = 0; base < NUM_BASES; ++base) {
                     count_data[ctx * NUM_BASES + base] = model.get_count(b, ctx, base);
                 }
@@ -325,12 +337,12 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
             py_count_mat.to_be_stolen();
             PyList_SET_ITEM((PyObject *)py_counts_list, b, (PyObject *)py_count_mat);
 
-            // CDF array: 1024 x 4 (float64)
-            npy_intp cdf_dims[2] = {NUM_5MERS, NUM_BASES};
+            // CDF array: num_kmers x 4 (float64)
+            npy_intp cdf_dims[2] = {num_kmers, NUM_BASES};
             PMPY py_cdf_mat(PyArray_SimpleNew(2, cdf_dims, NPY_DOUBLE), true);
             double *cdf_data = (double *)PyArray_DATA(
                 (PyArrayObject *)(PyObject *)py_cdf_mat);
-            for (int ctx = 0; ctx < NUM_5MERS; ++ctx) {
+            for (int ctx = 0; ctx < num_kmers; ++ctx) {
                 for (int base = 0; base < NUM_BASES; ++base) {
                     cdf_data[ctx * NUM_BASES + base] = model.get_cdf(b, ctx, base);
                 }
@@ -352,6 +364,8 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PMPY py_total(PyLong_FromUnsignedLongLong(model.get_total_kmers()), true);
         PMPY py_masked(PyLong_FromUnsignedLongLong(total_masked), true);
         PMPY py_n(PyLong_FromUnsignedLongLong(total_n), true);
+        PMPY py_k(PyLong_FromLong(k), true);
+        PMPY py_num_kmers(PyLong_FromLong(num_kmers), true);
 
         py_counts_list.to_be_stolen();
         py_cdf_list.to_be_stolen();
@@ -359,6 +373,8 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         py_total.to_be_stolen();
         py_masked.to_be_stolen();
         py_n.to_be_stolen();
+        py_k.to_be_stolen();
+        py_num_kmers.to_be_stolen();
 
         PyDict_SetItemString(result, "counts", py_counts_list);
         PyDict_SetItemString(result, "cdf", py_cdf_list);
@@ -366,6 +382,8 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PyDict_SetItemString(result, "total_kmers", py_total);
         PyDict_SetItemString(result, "total_masked", py_masked);
         PyDict_SetItemString(result, "total_n", py_n);
+        PyDict_SetItemString(result, "k", py_k);
+        PyDict_SetItemString(result, "num_kmers", py_num_kmers);
 
         result.to_be_stolen();
         return (PyObject *)result;
@@ -390,7 +408,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
  * Sample one or more synthetic genome sequences from a trained model.
  *
  * Python args:
- *   cdf_list       - list of 2D numpy arrays (one per bin), each 1024 x 4
+ *   cdf_list       - list of 2D numpy arrays (one per bin), each num_kmers x 4
  *   breaks         - list of float, bin boundaries
  *   bin_indices    - numpy int32 array, flat bin index per iterator position
  *   iter_starts    - numpy int64 array, start of each iter position
@@ -401,6 +419,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
  *   output_format  - int: 0=seq, 1=fasta, 2=vector
  *   n_samples      - int, number of samples per interval
  *   seed           - int or None, random seed
+ *   k              - int, Markov order (1..10, default 5)
  *
  * Returns: list of strings (format=2) or None (format=0,1)
  */
@@ -420,15 +439,24 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         int output_format = 2;
         int n_samples = 1;
         PyObject *py_seed = NULL;
+        int k = 5;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOsiiO",
+        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOi",
                               &py_cdf_list, &py_breaks,
                               &py_bin_indices, &py_iter_starts, &py_iter_chroms,
                               &py_intervals, &py_mask_copy,
                               &output_path, &output_format, &n_samples,
-                              &py_seed)) {
+                              &py_seed, &k)) {
             verror("Invalid arguments to pm_gsynth_sample");
         }
+
+        // Validate k
+        if (k < 1 || k > StratifiedMarkovModel::MAX_K) {
+            verror("Markov order k must be in [1, %d], got %d",
+                   StratifiedMarkovModel::MAX_K, k);
+        }
+
+        int num_kmers = 1 << (2 * k);  // 4^k
 
         // Set random seed if provided
         if (py_seed && py_seed != Py_None) {
@@ -450,7 +478,8 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         }
 
         // --- Build CDF data from Python list ---
-        std::vector<std::vector<std::array<float, NUM_BASES>>> cdf_data(num_bins);
+        // Use flat vector layout: cdf_data[bin][kmer_idx * NUM_BASES + base_idx]
+        std::vector<std::vector<float>> cdf_data(num_bins);
         if (!PyList_Check(py_cdf_list) || PyList_Size(py_cdf_list) != num_bins) {
             verror("cdf_list must be a list with %d elements", num_bins);
         }
@@ -463,17 +492,14 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
             }
             PyArrayObject *mat = (PyArrayObject *)(PyObject *)arr;
             if (PyArray_NDIM(mat) != 2 ||
-                PyArray_DIM(mat, 0) != NUM_5MERS ||
+                PyArray_DIM(mat, 0) != num_kmers ||
                 PyArray_DIM(mat, 1) != NUM_BASES) {
-                verror("CDF matrix %d must be %d x %d", b, NUM_5MERS, NUM_BASES);
+                verror("CDF matrix %d must be %d x %d", b, num_kmers, NUM_BASES);
             }
             double *data = (double *)PyArray_DATA(mat);
-            cdf_data[b].resize(NUM_5MERS);
-            for (int ctx = 0; ctx < NUM_5MERS; ++ctx) {
-                for (int base = 0; base < NUM_BASES; ++base) {
-                    cdf_data[b][ctx][base] = static_cast<float>(
-                        data[ctx * NUM_BASES + base]);
-                }
+            cdf_data[b].resize(num_kmers * NUM_BASES);
+            for (int i = 0; i < num_kmers * NUM_BASES; ++i) {
+                cdf_data[b][i] = static_cast<float>(data[i]);
             }
         }
 
@@ -625,8 +651,8 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                         ++mask_cursor;
                     }
 
-                    // Initialize first 5 bases
-                    int64_t init_len = std::min<int64_t>(5, interval_len);
+                    // Initialize first k bases
+                    int64_t init_len = std::min<int64_t>(k, interval_len);
                     for (int64_t i = 0; i < init_len; ++i) {
                         int64_t pos = interval_start + i;
                         if (is_position_masked(pos, mask_copy_ivs, mask_cursor) &&
@@ -666,19 +692,19 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                             }
                         }
 
-                        // Get 5-mer context
-                        int context_idx = StratifiedMarkovModel::encode_5mer(
-                            &synth_seq[rel_pos - 5]);
+                        // Get k-mer context
+                        int context_idx = StratifiedMarkovModel::encode_kmer(
+                            &synth_seq[rel_pos - k], k);
 
                         int next_base;
                         if (context_idx < 0 || bin_idx < 0 || bin_idx >= num_bins) {
                             next_base = static_cast<int>(drand48() * NUM_BASES);
                         } else {
                             float r = static_cast<float>(drand48());
-                            const auto &cdf = cdf_data[bin_idx][context_idx];
+                            int base_offset = context_idx * NUM_BASES;
                             next_base = NUM_BASES - 1;
                             for (int b = 0; b < NUM_BASES; ++b) {
-                                if (r < cdf[b]) {
+                                if (r < cdf_data[bin_idx][base_offset + b]) {
                                     next_base = b;
                                     break;
                                 }

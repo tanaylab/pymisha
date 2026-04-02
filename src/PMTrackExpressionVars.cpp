@@ -654,6 +654,15 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
             if (found_smin) score_min_f = (float)smin_d;
             if (found_smax) score_max_f = (float)smax_d;
 
+            // Parse direction parameter
+            std::string dir_str = vt_obj_to_string(vt_dict_get(spec, "direction"), "above");
+            PWMEditDistanceScorer::Direction direction = PWMEditDistanceScorer::Direction::ABOVE;
+            if (dir_str == "below") {
+                direction = PWMEditDistanceScorer::Direction::BELOW;
+            } else if (dir_str != "above") {
+                TGLError("direction parameter must be \"above\" or \"below\"");
+            }
+
             PWMEditDistanceScorer::Mode mode = PWMEditDistanceScorer::Mode::MIN_EDITS;
             if (func == "pwm.edit_distance.pos") mode = PWMEditDistanceScorer::Mode::MIN_EDITS_POSITION;
             else if (func == "pwm.max.edit_distance") mode = PWMEditDistanceScorer::Mode::PWM_MAX_EDITS;
@@ -661,7 +670,7 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
             vvar.scorer = std::make_unique<PWMEditDistanceScorer>(
                 pssm, vvar.seqfetch.get(), (float)score_thresh,
                 max_edits, extend, strand, mode,
-                score_min_f, max_indels, score_max_f);
+                score_min_f, max_indels, score_max_f, direction);
         } else if (is_lse_edit_dist) {
             int max_edits = (int)vt_obj_to_int64(vt_dict_get(spec, "max_edits"), -1);
             float score_min_f = std::numeric_limits<float>::quiet_NaN();
@@ -672,13 +681,22 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
             if (found_smin) score_min_f = (float)smin_d;
             if (found_smax) score_max_f = (float)smax_d;
 
+            // Parse direction parameter
+            std::string lse_dir_str = vt_obj_to_string(vt_dict_get(spec, "direction"), "above");
+            PWMLseEditDistanceScorer::Direction lse_direction = PWMLseEditDistanceScorer::Direction::ABOVE;
+            if (lse_dir_str == "below") {
+                lse_direction = PWMLseEditDistanceScorer::Direction::BELOW;
+            } else if (lse_dir_str != "above") {
+                TGLError("direction parameter must be \"above\" or \"below\"");
+            }
+
             PWMLseEditDistanceScorer::Mode mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE;
             if (func == "pwm.edit_distance.lse.pos") mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE_POS;
 
             vvar.scorer = std::make_unique<PWMLseEditDistanceScorer>(
                 pssm, vvar.seqfetch.get(), (float)score_thresh,
                 max_edits, extend, strand, mode,
-                score_min_f, score_max_f);
+                score_min_f, score_max_f, lse_direction);
         } else {
             // Standard PWM scoring: pwm, pwm.max, pwm.max.pos, pwm.count
             std::vector<float> spat_factor;

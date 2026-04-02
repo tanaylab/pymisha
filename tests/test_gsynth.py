@@ -7,6 +7,7 @@ import tempfile
 
 import numpy as np
 import pytest
+import yaml
 
 import pymisha as pm
 
@@ -1916,3 +1917,631 @@ class TestGsynthRandomAdvanced:
             assert sampled[500:700].upper() == orig.upper()
         finally:
             os.unlink(fasta_path)
+
+
+# ============================================================================
+# Variable Markov order k
+# ============================================================================
+
+
+class TestGsynthVariableK:
+    """Tests for variable Markov order k parameter in gsynth functions."""
+
+    # ------------------------------------------------------------------
+    # k validation
+    # ------------------------------------------------------------------
+
+    def test_k_zero_raises(self):
+        """k=0 is below the minimum (1) and should raise ValueError."""
+        with pytest.raises(ValueError, match=r"\[1, 10\]"):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 1000), iterator=200, k=0
+            )
+
+    def test_k_eleven_raises(self):
+        """k=11 is above the maximum (10) and should raise ValueError."""
+        with pytest.raises(ValueError, match=r"\[1, 10\]"):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 1000), iterator=200, k=11
+            )
+
+    def test_k_negative_raises(self):
+        """k=-1 should raise ValueError."""
+        with pytest.raises(ValueError, match=r"\[1, 10\]"):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 1000), iterator=200, k=-1
+            )
+
+    def test_k_float_rejected(self):
+        """Non-integer k (e.g. 3.5) should raise ValueError."""
+        with pytest.raises(ValueError, match="integer"):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 10000), iterator=200, k=3.5
+            )
+
+    def test_k_string_raises(self):
+        """Non-numeric k (string) should raise."""
+        with pytest.raises((ValueError, TypeError)):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 1000), iterator=200, k="abc"
+            )
+
+    def test_k_default_is_five(self):
+        """Default k should be 5."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200,
+        )
+        assert model.k == 5
+        assert model.num_kmers == 1024
+
+    # ------------------------------------------------------------------
+    # Training with various k values
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("k,expected_kmers", [
+        (1, 4),
+        (3, 64),
+        (5, 1024),
+        (7, 16384),
+    ])
+    def test_train_0d_various_k(self, k, expected_kmers):
+        """Train 0D model with k={k} and verify attributes."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        assert isinstance(model, pm.GsynthModel)
+        assert model.k == k
+        assert model.num_kmers == expected_kmers
+        assert model.n_dims == 0
+        assert model.total_bins == 1
+        assert model.total_kmers > 0
+
+        # CDF array shape
+        cdf_mat = model.model_data["cdf"][0]
+        assert cdf_mat.shape == (expected_kmers, 4)
+
+        # Counts array shape
+        counts_mat = model.model_data["counts"][0]
+        assert counts_mat.shape == (expected_kmers, 4)
+
+    def test_train_k10(self):
+        """Train 0D model with k=10 (max)."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=10,
+        )
+        assert model.k == 10
+        assert model.num_kmers == 4 ** 10  # 1048576
+        assert model.model_data["cdf"][0].shape == (1048576, 4)
+
+    @pytest.mark.parametrize("k", [1, 3, 5, 7])
+    def test_cdf_validity_per_k(self, k):
+        """CDF for k={k} should be monotonic with last column = 1.0."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        cdf_mat = model.model_data["cdf"][0]
+        n_kmers = 4 ** k
+        assert cdf_mat.shape == (n_kmers, 4)
+
+        # Values in [0, 1]
+        assert np.all(cdf_mat >= 0)
+        assert np.all(cdf_mat <= 1)
+
+        # Last column should be 1.0
+        np.testing.assert_allclose(cdf_mat[:, 3], 1.0, atol=1e-5)
+
+        # Each row should be non-decreasing
+        for ctx in range(min(n_kmers, 100)):  # spot-check first 100
+            assert np.all(np.diff(cdf_mat[ctx, :]) >= -1e-10)
+
+    # ------------------------------------------------------------------
+    # k=5 explicit matches default
+    # ------------------------------------------------------------------
+
+    def test_k5_explicit_matches_default(self):
+        """Training with explicit k=5 should produce identical results to default."""
+        ivs = pm.gintervals("1", 0, 50000)
+        model_k5 = pm.gsynth_train(intervals=ivs, iterator=200, k=5)
+        model_default = pm.gsynth_train(intervals=ivs, iterator=200)
+
+        assert model_k5.k == 5
+        assert model_default.k == 5
+        assert model_k5.num_kmers == 1024
+        assert model_default.num_kmers == 1024
+
+        # CDF matrices should be identical
+        np.testing.assert_array_almost_equal(
+            model_k5.model_data["cdf"][0],
+            model_default.model_data["cdf"][0],
+            decimal=15,
+        )
+        # Counts should be identical
+        np.testing.assert_array_equal(
+            model_k5.model_data["counts"][0],
+            model_default.model_data["counts"][0],
+        )
+
+    # ------------------------------------------------------------------
+    # Repr with variable k
+    # ------------------------------------------------------------------
+
+    def test_repr_shows_k(self):
+        """Model repr should display the Markov order."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200, k=3
+        )
+        s = repr(model)
+        assert "Markov" in s
+        assert "3" in s
+
+
+class TestGsynthVariableKSaveLoad:
+    """Save/load round-trip tests for variable Markov order k."""
+
+    # ------------------------------------------------------------------
+    # Save/load round-trip with k != 5
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("k", [3, 7])
+    def test_save_load_roundtrip_variable_k(self, k):
+        """Train with k={k}, save to .gsm, load -> k and data preserved."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        assert model.k == k
+        n_kmers = 4 ** k
+
+        path = os.path.join(tempfile.mkdtemp(), f"model_k{k}.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            loaded = pm.gsynth_load(path)
+
+            assert isinstance(loaded, pm.GsynthModel)
+            assert loaded.k == k
+            assert loaded.num_kmers == n_kmers
+
+            # CDF dimensions match
+            assert loaded.model_data["cdf"][0].shape == (n_kmers, 4)
+
+            # Counts match exactly
+            np.testing.assert_array_equal(
+                loaded.model_data["counts"][0],
+                model.model_data["counts"][0],
+            )
+            # CDF match exactly
+            np.testing.assert_array_almost_equal(
+                loaded.model_data["cdf"][0],
+                model.model_data["cdf"][0],
+                decimal=15,
+            )
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_save_load_roundtrip_k1(self):
+        """Train with k=1 (minimal), save, load -> preserved."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=1,
+        )
+        assert model.k == 1
+        assert model.num_kmers == 4
+
+        path = os.path.join(tempfile.mkdtemp(), "model_k1.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            loaded = pm.gsynth_load(path)
+
+            assert loaded.k == 1
+            assert loaded.num_kmers == 4
+            assert loaded.model_data["cdf"][0].shape == (4, 4)
+            np.testing.assert_array_equal(
+                loaded.model_data["counts"][0],
+                model.model_data["counts"][0],
+            )
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # .gsm metadata version: k=5 -> v1, k!=5 -> v2
+    # ------------------------------------------------------------------
+
+    def test_metadata_version_k5_is_v1(self):
+        """k=5 model should save with version 1 for backward compatibility."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+            k=5,
+        )
+        path = os.path.join(tempfile.mkdtemp(), "model_k5.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            with open(os.path.join(path, "metadata.yaml")) as f:
+                meta = yaml.safe_load(f)
+            assert meta["version"] == 1
+            assert meta["markov_order"] == 5
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @pytest.mark.parametrize("k", [1, 3, 7])
+    def test_metadata_version_k_nondefault_is_v2(self, k):
+        """k!= 5 models should save with version 2."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        path = os.path.join(tempfile.mkdtemp(), f"model_k{k}.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            with open(os.path.join(path, "metadata.yaml")) as f:
+                meta = yaml.safe_load(f)
+            assert meta["version"] == 2
+            assert meta["markov_order"] == k
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Backward compatibility: old v1 files load as k=5
+    # ------------------------------------------------------------------
+
+    def test_backward_compat_v1_loads_as_k5(self):
+        """A v1 format .gsm file (no markov_order) should load with k=5."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+            k=5,
+        )
+        path = os.path.join(tempfile.mkdtemp(), "model_v1.gsm")
+        try:
+            pm.gsynth_save(model, path)
+
+            # Manually strip markov_order from metadata to simulate old v1
+            meta_path = os.path.join(path, "metadata.yaml")
+            with open(meta_path) as f:
+                meta = yaml.safe_load(f)
+            assert meta["version"] == 1
+            # Keep version=1 but remove markov_order
+            meta.pop("markov_order", None)
+            with open(meta_path, "w") as f:
+                yaml.safe_dump(meta, f)
+
+            loaded = pm.gsynth_load(path)
+            assert loaded.k == 5
+            assert loaded.num_kmers == 1024
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Sampling identical from saved/loaded model with variable k
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("k", [3, 7])
+    def test_sampling_identical_after_save_load(self, k):
+        """Sampling from loaded model should match original with same seed."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        path = os.path.join(tempfile.mkdtemp(), f"model_k{k}.gsm")
+        try:
+            pm.gsynth_save(model, path)
+            loaded = pm.gsynth_load(path)
+
+            ivs = pm.gintervals("1", 0, 5000)
+            s1 = pm.gsynth_sample(model, intervals=ivs, seed=60427)
+            s2 = pm.gsynth_sample(loaded, intervals=ivs, seed=60427)
+            assert s1 == s2
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_save_load_zip_variable_k(self):
+        """Compressed (.zip) round-trip preserves k."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+            k=3,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".gsm.zip", delete=False) as f:
+            path = f.name
+        try:
+            pm.gsynth_save(model, path, compress=True)
+            loaded = pm.gsynth_load(path)
+            assert loaded.k == 3
+            assert loaded.num_kmers == 64
+            assert loaded.model_data["cdf"][0].shape == (64, 4)
+        finally:
+            os.unlink(path)
+
+
+class TestGsynthVariableKSampling:
+    """Sampling with variable Markov order k."""
+
+    @pytest.mark.parametrize("k", [1, 3, 5, 7])
+    def test_sample_valid_dna_per_k(self, k):
+        """Sampling from k={k} model should produce valid DNA sequences."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=k,
+        )
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals("1", 0, 5000),
+            seed=42,
+        )
+        assert len(seqs) == 1
+        assert len(seqs[0]) == 5000
+        assert all(c in "ACGT" for c in seqs[0])
+
+    def test_sample_k1_correct_length(self):
+        """k=1 model generates sequences of the correct length."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=1,
+        )
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals("1", 0, 10000),
+            seed=42,
+        )
+        assert len(seqs[0]) == 10000
+
+    def test_sample_seed_reproducible_variable_k(self):
+        """Same seed -> identical output for k=3 model."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=3,
+        )
+        ivs = pm.gintervals("1", 0, 5000)
+        s1 = pm.gsynth_sample(model, intervals=ivs, seed=42)
+        s2 = pm.gsynth_sample(model, intervals=ivs, seed=42)
+        assert s1 == s2
+
+    def test_sample_different_seeds_variable_k(self):
+        """Different seeds -> different output for k=3 model."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=3,
+        )
+        ivs = pm.gintervals("1", 0, 5000)
+        s1 = pm.gsynth_sample(model, intervals=ivs, seed=42)
+        s2 = pm.gsynth_sample(model, intervals=ivs, seed=123)
+        assert s1 != s2
+
+    def test_sample_fasta_output_variable_k(self):
+        """FASTA output with k=3 model should be valid."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=3,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".fa", delete=False) as f:
+            output_path = f.name
+        try:
+            pm.gsynth_sample(
+                model,
+                output=output_path,
+                output_format="fasta",
+                intervals=pm.gintervals("1", 0, 5000),
+                seed=60427,
+            )
+            assert os.path.exists(output_path)
+            with open(output_path) as f:
+                lines = f.readlines()
+
+            seq_lines = [ln.strip() for ln in lines if not ln.startswith(">")]
+            full_seq = "".join(seq_lines)
+            assert len(full_seq) == 5000
+            assert all(c in "ACGT" for c in full_seq)
+        finally:
+            os.unlink(output_path)
+
+    def test_sample_multi_interval_variable_k(self):
+        """k=3 model works with multiple chromosomes."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals_all(),
+            iterator=200,
+            k=3,
+        )
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals(["1", "2"], [0, 0], [1000, 1000]),
+            seed=60427,
+        )
+        assert len(seqs) == 2
+        assert len(seqs[0]) == 1000
+        assert len(seqs[1]) == 1000
+        assert all(c in "ACGT" for c in seqs[0])
+        assert all(c in "ACGT" for c in seqs[1])
+
+    def test_sample_n_samples_variable_k(self):
+        """n_samples with k=3 generates multiple sequences."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            k=3,
+        )
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals("1", 0, 1000),
+            n_samples=3,
+            seed=60427,
+        )
+        assert len(seqs) == 3
+        for s in seqs:
+            assert len(s) == 1000
+            assert all(c in "ACGT" for c in s)
+        # At least some should differ
+        assert len(set(seqs)) > 1
+
+
+class TestGsynthVariableK1DStratification:
+    """1D stratification with variable Markov order k."""
+
+    def test_train_1d_with_k3(self):
+        """Train 1D model with k=3 and verify structure."""
+        pm.gvtrack_create("g_frac_k", None, "kmer.frac", kmer="G")
+        pm.gvtrack_create("c_frac_k", None, "kmer.frac", kmer="C")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac_k + c_frac_k",
+                    "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+                k=3,
+            )
+            assert model.k == 3
+            assert model.num_kmers == 64
+            assert model.n_dims == 1
+            assert model.dim_sizes == [5]
+            assert model.total_bins == 5
+
+            # All CDF matrices should be 64 x 4
+            for b in range(model.total_bins):
+                assert model.model_data["cdf"][b].shape == (64, 4)
+        finally:
+            pm.gvtrack_rm("g_frac_k")
+            pm.gvtrack_rm("c_frac_k")
+
+    def test_sample_from_1d_k3_model(self):
+        """Sample from 1D k=3 model and verify valid DNA."""
+        pm.gvtrack_create("g_frac_k", None, "kmer.frac", kmer="G")
+        pm.gvtrack_create("c_frac_k", None, "kmer.frac", kmer="C")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac_k + c_frac_k",
+                    "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+                k=3,
+            )
+            seqs = pm.gsynth_sample(
+                model,
+                intervals=pm.gintervals("1", 0, 5000),
+                iterator=200,
+                seed=60427,
+            )
+            assert len(seqs[0]) == 5000
+            assert all(c in "ACGT" for c in seqs[0])
+        finally:
+            pm.gvtrack_rm("g_frac_k")
+            pm.gvtrack_rm("c_frac_k")
+
+    def test_1d_save_load_variable_k(self):
+        """Save/load round-trip for 1D model with k=3."""
+        pm.gvtrack_create("g_frac_k", None, "kmer.frac", kmer="G")
+        pm.gvtrack_create("c_frac_k", None, "kmer.frac", kmer="C")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac_k + c_frac_k",
+                    "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+                k=3,
+            )
+            path = os.path.join(tempfile.mkdtemp(), "model_1d_k3.gsm")
+            try:
+                pm.gsynth_save(model, path)
+                loaded = pm.gsynth_load(path)
+
+                assert loaded.k == 3
+                assert loaded.num_kmers == 64
+                assert loaded.n_dims == 1
+                assert loaded.total_bins == 5
+                for b in range(5):
+                    np.testing.assert_array_equal(
+                        loaded.model_data["counts"][b],
+                        model.model_data["counts"][b],
+                    )
+                    np.testing.assert_array_almost_equal(
+                        loaded.model_data["cdf"][b],
+                        model.model_data["cdf"][b],
+                        decimal=15,
+                    )
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+        finally:
+            pm.gvtrack_rm("g_frac_k")
+            pm.gvtrack_rm("c_frac_k")
+
+    def test_per_bin_kmers_sum_with_variable_k(self):
+        """per_bin_kmers should sum to total_kmers with k=3."""
+        pm.gvtrack_create("g_frac_k", None, "kmer.frac", kmer="G")
+        pm.gvtrack_create("c_frac_k", None, "kmer.frac", kmer="C")
+        try:
+            model = pm.gsynth_train(
+                {
+                    "expr": "g_frac_k + c_frac_k",
+                    "breaks": np.linspace(0, 1, 11).tolist(),
+                },
+                intervals=pm.gintervals("1", 0, 50000),
+                iterator=200,
+                k=3,
+            )
+            assert int(np.sum(model.per_bin_kmers)) == model.total_kmers
+        finally:
+            pm.gvtrack_rm("g_frac_k")
+            pm.gvtrack_rm("c_frac_k")
+
+
+class TestGsynthVariableKParallel:
+    """Parallel training and sampling with variable Markov order k."""
+
+    def test_parallel_train_k3_matches_serial(self):
+        """Parallel train with k=3 should match serial."""
+        ivs = pm.gintervals_all()
+        model_serial = pm.gsynth_train(
+            intervals=ivs, iterator=200, k=3, allow_parallel=False,
+        )
+        model_parallel = pm.gsynth_train(
+            intervals=ivs, iterator=200, k=3, allow_parallel=True,
+        )
+        assert model_serial.k == model_parallel.k == 3
+        assert model_serial.total_kmers == model_parallel.total_kmers
+
+        np.testing.assert_array_equal(
+            model_serial.model_data["counts"][0],
+            model_parallel.model_data["counts"][0],
+        )
+        np.testing.assert_array_almost_equal(
+            model_serial.model_data["cdf"][0],
+            model_parallel.model_data["cdf"][0],
+            decimal=15,
+        )
+
+    def test_parallel_sample_k3_valid(self):
+        """Parallel sampling from k=3 model produces valid sequences."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals_all(),
+            iterator=200,
+            k=3,
+            allow_parallel=True,
+        )
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals("1", 0, 10000),
+            seed=42,
+            allow_parallel=True,
+        )
+        assert len(seqs) == 1
+        assert len(seqs[0]) == 10000
+        assert all(c in "ACGT" for c in seqs[0])
