@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.23 (2026-04-04)
+
+### Performance
+- **LUT-based DNA encoding:** Replaced all switch-statement character encoding in DnaPSSM with static 256-entry lookup tables (BASE_ENCODE, COMPLEMENT_ENCODE, NEUTRAL_CHAR), eliminating branch misprediction overhead in PWM scoring hot loops. Fixed latent `case 'h'` bug in `integrate_energy` reverse-complement path. Ported from R misha PR #83.
+- **DP buffer reuse:** PWMEditDistanceScorer `compute_with_indels()` now reuses a persistent buffer instead of per-window heap allocation, reducing malloc/free overhead for indel-mode edit distance scoring.
+
 ## v0.1.22 (2026-04-03)
 
 ### Features

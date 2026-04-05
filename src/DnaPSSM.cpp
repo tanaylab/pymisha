@@ -9,6 +9,73 @@
 
 const float NEG_INF = -std::numeric_limits<float>::infinity();
 
+// O(1) lookup tables for base encoding — replaces switch statements in hot loops.
+// BASE_ENCODE:      A/a->0, C/c->1, G/g->2, T/t->3, else->-1
+// COMPLEMENT_ENCODE: A/a->3(T), C/c->2(G), G/g->1(C), T/t->0(A), else->-1
+// NEUTRAL_CHAR:     1 for N/n/*, 0 otherwise
+
+#define X -1
+const int8_t DnaLookupTables::BASE_ENCODE[256] = {
+//  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 0-15
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 16-31
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 32-47
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 48-63
+    X,  0,  X,  1,  X,  X,  X,  2,  X,  X,  X,  X,  X,  X,  X,  X,  // 64-79  (A=65->0, C=67->1, G=71->2)
+    X,  X,  X,  X,  3,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 80-95  (T=84->3)
+    X,  0,  X,  1,  X,  X,  X,  2,  X,  X,  X,  X,  X,  X,  X,  X,  // 96-111 (a=97->0, c=99->1, g=103->2)
+    X,  X,  X,  X,  3,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 112-127 (t=116->3)
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 128-143
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 144-159
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 160-175
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 176-191
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 192-207
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 208-223
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 224-239
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // 240-255
+};
+
+const int8_t DnaLookupTables::COMPLEMENT_ENCODE[256] = {
+//  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  3,  X,  2,  X,  X,  X,  1,  X,  X,  X,  X,  X,  X,  X,  X,  // A->3(T), C->2(G), G->1(C)
+    X,  X,  X,  X,  0,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // T->0(A)
+    X,  3,  X,  2,  X,  X,  X,  1,  X,  X,  X,  X,  X,  X,  X,  X,  // a->3, c->2, g->1
+    X,  X,  X,  X,  0,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  // t->0
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+    X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,  X,
+};
+#undef X
+
+const int8_t DnaLookupTables::NEUTRAL_CHAR[256] = {
+//  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,  // '*'=42->1
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  // 'N'=78->1
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  // 'n'=110->1
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+};
+
 
 void DnaProbVec::normalize()
 {
@@ -158,14 +225,12 @@ void DnaPSSM::calc_like(const string &target, float &logp) const
 	for(vector<DnaProbVec>::const_iterator p = m_chars.begin();
 	    p < m_chars.end();
 	    p++) {
-		if(
-			*i != 'A' && *i != 'C' && *i != 'G' && *i != 'T' && 
-			*i != 'a' && *i != 'c' && *i != 'g' && *i != 't'
-			) {
+		int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*i];
+		if(code < 0) {
 			logp = NEG_INF;
 			return;
 		}
-		logp += p->get_log_prob(*i);
+		logp += p->get_log_prob_from_code(code);
 		i++;
 	}
 }
@@ -176,25 +241,13 @@ void DnaPSSM::calc_like_rc(const string &target, float &logp) const
 	logp = 0;
 	for(vector<DnaProbVec>::const_reverse_iterator p = m_chars.rbegin();
 	    p != m_chars.rend();
-	    p++) {		
-		char c;
-		switch(*i) {
-			case 'a':
-			case 'A': c = 'T';
-				  break;
-			case 't':
-			case 'T': c = 'A';
-				  break;
-			case 'c':
-			case 'C': c = 'G';
-				  break;
-			case 'g':
-			case 'G': c = 'C';
-				  break;
-			default:  logp = NEG_INF;
-				  return;
+	    p++) {
+		int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*i];
+		if(code < 0) {
+			logp = NEG_INF;
+			return;
 		}
-		logp += p->get_log_prob(c);
+		logp += p->get_log_prob_from_code(code);
 		i++;
 	}
 }
@@ -206,14 +259,12 @@ void DnaPSSM::calc_like(string::const_iterator &j, float &logp) const
 	for(vector<DnaProbVec>::const_iterator p = m_chars.begin();
 	    p < m_chars.end();
 	    p++) {
-		if(
-			*i != 'A' && *i != 'C' && *i != 'G' && *i != 'T' && 
-			*i != 'a' && *i != 'c' && *i != 'g' && *i != 't'
-			) {
+		int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*i];
+		if(code < 0) {
 			logp = NEG_INF;
 			return;
 		}
-		logp += p->get_log_prob(*i);
+		logp += p->get_log_prob_from_code(code);
 		i++;
 	}
 }
@@ -228,24 +279,12 @@ void DnaPSSM::calc_like_rc(string::const_iterator &j, float &logp) const
 	for(vector<DnaProbVec>::const_reverse_iterator p = m_chars.rbegin();
 	    p != m_chars.rend();
 	    p++) {
-		char c;
-		switch(*i) {
-			case 'a':
-			case 'A': c = 'T';
-				  break;
-			case 't':
-			case 'T': c = 'A';
-				  break;
-			case 'c':
-			case 'C': c = 'G';
-				  break;
-			case 'g':
-			case 'G': c = 'C';
-				  break;
-			default:  logp = NEG_INF;
-				  return;
+		int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*i];
+		if(code < 0) {
+			logp = NEG_INF;
+			return;
 		}
-		logp += p->get_log_prob(c);
+		logp += p->get_log_prob_from_code(code);
 		i++;
 	}
 }
@@ -276,11 +315,14 @@ string::const_iterator DnaPSSM::max_like_match(const string &target,
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += p->get_avg_log_prob();
 			} else {
-				logp += p->get_log_prob(*j);
-			}			
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
+			}
 			j++;
 		}
 
@@ -296,26 +338,13 @@ string::const_iterator DnaPSSM::max_like_match(const string &target,
 					rlogp = NEG_INF;
 					break;
 				}
-				
-				switch(*j) {
-					case 'a':
-					case 'A': rlogp += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': rlogp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': rlogp += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': rlogp += p->get_log_prob('C');
-						  break;
-					case '*': rlogp += p->get_avg_log_prob();
-						  break;
-					case 'n':
-					case 'N': rlogp += p->get_avg_log_prob();
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					rlogp += p->get_avg_log_prob();
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						rlogp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -373,10 +402,13 @@ void DnaPSSM::update_like_vec(const string &target,
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += c_log_quarter;
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -392,26 +424,13 @@ void DnaPSSM::update_like_vec(const string &target,
 					rlogp = NEG_INF;
 					break;
 				}
-				
-				switch(*j) {
-					case 'a':
-					case 'A': rlogp += p->get_log_prob('T');
-						  break;
-					case 't': 
-					case 'T': rlogp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': rlogp += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': rlogp += p->get_log_prob('C');
-						  break;
-					case '*': rlogp += p->get_avg_log_prob();
-						  break;
-					case 'n':
-					case 'N': rlogp += p->get_avg_log_prob();
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					rlogp += p->get_avg_log_prob();
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						rlogp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -449,12 +468,13 @@ void DnaPSSM::integrate_like_seg(const char *min_i, const char *max_i, float &en
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j == 'n' || *j =='*') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += p->get_avg_log_prob();
-			} else if(*j > 'Z') {
-				logp += p->get_log_prob(*j-('a'-'A'));
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -471,31 +491,13 @@ void DnaPSSM::integrate_like_seg(const char *min_i, const char *max_i, float &en
 					logp = NEG_INF;
 					break;
 				}
-				
-				switch(*j) {
-					case 'A': logp += p->get_log_prob('T');
-						  break;
-					case 'T': logp += p->get_log_prob('A');
-						  break;
-					case 'C': logp += p->get_log_prob('G');
-						  break;
-					case 'G': logp += p->get_log_prob('C');
-						  break;
-					case 'a': logp += p->get_log_prob('T');
-						  break;
-					case 't': logp += p->get_log_prob('A');
-						  break;
-					case 'c': logp += p->get_log_prob('G');
-						  break;
-					case 'g': logp += p->get_log_prob('C');
-						  break;
-					case '*': logp += p->get_avg_log_prob();
-						  break;
-					case 'N': logp += p->get_avg_log_prob();
-						  break;
-					case 'n': logp += p->get_avg_log_prob();
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp += p->get_avg_log_prob();
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -528,10 +530,13 @@ void DnaPSSM::integrate_like(const string &target, float &energy, vector<float> 
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += c_log_quarter;
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -550,26 +555,13 @@ void DnaPSSM::integrate_like(const string &target, float &energy, vector<float> 
 					logp = NEG_INF;
 					break;
 				}
-				
-				switch(*j) {
-					case 'a':
-					case 'A': logp += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': logp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': logp += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': logp += p->get_log_prob('C');
-						  break;
-					case '*': logp += p->get_avg_log_prob();
-						  break;
-					case 'n':
-					case 'N': logp += p->get_avg_log_prob();
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp += p->get_avg_log_prob();
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -594,23 +586,10 @@ void DnaPSSM::count(string::const_iterator seq, float weight, int dir)
 		for(vector<DnaProbVec>::reverse_iterator i = m_chars.rbegin();
 		    i != m_chars.rend();
 		    i++) {
-			char c = 'N';
-			switch(*seq) {
-				case 'a':
-				case 'A': c = 'T';
-					  break;
-				case 't':
-				case 'T': c = 'A';
-					  break;
-				case 'c':
-				case 'C': c = 'G';
-					  break;
-				case 'g':
-				case 'G': c = 'C';
-					  break;
-				default: break;
+			int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*seq];
+			if(code >= 0) {
+				i->direct_incr_weight(code, weight);
 			}
-			i->incr_weight(c, weight);
 			++seq;
 		}
 	}
@@ -644,7 +623,7 @@ void DnaPSSM::count_weighted(const string &target, vector<float> &wgts,
 			for(vector<DnaProbVec>::iterator p = m_chars.begin();
 			    p < m_chars.end();
 			    p++) {
-				if((*j) && *j != 'N' && *j !='*' && *j != 'n') {
+				if((*j) && !DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 					p->incr_weight(*j, *wgt);
 				}
 				j++;
@@ -654,20 +633,9 @@ void DnaPSSM::count_weighted(const string &target, vector<float> &wgts,
 							m_chars.rbegin();
 			    p != m_chars.rend();
 			    p++) {
-				switch(*j) {
-					case 'a':
-					case 'A': p->direct_incr_weight(3, *wgt);
-						  break;
-					case 't':
-					case 'T': p->direct_incr_weight(0, *wgt);
-						  break;
-					case 'c':
-					case 'C': p->direct_incr_weight(2, *wgt);
-						  break;
-					case 'g':
-					case 'G': p->direct_incr_weight(1, *wgt);
-						  break;
-					default:  break;
+				int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					p->direct_incr_weight(code, *wgt);
 				}
 				j++;
 			}
@@ -704,7 +672,7 @@ void DnaPSSM::count_log_weighted(const string &target, vector<float> &wgts,
 			for(vector<DnaProbVec>::iterator p = m_chars.begin();
 			    p < m_chars.end();
 			    p++) {
-				if((*j) && *j != 'N' && *j !='*' && *j != 'n') {
+				if((*j) && !DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 					p->incr_log_weight(*j, *wgt);
 				}
 				j++;
@@ -714,20 +682,9 @@ void DnaPSSM::count_log_weighted(const string &target, vector<float> &wgts,
 							m_chars.rbegin();
 			    p != m_chars.rend();
 			    p++) {
-				switch(*j) {
-					case 'a':
-					case 'A': p->direct_incr_log_weight(3, *wgt);
-						  break;
-					case 't':
-					case 'T': p->direct_incr_log_weight(0, *wgt);
-						  break;
-					case 'c':
-					case 'C': p->direct_incr_log_weight(2, *wgt);
-						  break;
-					case 'g':
-					case 'G': p->direct_incr_log_weight(1, *wgt);
-						  break;
-					default:  break;
+				int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					p->direct_incr_log_weight(code, *wgt);
 				}
 				j++;
 			}
@@ -945,10 +902,13 @@ void DnaPSSM::integrate_energy(const string &target, float &energy, vector<float
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += p->get_avg_log_prob();
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -965,26 +925,13 @@ void DnaPSSM::integrate_energy(const string &target, float &energy, vector<float
 					logp = NEG_INF;
 					break;
 				}
-
-				switch(*j) {
-					case 'a':
-					case 'A': logp += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': logp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': logp += p->get_log_prob('G');
-						  break;
-					case 'h':
-					case 'G': logp += p->get_log_prob('C');
-						  break;
-					case '*': logp += c_log_quarter;
-						  break;
-					case 'n':
-					case 'N': logp += c_log_quarter;
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp += c_log_quarter;
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -1026,10 +973,13 @@ void DnaPSSM::integrate_energy_logspat(const string &target, float &energy, vect
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += p->get_avg_log_prob();
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -1046,26 +996,13 @@ void DnaPSSM::integrate_energy_logspat(const string &target, float &energy, vect
 					logp = NEG_INF;
 					break;
 				}
-
-				switch(*j) {
-					case 'a':
-					case 'A': logp += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': logp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': logp += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': logp += p->get_log_prob('C');
-						  break;
-					case '*': logp += c_log_quarter;
-						  break;
-					case 'n':
-					case 'N': logp += c_log_quarter;
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp += c_log_quarter;
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -1109,10 +1046,13 @@ void DnaPSSM::integrate_energy_max_logspat(const string &target, float &energy, 
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += p->get_avg_log_prob();
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			j++;
 		}
@@ -1128,26 +1068,13 @@ void DnaPSSM::integrate_energy_max_logspat(const string &target, float &energy, 
 					logp_rev = NEG_INF;
 					break;
 				}
-
-				switch(*j) {
-					case 'a':
-					case 'A': logp_rev += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': logp_rev += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': logp_rev += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': logp_rev += p->get_log_prob('C');
-						  break;
-					case '*': logp_rev += c_log_quarter;
-						  break;
-					case 'n':
-					case 'N': logp_rev += c_log_quarter;
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp_rev += c_log_quarter;
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp_rev += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
@@ -1184,10 +1111,13 @@ void DnaPSSM::like_thresh_match(const string &target, float thresh,
 				logp = NEG_INF;
 				break;
 			}
-			if(*j == 'N' || *j =='*' || *j == 'n') {
+			if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
 				logp += c_log_quarter;
 			} else {
-				logp += p->get_log_prob(*j);
+				int code = DnaLookupTables::BASE_ENCODE[(unsigned char)*j];
+				if(code >= 0) {
+					logp += p->get_log_prob_from_code(code);
+				}
 			}
 			if(logp < thresh) {
 				break;
@@ -1209,26 +1139,13 @@ void DnaPSSM::like_thresh_match(const string &target, float thresh,
 					logp = NEG_INF;
 					break;
 				}
-
-				switch(*j) {
-					case 'a':
-					case 'A': logp += p->get_log_prob('T');
-						  break;
-					case 't':
-					case 'T': logp += p->get_log_prob('A');
-						  break;
-					case 'c':
-					case 'C': logp += p->get_log_prob('G');
-						  break;
-					case 'g':
-					case 'G': logp += p->get_log_prob('C');
-						  break;
-					case '*': logp += c_log_quarter;
-						  break;
-					case 'n':
-					case 'N': logp += c_log_quarter;
-						  break;
-					default:  break;
+				if(DnaLookupTables::NEUTRAL_CHAR[(unsigned char)*j]) {
+					logp += c_log_quarter;
+				} else {
+					int code = DnaLookupTables::COMPLEMENT_ENCODE[(unsigned char)*j];
+					if(code >= 0) {
+						logp += p->get_log_prob_from_code(code);
+					}
 				}
 				j++;
 			}
