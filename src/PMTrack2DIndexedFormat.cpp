@@ -45,21 +45,20 @@ static bool copy_file_contents_2d(const string &src, FILE *dest, uint64_t &bytes
     }
 
     const size_t BUFFER_SIZE = 1024 * 1024;
-    char *buffer = new char[BUFFER_SIZE];
+    std::vector<char> buf_vec(BUFFER_SIZE);
+    char *buffer = buf_vec.data();
     uint64_t total_read = 0;
 
     while (total_read < file_size) {
         size_t to_read = min((uint64_t)BUFFER_SIZE, file_size - total_read);
         size_t read_bytes = fread(buffer, 1, to_read, src_fp);
         if (read_bytes != to_read) {
-            delete[] buffer;
             fclose(src_fp);
             TGLError<GenomeTrack>("Failed to read from %s", src.c_str());
         }
 
         size_t written = fwrite(buffer, 1, read_bytes, dest);
         if (written != read_bytes) {
-            delete[] buffer;
             fclose(src_fp);
             TGLError<GenomeTrack>("Failed to write to track.dat");
         }
@@ -67,7 +66,6 @@ static bool copy_file_contents_2d(const string &src, FILE *dest, uint64_t &bytes
         total_read += read_bytes;
     }
 
-    delete[] buffer;
     fclose(src_fp);
     bytes_written = file_size;
     return true;

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <memory>
 #include <sys/stat.h>
 
 #include "port.h"
@@ -7,23 +8,16 @@
 #include "GenomeIndex.h"
 
 GenomeSeqFetch::GenomeSeqFetch()
-    : m_cur_chromid(-1), m_cache_valid(false), m_indexed_mode(false), m_index(nullptr) {}
+    : m_cur_chromid(-1), m_cache_valid(false), m_indexed_mode(false) {}
 
-GenomeSeqFetch::~GenomeSeqFetch() {
-    if (m_index) {
-        delete m_index;
-    }
-}
+GenomeSeqFetch::~GenomeSeqFetch() = default;
 
 void GenomeSeqFetch::set_seqdir(const std::string &dir) {
     m_seqdir = dir;
     m_cache_valid = false;
     m_cur_chromid = -1;
 
-    if (m_index) {
-        delete m_index;
-        m_index = nullptr;
-    }
+    m_index.reset();
     if (m_bfile.opened())
         m_bfile.close();
 
@@ -34,7 +28,7 @@ void GenomeSeqFetch::set_seqdir(const std::string &dir) {
     if (stat(idx_path.c_str(), &st) == 0) {
         // Indexed mode: load index and open main genome.seq file
         m_indexed_mode = true;
-        m_index = new GenomeIndex();
+        m_index = std::make_unique<GenomeIndex>();
         m_index->load(idx_path);
 
         // Open the consolidated genome.seq file

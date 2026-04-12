@@ -243,24 +243,24 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		if (has_function(SIZE))
 			m_last_size = num_vs;
 
-			// Sample from collected values
-			if (has_function(SAMPLE) && !m_scratch_all_values.empty()) {
-				int idx = (int)(s_rnd_func() * m_scratch_all_values.size());
-				if (idx >= (int)m_scratch_all_values.size())
-					idx = (int)m_scratch_all_values.size() - 1;
-				if (idx < 0)
-					idx = 0;
-				m_last_sample = m_scratch_all_values[idx];
-			}
+		// Sample from collected values
+		if (has_function(SAMPLE) && !m_scratch_all_values.empty()) {
+			int idx = (int)(s_rnd_func() * m_scratch_all_values.size());
+			if (idx >= (int)m_scratch_all_values.size())
+				idx = (int)m_scratch_all_values.size() - 1;
+			if (idx < 0)
+				idx = 0;
+			m_last_sample = m_scratch_all_values[idx];
+		}
 
-			if (has_function(SAMPLE_POS) && !m_scratch_all_positions.empty()) {
-				int idx = (int)(s_rnd_func() * m_scratch_all_positions.size());
-				if (idx >= (int)m_scratch_all_positions.size())
-					idx = (int)m_scratch_all_positions.size() - 1;
-				if (idx < 0)
-					idx = 0;
-				m_last_sample_pos = m_scratch_all_positions[idx];
-			}
+		if (has_function(SAMPLE_POS) && !m_scratch_all_positions.empty()) {
+			int idx = (int)(s_rnd_func() * m_scratch_all_positions.size());
+			if (idx >= (int)m_scratch_all_positions.size())
+				idx = (int)m_scratch_all_positions.size() - 1;
+			if (idx < 0)
+				idx = 0;
+			m_last_sample_pos = m_scratch_all_positions[idx];
+		}
 
 		if (num_vs > 0)
 			m_last_avg = m_last_nearest = m_last_sum / num_vs;

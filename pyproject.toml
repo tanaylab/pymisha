@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymisha"
-version = "0.1.24"
+version = "0.1.25"
 description = "Python interface for misha genomic databases with C++ streaming backends"
 readme = "README.md"
 license = {text = "MIT"}
@@ -91,3 +91,11 @@ python_functions = ["test_*"]
 markers = [
     "benchmark: mark test as a benchmark",
 ]
+
+[tool.coverage.run]
+source = ["pymisha"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

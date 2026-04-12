@@ -73,6 +73,15 @@ filtered = pm.gscreen("track1 > 0.5", intervals)
 stats = pm.gsummary("track1", intervals)
 ```
 
+## Thread safety
+
+PyMisha inherits R misha's single-threaded design. Keep the following constraints in mind:
+
+- **Not thread-safe.** All module-level state (`_GROOT`, `_UROOT`, `_VTRACKS`, `CONFIG`) is process-global and unsynchronized. Do not call PyMisha from multiple threads concurrently.
+- **One database per process.** You cannot have two databases open simultaneously; `gsetroot()` replaces the active database globally.
+- **`CONFIG` is global.** Changing settings like `max_processes` affects every subsequent operation in the process.
+- **Multiprocessing uses `fork()`.** The C++ backend parallelizes via `fork()` with shared memory (mmap) and semaphores. This is transparent to the caller but means PyMisha should not be used inside already-forked worker processes or with `fork`-unsafe libraries.
+
 ## Examples
 
 Using the built-in example database:

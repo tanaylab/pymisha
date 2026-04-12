@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.25 (2026-04-12)
+
+### Maintenance
+- **Public API cleanup:** Removed 10 underscore-prefixed internal symbols from `__all__`; added `noqa: F401` for the C++ bridge imports.
+- **C++ memory safety:** Replaced `new char[]`/`delete[]` with `std::vector<char>` in indexed format writers. Replaced manual `new`/`delete` with `std::unique_ptr` in PMWilcox, GenomeSeqFetch, PMTrackExpressionVars. Added `snprintf` bounds checking for shared-memory error buffer.
+- **Compiler warnings:** Removed `-Wno-switch` and `-Wno-strict-aliasing` suppressions from setup.py. Fixed misleading indentation in GenomeTrackFixedBin.cpp and uninitialized variable in PMTrackCreate.cpp. Zero warnings from project sources.
+- **Coverage reporting:** Added `[tool.coverage.run]`/`[tool.coverage.report]` to pyproject.toml; added `--cov=pymisha --cov-report=term-missing` to Linux CI.
+
+### Documentation
+- **Thread safety:** Added concurrency constraints section to README.md and quickstart guide (single-threaded, one DB per process, global CONFIG).
+- **`_PMLOCALS` comment:** Expanded explanation of the C++ namespace bridge at the end of `__init__.py`.
+
 ## v0.1.24 (2026-04-12)
 
 ### Features

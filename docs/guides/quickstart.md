@@ -22,6 +22,10 @@ filtered = pm.gscreen("track1 > 0.5", intervals)
 stats = pm.gsummary("track1", intervals)
 ```
 
+## Thread safety
+
+PyMisha is **not thread-safe**. All state (active database, virtual tracks, config) is process-global, so you should not call PyMisha from multiple threads or open more than one database per process. See the [README](https://github.com/tanaylab/pymisha#thread-safety) for full details.
+
 ## Example DB
 
 ```python

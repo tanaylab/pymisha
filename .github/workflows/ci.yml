@@ -35,7 +35,7 @@ jobs:
         run: python -m mypy pymisha/
 
       - name: Run tests
-        run: pytest tests/ -x -q --override-ini="addopts="
+        run: pytest tests/ -x -q --override-ini="addopts=" --cov=pymisha --cov-report=term-missing
 
   test-macos:
     # Only run macOS on PRs and main pushes, not dev pushes

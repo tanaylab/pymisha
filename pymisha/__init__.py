@@ -16,7 +16,7 @@ except PackageNotFoundError:
 import numpy as np  # noqa: F401
 
 from . import _shared
-from ._shared import (
+from ._shared import (  # noqa: F401 — imported for _PMLOCALS C++ bridge
     CONFIG,
     _bound_colname,
     _checkroot,
@@ -395,19 +395,12 @@ __all__ = [
     'gsynth_load',
     'gsynth_convert',
 
-    # Internal (shared)
-    '_bound_colname',
-    '_checkroot',
-    '_chunk_slices',
-    '_df2pymisha',
-    '_iterated_intervals',
-    '_itr2pymisha',
-    '_make_progress_callback',
-    '_progress_context',
-    '_pymisha',
-    '_pymisha2df',
 ]
 
-# Export module locals to the C extension for access to Python functions
-# This must be at the end of the file after all functions are defined
+# Bridge the Python module namespace to the C++ extension. The C++ side
+# looks up Python functions by name at runtime (e.g., for interval callbacks
+# and expression evaluation). locals() captures every public function, class,
+# and import defined above. Monkeypatching after import will be visible to C++.
+# This line MUST remain at the end of the file — moving it earlier means the
+# C++ extension sees an incomplete namespace.
 _pymisha._PMLOCALS = locals()

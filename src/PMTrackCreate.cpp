@@ -566,7 +566,7 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
             verror("Track '%s' already exists", track);
 
         string alg_str(alg);
-        bool use_linear_ramp;
+        bool use_linear_ramp = false;
         if (alg_str == "LINEAR_RAMP")
             use_linear_ramp = true;
         else if (alg_str == "MEAN")

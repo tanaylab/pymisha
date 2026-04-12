@@ -181,21 +181,21 @@ PyMisha::~PyMisha()
 string PyMisha::get_shm_sem_name()
 {
     char buf[100];
-    sprintf(buf, "pymisha-shm-sem-%d", (int)getpid());
+    snprintf(buf, sizeof(buf), "pymisha-shm-sem-%d", (int)getpid());
     return buf;
 }
 
 string PyMisha::get_fifo_sem_name()
 {
     char buf[100];
-    sprintf(buf, "pymisha-fifo-sem-%d", (int)getpid());
+    snprintf(buf, sizeof(buf), "pymisha-fifo-sem-%d", (int)getpid());
     return buf;
 }
 
 string PyMisha::get_fifo_name()
 {
     char buf[100];
-    sprintf(buf, "/tmp/pymisha-fifo-%d", s_is_kid ? (int)getppid() : (int)getpid());
+    snprintf(buf, sizeof(buf), "/tmp/pymisha-fifo-%d", s_is_kid ? (int)getppid() : (int)getpid());
     return buf;
 }
 
@@ -479,8 +479,7 @@ void PyMisha::handle_error(const char *msg)
         {
             SemLocker sl(s_shm_sem);
             if (!s_shm->error_msg[0]) {
-                strncpy(s_shm->error_msg, msg, sizeof(s_shm->error_msg) - 1);
-                s_shm->error_msg[sizeof(s_shm->error_msg) - 1] = '\0';
+                snprintf(s_shm->error_msg, sizeof(s_shm->error_msg), "%s", msg);
             }
         }
         // Use _exit() instead of exit() to avoid running Python/C++ destructors

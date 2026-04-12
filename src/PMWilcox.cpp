@@ -8,6 +8,7 @@
 #include "PMTrackExpressionIterator.h"
 #include "IncrementalWilcox.h"
 
+#include <memory>
 #include <new>
 #include <vector>
 #include <string>
@@ -236,16 +237,15 @@ PyObject *pm_wilcox(PyObject *self, PyObject *args)
         unsigned bin_size = (unsigned)fbi->get_bin_size();
 
         std::vector<IntervalPval> res_intervals;
-        SlidingWilcox *wilcox = NULL;
+        std::unique_ptr<SlidingWilcox> wilcox;
         GInterval last_interval(-1, -1, -1);
 
         for (; !scanner.isend(); scanner.next()) {
             const GInterval &cur_interval = scanner.last_interval();
 
             if (last_interval.chromid != cur_interval.chromid || last_interval.end != cur_interval.start) {
-                delete wilcox;
-                wilcox = NULL;
-                wilcox = new SlidingWilcox(onetailed != 0, w2f,
+                wilcox.reset();
+                wilcox = std::make_unique<SlidingWilcox>(onetailed != 0, w2f,
                                            (unsigned)winsize1, (unsigned)winsize2,
                                            bin_size, cur_interval.chromid,
                                            res_intervals, maxz);
@@ -256,7 +256,7 @@ PyObject *pm_wilcox(PyObject *self, PyObject *args)
 
             check_interrupt();
         }
-        delete wilcox;
+        wilcox.reset();
 
         if (res_intervals.empty()) {
             Py_INCREF(Py_None);

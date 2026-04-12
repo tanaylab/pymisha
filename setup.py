@@ -14,8 +14,6 @@ setup(
                 '-std=c++17',
                 '-O2',
                 '-Wno-unused-function',
-                '-Wno-switch',
-                '-Wno-strict-aliasing',
                 '-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
                 '-DPYTHON'
             ],

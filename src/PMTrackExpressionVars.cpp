@@ -196,8 +196,8 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
 
     if (track_type == GenomeTrack::FIXED_BIN) {
         // Create fixed bin track object
-        auto *fixed_bin = new GenomeTrackFixedBin();
-        var.track = std::unique_ptr<GenomeTrack>(fixed_bin);
+        var.track = std::make_unique<GenomeTrackFixedBin>();
+        auto *fixed_bin = static_cast<GenomeTrackFixedBin *>(var.track.get());
 
         // Pre-load bin size from first available chromosome to enable proper iterator selection
         const GenomeChromKey &chromkey = g_pmdb->chromkey();

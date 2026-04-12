@@ -8,6 +8,7 @@
 #ifndef GENOMESEQFETCH_H_
 #define GENOMESEQFETCH_H_
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -43,8 +44,8 @@ private:
 	std::vector<char>  m_cached_seq;
 
 	// Indexed genome support
-	bool               m_indexed_mode;
-	GenomeIndex*       m_index;
+	bool                              m_indexed_mode;
+	std::unique_ptr<GenomeIndex>      m_index;
 };
 
 #endif /* GENOMESEQFETCH_H_ */
