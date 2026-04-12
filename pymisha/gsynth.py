@@ -1,5 +1,7 @@
 """Genome synthesis functions (gsynth.*)."""
 
+from __future__ import annotations
+
 import logging as _logging
 import multiprocessing as _multiprocessing
 import os as _os
@@ -9,6 +11,7 @@ from dataclasses import field as _field
 from typing import Any as _Any
 
 import numpy as _numpy
+import pandas as _pd
 import yaml as _yaml
 
 from ._safe_pickle import restricted_load
@@ -94,11 +97,11 @@ class GsynthModel:
     min_obs: int = 0
 
     @property
-    def num_kmers(self):
+    def num_kmers(self) -> int:
         """Number of k-mer contexts (4^k)."""
-        return 4 ** self.k
+        return int(4 ** self.k)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         lines = [
             f"Synthetic Genome Markov-{self.k} Model",
             f"  Markov order: {self.k}",
@@ -122,7 +125,7 @@ class GsynthModel:
 # gsynth_bin_map — pure Python
 # ---------------------------------------------------------------------------
 
-def gsynth_bin_map(breaks, merge_ranges):
+def gsynth_bin_map(breaks: list[float] | _numpy.ndarray, merge_ranges: list[dict[str, _Any]]) -> _numpy.ndarray:
     """Compute bin mapping for merging sparse bins.
 
     Converts value-based merge specifications into an integer index array that
@@ -192,14 +195,14 @@ def gsynth_bin_map(breaks, merge_ranges):
 
         # Determine target bin
         to_lo, to_hi = (to_val, to_val) if _numpy.isscalar(to_val) else to_val
-        to_mid = (float(to_lo) + float(to_hi)) / 2.0
+        to_mid = (float(to_lo) + float(to_hi)) / 2.0  # type: ignore[arg-type]
         target_bin = _numpy.searchsorted(breaks[:-1], to_mid, side="right") - 1
         target_bin = int(_numpy.clip(target_bin, 0, num_bins - 1))
 
         # Verify target bin matches the specified range
         if not (breaks[target_bin] <= to_hi and breaks[target_bin + 1] >= to_lo):
             raise ValueError(
-                f"Target range ({to_lo}, {to_hi}) does not match any bin in breaks"
+                f"Target range ({to_lo!r}, {to_hi!r}) does not match any bin in breaks"
             )
 
         # Determine source bins
@@ -207,7 +210,7 @@ def gsynth_bin_map(breaks, merge_ranges):
             continue
 
         if _numpy.isscalar(from_val):
-            from_lo = float(from_val)
+            from_lo = float(from_val)  # type: ignore[arg-type]
             from_hi = float("inf")
         else:
             from_lo, from_hi = float(from_val[0]), float(from_val[1])
@@ -227,7 +230,12 @@ def gsynth_bin_map(breaks, merge_ranges):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _extract_bin_data(dim_specs, intervals, iterator, sample_bin_merge=None):
+def _extract_bin_data(
+    dim_specs: list[dict[str, _Any]],
+    intervals: _pd.DataFrame | None,
+    iterator: int | None,
+    sample_bin_merge: list[_Any] | None = None,
+) -> tuple[_numpy.ndarray, _numpy.ndarray, _numpy.ndarray, list[float], _numpy.ndarray | None, list[int]]:
     """Extract track values and compute flat bin indices.
 
     Parameters
@@ -340,8 +348,7 @@ def _extract_bin_data(dim_specs, intervals, iterator, sample_bin_merge=None):
     )
 
     # Create flat breaks for C++: just [0, 1, 2, ..., total_bins]
-    flat_breaks = list(range(total_bins + 1))
-    flat_breaks = [float(x) for x in flat_breaks]
+    flat_breaks: list[float] = [float(x) for x in range(total_bins + 1)]
 
     return flat_idx, iter_starts, iter_chroms, flat_breaks, None, dim_sizes
 
@@ -350,13 +357,13 @@ def _extract_bin_data(dim_specs, intervals, iterator, sample_bin_merge=None):
 # Parallel processing helpers
 # ---------------------------------------------------------------------------
 
-def _compute_total_bases(intervals):
+def _compute_total_bases(intervals: _pd.DataFrame) -> int:
     """Compute total bases covered by intervals DataFrame."""
     return int((intervals["end"] - intervals["start"]).sum())
 
 
-def _should_parallelize(intervals, allow_parallel, num_cores,
-                        max_chunk_size=None):
+def _should_parallelize(intervals: _pd.DataFrame, allow_parallel: bool, num_cores: int | None,
+                        max_chunk_size: int | None = None) -> tuple[bool, int]:
     """Determine whether parallel processing should be used.
 
     Returns (do_parallel, effective_cores) tuple.
@@ -384,7 +391,7 @@ def _should_parallelize(intervals, allow_parallel, num_cores,
     return True, effective_cores
 
 
-def _chunk_intervals(intervals, n_chunks):
+def _chunk_intervals(intervals: _pd.DataFrame, n_chunks: int) -> list[_pd.DataFrame]:
     """Split intervals DataFrame into approximately equal chunks by row.
 
     Each chunk is a contiguous slice of the intervals DataFrame.
@@ -407,7 +414,7 @@ def _chunk_intervals(intervals, n_chunks):
     return chunks
 
 
-def _generate_chunk_seeds(seed, n_chunks):
+def _generate_chunk_seeds(seed: int | None, n_chunks: int) -> list[int | None]:
     """Generate reproducible per-chunk seeds from a master seed.
 
     If seed is None, returns a list of Nones.
@@ -418,7 +425,7 @@ def _generate_chunk_seeds(seed, n_chunks):
     return [int(rng.randint(0, 2**31 - 1)) for _ in range(n_chunks)]
 
 
-def _worker_train_chunk(args):
+def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
     """Worker function for parallel gsynth_train.
 
     Runs in a forked subprocess. The child inherits the parent's
@@ -484,7 +491,12 @@ def _worker_train_chunk(args):
     }
 
 
-def _merge_train_results(chunk_results, total_bins, pseudocount, k=5):
+def _merge_train_results(
+    chunk_results: list[dict[str, _Any]],
+    total_bins: int,
+    pseudocount: float,
+    k: int = 5,
+) -> dict[str, _Any]:
     """Merge training results from multiple chunks.
 
     Sums count arrays across chunks and recomputes CDFs.
@@ -546,7 +558,7 @@ def _merge_train_results(chunk_results, total_bins, pseudocount, k=5):
     }
 
 
-def _worker_sample_chunk(args):
+def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
     """Worker function for parallel gsynth_sample.
 
     Runs in a forked subprocess. The child inherits the parent's
@@ -595,7 +607,7 @@ def _worker_sample_chunk(args):
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
     # Call C++ backend (vector mode)
-    return _pymisha.pm_gsynth_sample(
+    return list(_pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
@@ -608,17 +620,25 @@ def _worker_sample_chunk(args):
         int(n_samples),
         chunk_seed,
         int(k),
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
 # gsynth_train
 # ---------------------------------------------------------------------------
 
-def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
-                 pseudocount=1.0, min_obs=0, k=5,
-                 allow_parallel=True, num_cores=None,
-                 max_chunk_size=None):
+def gsynth_train(
+    *dim_specs: dict[str, _Any],
+    mask: _pd.DataFrame | None = None,
+    intervals: _pd.DataFrame | None = None,
+    iterator: int | None = None,
+    pseudocount: float = 1.0,
+    min_obs: int = 0,
+    k: int = 5,
+    allow_parallel: bool = True,
+    num_cores: int | None = None,
+    max_chunk_size: int | None = None,
+) -> GsynthModel:
     """Train a stratified Markov model from genome sequences.
 
     Computes a k-th order Markov model optionally stratified by bins of one or
@@ -867,11 +887,21 @@ def gsynth_train(*dim_specs, mask=None, intervals=None, iterator=None,
 # gsynth_sample
 # ---------------------------------------------------------------------------
 
-def gsynth_sample(model, output=None, *, output_format="fasta",
-                  intervals=None, iterator=None, mask_copy=None,
-                  n_samples=1, seed=None, bin_merge=None,
-                  allow_parallel=True, num_cores=None,
-                  max_chunk_size=None):
+def gsynth_sample(
+    model: GsynthModel,
+    output: str | None = None,
+    *,
+    output_format: str = "fasta",
+    intervals: _pd.DataFrame | None = None,
+    iterator: int | None = None,
+    mask_copy: _pd.DataFrame | None = None,
+    n_samples: int = 1,
+    seed: int | None = None,
+    bin_merge: list[_Any] | None = None,
+    allow_parallel: bool = True,
+    num_cores: int | None = None,
+    max_chunk_size: int | None = None,
+) -> list[str] | None:
     """Sample synthetic genome sequences from a trained model.
 
     Generates a synthetic genome by sampling from a trained stratified
@@ -1082,7 +1112,7 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
     # Call C++ backend
-    return _pymisha.pm_gsynth_sample(
+    _raw = _pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
@@ -1096,9 +1126,10 @@ def gsynth_sample(model, output=None, *, output_format="fasta",
         seed,
         int(model_k),
     )
+    return list(_raw) if _raw is not None else None
 
 
-def _write_fasta(output_path, intervals, sequences, n_samples):
+def _write_fasta(output_path: str, intervals: _pd.DataFrame, sequences: list[str], n_samples: int) -> None:
     """Write sequences to a FASTA file.
 
     Parameters
@@ -1132,9 +1163,16 @@ def _write_fasta(output_path, intervals, sequences, n_samples):
 # gsynth_random
 # ---------------------------------------------------------------------------
 
-def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
-                  output_format="fasta", mask_copy=None, n_samples=1,
-                  seed=None):
+def gsynth_random(
+    *,
+    intervals: _pd.DataFrame | None = None,
+    nuc_probs: dict[str, float] | None = None,
+    output: str | None = None,
+    output_format: str = "fasta",
+    mask_copy: _pd.DataFrame | None = None,
+    n_samples: int = 1,
+    seed: int | None = None,
+) -> list[str] | None:
     """Generate random genome sequences without a trained model.
 
     Produces random DNA sequences where each nucleotide is sampled
@@ -1226,6 +1264,7 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
     cdf_mat = _numpy.tile(cdf, (num_kmers, 1))  # num_kmers x 4
     cdf_list = [cdf_mat]  # Single bin
 
+    assert isinstance(intervals, _pd.DataFrame)
     # Single bin: all positions map to bin 0
     n_positions = len(intervals)
     bin_indices = _numpy.zeros(n_positions, dtype=_numpy.int32)
@@ -1255,7 +1294,7 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
 
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
-    return _pymisha.pm_gsynth_sample(
+    _raw2 = _pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
@@ -1269,6 +1308,7 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
         seed,
         int(random_k),
     )
+    return list(_raw2) if _raw2 is not None else None
 
 
 
@@ -1276,8 +1316,15 @@ def gsynth_random(*, intervals=None, nuc_probs=None, output=None,
 # gsynth_replace_kmer
 # ---------------------------------------------------------------------------
 
-def gsynth_replace_kmer(target, replacement, *, intervals=None, output=None,
-                        output_format="fasta", check_composition=True):
+def gsynth_replace_kmer(
+    target: str,
+    replacement: str,
+    *,
+    intervals: _pd.DataFrame | None = None,
+    output: str | None = None,
+    output_format: str = "fasta",
+    check_composition: bool = True,
+) -> list[str] | None:
     """Iteratively replace a k-mer in genome sequences.
 
     Scans each sequence and replaces every occurrence of *target* with
@@ -1379,13 +1426,14 @@ def gsynth_replace_kmer(target, replacement, *, intervals=None, output=None,
         if parent:
             _os.makedirs(parent, exist_ok=True)
 
-    return _pymisha.pm_gsynth_replace_kmer(
+    _raw3 = _pymisha.pm_gsynth_replace_kmer(
         target,
         replacement,
         _df2pymisha(intervals),
         output_path,
         fmt_code,
     )
+    return list(_raw3) if _raw3 is not None else None
 
 
 
@@ -1393,7 +1441,7 @@ def gsynth_replace_kmer(target, replacement, *, intervals=None, output=None,
 # gsynth_save / gsynth_load
 # ---------------------------------------------------------------------------
 
-def gsynth_save(model, path, *, compress=False):
+def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> None:
     """Save a trained model to disk in .gsm format.
 
     Serialises a :class:`GsynthModel` to a cross-platform ``.gsm`` directory
@@ -1520,7 +1568,7 @@ def gsynth_save(model, path, *, compress=False):
             f.write(cdf_bytes)
 
 
-def _load_legacy_pickle(path):
+def _load_legacy_pickle(path: str) -> GsynthModel:
     """Load a legacy pickle-format GsynthModel.
 
     Parameters
@@ -1553,7 +1601,7 @@ def _load_legacy_pickle(path):
     return model
 
 
-def _load_gsm_from_meta_and_files(metadata, read_file):
+def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) -> GsynthModel:
     """Build a GsynthModel from parsed metadata and a file-reader callable.
 
     Parameters
@@ -1627,7 +1675,7 @@ def _load_gsm_from_meta_and_files(metadata, read_file):
     )
 
 
-def gsynth_load(path):
+def gsynth_load(path: str) -> GsynthModel:
     """Load a trained model from disk.
 
     Auto-detects the format: ``.gsm`` directory, ``.gsm`` ZIP archive, or
@@ -1679,7 +1727,7 @@ def gsynth_load(path):
         with open(meta_path) as f:
             metadata = _yaml.safe_load(f)
 
-        def read_file(name):
+        def read_file(name: str) -> bytes:
             with open(_os.path.join(path, name), "rb") as fh:
                 return fh.read()
 
@@ -1699,7 +1747,7 @@ def gsynth_load(path):
     raise FileNotFoundError(f"Path not found: {path}")
 
 
-def gsynth_convert(input_path, output_path, *, compress=False):
+def gsynth_convert(input_path: str, output_path: str, *, compress: bool = False) -> None:
     """Convert a legacy pickle model to ``.gsm`` format.
 
     Reads a model from *input_path* (any supported format, including legacy

@@ -252,6 +252,7 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     5
     """
     _checkroot()
+    assert _shared._GROOT is not None
 
     if not os.path.isdir(path):
         raise ValueError(f"Dataset path '{path}' does not exist")
@@ -433,6 +434,7 @@ def gdataset_save(
     ... )
     """
     _checkroot()
+    assert _shared._GROOT is not None
 
     track_names = _as_list(tracks, "tracks")
     interval_names = _as_list(intervals, "intervals")

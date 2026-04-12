@@ -1,5 +1,8 @@
 """Sequence manipulation functions (gseq.*)."""
 
+from __future__ import annotations
+
+import collections.abc
 import math as _math
 
 import numpy as _numpy
@@ -25,7 +28,7 @@ def _kmer_strings(k: int) -> _numpy.ndarray:
     """Return array of all 4**k k-mer strings for a given k, cached."""
     if k in _KMER_STRING_CACHE:
         return _KMER_STRING_CACHE[k]
-    num = 4 ** k
+    num = 4**k
     # Build via cartesian product of base indices
     codes = _numpy.arange(num, dtype=_numpy.int64)
     chars = _numpy.empty((num, k), dtype="U1")
@@ -38,13 +41,14 @@ def _kmer_strings(k: int) -> _numpy.ndarray:
     _KMER_STRING_CACHE[k] = result
     return result
 
+
 # PWM scoring constants
-_PWM_BASE_CODE = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-_PWM_COMP_CODE = {'A': 3, 'C': 2, 'G': 1, 'T': 0}  # complement base codes
+_PWM_BASE_CODE = {"A": 0, "C": 1, "G": 2, "T": 3}
+_PWM_COMP_CODE = {"A": 3, "C": 2, "G": 1, "T": 0}  # complement base codes
 _LOG_QUARTER = _math.log(0.25)
 
 
-def gseq_extract(intervals):
+def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
     """
     Extract DNA sequences for given intervals.
 
@@ -83,10 +87,10 @@ def gseq_extract(intervals):
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    return _pymisha.pm_seq_extract(_df2pymisha(intervals), CONFIG)
+    return list(_pymisha.pm_seq_extract(_df2pymisha(intervals), CONFIG))
 
 
-def gseq_rev(seq):
+def gseq_rev(seq: str | list[str]) -> str | list[str]:
     """
     Reverse DNA sequence(s).
 
@@ -117,7 +121,7 @@ def gseq_rev(seq):
     return [s[::-1] for s in seq]
 
 
-def gseq_comp(seq):
+def gseq_comp(seq: str | list[str]) -> str | list[str]:
     """
     Return complement of DNA sequence(s).
 
@@ -148,7 +152,7 @@ def gseq_comp(seq):
     return [s.translate(_COMPLEMENT) for s in seq]
 
 
-def gseq_revcomp(seq):
+def gseq_revcomp(seq: str | list[str]) -> str | list[str]:
     """
     Return reverse complement of DNA sequence(s).
 
@@ -179,7 +183,7 @@ def gseq_revcomp(seq):
     return [s[::-1].translate(_COMPLEMENT) for s in seq]
 
 
-def grevcomp(seq):
+def grevcomp(seq: str | list[str]) -> str | list[str]:
     """
     Return reverse complement of a DNA string.
 
@@ -225,8 +229,16 @@ def _count_str_occurrences(haystack: str, needle: str) -> int:
     return count
 
 
-def _count_kmer_in_seq(seq, kmer, strand, start_pos, end_pos, extend,
-                       skip_gaps, gap_chars):
+def _count_kmer_in_seq(
+    seq: str,
+    kmer: str,
+    strand: int,
+    start_pos: int | None,
+    end_pos: int | None,
+    extend: bool,
+    skip_gaps: bool,
+    gap_chars: list[str],
+) -> int:
     """Count occurrences of a k-mer in a single sequence.
 
     Parameters follow R misha conventions:
@@ -281,7 +293,7 @@ def _count_kmer_in_seq(seq, kmer, strand, start_pos, end_pos, extend,
     return count
 
 
-def _numpy_count_kmer(seq_bytes, kmer_bytes, k):
+def _numpy_count_kmer(seq_bytes: _numpy.ndarray, kmer_bytes: _numpy.ndarray, k: int) -> int:
     """Count overlapping occurrences of kmer_bytes in seq_bytes using numpy.
 
     Parameters
@@ -304,11 +316,13 @@ def _numpy_count_kmer(seq_bytes, kmer_bytes, k):
     n_windows = n - k + 1
     match = _numpy.ones(n_windows, dtype=bool)
     for j in range(k):
-        match &= seq_bytes[j:j + n_windows] == kmer_bytes[j]
+        match &= seq_bytes[j : j + n_windows] == kmer_bytes[j]
     return int(match.sum())
 
 
-def _numpy_count_kmer_per_seq(seq_bytes, boundaries, kmer_bytes, k):
+def _numpy_count_kmer_per_seq(
+    seq_bytes: _numpy.ndarray, boundaries: _numpy.ndarray, kmer_bytes: _numpy.ndarray, k: int
+) -> _numpy.ndarray:
     """Count k-mer occurrences per sequence in a concatenated byte array.
 
     Sequences are concatenated with N*k separators so k-mer matches cannot
@@ -342,7 +356,7 @@ def _numpy_count_kmer_per_seq(seq_bytes, boundaries, kmer_bytes, k):
     n_windows = n_total - k + 1
     match = _numpy.ones(n_windows, dtype=bool)
     for j in range(k):
-        match &= seq_bytes[j:j + n_windows] == kmer_bytes[j]
+        match &= seq_bytes[j : j + n_windows] == kmer_bytes[j]
 
     match_positions = _numpy.flatnonzero(match)
     if match_positions.size == 0:
@@ -353,7 +367,7 @@ def _numpy_count_kmer_per_seq(seq_bytes, boundaries, kmer_bytes, k):
     return _numpy.bincount(seq_idx, minlength=n_seqs)
 
 
-def _gseq_kmer_fast(seqs, kmer, mode, strand, k):
+def _gseq_kmer_fast(seqs: list[str], kmer: str, mode: str, strand: int, k: int) -> _numpy.ndarray:
     """Fast path for gseq_kmer: no ROI, no gaps, no extend.
 
     Uses numpy byte-level matching for vectorized k-mer counting.
@@ -364,11 +378,7 @@ def _gseq_kmer_fast(seqs, kmer, mode, strand, k):
 
     kmer_bytes = _numpy.frombuffer(kmer.encode("ascii"), dtype=_numpy.uint8)
     kmer_rc = kmer[::-1].translate(_COMPLEMENT).upper() if strand != 1 else None
-    kmer_rc_bytes = (
-        _numpy.frombuffer(kmer_rc.encode("ascii"), dtype=_numpy.uint8)
-        if kmer_rc is not None
-        else None
-    )
+    kmer_rc_bytes = _numpy.frombuffer(kmer_rc.encode("ascii"), dtype=_numpy.uint8) if kmer_rc is not None else None
 
     # Determine which patterns to search for
     search_fwd = strand in (0, 1)
@@ -388,6 +398,7 @@ def _gseq_kmer_fast(seqs, kmer, mode, strand, k):
             if search_fwd:
                 count += _count_str_occurrences(seq_upper, kmer)
             if search_rev:
+                assert kmer_rc is not None
                 count += _count_str_occurrences(seq_upper, kmer_rc)
             if mode == "frac":
                 possible = max(0, seq_len - k + 1)
@@ -410,15 +421,14 @@ def _gseq_kmer_fast(seqs, kmer, mode, strand, k):
         if search_fwd:
             count += _numpy_count_kmer(sb, kmer_bytes, k)
         if search_rev:
+            assert kmer_rc_bytes is not None
             count += _numpy_count_kmer(sb, kmer_rc_bytes, k)
 
         if mode == "frac":
             possible = max(0, seq_len - k + 1)
             if strand == 0:
                 possible *= 2
-            return _numpy.array(
-                [count / possible if possible > 0 else 0.0], dtype=float
-            )
+            return _numpy.array([count / possible if possible > 0 else 0.0], dtype=float)
         return _numpy.array([float(count)], dtype=float)
 
     # Multiple sequences: concatenate with N*k separators for batch processing.
@@ -441,29 +451,34 @@ def _gseq_kmer_fast(seqs, kmer, mode, strand, k):
     rev_counts = _numpy.zeros(n, dtype=_numpy.int64)
 
     if search_fwd:
-        fwd_counts = _numpy_count_kmer_per_seq(
-            all_bytes, boundaries, kmer_bytes, k
-        )
+        fwd_counts = _numpy_count_kmer_per_seq(all_bytes, boundaries, kmer_bytes, k)
     if search_rev:
-        rev_counts = _numpy_count_kmer_per_seq(
-            all_bytes, boundaries, kmer_rc_bytes, k
-        )
+        assert kmer_rc_bytes is not None
+        rev_counts = _numpy_count_kmer_per_seq(all_bytes, boundaries, kmer_rc_bytes, k)
 
-    total_counts = fwd_counts + rev_counts
+    total_counts: _numpy.ndarray = fwd_counts + rev_counts
 
     if mode == "frac":
-        possible = _numpy.maximum(0, seq_lens - k + 1).astype(float)
+        possible_arr = _numpy.maximum(0, seq_lens - k + 1).astype(float)
         if strand == 0:
-            possible *= 2
+            possible_arr *= 2
         with _numpy.errstate(divide="ignore", invalid="ignore"):
-            return _numpy.where(possible > 0, total_counts / possible, 0.0)
+            return _numpy.where(possible_arr > 0, total_counts / possible_arr, 0.0)
 
     return total_counts.astype(float)
 
 
-def gseq_kmer(seqs, kmer, mode="count", strand=0, start_pos=None,
-              end_pos=None, extend=False, skip_gaps=True,
-              gap_chars=None):
+def gseq_kmer(
+    seqs: str | list[str],
+    kmer: str,
+    mode: str = "count",
+    strand: int = 0,
+    start_pos: int | None = None,
+    end_pos: int | None = None,
+    extend: bool = False,
+    skip_gaps: bool = True,
+    gap_chars: list[str] | None = None,
+) -> _numpy.ndarray:
     """
     Count k-mer occurrences in DNA sequences.
 
@@ -560,8 +575,7 @@ def gseq_kmer(seqs, kmer, mode="count", strand=0, start_pos=None,
     results = _numpy.zeros(len(seqs), dtype=float)
 
     for i, seq in enumerate(seqs):
-        count = _count_kmer_in_seq(seq, kmer, strand, start_pos, end_pos,
-                                   extend, skip_gaps, gap_chars)
+        count = _count_kmer_in_seq(seq, kmer, strand, start_pos, end_pos, extend, skip_gaps, gap_chars)
         if mode == "frac":
             seq_len = len(seq)
             if start_pos is not None and end_pos is not None:
@@ -582,7 +596,9 @@ def gseq_kmer(seqs, kmer, mode="count", strand=0, start_pos=None,
     return results
 
 
-def gseq_kmer_dist(intervals, k=6, mask=None):
+def gseq_kmer_dist(
+    intervals: _pandas.DataFrame | str, k: int = 6, mask: _pandas.DataFrame | None = None
+) -> _pandas.DataFrame:
     """
     Compute k-mer distribution in genomic intervals.
 
@@ -634,14 +650,13 @@ def gseq_kmer_dist(intervals, k=6, mask=None):
     # If mask is provided, extract mask intervals and subtract
     if mask is not None:
         from .intervals import gintervals_diff
+
         intervals_clean = gintervals_diff(intervals, mask)
         if intervals_clean is None or len(intervals_clean) == 0:
-            return _pandas.DataFrame({"kmer": [], "count": []}).astype(
-                {"kmer": str, "count": int}
-            )
+            return _pandas.DataFrame({"kmer": [], "count": []}).astype({"kmer": str, "count": int})
         seqs = gseq_extract(intervals_clean)
 
-    num_kmers = 4 ** k
+    num_kmers = 4**k
     counts = _numpy.zeros(num_kmers, dtype=_numpy.int64)
 
     # Pre-compute powers of 4 for the rolling hash
@@ -690,14 +705,13 @@ def gseq_kmer_dist(intervals, k=6, mask=None):
                 window_codes = _numpy.zeros(n_windows, dtype=_numpy.int64)
                 for j in range(k):
                     window_codes *= 4
-                    window_codes += segment[j:j + n_windows]
+                    window_codes += segment[j : j + n_windows]
 
             counts += _numpy.bincount(window_codes, minlength=num_kmers)
 
     nonzero_idx = _numpy.flatnonzero(counts)
     if nonzero_idx.size == 0:
-        return _pandas.DataFrame({"kmer": _pandas.Series(dtype=str),
-                                  "count": _pandas.Series(dtype=int)})
+        return _pandas.DataFrame({"kmer": _pandas.Series(dtype=str), "count": _pandas.Series(dtype=int)})
 
     # Use cached k-mer string table for fast decoding
     all_kmers = _kmer_strings(k)
@@ -716,28 +730,36 @@ def gseq_kmer_dist(intervals, k=6, mask=None):
 # Base encoding for vectorized PWM scoring
 _PWM_FWD_CODE = _numpy.full(256, -1, dtype=_numpy.int8)
 _PWM_RC_CODE = _numpy.full(256, -1, dtype=_numpy.int8)
-for _b, _f, _r in ((ord('A'), 0, 3), (ord('C'), 1, 2),
-                    (ord('G'), 2, 1), (ord('T'), 3, 0)):
+for _b, _f, _r in ((ord("A"), 0, 3), (ord("C"), 1, 2), (ord("G"), 2, 1), (ord("T"), 3, 0)):
     _PWM_FWD_CODE[_b] = _f
     _PWM_FWD_CODE[_b + 32] = _f  # lowercase
     _PWM_RC_CODE[_b] = _r
     _PWM_RC_CODE[_b + 32] = _r
 
 
-def _numpy_logsumexp(arr):
+def _numpy_logsumexp(arr: _numpy.ndarray) -> float:
     """Numerically stable logsumexp over a 1-D array (finite values only)."""
     finite = arr[_numpy.isfinite(arr)]
     if finite.size == 0:
         return -_numpy.inf
     m = finite.max()
-    return m + _numpy.log(_numpy.sum(_numpy.exp(finite - m)))
+    return float(m + _numpy.log(_numpy.sum(_numpy.exp(finite - m))))
 
 
-def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
-                                mode, scan_fwd, scan_rev,
-                                score_thresh, return_strand,
-                                spat_log_factors=None, spat_bin=1,
-                                neutral_policy="average"):
+def _pwm_score_batch_vectorized(
+    seqs: list[str],
+    log_pssm: _numpy.ndarray,
+    avg_log: _numpy.ndarray,
+    w: int,
+    mode: str,
+    scan_fwd: bool,
+    scan_rev: bool,
+    score_thresh: float,
+    return_strand: bool,
+    spat_log_factors: _numpy.ndarray | None = None,
+    spat_bin: int = 1,
+    neutral_policy: str = "average",
+) -> _numpy.ndarray | tuple[_numpy.ndarray, _numpy.ndarray]:
     """Vectorized PWM scoring for a batch of sequences (no ROI/gaps).
 
     Replaces the per-window Python loop with numpy stride-tricks-based
@@ -747,7 +769,7 @@ def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
     results = _numpy.full(n, _numpy.nan, dtype=float)
     strand_results = _numpy.zeros(n, dtype=_numpy.int64) if return_strand else None
     use_spat = spat_log_factors is not None and len(spat_log_factors) > 0
-    n_spat = len(spat_log_factors) if use_spat else 0
+    n_spat = len(spat_log_factors) if spat_log_factors is not None else 0
 
     # Pre-compute reversed log_pssm for RC scoring
     # RC scoring at position j uses pssm[w-1-j, comp_code]
@@ -763,9 +785,9 @@ def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
             continue
 
         # Encode sequence to base codes
-        raw = _numpy.frombuffer(seq_upper.encode('ascii'), dtype=_numpy.uint8)
-        fwd_codes = _PWM_FWD_CODE[raw]   # A=0,C=1,G=2,T=3, other=-1
-        rc_codes = _PWM_RC_CODE[raw]      # A=3,C=2,G=1,T=0, other=-1
+        raw = _numpy.frombuffer(seq_upper.encode("ascii"), dtype=_numpy.uint8)
+        fwd_codes = _PWM_FWD_CODE[raw]  # A=0,C=1,G=2,T=3, other=-1
+        rc_codes = _PWM_RC_CODE[raw]  # A=3,C=2,G=1,T=0, other=-1
 
         n_windows = L - w + 1
 
@@ -821,6 +843,7 @@ def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
                     fwd_scores[wi] = s
 
             if use_spat:
+                assert spat_log_factors is not None
                 offsets = _numpy.arange(n_windows)
                 bins = _numpy.clip(offsets // spat_bin, 0, n_spat - 1)
                 spat = spat_log_factors[bins]
@@ -859,6 +882,7 @@ def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
                     rc_scores[wi] = s
 
             if use_spat:
+                assert spat_log_factors is not None
                 offsets = _numpy.arange(n_windows)
                 bins = _numpy.clip(offsets // spat_bin, 0, n_spat - 1)
                 spat = spat_log_factors[bins]
@@ -905,11 +929,12 @@ def _pwm_score_batch_vectorized(seqs, log_pssm, avg_log, w,
             results[i] = float(_numpy.sum(combined >= score_thresh))
 
     if return_strand and mode == "pos":
+        assert strand_results is not None
         return results, strand_results
     return results
 
 
-def _pwm_log_sum_exp(scores):
+def _pwm_log_sum_exp(scores: list[float]) -> float:
     """Numerically stable log-sum-exp matching C++/R iterative algorithm."""
     finite = [s for s in scores if _numpy.isfinite(s)]
     if not finite:
@@ -926,8 +951,15 @@ def _pwm_log_sum_exp(scores):
     return s
 
 
-def _pwm_score_window(bases, log_pssm, avg_log, w, neutral_set,
-                      neutral_policy, reverse):
+def _pwm_score_window(
+    bases: str,
+    log_pssm: _numpy.ndarray,
+    avg_log: _numpy.ndarray,
+    w: int,
+    neutral_set: frozenset[str],
+    neutral_policy: str,
+    reverse: bool,
+) -> float:
     """Score a single w-base window against the PSSM.
 
     Returns float score, -inf for unknown bases, or NaN for neutral+na policy.
@@ -942,7 +974,7 @@ def _pwm_score_window(bases, log_pssm, avg_log, w, neutral_set,
             elif neutral_policy == "log_quarter":
                 score += _LOG_QUARTER
             else:  # "na"
-                return float('nan')
+                return float("nan")
         else:
             if reverse:
                 code = _PWM_COMP_CODE.get(base, -1)
@@ -956,7 +988,9 @@ def _pwm_score_window(bases, log_pssm, avg_log, w, neutral_set,
     return score
 
 
-def _pwm_iter_windows(seq_upper, start_min, start_max, w, skip_gaps, gap_set):
+def _pwm_iter_windows(
+    seq_upper: str, start_min: int, start_max: int, w: int, skip_gaps: bool, gap_set: frozenset[str]
+) -> collections.abc.Generator[tuple[int, str], None, None]:
     """Yield (physical_pos_0based, window_str) for PWM scanning."""
     if skip_gaps and gap_set:
         # Build compacted sequence and logical-to-physical mapping
@@ -977,18 +1011,33 @@ def _pwm_iter_windows(seq_upper, start_min, start_max, w, skip_gaps, gap_set):
             phys_end = log_to_phys[log_i + w - 1]
             if phys_end > phys_end_bound:
                 continue
-            yield phys_start, "".join(comp[log_i:log_i + w])
+            yield phys_start, "".join(comp[log_i : log_i + w])
     else:
         for pos in range(start_min, start_max + 1):
-            yield pos, seq_upper[pos:pos + w]
+            yield pos, seq_upper[pos : pos + w]
 
 
-def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
-                        mode, scan_fwd, scan_rev, score_thresh,
-                        start_pos, end_pos, extend,
-                        skip_gaps, gap_set, neutral_set,
-                        neutral_policy, return_strand,
-                        spat_log_factors=None, spat_bin=1):
+def _pwm_score_sequence(
+    seq_upper: str,
+    L: int,
+    log_pssm: _numpy.ndarray,
+    avg_log: _numpy.ndarray,
+    w: int,
+    mode: str,
+    scan_fwd: bool,
+    scan_rev: bool,
+    score_thresh: float,
+    start_pos: int | None,
+    end_pos: int | None,
+    extend: bool | int,
+    skip_gaps: bool,
+    gap_set: frozenset[str],
+    neutral_set: frozenset[str],
+    neutral_policy: str,
+    return_strand: bool,
+    spat_log_factors: _numpy.ndarray | None = None,
+    spat_bin: int = 1,
+) -> float | int | tuple[float, int]:
     """Score a single uppercased sequence with PWM.
 
     Parameters
@@ -1019,11 +1068,11 @@ def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
         if mode == "count":
             return 0
         if return_strand and mode == "pos":
-            return (float('nan'), 0)
-        return float('nan')
+            return (float("nan"), 0)
+        return float("nan")
 
     use_spat = spat_log_factors is not None and len(spat_log_factors) > 0
-    n_spat = len(spat_log_factors) if use_spat else 0
+    n_spat = len(spat_log_factors) if spat_log_factors is not None else 0
 
     # Iterate windows and aggregate
     all_scores = []  # for lse
@@ -1033,12 +1082,11 @@ def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
     count = 0
     has_valid = False
 
-    for phys_pos, window in _pwm_iter_windows(seq_upper, start_min,
-                                              start_max, w,
-                                              skip_gaps, gap_set):
+    for phys_pos, window in _pwm_iter_windows(seq_upper, start_min, start_max, w, skip_gaps, gap_set):
         # Spatial log factor for this window position.
         # offset_from_roi = (phys_pos + 1) - roi_start  (matching C++: (s0+1) - roi_start1)
         if use_spat:
+            assert spat_log_factors is not None
             offset = (phys_pos + 1) - roi_start
             sb = offset // spat_bin
             if sb < 0:
@@ -1055,8 +1103,7 @@ def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
             if not is_rev and not scan_fwd:
                 continue
 
-            s = _pwm_score_window(window, log_pssm, avg_log, w,
-                                  neutral_set, neutral_policy, is_rev)
+            s = _pwm_score_window(window, log_pssm, avg_log, w, neutral_set, neutral_policy, is_rev)
             if _numpy.isnan(s):
                 continue
             has_valid = True
@@ -1078,17 +1125,17 @@ def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
     # Aggregate final result
     if mode == "lse":
         if not has_valid:
-            return float('nan')
+            return float("nan")
         return _pwm_log_sum_exp(all_scores)
     if mode == "max":
         if not has_valid:
-            return float('nan')
+            return float("nan")
         return best_score
     if mode == "pos":
         if not has_valid or best_pos < 0:
             if return_strand:
-                return (float('nan'), 0)
-            return float('nan')
+                return (float("nan"), 0)
+            return float("nan")
         if return_strand:
             return (float(best_pos), best_strand)
         return float(best_pos)
@@ -1096,12 +1143,27 @@ def _pwm_score_sequence(seq_upper, L, log_pssm, avg_log, w,
     return count
 
 
-def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
-             score_thresh=0, start_pos=None, end_pos=None, extend=False,
-             spat_factor=None, spat_bin=1, spat_min=None, spat_max=None,
-             return_strand=False, skip_gaps=True, gap_chars=None,
-             neutral_chars=None, neutral_chars_policy="average",
-             prior=0.01):
+def gseq_pwm(
+    seqs: str | list[str],
+    pssm: _numpy.ndarray | _pandas.DataFrame,
+    mode: str = "lse",
+    bidirect: bool = True,
+    strand: int = 0,
+    score_thresh: float = 0,
+    start_pos: int | None = None,
+    end_pos: int | None = None,
+    extend: bool | int = False,
+    spat_factor: _numpy.ndarray | list[float] | None = None,
+    spat_bin: int = 1,
+    spat_min: float | None = None,
+    spat_max: float | None = None,
+    return_strand: bool = False,
+    skip_gaps: bool = True,
+    gap_chars: list[str] | None = None,
+    neutral_chars: list[str] | None = None,
+    neutral_chars_policy: str = "average",
+    prior: float = 0.01,
+) -> _numpy.ndarray | _pandas.DataFrame:
     """
     Score DNA sequences with a position weight matrix (PWM/PSSM).
 
@@ -1213,17 +1275,13 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
     """
     # --- Validation ---
     if mode not in ("lse", "max", "pos", "count"):
-        raise ValueError(
-            f"mode must be 'lse', 'max', 'pos', or 'count', got '{mode}'"
-        )
+        raise ValueError(f"mode must be 'lse', 'max', 'pos', or 'count', got '{mode}'")
     if strand not in (-1, 0, 1):
         raise ValueError(f"strand must be -1, 0, or 1, got {strand}")
     if prior < 0:
         raise ValueError(f"prior must be non-negative, got {prior}")
     if neutral_chars_policy not in ("average", "log_quarter", "na"):
-        raise ValueError(
-            "neutral_chars_policy must be 'average', 'log_quarter', or 'na'"
-        )
+        raise ValueError("neutral_chars_policy must be 'average', 'log_quarter', or 'na'")
 
     # --- Spatial weighting ---
     spat_log_factors = None
@@ -1240,10 +1298,10 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
 
     # --- Normalize PSSM ---
     if isinstance(pssm, _pandas.DataFrame):
-        for col in ('A', 'C', 'G', 'T'):
+        for col in ("A", "C", "G", "T"):
             if col not in pssm.columns:
                 raise KeyError(f"PSSM DataFrame missing column '{col}'")
-        pssm_arr = pssm[['A', 'C', 'G', 'T']].values.astype(float)
+        pssm_arr = pssm[["A", "C", "G", "T"]].values.astype(float)
     elif isinstance(pssm, _numpy.ndarray):
         if pssm.ndim != 2 or pssm.shape[1] != 4:
             raise ValueError("PSSM array must have shape (w, 4)")
@@ -1304,10 +1362,17 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
                     break
         if not need_slow:
             r = _pwm_score_batch_vectorized(
-                seqs, log_pssm, avg_log, w,
-                mode, scan_fwd, scan_rev, score_thresh,
+                seqs,
+                log_pssm,
+                avg_log,
+                w,
+                mode,
+                scan_fwd,
+                scan_rev,
+                score_thresh,
                 return_strand,
-                spat_log_factors=spat_log_factors, spat_bin=spat_bin,
+                spat_log_factors=spat_log_factors,
+                spat_bin=spat_bin,
                 neutral_policy=neutral_chars_policy,
             )
             if return_strand and mode == "pos":
@@ -1315,24 +1380,38 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
             return r
 
     # --- Slow path: per-sequence scoring ---
-    results = []
-    strand_results = []
+    results: list[float | int | tuple[float, int]] = []
+    strand_results: list[int] = []
 
     for seq in seqs:
         seq_upper = seq.upper()
-        r = _pwm_score_sequence(
-            seq_upper, len(seq_upper), log_pssm, avg_log, w,
-            mode, scan_fwd, scan_rev, score_thresh,
-            start_pos, end_pos, extend,
-            skip_gaps, gap_set, neutral_set, neutral_chars_policy,
+        sr = _pwm_score_sequence(
+            seq_upper,
+            len(seq_upper),
+            log_pssm,
+            avg_log,
+            w,
+            mode,
+            scan_fwd,
+            scan_rev,
+            score_thresh,
+            start_pos,
+            end_pos,
+            extend,
+            skip_gaps,
+            gap_set,
+            neutral_set,
+            neutral_chars_policy,
             return_strand,
-            spat_log_factors=spat_log_factors, spat_bin=spat_bin,
+            spat_log_factors=spat_log_factors,
+            spat_bin=spat_bin,
         )
         if return_strand and mode == "pos":
-            results.append(r[0])
-            strand_results.append(r[1])
+            assert isinstance(sr, tuple)
+            results.append(sr[0])
+            strand_results.append(sr[1])
         else:
-            results.append(r)
+            results.append(sr)
 
     if return_strand and mode == "pos":
         return _pandas.DataFrame({"pos": results, "strand": strand_results})
@@ -1340,10 +1419,21 @@ def gseq_pwm(seqs, pssm, mode="lse", bidirect=True, strand=0,
     return _numpy.array(results, dtype=float)
 
 
-def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
-                    max_indels=None, bidirect=True,
-                    prior=0.01, score_min=None, score_max=None, extend=True,
-                    strand=1, direction="above"):
+def gseq_pwm_edits(
+    seqs: str | list[str] | _pandas.DataFrame,
+    pssm: _numpy.ndarray | _pandas.DataFrame,
+    score_thresh: float,
+    *,
+    max_edits: int | None = None,
+    max_indels: int | None = None,
+    bidirect: bool = True,
+    prior: float = 0.01,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    extend: bool | int = True,
+    strand: int = 1,
+    direction: str = "above",
+) -> _pandas.DataFrame:
     """
     Show optimal edits to reach a PWM score threshold.
 
@@ -1426,10 +1516,10 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
     gvtrack_create : Create virtual tracks with edit distance functions.
     """
     # Handle interval input
-    is_intervals = (isinstance(seqs, _pandas.DataFrame)
-                    and {"chrom", "start", "end"}.issubset(seqs.columns))
+    is_intervals = isinstance(seqs, _pandas.DataFrame) and {"chrom", "start", "end"}.issubset(seqs.columns)
     intervals_df = None
     if is_intervals:
+        assert isinstance(seqs, _pandas.DataFrame)
         intervals_df = seqs
         # Normalize PSSM to get motif width
         if isinstance(pssm, _pandas.DataFrame):
@@ -1443,23 +1533,22 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
         extended["end"] = extended["end"] + ext
         # Clamp to chromosome bounds
         from .intervals import gintervals_all
+
         chrom_sizes = gintervals_all()
         cs_map = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=False))
         for i in range(len(extended)):
             c = str(extended.iloc[i]["chrom"])
             if c in cs_map:
-                extended.iloc[i, extended.columns.get_loc("end")] = min(
-                    extended.iloc[i]["end"], cs_map[c]
-                )
+                extended.iloc[i, extended.columns.get_loc("end")] = min(extended.iloc[i]["end"], cs_map[c])
         seqs = gseq_extract(extended)
         extend = False  # already extended
 
     # Validate PSSM
     if isinstance(pssm, _pandas.DataFrame):
-        for col in ('A', 'C', 'G', 'T'):
+        for col in ("A", "C", "G", "T"):
             if col not in pssm.columns:
                 raise KeyError(f"PSSM DataFrame missing column '{col}'")
-        pssm_arr = pssm[['A', 'C', 'G', 'T']].values.astype(_numpy.float64)
+        pssm_arr = pssm[["A", "C", "G", "T"]].values.astype(_numpy.float64)
     elif isinstance(pssm, _numpy.ndarray):
         if pssm.ndim != 2 or pssm.shape[1] != 4:
             raise ValueError("PSSM array must have shape (w, 4)")
@@ -1488,31 +1577,37 @@ def gseq_pwm_edits(seqs, pssm, score_thresh, *, max_edits=None,
     if direction not in ("above", "below"):
         raise ValueError("direction must be 'above' or 'below'")
 
+    # For direction="below", default score_min to score_thresh (see vtracks.py).
+    if direction == "below" and score_min is None:
+        score_min = float(score_thresh)
+
     # Resolve strand mode
     strand_mode = 0 if bidirect else int(strand)
 
     # Call C++ binding
     result = _pymisha.pm_gseq_pwm_edits(
-        seqs, pssm_arr, float(score_thresh),
-        max_edits, int(bidirect), strand_mode,
-        float(prior), extend,
-        score_min, score_max,
-        max_indels, direction,
+        seqs,
+        pssm_arr,
+        float(score_thresh),
+        max_edits,
+        int(bidirect),
+        strand_mode,
+        float(prior),
+        extend,
+        score_min,
+        score_max,
+        max_indels,
+        direction,
     )
 
     df = _pandas.DataFrame(result)
 
     # Add interval columns if input was intervals
     if is_intervals and len(df) > 0:
-        df["chrom"] = intervals_df["chrom"].values[
-            _numpy.array(df["seq_idx"]) - 1
-        ]
-        df["start"] = intervals_df["start"].values[
-            _numpy.array(df["seq_idx"]) - 1
-        ]
-        df["end"] = intervals_df["end"].values[
-            _numpy.array(df["seq_idx"]) - 1
-        ]
+        assert isinstance(intervals_df, _pandas.DataFrame)
+        df["chrom"] = intervals_df["chrom"].values[_numpy.array(df["seq_idx"]) - 1]
+        df["start"] = intervals_df["start"].values[_numpy.array(df["seq_idx"]) - 1]
+        df["end"] = intervals_df["end"].values[_numpy.array(df["seq_idx"]) - 1]
         # Reorder columns
         cols = ["seq_idx", "chrom", "start", "end"] + [
             c for c in df.columns if c not in ("seq_idx", "chrom", "start", "end")

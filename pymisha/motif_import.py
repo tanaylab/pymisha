@@ -207,7 +207,7 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
                 break
             # Check if this line looks numeric
             try:
-                vals = [float(x) for x in ln.split()]
+                [float(x) for x in ln.split()]
             except ValueError:
                 break
             mat_lines.append(ln)
@@ -226,14 +226,14 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
         # Parse matrix
         rows: list[list[float]] = []
         for i, ml in enumerate(mat_lines):
-            vals = ml.split()
-            if len(vals) != 4:
+            toks: list[str] = ml.split()
+            if len(toks) != 4:
                 raise ValueError(
                     f"Expected 4 columns (A,C,G,T) at line "
                     f"{start_line + lpm_idx + i + 1} of motif '{motif_id}'"
                 )
             try:
-                row = [float(v) for v in vals]
+                row = [float(v) for v in toks]
             except ValueError as err:
                 raise ValueError(
                     f"Non-numeric value in probability matrix for "

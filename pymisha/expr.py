@@ -1,13 +1,17 @@
 """Expression parsing helpers."""
 
+from __future__ import annotations
+
 import ast
 import re
 import sys
+from types import FrameType
+from typing import Any
 
 from . import _shared
 
-_BUILTIN_EXPR_NAMES = {"np", "numpy", "CHROM", "START", "END", "True", "False", "None"}
-_ALWAYS_ALLOWED_NAMES = _BUILTIN_EXPR_NAMES | {"abs", "min", "max", "round", "float", "int", "bool"}
+_BUILTIN_EXPR_NAMES: set[str] = {"np", "numpy", "CHROM", "START", "END", "True", "False", "None"}
+_ALWAYS_ALLOWED_NAMES: set[str] = _BUILTIN_EXPR_NAMES | {"abs", "min", "max", "round", "float", "int", "bool"}
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
@@ -24,12 +28,19 @@ _TOKEN_RE = re.compile(
 )
 
 
-def _expr_safe_name(name):
+def _expr_safe_name(name: str) -> str:
     """Return a collision-proof identifier used in expression eval namespaces."""
     return "__pmv_" + name.encode("utf-8").hex()
 
 
-def _register_expr_name(name, track_names, vtrack_names, used_tracks, used_vtracks, var_map):
+def _register_expr_name(
+    name: str,
+    track_names: set[str],
+    vtrack_names: set[str],
+    used_tracks: set[str],
+    used_vtracks: set[str],
+    var_map: dict[str, str],
+) -> str:
     safe = _expr_safe_name(name)
     if name in track_names:
         used_tracks.add(name)
@@ -39,7 +50,14 @@ def _register_expr_name(name, track_names, vtrack_names, used_tracks, used_vtrac
     return safe
 
 
-def _replace_identifier_token(token, track_names, vtrack_names, used_tracks, used_vtracks, var_map):
+def _replace_identifier_token(
+    token: str,
+    track_names: set[str],
+    vtrack_names: set[str],
+    used_tracks: set[str],
+    used_vtracks: set[str],
+    var_map: dict[str, str],
+) -> str | None:
     if token in track_names or token in vtrack_names:
         return _register_expr_name(
             token, track_names, vtrack_names, used_tracks, used_vtracks, var_map
@@ -60,7 +78,7 @@ def _replace_identifier_token(token, track_names, vtrack_names, used_tracks, use
     return None
 
 
-def _find_vtracks_in_expr(expr):
+def _find_vtracks_in_expr(expr: str) -> list[str]:
     """Find virtual track names used in an expression."""
     if not _shared._VTRACKS:
         return []
@@ -82,7 +100,11 @@ def _find_vtracks_in_expr(expr):
     return [name for name in _shared._VTRACKS if name in matched]
 
 
-def _parse_expr_vars(expr, track_names, vtrack_names):
+def _parse_expr_vars(
+    expr: str,
+    track_names: set[str],
+    vtrack_names: set[str],
+) -> tuple[str, set[str], set[str], dict[str, str]]:
     """
     Parse an expression and replace track/vtrack names with safe Python identifiers.
 
@@ -91,10 +113,10 @@ def _parse_expr_vars(expr, track_names, vtrack_names):
     """
     tokens = _TOKEN_RE.findall(expr)
 
-    used_tracks = set()
-    used_vtracks = set()
-    var_map = {}
-    out = []
+    used_tracks: set[str] = set()
+    used_vtracks: set[str] = set()
+    var_map: dict[str, str] = {}
+    out: list[str] = []
 
     for token in tokens:
         if _IDENTIFIER_RE.fullmatch(token):
@@ -109,7 +131,7 @@ def _parse_expr_vars(expr, track_names, vtrack_names):
     return ''.join(out), used_tracks, used_vtracks, var_map
 
 
-def _caller_namespace(depth=1):
+def _caller_namespace(depth: int = 1) -> dict[str, Any]:
     """Capture the caller's local and global variables.
 
     Starts at the caller's frame and walks up through frames that share
@@ -125,7 +147,7 @@ def _caller_namespace(depth=1):
         caller_globals = frame.f_globals
         ns = dict(caller_globals)
         # Walk frames within the same module (same f_globals).
-        f = frame
+        f: FrameType | None = frame
         chain = []
         while f is not None and f.f_globals is caller_globals:
             chain.append(f.f_locals)
@@ -138,7 +160,7 @@ def _caller_namespace(depth=1):
         del frame
 
 
-def _resolve_user_vars(expr_eval, caller_ns):
+def _resolve_user_vars(expr_eval: str, caller_ns: dict[str, Any]) -> dict[str, Any]:
     """Find non-track identifiers in the parsed expression and resolve from caller namespace."""
     tree = ast.parse(expr_eval, mode="eval")
     user_vars = {}

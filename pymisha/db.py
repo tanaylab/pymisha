@@ -1,5 +1,7 @@
 """Database initialization and example DB helpers."""
 
+from __future__ import annotations
+
 import atexit
 import contextlib
 import copy
@@ -14,7 +16,7 @@ import pandas as pd
 from . import _shared
 from ._shared import CONFIG, _checkroot, _pymisha
 
-_EXAMPLE_TMP_DIRS = []
+_EXAMPLE_TMP_DIRS: list[str] = []
 
 
 def _cleanup_example_tmpdirs():
@@ -26,7 +28,7 @@ def _cleanup_example_tmpdirs():
 atexit.register(_cleanup_example_tmpdirs)
 
 
-def gdb_init(path: str, userpath: str = None):
+def gdb_init(path: str, userpath: str | None = None):
     """
     Initialize connection to a misha genomic database.
 
@@ -347,7 +349,7 @@ def gdb_init_examples(copy=True):
     return str(src)
 
 
-def gdb_info(groot: str = None):
+def gdb_info(groot: str | None = None):
     """
     Return high-level information about a misha database.
 

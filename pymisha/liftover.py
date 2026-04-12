@@ -11,11 +11,15 @@ Strand note: intervals APIs use {-1,0,1}, while chain-derived columns
 (`strand`, `strandsrc`) use {0,1} where 0='+' and 1='-'.
 """
 
+from __future__ import annotations
+
 import heapq
 import os
 import struct
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -51,7 +55,7 @@ _EMPTY_CHAIN_COLS = [
 ]
 
 
-def _empty_chain_df():
+def _empty_chain_df() -> pd.DataFrame:
     return pd.DataFrame({
         c: pd.Series(
             dtype="object" if c in ("chrom", "chromsrc") else "int64" if c in (
@@ -61,7 +65,7 @@ def _empty_chain_df():
     })
 
 
-def _normalize_chrom(name):
+def _normalize_chrom(name: str) -> str | None:
     """Normalize a chromosome name using the C++ chromkey."""
     try:
         normalized = _pymisha.pm_normalize_chroms([name])
@@ -72,10 +76,10 @@ def _normalize_chrom(name):
         raise
     if not normalized:
         return None
-    return normalized[0]
+    return str(normalized[0])
 
 
-def _get_db_chrom_sizes():
+def _get_db_chrom_sizes() -> dict[str, int]:
     """Return {chrom_name: size} for the current database."""
     all_iv = gintervals_all()
     return dict(
@@ -90,7 +94,11 @@ def _get_db_chrom_sizes():
 # Chain file parser
 # ===================================================================
 
-def _parse_chain_file(path, db_chrom_sizes, min_score=None):
+def _parse_chain_file(
+    path: str,
+    db_chrom_sizes: dict[str, int],
+    min_score: float | None = None,
+) -> dict[str, list[Any]] | None:
     """Parse a UCSC chain file and return list of chain block dicts.
 
     Each dict has: chrom, start, end, strand, chromsrc, startsrc, endsrc,
@@ -115,7 +123,7 @@ def _parse_chain_file(path, db_chrom_sizes, min_score=None):
     b_strandsrc = []
     b_chain_id = []
     b_score = []
-    src_chrom_sizes = {}  # track source chrom sizes for consistency validation
+    src_chrom_sizes: dict[str, int] = {}  # track source chrom sizes for consistency validation
 
     with open(chain_path, encoding="utf-8") as f:
         lineno = 0
@@ -340,7 +348,7 @@ def _parse_chain_file(path, db_chrom_sizes, min_score=None):
 # Overlap handling
 # ===================================================================
 
-def _handle_src_overlaps(df, policy):
+def _handle_src_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Handle source-side overlaps according to policy."""
     if df.empty or policy == "keep":
         return df
@@ -372,7 +380,7 @@ def _handle_src_overlaps(df, policy):
     raise ValueError(f"Unknown src_overlap_policy: {policy}")
 
 
-def _handle_tgt_overlaps(df, policy):
+def _handle_tgt_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Handle target-side overlaps according to policy."""
     if df.empty or policy == "keep":
         return df
@@ -416,7 +424,12 @@ def _handle_tgt_overlaps(df, policy):
     raise ValueError(f"Unknown tgt_overlap_policy: {policy}")
 
 
-def _discard_overlapping_intervals(df, chrom_col, start_col, end_col):
+def _discard_overlapping_intervals(
+    df: pd.DataFrame,
+    chrom_col: str,
+    start_col: str,
+    end_col: str,
+) -> pd.DataFrame:
     """Drop all intervals that overlap any other interval on the same chrom."""
     n = len(df)
     if n < 2:
@@ -475,7 +488,7 @@ def _discard_overlapping_intervals(df, chrom_col, start_col, end_col):
     return df
 
 
-def _handle_tgt_overlaps_auto(df, policy):
+def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Segment overlapping target intervals and select winner per segment.
 
     auto_score: highest score wins (tiebreak: longer span, lower chain_id)
@@ -691,7 +704,15 @@ def _handle_tgt_overlaps_auto(df, policy):
     return pd.concat(result_parts, ignore_index=True)[_EMPTY_CHAIN_COLS]
 
 
-def _sweep_line_winners(starts, ends, spans, chain_ids, scores, points, policy):
+def _sweep_line_winners(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    spans: np.ndarray,
+    chain_ids: np.ndarray,
+    scores: np.ndarray,
+    points: np.ndarray,
+    policy: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sweep-line fallback for large chrom groups in _handle_tgt_overlaps_auto.
 
     Returns (seg_starts, seg_ends, winner_indices) as numpy arrays.
@@ -706,20 +727,20 @@ def _sweep_line_winners(starts, ends, spans, chain_ids, scores, points, policy):
         ends_at[int(ends[idx])].append(idx)
 
     if policy == "auto_score":
-        def prio(idx):
+        def prio(idx: int) -> Any:
             return (-float(scores[idx]), -int(spans[idx]), int(chain_ids[idx]), int(idx))
     elif policy == "auto_first":
-        def prio(idx):
+        def prio(idx: int) -> Any:
             return (int(chain_ids[idx]), int(idx))
     else:  # auto_longer
-        def prio(idx):
+        def prio(idx: int) -> Any:
             return (-int(spans[idx]), -float(scores[idx]), int(chain_ids[idx]), int(idx))
 
-    active = set()
-    heap = []
-    r_seg_starts = []
-    r_seg_ends = []
-    r_winners = []
+    active: set[int] = set()
+    heap: list[tuple[Any, int]] = []
+    r_seg_starts: list[int] = []
+    r_seg_ends: list[int] = []
+    r_winners: list[int] = []
 
     for i in range(len(points) - 1):
         coord = int(points[i])
@@ -750,7 +771,7 @@ def _sweep_line_winners(starts, ends, spans, chain_ids, scores, points, policy):
     )
 
 
-def _handle_tgt_overlaps_agg(df):
+def _handle_tgt_overlaps_agg(df: pd.DataFrame) -> pd.DataFrame:
     """Segment overlapping target regions, keeping all chains per segment.
 
     Uses vectorized numpy operations for breakpoint segmentation and
@@ -866,7 +887,7 @@ def _handle_tgt_overlaps_agg(df):
     return pd.concat(result_parts, ignore_index=True)[_EMPTY_CHAIN_COLS]
 
 
-def _interval_union_length(starts, ends):
+def _interval_union_length(starts: np.ndarray, ends: np.ndarray) -> float:
     """Return total union length of half-open intervals."""
     if len(starts) == 0:
         return 0.0
@@ -901,7 +922,7 @@ def _interval_union_length(starts, ends):
     return float(np.sum(cluster_ends - cluster_starts))
 
 
-def _resolve_cluster_policy(df, policy):
+def _resolve_cluster_policy(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Apply best_cluster_* policy on mapped rows per intervalID."""
     if df.empty:
         return df
@@ -953,9 +974,9 @@ def _resolve_cluster_policy(df, policy):
             cluster_ids = np.cumsum(new_cluster).astype(np.int64)
             ordered["__cluster_id"] = cluster_ids
 
-        best_cluster = None
-        best_score = None
-        best_min_start = None
+        best_cluster: Any = None
+        best_score: float | None = None
+        best_min_start: int | None = None
 
         for cid, cgrp in ordered.groupby("__cluster_id", sort=False):
             cstarts = cgrp["__src_start"].to_numpy(dtype=np.int64, copy=False)
@@ -973,7 +994,7 @@ def _resolve_cluster_policy(df, policy):
             if (
                 best_score is None
                 or score > best_score
-                or (score == best_score and min_start < best_min_start)
+                or (score == best_score and best_min_start is not None and min_start < best_min_start)
             ):
                 best_score = score
                 best_min_start = min_start
@@ -992,9 +1013,13 @@ def _resolve_cluster_policy(df, policy):
 # Public API: gintervals_load_chain
 # ===================================================================
 
-def gintervals_load_chain(file, src_overlap_policy="error",
-                          tgt_overlap_policy="auto", src_groot=None,
-                          min_score=None):
+def gintervals_load_chain(
+    file: str,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    src_groot: str | None = None,
+    min_score: float | None = None,
+) -> pd.DataFrame:
     """Load an assembly conversion table from a UCSC chain file.
 
     Reads a UCSC-format chain file and returns an assembly conversion table
@@ -1144,8 +1169,12 @@ def gintervals_load_chain(file, src_overlap_policy="error",
 # Public API: gintervals_as_chain
 # ===================================================================
 
-def gintervals_as_chain(intervals, src_overlap_policy="error",
-                        tgt_overlap_policy="auto", min_score=None):
+def gintervals_as_chain(
+    intervals: pd.DataFrame,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    min_score: float | None = None,
+) -> pd.DataFrame:
     """Convert a DataFrame to chain format by validating columns and setting attributes.
 
     Validates that the input DataFrame has all required chain columns and
@@ -1249,7 +1278,12 @@ def gintervals_as_chain(intervals, src_overlap_policy="error",
 # Vectorized coordinate mapping
 # ===================================================================
 
-def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
+def _map_intervals_vectorized(
+    intervals: pd.DataFrame,
+    chain_df: pd.DataFrame,
+    include_metadata: bool,
+    value_col: str | None,
+) -> pd.DataFrame:
     """Map source intervals through chain blocks using vectorized numpy ops.
 
     For each source interval, finds overlapping chain blocks and computes
@@ -1267,7 +1301,7 @@ def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
     if value_col:
         empty_cols.append(value_col)
 
-    def _empty_result():
+    def _empty_result() -> pd.DataFrame:
         return pd.DataFrame({
             c: pd.Series(
                 dtype="object" if c == "chrom" else "int64" if c in (
@@ -1331,8 +1365,8 @@ def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
     all_r_chain_id = []
     all_r_src_start = []
     all_r_src_end = []
-    all_r_score = [] if include_metadata else None
-    all_r_value = [] if has_value_col else None
+    all_r_score: list[np.ndarray] | None = [] if include_metadata else None
+    all_r_value: list[np.ndarray] | None = [] if has_value_col else None
 
     # Group source intervals by chrom for batch processing
     # Use stable sort to preserve original ordering within each chrom
@@ -1481,9 +1515,11 @@ def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
         all_r_src_end.append(common_end)
 
         if include_metadata:
+            assert all_r_score is not None
             all_r_score.append(c_score[v_chain_idx])
 
         if has_value_col:
+            assert all_r_value is not None
             all_r_value.append(iv_values[v_interval_ids])
 
     # Concatenate results from all chrom groups
@@ -1500,8 +1536,10 @@ def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
         "__src_end": np.concatenate(all_r_src_end),
     }
     if include_metadata:
+        assert all_r_score is not None
         result_data["score"] = np.concatenate(all_r_score)
-    if has_value_col:
+    if has_value_col and value_col is not None:
+        assert all_r_value is not None
         result_data[value_col] = np.concatenate(all_r_value)
 
     return pd.DataFrame(result_data)
@@ -1511,11 +1549,20 @@ def _map_intervals_vectorized(intervals, chain_df, include_metadata, value_col):
 # Public API: gintervals_liftover
 # ===================================================================
 
-def gintervals_liftover(intervals, chain, src_overlap_policy="error",
-                        tgt_overlap_policy="auto", min_score=None,
-                        include_metadata=False, canonic=False,
-                        value_col=None, multi_target_agg="mean",
-                        params=None, na_rm=True, min_n=None):
+def gintervals_liftover(
+    intervals: pd.DataFrame,
+    chain: str | pd.DataFrame,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    min_score: float | None = None,
+    include_metadata: bool = False,
+    canonic: bool = False,
+    value_col: str | None = None,
+    multi_target_agg: str = "mean",
+    params: dict[str, Any] | int | None = None,
+    na_rm: bool = True,
+    min_n: int | None = None,
+) -> pd.DataFrame:
     """Convert intervals from another assembly to the current one using a chain.
 
     Maps each source interval through the chain's alignment blocks to produce
@@ -1687,7 +1734,11 @@ def gintervals_liftover(intervals, chain, src_overlap_policy="error",
 
 
 
-def _canonic_merge(df, include_metadata, value_col):
+def _canonic_merge(
+    df: pd.DataFrame,
+    include_metadata: bool,
+    value_col: str | None,
+) -> pd.DataFrame:
     """Merge adjacent target blocks from same intervalID and chain_id.
 
     Uses vectorized numpy operations for group detection and aggregation.
@@ -1756,16 +1807,16 @@ _TRACK_TYPE_DENSE = 0
 _TRACK_TYPE_SPARSE = 1
 
 
-def _compute_track_idx_checksum(entries):
+def _compute_track_idx_checksum(entries: list[tuple[int, int, int, int]]) -> int:
     crc = _crc64_init()
     for chrom_id, offset, length, _reserved in entries:
         crc = _crc64_incremental(crc, struct.pack("<I", chrom_id))
         crc = _crc64_incremental(crc, struct.pack("<Q", offset))
         crc = _crc64_incremental(crc, struct.pack("<Q", length))
-    return _crc64_finalize(crc)
+    return int(_crc64_finalize(crc))
 
 
-def _read_track_idx(idx_path):
+def _read_track_idx(idx_path: str) -> tuple[int, list[tuple[int, int, int, int]]]:
     with open(idx_path, "rb") as fh:
         if fh.read(8) != _TRACK_IDX_MAGIC:
             raise ValueError(f"Invalid track index header in {idx_path}")
@@ -1795,7 +1846,7 @@ def _read_track_idx(idx_path):
     return track_type_raw, entries
 
 
-def _source_db_root_from_track_dir(src_track_dir):
+def _source_db_root_from_track_dir(src_track_dir: str) -> Path | None:
     p = Path(src_track_dir).resolve()
     for parent in p.parents:
         if parent.name == "tracks":
@@ -1803,7 +1854,7 @@ def _source_db_root_from_track_dir(src_track_dir):
     return None
 
 
-def _load_source_chrom_names(src_track_dir):
+def _load_source_chrom_names(src_track_dir: str) -> dict[int, str]:
     db_root = _source_db_root_from_track_dir(src_track_dir)
     if db_root is None:
         raise ValueError(
@@ -1831,7 +1882,11 @@ def _load_source_chrom_names(src_track_dir):
     return dict(enumerate(chroms))
 
 
-def _parse_dense_payload(payload, chrom_name, source_label):
+def _parse_dense_payload(
+    payload: bytes,
+    chrom_name: str,
+    source_label: str,
+) -> list[tuple[str, int, int, float]]:
     if len(payload) < 4:
         return []
     if (len(payload) - 4) % 4 != 0:
@@ -1854,7 +1909,11 @@ def _parse_dense_payload(payload, chrom_name, source_label):
     return list(zip(chroms.tolist(), starts.tolist(), ends.tolist(), vals.tolist(), strict=False))
 
 
-def _parse_sparse_payload(payload, chrom_name, source_label):
+def _parse_sparse_payload(
+    payload: bytes,
+    chrom_name: str,
+    source_label: str,
+) -> list[tuple[str, int, int, float]]:
     if len(payload) < 4:
         return []
 
@@ -1877,7 +1936,7 @@ def _parse_sparse_payload(payload, chrom_name, source_label):
             f"{len(body)} bytes"
         )
 
-    def _decode_sparse_recs(dt):
+    def _decode_sparse_recs(dt: np.dtype) -> tuple[np.ndarray, bool]:
         recs = np.frombuffer(body, dtype=dt)
         if recs.size == 0:
             return recs, True
@@ -1927,7 +1986,7 @@ def _parse_sparse_payload(payload, chrom_name, source_label):
     return list(zip(chroms.tolist(), starts.tolist(), ends.tolist(), vals.tolist(), strict=False))
 
 
-def _read_indexed_source_track(src_track_dir):
+def _read_indexed_source_track(src_track_dir: str) -> tuple[str, pd.DataFrame]:
     idx_path = os.path.join(src_track_dir, "track.idx")
     dat_path = os.path.join(src_track_dir, "track.dat")
     if not os.path.exists(idx_path) or not os.path.exists(dat_path):
@@ -1968,7 +2027,7 @@ def _read_indexed_source_track(src_track_dir):
     return track_type, pd.DataFrame(rows, columns=["chrom", "start", "end", "value"])
 
 
-def _read_source_track(src_track_dir):
+def _read_source_track(src_track_dir: str) -> tuple[str, pd.DataFrame]:
     """Read a source track directory and return (type, intervals_df).
 
     Returns a DataFrame with columns: chrom, start, end, value.
@@ -2028,7 +2087,12 @@ def _read_source_track(src_track_dir):
     return track_type or "sparse", df
 
 
-def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
+def _aggregate_overlapping(
+    intervals_df: pd.DataFrame,
+    agg_func: Callable[[np.ndarray], float],
+    na_rm: bool = True,
+    min_n: int | None = None,
+) -> pd.DataFrame:
     """Aggregate values for overlapping target intervals.
 
     Segments each chromosome into disjoint regions using interval breakpoints,
@@ -2038,16 +2102,16 @@ def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
     if len(intervals_df) == 0:
         return intervals_df
 
-    def _agg_vals(vals):
+    def _agg_vals(vals: np.ndarray) -> float:
         vals = np.asarray(vals, dtype=np.float64)
         if not na_rm and np.any(np.isnan(vals)):
-            return np.nan
+            return float(np.nan)
         vals_clean = vals[~np.isnan(vals)]
         if min_n is not None and len(vals_clean) < min_n:
-            return np.nan
+            return float(np.nan)
         if len(vals_clean) == 0:
-            return np.nan
-        return agg_func(vals_clean if na_rm else vals)
+            return float(np.nan)
+        return float(agg_func(vals_clean if na_rm else vals))
 
     out_rows = []
     data = intervals_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
@@ -2070,8 +2134,8 @@ def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
             starts_at[int(starts[i])].append(i)
             ends_at[int(ends[i])].append(i)
 
-        active = set()
-        merged = []
+        active: set[int] = set()
+        merged: list[dict[str, Any]] = []
 
         for i in range(len(points) - 1):
             coord = int(points[i])
@@ -2111,10 +2175,19 @@ def _aggregate_overlapping(intervals_df, agg_func, na_rm=True, min_n=None):
     return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"]).reset_index(drop=True)
 
 
-def gtrack_liftover(track, description, src_track_dir, chain,
-                    src_overlap_policy="error", tgt_overlap_policy="auto",
-                    multi_target_agg="mean", params=None, na_rm=True,
-                    min_n=None, min_score=None):
+def gtrack_liftover(
+    track: str,
+    description: str,
+    src_track_dir: str,
+    chain: str | pd.DataFrame,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    multi_target_agg: str = "mean",
+    params: dict[str, Any] | None = None,
+    na_rm: bool = True,
+    min_n: int | None = None,
+    min_score: float | None = None,
+) -> None:
     """Import a track from another assembly via coordinate liftover.
 
     Reads a source track from *src_track_dir* (a directory containing

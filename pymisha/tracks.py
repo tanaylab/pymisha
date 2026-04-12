@@ -1,5 +1,7 @@
 """Track listing, metadata, and creation/import helpers."""
 
+from __future__ import annotations
+
 import bz2
 import contextlib
 import datetime as _datetime
@@ -18,6 +20,7 @@ import struct
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -34,9 +37,10 @@ from ._shared import (
     _preprocess_intervals_iterator,
     _pymisha,
 )
+from ._types import Intervals, NumpyArray
 
 
-def _load_track_attributes(track_name):
+def _load_track_attributes(track_name: str) -> dict[str, str]:
     """
     Load track attributes from .attributes file (binary) or .attributes.yaml.
     """
@@ -51,10 +55,10 @@ def _load_track_attributes(track_name):
         try:
             with open(bin_path, 'rb') as f:
                 data = f.read()
-            parts = data.split(b'\x00')
-            parts = [p.decode('utf-8', errors='replace') for p in parts if p]
-            for i in range(0, len(parts) - 1, 2):
-                attrs[parts[i]] = parts[i + 1]
+            raw_parts = data.split(b'\x00')
+            str_parts: list[str] = [p.decode('utf-8', errors='replace') for p in raw_parts if p]
+            for i in range(0, len(str_parts) - 1, 2):
+                attrs[str_parts[i]] = str_parts[i + 1]
             return attrs
         except (UnicodeDecodeError, ValueError):
             pass
@@ -62,7 +66,7 @@ def _load_track_attributes(track_name):
     yaml_path = os.path.join(track_path, ".attributes.yaml")
     if os.path.exists(yaml_path):
         try:
-            import yaml
+            import yaml  # type: ignore[import-untyped]
         except ImportError:
             return attrs
         try:
@@ -74,7 +78,7 @@ def _load_track_attributes(track_name):
     return attrs
 
 
-def _check_computed_tracks(exprs):
+def _check_computed_tracks(exprs: str | list[str]) -> None:
     """Check whether any track referenced in *exprs* is a COMPUTED track.
 
     COMPUTED tracks are a Hi-C normalization feature (PotentialComputer2D,
@@ -119,7 +123,7 @@ def _check_computed_tracks(exprs):
             )
 
 
-def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
+def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) -> list[str] | None:
     """
     Return a list of track names in the Genomic Database.
 
@@ -175,9 +179,10 @@ def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
         return None
 
     # Filter/rebase by current working directory
-    tracks = _apply_gwd_to_names(tracks)
-    if not tracks:
+    tracks_result: list[str] = list(_apply_gwd_to_names(tracks))
+    if not tracks_result:
         return None
+    tracks = tracks_result
 
     flags = re.IGNORECASE if ignore_case else 0
 
@@ -193,7 +198,7 @@ def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
 
     if attr_filters:
         converted_filters = {key.replace('_', '.'): pattern for key, pattern in attr_filters.items()}
-        filtered_tracks = []
+        filtered_tracks: list[str] = []
         for track in tracks:
             attrs = _load_track_attributes(track)
 
@@ -216,10 +221,10 @@ def gtrack_ls(*patterns, ignore_case=False, **attr_filters):
     if not tracks:
         return None
 
-    return tracks
+    return list(tracks)
 
 
-def gtrack_dbs(track, dataframe=False):
+def gtrack_dbs(track: str | list[str], dataframe: bool = False) -> dict[str, list[str]] | pd.DataFrame:
     """
     Return database root(s) containing the given track(s).
 
@@ -257,6 +262,7 @@ def gtrack_dbs(track, dataframe=False):
 
     tracks = [track] if isinstance(track, str) else list(track)
 
+    assert _shared._GROOT is not None
     all_dbs = [_shared._GROOT] + list(_shared._GDATASETS)
 
     result = {}
@@ -278,7 +284,7 @@ def gtrack_dbs(track, dataframe=False):
     return result
 
 
-def gtrack_info(track):
+def gtrack_info(track: str) -> dict[str, Any]:
     """
     Return metadata about a track.
 
@@ -320,7 +326,7 @@ def gtrack_info(track):
     {'type': 'sparse', 'dimensions': 1, ...}
     """
     _checkroot()
-    info = _pymisha.pm_track_info(track)
+    info: dict[str, Any] = dict(_pymisha.pm_track_info(track))
 
     if 'attributes_path' in info:
         del info['attributes_path']
@@ -353,7 +359,7 @@ def gtrack_info(track):
     return info
 
 
-def gtrack_dataset(track):
+def gtrack_dataset(track: str) -> str | None:
     """
     Return the database root path that contains a track.
 
@@ -391,10 +397,11 @@ def gtrack_dataset(track):
     if track is None:
         raise ValueError("track cannot be None")
     _checkroot()
-    return _pymisha.pm_track_dataset(track)
+    result: str | None = _pymisha.pm_track_dataset(track)
+    return result
 
 
-def _save_track_attributes(track_name, attrs):
+def _save_track_attributes(track_name: str, attrs: dict[str, str]) -> None:
     """
     Save track attributes to the .attributes file (binary format).
     """
@@ -426,17 +433,17 @@ def _save_track_attributes(track_name, attrs):
         f.write(b''.join(parts))
 
 
-def _track_exists(track_name):
+def _track_exists(track_name: str) -> bool:
     """Check if a track exists."""
     track_path = _pymisha.pm_track_path(track_name)
     return track_path is not None and track_path != ""
 
 
-def _validate_track_name(track):
+def _validate_track_name(track: str) -> None:
     validate_dotted_name(track, "track name")
 
 
-def _validate_track_var_name(var):
+def _validate_track_var_name(var: str) -> None:
     if not isinstance(var, str) or not var:
         raise ValueError("var must be a non-empty string")
     if "\x00" in var:
@@ -451,25 +458,25 @@ def _validate_track_var_name(var):
         raise ValueError("var must not contain path separators")
 
 
-def _target_root():
+def _target_root() -> str | None:
     return _shared._UROOT or _shared._GROOT
 
 
-def _track_dir_for_create(track):
+def _track_dir_for_create(track: str) -> Path:
     root = _target_root()
     if not root:
         raise ValueError("Database not initialized. Call gdb_init() first.")
     return Path(root) / "tracks" / f"{track.replace('.', '/')}.track"
 
 
-def _db_is_indexed(root):
+def _db_is_indexed(root: str | None) -> bool:
     if not root:
         return False
     seq_dir = Path(root) / "seq"
     return (seq_dir / "genome.idx").exists() and (seq_dir / "genome.seq").exists()
 
 
-def _normalize_intervals_df(intervals):
+def _normalize_intervals_df(intervals: Any) -> pd.DataFrame:
     if intervals is None:
         raise ValueError("intervals cannot be None")
     if not isinstance(intervals, pd.DataFrame):
@@ -495,7 +502,7 @@ def _normalize_intervals_df(intervals):
     return out.reset_index(drop=True)
 
 
-def _canonicalize_known_chroms(df):
+def _canonicalize_known_chroms(df: pd.DataFrame) -> pd.DataFrame:
     from .intervals import gintervals_all
 
     chrom_sizes = gintervals_all()
@@ -523,7 +530,7 @@ def _canonicalize_known_chroms(df):
     return out.reset_index(drop=True)
 
 
-def _set_created_attrs(track, description, created_by, attrs=None):
+def _set_created_attrs(track: str, description: str, created_by: str, attrs: dict[str, str] | None = None) -> None:
     # Bypass readonly check for internal track creation attrs
     existing_attrs = _load_track_attributes(track)
     existing_attrs["created.by"] = created_by
@@ -540,7 +547,7 @@ def _set_created_attrs(track, description, created_by, attrs=None):
     _save_track_attributes(track, existing_attrs)
 
 
-def _open_text_auto(path):
+def _open_text_auto(path: str | Path) -> Any:
     lower = str(path).lower()
     if lower.endswith(".gz"):
         return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="replace")
@@ -563,17 +570,20 @@ def _open_text_auto(path):
             finally:
                 zf.close()
 
-        stream.close = _close_with_zip
+        stream.close = _close_with_zip  # type: ignore[method-assign]
         return stream
     return open(path, encoding="utf-8", errors="replace")
 
 
-def _close_text_auto(stream):
+def _close_text_auto(stream: Any) -> None:
     stream.close()
 
 
-def _parse_bed(path):
-    chrom, start, end, value = [], [], [], []
+def _parse_bed(path: str) -> pd.DataFrame:
+    chrom: list[str] = []
+    start: list[int] = []
+    end: list[int] = []
+    value: list[float] = []
     stream = _open_text_auto(path)
     try:
         for raw in stream:
@@ -600,10 +610,13 @@ def _parse_bed(path):
     return pd.DataFrame({"chrom": chrom, "start": start, "end": end, "value": value})
 
 
-def _parse_wig_or_bedgraph(path):
-    chrom, start, end, value = [], [], [], []
-    mode = None
-    cur_chrom = None
+def _parse_wig_or_bedgraph(path: str) -> pd.DataFrame:
+    chrom: list[str] = []
+    start: list[int] = []
+    end: list[int] = []
+    value: list[float] = []
+    mode: str | None = None
+    cur_chrom: str | None = None
     cur_step = 1
     cur_span = 1
     cur_pos0 = 0
@@ -649,6 +662,7 @@ def _parse_wig_or_bedgraph(path):
             fields = line.split()
             if mode == "fixed" and len(fields) == 1:
                 v = float(fields[0])
+                assert cur_chrom is not None
                 chrom.append(cur_chrom)
                 start.append(cur_pos0)
                 end.append(cur_pos0 + cur_span)
@@ -658,6 +672,7 @@ def _parse_wig_or_bedgraph(path):
             if mode == "var" and len(fields) >= 2:
                 pos0 = int(float(fields[0])) - 1
                 v = float(fields[1])
+                assert cur_chrom is not None
                 chrom.append(cur_chrom)
                 start.append(pos0)
                 end.append(pos0 + cur_span)
@@ -678,10 +693,10 @@ def _parse_wig_or_bedgraph(path):
     return pd.DataFrame({"chrom": chrom, "start": start, "end": end, "value": value})
 
 
-def _parse_tabular_track(path):
+def _parse_tabular_track(path: str) -> pd.DataFrame:
     stream = _open_text_auto(path)
-    header = None
-    rows = []
+    header: list[str] | None = None
+    rows: list[list[str]] = []
     try:
         for raw in stream:
             line = raw.strip()
@@ -710,7 +725,7 @@ def _parse_tabular_track(path):
 
     idx = {c: i for i, c in enumerate(cols)}
     c_val = val_cols[0]
-    out = {"chrom": [], "start": [], "end": [], "value": []}
+    out: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": []}
     for fields in rows:
         if len(fields) < len(cols):
             continue
@@ -723,7 +738,7 @@ def _parse_tabular_track(path):
     return pd.DataFrame(out)
 
 
-def _parse_bigwig(path):
+def _parse_bigwig(path: str) -> pd.DataFrame:
     try:
         import pyBigWig
     except ImportError as exc:
@@ -738,7 +753,7 @@ def _parse_bigwig(path):
         raise ValueError(f"Failed to open BigWig file '{path}'")
     try:
         known = set(gintervals_all()["chrom"].astype(str).tolist())
-        out = {"chrom": [], "start": [], "end": [], "value": []}
+        out: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": []}
         for chrom in (bw.chroms() or {}):
             try:
                 norm = _pymisha.pm_normalize_chroms([chrom])[0]
@@ -762,12 +777,12 @@ def _parse_bigwig(path):
     return pd.DataFrame(out)
 
 
-def _ensure_track_absent(track):
+def _ensure_track_absent(track: str) -> None:
     if _track_exists(track):
         raise ValueError(f"Track '{track}' already exists")
 
 
-def gtrack_create_sparse(track, description, intervals, values):
+def gtrack_create_sparse(track: str, description: str, intervals: Intervals, values: Any) -> None:
     """
     Create a Sparse track from intervals and values.
 
@@ -855,7 +870,14 @@ def gtrack_create_sparse(track, description, intervals, values):
         raise
 
 
-def gtrack_create_dense(track, description, intervals, values, binsize, defval=np.nan):
+def gtrack_create_dense(
+    track: str,
+    description: str,
+    intervals: Intervals,
+    values: Any,
+    binsize: int,
+    defval: float = np.nan,
+) -> None:
     """
     Create a Dense (fixed-bin) track from intervals and values.
 
@@ -952,14 +974,14 @@ def gtrack_create_dense(track, description, intervals, values, binsize, defval=n
 
 
 def gtrack_create_dense_direct(
-    track,
-    description,
-    intervals,
-    values,
-    binsize,
-    defval=np.nan,
-    reload=True,
-):
+    track: str,
+    description: str,
+    intervals: Intervals,
+    values: Any,
+    binsize: int,
+    defval: float = np.nan,
+    reload: bool = True,
+) -> None:
     """
     Create a Dense track by writing binary files directly.
 
@@ -1136,7 +1158,7 @@ def gtrack_create_dense_direct(
         raise
 
 
-def gtrack_modify(track, expr, intervals=None):
+def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> None:
     """
     Modify a Dense track's values in-place by evaluating an expression.
 
@@ -1212,8 +1234,16 @@ def gtrack_modify(track, expr, intervals=None):
     _save_track_attributes(track, attrs)
 
 
-def gtrack_smooth(track, description, expr, winsize, weight_thr=0, smooth_nans=False,
-                  alg="LINEAR_RAMP", iterator=None):
+def gtrack_smooth(
+    track: str,
+    description: str,
+    expr: str,
+    winsize: float,
+    weight_thr: float = 0,
+    smooth_nans: bool = False,
+    alg: str = "LINEAR_RAMP",
+    iterator: int | None = None,
+) -> None:
     """
     Create a new Dense track with smoothed values from a track expression.
 
@@ -1327,7 +1357,13 @@ def gtrack_smooth(track, description, expr, winsize, weight_thr=0, smooth_nans=F
         raise
 
 
-def gtrack_create(track, description, expr, iterator=None, band=None):
+def gtrack_create(
+    track: str,
+    description: str,
+    expr: str,
+    iterator: int | None = None,
+    band: tuple[int, int] | None = None,
+) -> None:
     """
     Create a track from a track expression.
 
@@ -1443,7 +1479,7 @@ def gtrack_create(track, description, expr, iterator=None, band=None):
         raise
 
 
-def _load_pssm_from_db(pssmset, pssmid):
+def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
     """Load a PSSM matrix from the database's pssms/ directory.
 
     Reads ``GROOT/pssms/{pssmset}.key`` and ``GROOT/pssms/{pssmset}.data``.
@@ -1518,7 +1554,14 @@ def _load_pssm_from_db(pssmset, pssmid):
     return pssm
 
 
-def gtrack_create_pwm_energy(track, description, pssmset, pssmid, prior, iterator):
+def gtrack_create_pwm_energy(
+    track: str,
+    description: str,
+    pssmset: str,
+    pssmid: int,
+    prior: float,
+    iterator: int,
+) -> None:
     """
     Create a track from a PSSM energy function.
 
@@ -1629,7 +1672,14 @@ def gtrack_create_pwm_energy(track, description, pssmset, pssmid, prior, iterato
             gvtrack_rm(vtrack_name)
 
 
-def gtrack_import(track, description, file, binsize=None, defval=np.nan, attrs=None):
+def gtrack_import(
+    track: str,
+    description: str,
+    file: str,
+    binsize: int | None = None,
+    defval: float = np.nan,
+    attrs: dict[str, str] | None = None,
+) -> None:
     """
     Create a track from a WIG, BigWig, BedGraph, BED, or tab-delimited file.
 
@@ -1716,7 +1766,7 @@ def gtrack_import(track, description, file, binsize=None, defval=np.nan, attrs=N
     _set_created_attrs(track, description, created_by, attrs=attrs)
 
 
-def _download_ftp_matches(path_pattern, tmpdir):
+def _download_ftp_matches(path_pattern: str, tmpdir: str) -> list[str]:
     parsed = urlparse(path_pattern)
     if parsed.scheme.lower() != "ftp":
         raise ValueError("Only ftp:// URLs are supported for remote import sets")
@@ -1771,7 +1821,13 @@ def _download_ftp_matches(path_pattern, tmpdir):
             ftp.close()
 
 
-def gtrack_import_set(description, path, binsize, track_prefix=None, defval=np.nan):
+def gtrack_import_set(
+    description: str,
+    path: str,
+    binsize: int,
+    track_prefix: str | None = None,
+    defval: float = np.nan,
+) -> dict[str, list[str]]:
     """
     Create one or more tracks from multiple WIG/BedGraph/BigWig/tab files.
 
@@ -1836,6 +1892,7 @@ def gtrack_import_set(description, path, binsize, track_prefix=None, defval=np.n
     files = []
     path_str = str(path)
     if path_str.lower().startswith("ftp://"):
+        assert _shared._GROOT is not None
         downloads_root = Path(_shared._GROOT) / "downloads"
         downloads_root.mkdir(parents=True, exist_ok=True)
         tmpdir = tempfile.mkdtemp(prefix="pymisha-import-set-", dir=str(downloads_root))
@@ -1873,7 +1930,7 @@ def gtrack_import_set(description, path, binsize, track_prefix=None, defval=np.n
     return result
 
 
-def _cleanup_empty_track_parents(track_dir, db_root):
+def _cleanup_empty_track_parents(track_dir: str | Path, db_root: str) -> None:
     tracks_root = Path(db_root) / "tracks"
     cur = Path(track_dir).parent
     while cur != tracks_root and cur.exists():
@@ -1884,7 +1941,7 @@ def _cleanup_empty_track_parents(track_dir, db_root):
         cur = cur.parent
 
 
-def gtrack_mv(src, dest):
+def gtrack_mv(src: str, dest: str) -> None:
     """
     Rename or move a track within the same database.
 
@@ -1934,6 +1991,7 @@ def gtrack_mv(src, dest):
 
     src_dir = Path(_pymisha.pm_track_path(src))
     src_db = gtrack_dataset(src)
+    assert src_db is not None
     dest_dir = Path(src_db) / "tracks" / f"{dest.replace('.', '/')}.track"
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     if dest_dir.exists():
@@ -1948,7 +2006,7 @@ def gtrack_mv(src, dest):
     _pymisha.pm_dbreload()
 
 
-def gtrack_copy(src, dest):
+def gtrack_copy(src: str, dest: str) -> None:
     """
     Create a copy of an existing track.
 
@@ -2009,7 +2067,7 @@ def gtrack_copy(src, dest):
     _pymisha.pm_dbreload()
 
 
-def gtrack_rm(track, force=False, db=None):
+def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:
     """
     Remove a track from disk.
 
@@ -2061,7 +2119,9 @@ def gtrack_rm(track, force=False, db=None):
             if force:
                 return
             raise ValueError(f"Track '{track}' does not exist")
-        db_root = gtrack_dataset(track)
+        db_root_result = gtrack_dataset(track)
+        assert db_root_result is not None
+        db_root = db_root_result
         track_dir = Path(path)
     else:
         db_root = str(Path(db))
@@ -2080,14 +2140,14 @@ def gtrack_rm(track, force=False, db=None):
 
 
 def gtrack_import_mappedseq(
-    track,
-    description,
-    file,
-    pileup=0,
-    binsize=-1,
-    cols_order=(9, 11, 13, 14),
-    remove_dups=True,
-):
+    track: str,
+    description: str,
+    file: str,
+    pileup: int = 0,
+    binsize: int = -1,
+    cols_order: tuple[int, int, int, int] | None = (9, 11, 13, 14),
+    remove_dups: bool = True,
+) -> dict[str, Any]:
     """
     Import mapped sequences from SAM/tab-delimited text into a track.
 
@@ -2160,13 +2220,15 @@ def gtrack_import_mappedseq(
         raise ValueError("For pileup>0 (dense), binsize must be > 0")
 
     is_sam = cols_order is None
+    cols_order_list: list[int] | None = None
     if not is_sam:
+        assert cols_order is not None
         if len(cols_order) != 4:
             raise ValueError("cols_order must have 4 entries: sequence, chromosome, coordinate, strand")
-        cols_order = [int(x) for x in cols_order]
-        if min(cols_order) <= 0:
+        cols_order_list = [int(x) for x in cols_order]
+        if min(cols_order_list) <= 0:
             raise ValueError("cols_order indices are 1-based and must be positive")
-        if len(set(cols_order)) != 4:
+        if len(set(cols_order_list)) != 4:
             raise ValueError("cols_order entries must be unique")
 
     from .intervals import gintervals_all
@@ -2179,11 +2241,11 @@ def gtrack_import_mappedseq(
     mapped = np.zeros(nchrom, dtype=np.int64)
     dups = np.zeros(nchrom, dtype=np.int64)
     total_unmapped = 0
-    plus = [[] for _ in range(nchrom)]
-    minus = [[] for _ in range(nchrom)]
+    plus: list[list[int]] = [[] for _ in range(nchrom)]
+    minus: list[list[int]] = [[] for _ in range(nchrom)]
 
     # Cache for chromosome name normalization (avoids repeated C++ calls)
-    _chrom_norm_cache = {}
+    _chrom_norm_cache: dict[str, str | None] = {}
 
     path = str(file)
     if not os.path.exists(path):
@@ -2210,10 +2272,11 @@ def gtrack_import_mappedseq(
                     flag = int(fields[1], 0)
                     strand = "-" if (flag & 0x10) else "+"
                 else:
-                    seq = fields[cols_order[0] - 1]
-                    chrom = fields[cols_order[1] - 1]
-                    coord = int(fields[cols_order[2] - 1])
-                    strand = fields[cols_order[3] - 1]
+                    assert cols_order_list is not None
+                    seq = fields[cols_order_list[0] - 1]
+                    chrom = fields[cols_order_list[1] - 1]
+                    coord = int(fields[cols_order_list[2] - 1])
+                    strand = fields[cols_order_list[3] - 1]
             except Exception:
                 total_unmapped += 1
                 continue
@@ -2361,37 +2424,37 @@ def gtrack_import_mappedseq(
         })
         gtrack_create_dense(track, description, ddf[["chrom", "start", "end"]], ddf["value"], binsize, np.nan)
     else:
-        sparse_rows = {"chrom": [], "start": [], "end": [], "value": []}
+        sparse_rows: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": []}
         for ci, chrom in enumerate(chroms):
             p = sorted(plus[ci])
             m = sorted(minus[ci])
             i = j = 0
             while i < len(p) or j < len(m):
                 val = 0.0
-                coord = None
+                coord2: int | None = None
                 if i < len(p) and (j >= len(m) or m[j] >= p[i]):
-                    coord = p[i]
+                    coord2 = p[i]
                     val = max(val + (0.0 if remove_dups else 1.0), 1.0)
                     i += 1
-                    while i < len(p) and p[i] == coord:
+                    while i < len(p) and p[i] == coord2:
                         dups[ci] += 1
                         if not remove_dups:
                             val += 1.0
                         i += 1
-                if j < len(m) and (coord is None or m[j] == coord):
-                    coord = m[j]
+                if j < len(m) and (coord2 is None or m[j] == coord2):
+                    coord2 = m[j]
                     val = max(val + (0.0 if remove_dups else 1.0), 1.0)
                     j += 1
-                    while j < len(m) and m[j] == coord:
+                    while j < len(m) and m[j] == coord2:
                         dups[ci] += 1
                         if not remove_dups:
                             val += 1.0
                         j += 1
-                if coord is None:
+                if coord2 is None:
                     continue
                 sparse_rows["chrom"].append(chrom)
-                sparse_rows["start"].append(coord)
-                sparse_rows["end"].append(coord + 1)
+                sparse_rows["start"].append(coord2)
+                sparse_rows["end"].append(coord2 + 1)
                 sparse_rows["value"].append(val)
 
         sdf = pd.DataFrame(sparse_rows)
@@ -2415,7 +2478,7 @@ def gtrack_import_mappedseq(
     return {"total": total, "chrom": chrom_stat}
 
 
-def gtrack_exists(track):
+def gtrack_exists(track: str) -> bool:
     """
     Test for track existence in the Genomic Database.
 
@@ -2460,7 +2523,7 @@ def gtrack_exists(track):
     return _track_exists(track)
 
 
-def gtrack_path(track):
+def gtrack_path(track: str) -> str:
     """
     Return the filesystem path of a track's directory.
 
@@ -2495,13 +2558,13 @@ def gtrack_path(track):
     if track is None:
         raise ValueError("track cannot be None")
     _checkroot()
-    path = _pymisha.pm_track_path(track)
+    path: str | None = _pymisha.pm_track_path(track)
     if path is None:
         raise ValueError(f"Track '{track}' does not exist")
     return path
 
 
-def gtrack_attr_get(track, attr):
+def gtrack_attr_get(track: str, attr: str) -> str:
     """
     Get a single track attribute value.
 
@@ -2549,7 +2612,7 @@ def gtrack_attr_get(track, attr):
     return attrs.get(attr, "")
 
 
-def gtrack_convert_to_indexed(track, remove_old=False):
+def gtrack_convert_to_indexed(track: str, remove_old: bool = False) -> None:
     """
     Convert a per-chromosome track to indexed format.
 
@@ -2593,10 +2656,11 @@ def gtrack_convert_to_indexed(track, remove_old=False):
                 track, remove_old=remove_old, force=False
             )
 
-    return _pymisha.pm_track_convert_to_indexed(track, bool(remove_old))
+    _pymisha.pm_track_convert_to_indexed(track, bool(remove_old))
+    return None
 
 
-def gtrack_create_empty_indexed(track):
+def gtrack_create_empty_indexed(track: str) -> None:
     """
     Create empty indexed files for an existing track directory.
 
@@ -2628,10 +2692,10 @@ def gtrack_create_empty_indexed(track):
     if track is None:
         raise ValueError("track cannot be None")
     _checkroot()
-    return _pymisha.pm_track_create_empty_indexed(track)
+    _pymisha.pm_track_create_empty_indexed(track)
 
 
-def gtrack_2d_convert_to_indexed(track, remove_old=True, force=False):
+def gtrack_2d_convert_to_indexed(track: str, remove_old: bool = True, force: bool = False) -> None:
     """
     Convert a 2D track to indexed format (track.dat + track.idx).
 
@@ -2699,7 +2763,7 @@ def gtrack_2d_convert_to_indexed(track, remove_old=True, force=False):
     _pymisha.pm_track2d_convert_to_indexed(track_path, track_type_int)
 
 
-def gtrack_attr_set(track, attr, value):
+def gtrack_attr_set(track: str, attr: str, value: str) -> None:
     """
     Set a track attribute value.
 
@@ -2767,7 +2831,7 @@ def gtrack_attr_set(track, attr, value):
     _save_track_attributes(track, attrs)
 
 
-def gtrack_attr_import(table, remove_others=False):
+def gtrack_attr_import(table: pd.DataFrame, remove_others: bool = False) -> None:
     """
     Bulk import track attributes from a DataFrame.
 
@@ -2864,7 +2928,7 @@ def gtrack_attr_import(table, remove_others=False):
         _save_track_attributes(track, new_attrs)
 
 
-def gtrack_attr_export(tracks=None, attrs=None):
+def gtrack_attr_export(tracks: list[str] | None = None, attrs: list[str] | None = None) -> pd.DataFrame:
     """
     Export track attributes as a DataFrame.
 
@@ -2915,8 +2979,8 @@ def gtrack_attr_export(tracks=None, attrs=None):
                 raise ValueError(f"Track '{track}' does not exist")
 
     # Collect all attributes
-    all_attrs = {}  # track -> {attr: value}
-    all_attr_names = set()
+    all_attrs: dict[str, dict[str, str]] = {}  # track -> {attr: value}
+    all_attr_names: set[str] = set()
 
     for track in tracks:
         track_attrs = _load_track_attributes(track)
@@ -2947,7 +3011,7 @@ def gtrack_attr_export(tracks=None, attrs=None):
 #  Track variables  (gtrack.var.* in R)
 # ---------------------------------------------------------------------------
 
-def _track_var_dir(track_name):
+def _track_var_dir(track_name: str) -> str:
     """Return the path to the vars/ directory for a track, creating it if needed."""
     track_path = _pymisha.pm_track_path(track_name)
     if not track_path:
@@ -2955,7 +3019,7 @@ def _track_var_dir(track_name):
     return os.path.join(track_path, "vars")
 
 
-def gtrack_var_ls(track, pattern=""):
+def gtrack_var_ls(track: str, pattern: str = "") -> list[str]:
     """
     List track variables.
 
@@ -3008,7 +3072,7 @@ def gtrack_var_ls(track, pattern=""):
     return sorted(files)
 
 
-def gtrack_var_get(track, var):
+def gtrack_var_get(track: str, var: str) -> Any:
     """
     Get the value of a track variable.
 
@@ -3083,7 +3147,7 @@ def gtrack_var_get(track, var):
     )
 
 
-def gtrack_var_set(track, var, value):
+def gtrack_var_set(track: str, var: str, value: Any) -> None:
     """
     Set the value of a track variable.
 
@@ -3143,7 +3207,7 @@ def gtrack_var_set(track, var, value):
         f.write(payload)
 
 
-def gtrack_var_rm(track, var):
+def gtrack_var_rm(track: str, var: str) -> None:
     """
     Remove a track variable.
 
@@ -3193,7 +3257,7 @@ def gtrack_var_rm(track, var):
 # ---------------------------------------------------------------------------
 
 
-def _normalize_2d_intervals(intervals):
+def _normalize_2d_intervals(intervals: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Validate and normalize a 2D intervals DataFrame.
 
@@ -3231,7 +3295,7 @@ def _normalize_2d_intervals(intervals):
     return out, chrom_sizes_df
 
 
-def _detect_points_vs_rects(intervals):
+def _detect_points_vs_rects(intervals: pd.DataFrame) -> bool:
     """
     Detect if all intervals are unit-sized (points) or general rectangles.
 
@@ -3242,7 +3306,7 @@ def _detect_points_vs_rects(intervals):
     return bool((widths1 == 1).all() and (widths2 == 1).all())
 
 
-def gtrack_2d_create(track, description, intervals, values):
+def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, values: Any) -> None:
     """
     Create a 2D track from intervals and values.
 
@@ -3342,6 +3406,7 @@ def gtrack_2d_create(track, description, intervals, values):
             arena = (0, 0, cs1, cs2)
 
             # Collect objects and check overlaps
+            objs: list[Any]
             if is_points:
                 group_indices = group.index.to_numpy()
                 s1 = group["start1"].to_numpy(dtype=int)
@@ -3378,7 +3443,7 @@ def gtrack_2d_create(track, description, intervals, values):
         raise
 
 
-def gtrack_2d_import(track, description, file):
+def gtrack_2d_import(track: str, description: str, file: str | list[str]) -> None:
     """
     Import a 2D track from one or more tab-delimited files.
 
@@ -3467,8 +3532,12 @@ def gtrack_2d_import(track, description, file):
 
 
 def gtrack_2d_import_contacts(
-    track, description, contacts, fends=None, allow_duplicates=True
-):
+    track: str,
+    description: str,
+    contacts: str | list[str],
+    fends: str | None = None,
+    allow_duplicates: bool = True,
+) -> None:
     """
     Create a 2D Points track from inter-genomic contacts.
 
@@ -3562,7 +3631,7 @@ def gtrack_2d_import_contacts(
     # ------------------------------------------------------------------
     # 2. Read contact files and build a list of (chrom1, mid1, chrom2, mid2, value)
     # ------------------------------------------------------------------
-    records = []  # list of (chrom1_str, mid1, chrom2_str, mid2, value)
+    records: list[tuple[str, int, str, int, float]] = []  # list of (chrom1_str, mid1, chrom2_str, mid2, value)
 
     for cfile in contacts:
         if not os.path.exists(cfile):
@@ -3647,7 +3716,7 @@ def gtrack_2d_import_contacts(
     # 4. Canonical ordering + cis mirroring
     # ------------------------------------------------------------------
     # key = (chrom1, mid1, chrom2, mid2), value = summed count
-    contact_map = {}
+    contact_map: dict[tuple[str, int, str, int], float] = {}
 
     for c1_raw, m1, c2_raw, m2, val in records:
         c1 = cmap.get(c1_raw, c1_raw)
@@ -3692,11 +3761,11 @@ def gtrack_2d_import_contacts(
     # ------------------------------------------------------------------
     # 5. Build intervals DataFrame (POINTS: start=mid, end=mid+1) and values
     # ------------------------------------------------------------------
-    rows = {
+    rows: dict[str, list[Any]] = {
         "chrom1": [], "start1": [], "end1": [],
         "chrom2": [], "start2": [], "end2": [],
     }
-    values = []
+    values: list[float] = []
     for (c1, m1, c2, m2), val in sorted(contact_map.items()):
         rows["chrom1"].append(c1)
         rows["start1"].append(m1)

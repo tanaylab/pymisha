@@ -1,5 +1,12 @@
 """Lookup and bin transform functions."""
 
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
 from . import _shared
 from ._shared import (
     _checkroot,
@@ -11,13 +18,22 @@ from ._shared import (
     _pymisha2df,
     _remap_interval_ids,
 )
+from ._types import Iterator
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
 from .extract import _is_2d_intervals, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_2d_all, gintervals_all
 
 
-def glookup(lookup_table, *args, intervals=None, include_lowest=False,
-            force_binning=True, iterator=None, band=None, **kwargs):
+def glookup(
+    lookup_table: np.ndarray,
+    *args: str | np.ndarray | list[float],
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    force_binning: bool = True,
+    iterator: Iterator = None,
+    band: tuple[int, int] | None = None,
+    **kwargs: Any,
+) -> pd.DataFrame | None:
     """
     Look up values in an N-dimensional lookup table indexed by track expressions.
 
@@ -86,9 +102,7 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
 
     # Parse arguments: (expr1, breaks1, expr2, breaks2, ...)
     if len(args) < 2:
-        raise ValueError(
-            "Usage: glookup(lookup_table, [expr, breaks]+, intervals=intervals, ...)"
-        )
+        raise ValueError("Usage: glookup(lookup_table, [expr, breaks]+, intervals=intervals, ...)")
 
     if len(args) % 2 != 0:
         raise ValueError("glookup requires pairs of (expression, breaks) arguments")
@@ -119,35 +133,33 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
 
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
-            raise ValueError(f"Breaks at position {i+1} must be 1D array")
+            raise ValueError(f"Breaks at position {i + 1} must be 1D array")
         if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i+1} must have at least 2 elements")
+            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
 
         # Validate breaks are strictly increasing
         if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i+1} must be strictly increasing")
+            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
 
         exprs.append(expr)
         breaks_list.append(breaks)
 
     from .tracks import _check_computed_tracks
+
     _check_computed_tracks(exprs)
 
     # Validate lookup_table dimensions match number of expr-breaks pairs
     expected_dims = len(exprs)
     if lookup_table.ndim != expected_dims:
         raise ValueError(
-            f"lookup_table has {lookup_table.ndim} dimensions but "
-            f"{expected_dims} expr-breaks pairs were provided"
+            f"lookup_table has {lookup_table.ndim} dimensions but {expected_dims} expr-breaks pairs were provided"
         )
 
     # Validate lookup_table shape matches number of bins
     n_bins = [len(b) - 1 for b in breaks_list]
     for i, (n, expected) in enumerate(zip(lookup_table.shape, n_bins, strict=False)):
         if n != expected:
-            raise ValueError(
-                f"lookup_table dimension {i} has size {n} but {expected} bins expected"
-            )
+            raise ValueError(f"lookup_table dimension {i} has size {n} but {expected} bins expected")
 
     # Check if we need the Python path (vtracks, band, or 2D intervals)
     intervals_set_out = kwargs.get("intervals_set_out")
@@ -159,13 +171,13 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
         with _config_no_mt(_itr_id_map) as _base_cfg:
             config = dict(_base_cfg)
             if progress is not None:
-                config['progress'] = progress
+                config["progress"] = progress
             if progress_desc:
-                config['progress_desc'] = progress_desc
+                config["progress_desc"] = progress_desc
 
             # Flatten lookup table in Fortran (column-major) order to match
             # BinsManager::vals2idx flat index convention
-            flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order='F'))
+            flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order="F"))
 
             result = _pymisha.pm_lookup(
                 exprs,
@@ -185,45 +197,67 @@ def glookup(lookup_table, *args, intervals=None, include_lowest=False,
         df = _remap_interval_ids(df, _itr_id_map)
         if intervals_set_out is not None:
             from .intervals import gintervals_save
+
             gintervals_save(df[["chrom", "start", "end"]], intervals_set_out)
             return None
         return df
 
     # Fall back to Python implementation for virtual tracks / band / 2D
     result = _glookup_python(
-        lookup_table, exprs, breaks_list, intervals,
-        include_lowest=include_lowest, force_binning=force_binning,
-        iterator=iterator, band=band,
-        progress=progress, progress_desc=progress_desc,
+        lookup_table,
+        exprs,
+        breaks_list,
+        intervals,
+        include_lowest=include_lowest,
+        force_binning=force_binning,
+        iterator=iterator,
+        band=band,
+        progress=progress,
+        progress_desc=progress_desc,
     )
     if result is not None and intervals_set_out is not None:
         from .intervals import gintervals_save
+
         gintervals_save(result[["chrom", "start", "end"]], intervals_set_out)
         return None
     return result
 
 
-def _glookup_python(lookup_table, exprs, breaks_list, intervals,
-                    include_lowest=False, force_binning=True,
-                    iterator=None, band=None,
-                    progress=None, progress_desc=None):
+def _glookup_python(
+    lookup_table: np.ndarray,
+    exprs: list[str],
+    breaks_list: list[np.ndarray],
+    intervals: pd.DataFrame,
+    include_lowest: bool = False,
+    force_binning: bool = True,
+    iterator: Iterator = None,
+    band: tuple[int, int] | None = None,
+    progress: Any = None,
+    progress_desc: str | None = None,
+) -> pd.DataFrame | None:
     """Pure-Python fallback for glookup (used when vtracks, band, or 2D)."""
     all_values = []
     extract_result = None
-    coord_cols = None
+    output_coord_cols: list[str] = []
 
     for i, expr in enumerate(exprs):
-        result = gextract(expr, intervals, iterator=iterator, band=band,
-                         progress=progress, progress_desc=progress_desc)
+        result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
             return None
 
-        coord_cols = {
-            "chrom", "start", "end",
-            "chrom1", "start1", "end1", "chrom2", "start2", "end2",
+        _meta_cols = {
+            "chrom",
+            "start",
+            "end",
+            "chrom1",
+            "start1",
+            "end1",
+            "chrom2",
+            "start2",
+            "end2",
             "intervalID",
         }
-        data_cols = [c for c in result.columns if c not in coord_cols]
+        data_cols = [c for c in result.columns if c not in _meta_cols]
         if not data_cols:
             return None
 
@@ -233,27 +267,24 @@ def _glookup_python(lookup_table, exprs, breaks_list, intervals,
         if i == 0:
             extract_result = result
             if {"chrom", "start", "end", "intervalID"}.issubset(result.columns):
-                coord_cols = ["chrom", "start", "end", "intervalID"]
-            elif {
-                "chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"
-            }.issubset(result.columns):
-                coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
+                output_coord_cols = ["chrom", "start", "end", "intervalID"]
+            elif {"chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"}.issubset(result.columns):
+                output_coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
             else:
                 raise ValueError("Unsupported extract result schema returned by gextract")
         else:
+            assert extract_result is not None
             if len(result) != len(extract_result):
                 raise ValueError(
                     "glookup expression extraction produced mismatched row counts; "
                     "cannot align multi-expression lookup safely"
                 )
-            for c in coord_cols:
+            for c in output_coord_cols:
                 if not _numpy.array_equal(
                     result[c].to_numpy(),
                     extract_result[c].to_numpy(),
                 ):
-                    raise ValueError(
-                        f"glookup expression extraction produced misaligned rows (column '{c}')"
-                    )
+                    raise ValueError(f"glookup expression extraction produced misaligned rows (column '{c}')")
 
     n_values = len(all_values[0])
 
@@ -262,7 +293,7 @@ def _glookup_python(lookup_table, exprs, breaks_list, intervals,
     for values, breaks in zip(all_values, breaks_list, strict=False):
         n_bin = len(breaks) - 1
 
-        indices = _numpy.searchsorted(breaks, values, side='right') - 1
+        indices = _numpy.searchsorted(breaks, values, side="right") - 1
 
         if include_lowest:
             at_lowest = values == breaks[0]
@@ -295,7 +326,7 @@ def _glookup_python(lookup_table, exprs, breaks_list, intervals,
 
     valid = _numpy.ones(n_values, dtype=bool)
     for indices in bin_indices:
-        valid &= (indices >= 0)
+        valid &= indices >= 0
 
     if valid.any():
         if len(exprs) == 1:
@@ -306,20 +337,21 @@ def _glookup_python(lookup_table, exprs, breaks_list, intervals,
             flat = _numpy.ravel_multi_index(valid_idx, lookup_table.shape)
             output_values[valid] = lookup_table.reshape(-1)[flat]
 
-    result = extract_result[coord_cols].copy()
+    assert extract_result is not None
+    result = extract_result[output_coord_cols].copy()
     result["value"] = output_values
 
     return result
 
 
-def _resolve_lookup_dimensions(exprs, iterator):
+def _resolve_lookup_dimensions(exprs: list[str], iterator: Iterator | str) -> set[int]:
     """Infer whether lookup output should be 1D or 2D from used physical tracks."""
     track_names = set(_pymisha.pm_track_names())
     if not track_names:
         return set()
 
     used_tracks = set()
-    vtrack_names = _shared._VTRACKS
+    vtrack_names = set(_shared._VTRACKS)
 
     for expr in exprs:
         _, parsed_tracks, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
@@ -339,8 +371,16 @@ def _resolve_lookup_dimensions(exprs, iterator):
     return dims
 
 
-def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
-                  include_lowest=False, force_binning=True, band=None):
+def gtrack_lookup(
+    track: str,
+    description: str,
+    lookup_table: np.ndarray,
+    *args: str | np.ndarray | list[float],
+    iterator: Iterator | str = None,
+    include_lowest: bool = False,
+    force_binning: bool = True,
+    band: tuple[int, int] | None = None,
+) -> None:
     """
     Create a track from an N-dimensional lookup table.
 
@@ -402,10 +442,7 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
 
     # Parse arguments: (expr1, breaks1, expr2, breaks2, ...)
     if len(args) < 2:
-        raise ValueError(
-            "Usage: gtrack_lookup(track, description, lookup_table, "
-            "[expr, breaks]+, iterator=..., ...)"
-        )
+        raise ValueError("Usage: gtrack_lookup(track, description, lookup_table, [expr, breaks]+, iterator=..., ...)")
 
     if len(args) % 2 != 0:
         raise ValueError("gtrack_lookup requires pairs of (expression, breaks) arguments")
@@ -426,11 +463,11 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
 
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
-            raise ValueError(f"Breaks at position {i+1} must be 1D array")
+            raise ValueError(f"Breaks at position {i + 1} must be 1D array")
         if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i+1} must have at least 2 elements")
+            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
         if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i+1} must be strictly increasing")
+            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
 
         exprs.append(expr)
         breaks_list.append(breaks)
@@ -439,16 +476,13 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
     expected_dims = len(exprs)
     if lookup_table.ndim != expected_dims and not (lookup_table.ndim == 1 and expected_dims == 1):
         raise ValueError(
-            f"lookup_table has {lookup_table.ndim} dimensions but "
-                f"{expected_dims} expr-breaks pairs were provided"
-            )
+            f"lookup_table has {lookup_table.ndim} dimensions but {expected_dims} expr-breaks pairs were provided"
+        )
 
     n_bins = [len(b) - 1 for b in breaks_list]
     for i, (n, expected) in enumerate(zip(lookup_table.shape, n_bins, strict=False)):
         if n != expected:
-            raise ValueError(
-                f"lookup_table dimension {i} has size {n} but {expected} bins expected"
-            )
+            raise ValueError(f"lookup_table dimension {i} has size {n} but {expected} bins expected")
 
     # Lazy imports to avoid circular dependency
     import shutil
@@ -472,21 +506,21 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
     scope_intervals = gintervals_2d_all() if use_2d_scope else gintervals_all()
 
     # Compute lookup values using glookup over the whole genome
+    # iterator may be a str (track expression) which glookup handles via gextract
     result = glookup(
-        lookup_table, *args,
+        lookup_table,
+        *args,
         intervals=scope_intervals,
         include_lowest=include_lowest,
         force_binning=force_binning,
-        iterator=iterator,
+        iterator=iterator,  # type: ignore[arg-type]
         band=band,
     )
 
     if result is None or len(result) == 0:
         raise ValueError("Lookup produced no values; cannot create track")
 
-    is_2d_result = {
-        "chrom1", "start1", "end1", "chrom2", "start2", "end2"
-    }.issubset(result.columns)
+    is_2d_result = {"chrom1", "start1", "end1", "chrom2", "start2", "end2"}.issubset(result.columns)
     if is_2d_result:
         intervals_df = result[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
     else:
@@ -496,9 +530,7 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
     # Determine track type from iterator for 1D outputs.
     # If iterator is a positive integer, create dense track; otherwise sparse.
     is_dense = (
-        (not is_2d_result)
-        and isinstance(iterator, (int, float, _numpy.integer, _numpy.floating))
-        and int(iterator) > 0
+        (not is_2d_result) and isinstance(iterator, (int, float, _numpy.integer, _numpy.floating)) and int(iterator) > 0
     )
 
     track_dir = _track_dir_for_create(track)
@@ -506,25 +538,23 @@ def gtrack_lookup(track, description, lookup_table, *args, iterator=None,
     try:
         if is_2d_result:
             from .tracks import gtrack_2d_create
+
             gtrack_2d_create(track, description, intervals_df, values)
         elif is_dense:
+            assert isinstance(iterator, (int, float, _numpy.integer, _numpy.floating))
             binsize = int(iterator)
-            gtrack_create_dense(track, description, intervals_df, values,
-                                binsize, defval=_numpy.nan)
+            gtrack_create_dense(track, description, intervals_df, values, binsize, defval=_numpy.nan)
         else:
             gtrack_create_sparse(track, description, intervals_df, values)
 
         # Build created.by string matching R convention
         exprs_str = ", ".join(
-            f'"{e}", c({", ".join(str(v) for v in b)})'
-            for e, b in zip(exprs, breaks_list, strict=False)
+            f'"{e}", c({", ".join(str(v) for v in b)})' for e, b in zip(exprs, breaks_list, strict=False)
         )
-        created_by = (
-            f'gtrack.lookup("{track}", description, lookup_table, '
-            f'{exprs_str}, iterator={iterator!r})'
-        )
+        created_by = f'gtrack.lookup("{track}", description, lookup_table, {exprs_str}, iterator={iterator!r})'
         # Bypass readonly check for internal track creation
         from .tracks import _load_track_attributes, _save_track_attributes
+
         attrs = _load_track_attributes(track)
         attrs["created.by"] = created_by
         _save_track_attributes(track, attrs)

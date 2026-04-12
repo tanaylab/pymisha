@@ -12,10 +12,13 @@ Binary format (StatQuadTreeCached):
 Struct Stat (pack(8)): [int64 occupied_area] [double weighted_sum] [double min_val] [double max_val]
 """
 
+from __future__ import annotations
+
 import contextlib
 import mmap
 import os
 import struct
+from typing import Any
 
 import numpy as np
 
@@ -36,37 +39,37 @@ _MAX_DEPTH = 20
 _MAX_NODE_OBJS = 20
 
 
-def _pack_stat(occupied_area, weighted_sum, min_val, max_val):
+def _pack_stat(occupied_area: int, weighted_sum: float, min_val: float, max_val: float) -> bytes:
     """Pack a Stat struct: int64 + 3 doubles = 32 bytes."""
     return struct.pack("<qddd", occupied_area, weighted_sum, min_val, max_val)
 
 
-def _pack_arena(x1, y1, x2, y2):
+def _pack_arena(x1: int, y1: int, x2: int, y2: int) -> bytes:
     """Pack arena Rectangle: 4 x int64 = 32 bytes."""
     return struct.pack("<qqqq", x1, y1, x2, y2)
 
 
-def _pack_node_base(is_leaf, stat_bytes, arena_bytes):
+def _pack_node_base(is_leaf: bool, stat_bytes: bytes, arena_bytes: bytes) -> bytes:
     """Pack NodeBase: bool(1) + pad(7) + stat(32) + arena(32) = 72 bytes."""
     return struct.pack("<B", 1 if is_leaf else 0) + b"\x00" * 7 + stat_bytes + arena_bytes
 
 
-def _pack_leaf(is_leaf, stat_bytes, arena_bytes, num_objs):
+def _pack_leaf(is_leaf: bool, stat_bytes: bytes, arena_bytes: bytes, num_objs: int) -> bytes:
     """Pack Leaf struct: NodeBase(72) + uint32(4) + pad(4) = 80 bytes."""
     return _pack_node_base(is_leaf, stat_bytes, arena_bytes) + struct.pack("<I", num_objs) + b"\x00" * 4
 
 
-def _pack_node(stat_bytes, arena_bytes, kid_ptrs):
+def _pack_node(stat_bytes: bytes, arena_bytes: bytes, kid_ptrs: list[int]) -> bytes:
     """Pack Node struct: NodeBase(72) + 4 x int64(32) = 104 bytes."""
     return _pack_node_base(False, stat_bytes, arena_bytes) + struct.pack("<qqqq", *kid_ptrs)
 
 
-def _pack_rect_obj(obj_id, x1, y1, x2, y2, value):
+def _pack_rect_obj(obj_id: int, x1: int, y1: int, x2: int, y2: int, value: float) -> bytes:
     """Pack Obj<Rectangle_val<float>>: uint64(8) + 4xint64(32) + float(4) + pad(4) = 48 bytes."""
     return struct.pack("<Qqqqq", obj_id, x1, y1, x2, y2) + struct.pack("<f", value) + b"\x00" * 4
 
 
-def _pack_point_obj(obj_id, x, y, value):
+def _pack_point_obj(obj_id: int, x: int, y: int, value: float) -> bytes:
     """Pack Obj<Point_val<float>>: uint64(8) + 2xint64(16) + float(4) + pad(4) = 32 bytes."""
     return struct.pack("<Qqq", obj_id, x, y) + struct.pack("<f", value) + b"\x00" * 4
 
@@ -75,16 +78,16 @@ class _QuadNode:
     """In-memory quad-tree node for building before serialization."""
     __slots__ = ("is_leaf", "arena", "stat", "kids", "obj_indices")
 
-    def __init__(self, arena):
+    def __init__(self, arena: tuple[int, int, int, int]) -> None:
         self.is_leaf = True
         self.arena = arena  # (x1, y1, x2, y2)
-        self.stat = {"occupied_area": 0, "weighted_sum": 0.0,
-                     "min_val": float("inf"), "max_val": float("-inf")}
-        self.kids = [None, None, None, None]  # NW, NE, SE, SW
-        self.obj_indices = []
+        self.stat: dict[str, Any] = {"occupied_area": 0, "weighted_sum": 0.0,
+                                     "min_val": float("inf"), "max_val": float("-inf")}
+        self.kids: list[_QuadNode | None] = [None, None, None, None]  # NW, NE, SE, SW
+        self.obj_indices: list[int] = []
 
 
-def _rect_intersect(r1, r2):
+def _rect_intersect(r1: tuple[int, int, int, int], r2: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
     """Return intersection of two rectangles, or None if empty."""
     x1 = max(r1[0], r2[0])
     y1 = max(r1[1], r2[1])
@@ -95,11 +98,11 @@ def _rect_intersect(r1, r2):
     return None
 
 
-def _rect_area(r):
+def _rect_area(r: tuple[int, int, int, int]) -> int:
     return (r[2] - r[0]) * (r[3] - r[1])
 
 
-def _do_rects_overlap(r1, r2):
+def _do_rects_overlap(r1: tuple[int, int, int, int], r2: tuple[int, int, int, int]) -> bool:
     """Check if two rectangles overlap (non-empty intersection)."""
     return (r1[0] < r2[2] and r2[0] < r1[2] and
             r1[1] < r2[3] and r2[1] < r1[3])
@@ -112,15 +115,23 @@ class QuadTree:
     Supports Rectangle_val<float> (RECTS) and Point_val<float> (POINTS) objects.
     """
 
-    def __init__(self, x1, y1, x2, y2, is_points=False,
-                 max_depth=_MAX_DEPTH, max_node_objs=_MAX_NODE_OBJS):
+    def __init__(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        is_points: bool = False,
+        max_depth: int = _MAX_DEPTH,
+        max_node_objs: int = _MAX_NODE_OBJS,
+    ) -> None:
         self.root = _QuadNode((x1, y1, x2, y2))
         self.is_points = is_points
         self.max_depth = max_depth
         self.max_node_objs = max_node_objs
-        self.objs = []  # list of (x1, y1, x2, y2, value) for rects or (x, y, value) for points
+        self.objs: list[tuple[Any, ...]] = []  # list of (x1, y1, x2, y2, value) for rects or (x, y, value) for points
 
-    def insert(self, obj):
+    def insert(self, obj: tuple[Any, ...]) -> None:
         """Insert an object. For rects: (x1,y1,x2,y2,value). For points: (x,y,value)."""
         if self.is_points:
             x, y, v = obj
@@ -138,18 +149,25 @@ class QuadTree:
         self.objs.append(obj)
         self._insert(self.root, inter, 0, obj_idx, obj_rect)
 
-    def _get_value(self, obj_idx):
+    def _get_value(self, obj_idx: int) -> float:
         if self.is_points:
-            return self.objs[obj_idx][2]
-        return self.objs[obj_idx][4]
+            return float(self.objs[obj_idx][2])
+        return float(self.objs[obj_idx][4])
 
-    def _get_rect(self, obj_idx):
+    def _get_rect(self, obj_idx: int) -> tuple[Any, ...]:
         if self.is_points:
             x, y, v = self.objs[obj_idx]
             return (x, y, x + 1, y + 1)
         return self.objs[obj_idx][:4]
 
-    def _insert(self, node, intersection, depth, obj_idx, obj_rect):
+    def _insert(
+        self,
+        node: _QuadNode,
+        intersection: tuple[int, int, int, int],
+        depth: int,
+        obj_idx: int,
+        obj_rect: tuple[Any, ...],
+    ) -> None:
         # Update stats
         area = _rect_area(intersection)
         val = self._get_value(obj_idx)
@@ -172,11 +190,12 @@ class QuadTree:
         # Insert into children
         for iquad in range(4):
             kid = node.kids[iquad]
+            assert kid is not None
             inter = _rect_intersect(obj_rect, kid.arena)
             if inter is not None:
                 self._insert(kid, inter, depth + 1, obj_idx, obj_rect)
 
-    def _split_leaf(self, node, depth):
+    def _split_leaf(self, node: _QuadNode, depth: int) -> None:
         """Convert a leaf to an internal node with 4 children."""
         x1, y1, x2, y2 = node.arena
         split_x = (x1 + x2) // 2
@@ -198,21 +217,24 @@ class QuadTree:
             obj_rect = self._get_rect(oi)
             for iquad in range(4):
                 kid = node.kids[iquad]
+                assert kid is not None
                 inter = _rect_intersect(obj_rect, kid.arena)
                 if inter is not None:
                     self._insert(kid, inter, depth + 1, oi, obj_rect)
 
-    def _count_subtree_bytes(self, node):
+    def _count_subtree_bytes(self, node: _QuadNode) -> int:
         """Estimate serialized byte size of a subtree (excluding chunk header)."""
         obj_size = 32 if self.is_points else 48
         if node.is_leaf:
             return 80 + len(node.obj_indices) * obj_size
         size = 104  # Node struct
         for iquad in range(4):
-            size += self._count_subtree_bytes(node.kids[iquad])
+            kid = node.kids[iquad]
+            assert kid is not None
+            size += self._count_subtree_bytes(kid)
         return size
 
-    def serialize(self, f, chunk_size=0):
+    def serialize(self, f: Any, chunk_size: int = 0) -> None:
         """
         Serialize the quad-tree to a file-like object in StatQuadTreeCached format.
 
@@ -238,7 +260,7 @@ class QuadTree:
 
         # Map node id -> chunk file position (for cross-chunk references)
         # A node gets an entry here if it was serialized as a separate chunk.
-        node_chunk_fpos = {}
+        node_chunk_fpos: dict[int, int] = {}
 
         if chunk_size > 0:
             # Multi-chunk: analyze subtree sizes and write large subtrees
@@ -266,7 +288,13 @@ class QuadTree:
 
         f.seek(chunk_end)
 
-    def _analyze_and_serialize(self, f, node, chunk_size, node_chunk_fpos):
+    def _analyze_and_serialize(
+        self,
+        f: Any,
+        node: _QuadNode,
+        chunk_size: int,
+        node_chunk_fpos: dict[int, int],
+    ) -> int:
         """Recursively analyze subtree sizes and write large subtrees as separate chunks.
 
         Follows R misha's analyze_n_serialize_subtree algorithm: bottom-up
@@ -279,6 +307,7 @@ class QuadTree:
         size = 104  # Node struct
         for iquad in range(4):
             kid = node.kids[iquad]
+            assert kid is not None
             subtree_size = self._analyze_and_serialize(f, kid, chunk_size, node_chunk_fpos)
             if subtree_size > 0:
                 size += subtree_size
@@ -306,7 +335,13 @@ class QuadTree:
 
         return size
 
-    def _serialize_node(self, f, node, chunk_start, node_chunk_fpos):
+    def _serialize_node(
+        self,
+        f: Any,
+        node: _QuadNode,
+        chunk_start: int,
+        node_chunk_fpos: dict[int, int],
+    ) -> int:
         """Serialize a node, return offset from chunk_start."""
         if node.is_leaf:
             return self._serialize_leaf(f, node, chunk_start)
@@ -315,6 +350,7 @@ class QuadTree:
         kid_offsets = [0, 0, 0, 0]
         for iquad in range(4):
             kid = node.kids[iquad]
+            assert kid is not None
             kid_fpos = node_chunk_fpos.get(id(kid))
             if kid_fpos is not None:
                 # Kid was written as a separate chunk — store negative file position
@@ -323,25 +359,25 @@ class QuadTree:
                 kid_offsets[iquad] = self._serialize_node(f, kid, chunk_start, node_chunk_fpos)
 
         # Write node
-        offset = f.tell() - chunk_start
+        offset: int = int(f.tell()) - chunk_start
         stat_bytes = _pack_stat(
-            node.stat["occupied_area"],
-            node.stat["weighted_sum"],
-            node.stat["min_val"],
-            node.stat["max_val"],
+            int(node.stat["occupied_area"]),
+            float(node.stat["weighted_sum"]),
+            float(node.stat["min_val"]),
+            float(node.stat["max_val"]),
         )
         arena_bytes = _pack_arena(*node.arena)
         f.write(_pack_node(stat_bytes, arena_bytes, kid_offsets))
         return offset
 
-    def _serialize_leaf(self, f, node, chunk_start):
+    def _serialize_leaf(self, f: Any, node: _QuadNode, chunk_start: int) -> int:
         """Serialize a leaf node and its objects, return offset from chunk_start."""
-        offset = f.tell() - chunk_start
+        offset: int = int(f.tell()) - chunk_start
         stat_bytes = _pack_stat(
-            node.stat["occupied_area"],
-            node.stat["weighted_sum"],
-            node.stat["min_val"],
-            node.stat["max_val"],
+            int(node.stat["occupied_area"]),
+            float(node.stat["weighted_sum"]),
+            float(node.stat["min_val"]),
+            float(node.stat["max_val"]),
         )
         arena_bytes = _pack_arena(*node.arena)
         n = len(node.obj_indices)
@@ -359,7 +395,13 @@ class QuadTree:
         return offset
 
 
-def write_2d_track_file(filepath, objects, arena, is_points=False, chunk_size=0):
+def write_2d_track_file(
+    filepath: str,
+    objects: list[tuple[Any, ...]],
+    arena: tuple[int, int, int, int],
+    is_points: bool = False,
+    chunk_size: int = 0,
+) -> None:
     """
     Write a misha-compatible 2D track file for one chromosome pair.
 
@@ -391,7 +433,7 @@ def write_2d_track_file(filepath, objects, arena, is_points=False, chunk_size=0)
         qtree.serialize(f, chunk_size=chunk_size)
 
 
-def verify_no_overlaps_2d(rects):
+def verify_no_overlaps_2d(rects: list[tuple[int, int, int, int]]) -> None:
     """
     Verify that no two 2D rectangles overlap.
 
@@ -410,7 +452,7 @@ def verify_no_overlaps_2d(rects):
     # Sweep-line by x1 with active intervals whose x2 exceeds current x1.
     indexed = list(enumerate(rects))
     indexed.sort(key=lambda x: (x[1][0], x[1][2], x[1][1], x[1][3]))
-    active = []
+    active: list[tuple[int, int, int, int]] = []
     for _, rect in indexed:
         x1, y1, x2, y2 = rect
         active = [r for r in active if r[2] > x1]
@@ -436,7 +478,7 @@ _RECT_OBJ_SIZE = 48   # uint64(8) + 4*int64(32) + float(4) + pad(4)
 _POINT_OBJ_SIZE = 32  # uint64(8) + 2*int64(16) + float(4) + pad(4)
 
 
-def _unpack_node_base(data, offset):
+def _unpack_node_base(data: bytes | mmap.mmap, offset: int) -> tuple[bool, tuple[int, int, int, int]]:
     """Unpack NodeBase from data at offset. Returns (is_leaf, arena)."""
     is_leaf = struct.unpack_from("<B", data, offset)[0] != 0
     # Skip pad(7) + Stat(32) = 39 bytes to get to arena at offset+40
@@ -445,7 +487,7 @@ def _unpack_node_base(data, offset):
     return is_leaf, (x1, y1, x2, y2)
 
 
-def _unpack_stat(data, offset):
+def _unpack_stat(data: bytes | mmap.mmap, offset: int) -> tuple[int, float, float, float]:
     """Unpack Stat struct from a NodeBase at *offset*.
 
     Stat is at offset+8 (after bool(1)+pad(7)): int64 occupied_area,
@@ -457,9 +499,9 @@ def _unpack_stat(data, offset):
     return struct.unpack_from("<qddd", data, stat_off)
 
 
-def _read_leaf_objects(data, offset, num_objs, is_points):
+def _read_leaf_objects(data: bytes | mmap.mmap, offset: int, num_objs: int, is_points: bool) -> list[tuple[Any, ...]]:
     """Read objects following a leaf header. Returns list of tuples."""
-    objs = []
+    objs: list[tuple[Any, ...]] = []
     pos = offset
     if is_points:
         for _ in range(num_objs):
@@ -476,7 +518,7 @@ def _read_leaf_objects(data, offset, num_objs, is_points):
     return objs
 
 
-def _resolve_chunk_node(data, chunk_fpos):
+def _resolve_chunk_node(data: bytes | mmap.mmap, chunk_fpos: int) -> tuple[int, int]:
     """Read a chunk header and return (chunk_fpos, top_node_offset).
 
     A chunk starts with [int64 chunk_size][int64 top_node_offset].
@@ -499,7 +541,15 @@ def _resolve_chunk_node(data, chunk_fpos):
     return chunk_fpos, top_node_offset
 
 
-def _collect_all_objects(data, chunk_data_offset, node_offset, is_points, _visited=None, _depth=0, _out=None):
+def _collect_all_objects(
+    data: bytes | mmap.mmap,
+    chunk_data_offset: int,
+    node_offset: int,
+    is_points: bool,
+    _visited: set[tuple[int, int]] | None = None,
+    _depth: int = 0,
+    _out: list[tuple[Any, ...]] | None = None,
+) -> list[tuple[Any, ...]]:
     """Recursively collect all objects from a quad-tree node."""
     if _visited is None:
         _visited = set()
@@ -541,7 +591,19 @@ def _collect_all_objects(data, chunk_data_offset, node_offset, is_points, _visit
         _visited.discard(key)
 
 
-def _query_node(data, chunk_data_offset, node_offset, is_points, qx1, qy1, qx2, qy2, seen_ids, _visited=None, _depth=0):
+def _query_node(
+    data: bytes | mmap.mmap,
+    chunk_data_offset: int,
+    node_offset: int,
+    is_points: bool,
+    qx1: int,
+    qy1: int,
+    qx2: int,
+    qy2: int,
+    seen_ids: set[int],
+    _visited: set[tuple[int, int]] | None = None,
+    _depth: int = 0,
+) -> list[tuple[Any, ...]]:
     """Recursively query a quad-tree node for objects intersecting the query rectangle."""
     if _visited is None:
         _visited = set()
@@ -605,7 +667,7 @@ def _query_node(data, chunk_data_offset, node_offset, is_points, qx1, qy1, qx2, 
         _visited.discard(key)
 
 
-def _read_file_header(filepath):
+def _read_file_header(filepath: str) -> tuple[bool, int, mmap.mmap]:
     """Read a 2D track file header. Returns (is_points, num_objs, data_bytes)."""
     with open(filepath, "rb") as f:
         data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -626,7 +688,7 @@ def _read_file_header(filepath):
         raise
 
 
-def read_2d_track_objects(filepath):
+def read_2d_track_objects(filepath: str) -> tuple[bool, list[tuple[Any, ...]]]:
     """
     Read all objects from a misha 2D track file.
 
@@ -654,8 +716,8 @@ def read_2d_track_objects(filepath):
         raw_objs = _collect_all_objects(data, root_chunk_fpos, top_node_offset, is_points)
 
         # Deduplicate by obj_id and strip obj_id from output
-        seen = set()
-        result = []
+        seen: set[Any] = set()
+        result: list[tuple[Any, ...]] = []
         for obj in raw_objs:
             obj_id = obj[0]
             if obj_id not in seen:
@@ -672,7 +734,17 @@ def read_2d_track_objects(filepath):
         data.close()
 
 
-def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, qx2, qy2, band=None):
+def query_2d_track_opened(
+    data: bytes | mmap.mmap,
+    is_points: bool,
+    num_objs: int,
+    root_chunk_fpos: int,
+    qx1: int,
+    qy1: int,
+    qx2: int,
+    qy2: int,
+    band: tuple[int, int] | None = None,
+) -> list[tuple[Any, ...]]:
     """
     Query a pre-opened 2D track mmap for objects intersecting a rectangle.
 
@@ -713,7 +785,7 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
                 data, int(qx1), int(qy1), int(qx2), int(qy2),
                 1 if is_points else 0, has_band, int(band_d1), int(band_d2))
             n = len(r["id"])
-            result = []
+            result: list[tuple[Any, ...]] = []
             if is_points:
                 for i in range(n):
                     result.append((int(r["x1"][i]), int(r["y1"][i]), float(r["val"][i])))
@@ -728,19 +800,20 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
 
     top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
 
-    seen_ids = set()
+    seen_ids: set[int] = set()
     raw_objs = _query_node(data, root_chunk_fpos, top_node_offset, is_points,
                            qx1, qy1, qx2, qy2, seen_ids)
 
     # Strip obj_id from output
-    result = []
+    result2: list[tuple[Any, ...]] = []
     for obj in raw_objs:
         if is_points:
             _, x, y, val = obj
-            result.append((x, y, val))
+            result2.append((x, y, val))
         else:
             _, x1, y1, x2, y2, val = obj
-            result.append((x1, y1, x2, y2, val))
+            result2.append((x1, y1, x2, y2, val))
+    result = result2
 
     # Apply band filter if needed (Python fallback doesn't handle band)
     if band is not None:
@@ -754,9 +827,9 @@ def query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos, qx1, qy1, 
     return result
 
 
-def _query_node_stats(data, chunk_data_offset, node_offset, is_points,
-                      qx1, qy1, qx2, qy2, stat,
-                      _visited=None, _depth=0):
+def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offset: int, is_points: bool,
+                      qx1: int, qy1: int, qx2: int, qy2: int, stat: list[float | int],
+                      _visited: set[tuple[int, int]] | None = None, _depth: int = 0) -> None:
     """Hybrid quad-tree stat traversal matching R misha's ``get_stat``.
 
     For internal nodes whose arena is *fully contained* by the query rectangle,
@@ -864,8 +937,8 @@ def _query_node_stats(data, chunk_data_offset, node_offset, is_points,
         _visited.discard(key)
 
 
-def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
-                         qx1, qy1, qx2, qy2, band=None):
+def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
+                         qx1: int, qy1: int, qx2: int, qy2: int, band: tuple[int, int] | None = None) -> dict[str, Any]:
     """
     Query a pre-opened 2D track mmap and return aggregated stats for a query rectangle.
 
@@ -907,9 +980,9 @@ def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
             band_d2 = band[1] if band else 0
-            return _pymisha.pm_quadtree_query_stats(
+            return dict(_pymisha.pm_quadtree_query_stats(
                 data, int(qx1), int(qy1), int(qx2), int(qy2),
-                1 if is_points else 0, has_band, int(band_d1), int(band_d2))
+                1 if is_points else 0, has_band, int(band_d1), int(band_d2)))
         except Exception:
             pass  # Fall back to Python implementation
 
@@ -936,8 +1009,8 @@ def query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
             "min_val": stat[2], "max_val": stat[3]}
 
 
-def query_2d_track_stats_batch(data, is_points, num_objs, root_chunk_fpos,
-                                rects, band=None):
+def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
+                                rects: np.ndarray, band: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
     """
     Batch stats query: compute aggregated stats for N query rectangles in one call.
 
@@ -979,10 +1052,10 @@ def query_2d_track_stats_batch(data, is_points, num_objs, root_chunk_fpos,
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
             band_d2 = band[1] if band else 0
-            return _pymisha.pm_quadtree_query_stats_batch(
+            return dict(_pymisha.pm_quadtree_query_stats_batch(
                 data, rects_arr,
                 1 if is_points else 0,
-                has_band, int(band_d1), int(band_d2))
+                has_band, int(band_d1), int(band_d2)))
         except Exception:
             pass  # Fall back to Python per-rect loop
 
@@ -1002,8 +1075,8 @@ def query_2d_track_stats_batch(data, is_points, num_objs, root_chunk_fpos,
     return {"occupied_area": occ, "weighted_sum": ws, "min_val": mn, "max_val": mx}
 
 
-def _query_2d_track_stats_with_band(data, is_points, num_objs, root_chunk_fpos,
-                                     qx1, qy1, qx2, qy2, band):
+def _query_2d_track_stats_with_band(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
+                                     qx1: int, qy1: int, qx2: int, qy2: int, band: tuple[int, int]) -> dict[str, Any]:
     """Fall-back stat query when a diagonal band filter is active.
 
     Band filtering cannot leverage node-level stats (the stored stats don't
@@ -1050,8 +1123,17 @@ def _query_2d_track_stats_with_band(data, is_points, num_objs, root_chunk_fpos,
             "min_val": min_val, "max_val": max_val}
 
 
-def query_2d_track_opened_arrays(data, is_points, num_objs, root_chunk_fpos,
-                                  qx1, qy1, qx2, qy2, band=None):
+def query_2d_track_opened_arrays(
+    data: bytes | mmap.mmap,
+    is_points: bool,
+    num_objs: int,
+    root_chunk_fpos: int,
+    qx1: int,
+    qy1: int,
+    qx2: int,
+    qy2: int,
+    band: tuple[int, int] | None = None,
+) -> dict[str, np.ndarray]:
     """
     Query a pre-opened 2D track mmap and return numpy arrays directly.
 
@@ -1082,7 +1164,7 @@ def query_2d_track_opened_arrays(data, is_points, num_objs, root_chunk_fpos,
         For POINTS, x2 = x1 + 1, y2 = y1 + 1.
         Empty arrays if no objects found.
     """
-    _empty = {
+    _empty: dict[str, np.ndarray] = {
         "x1": np.empty(0, dtype=np.int64),
         "y1": np.empty(0, dtype=np.int64),
         "x2": np.empty(0, dtype=np.int64),
@@ -1145,7 +1227,7 @@ def query_2d_track_opened_arrays(data, is_points, num_objs, root_chunk_fpos,
     }
 
 
-def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):
+def query_2d_track_objects(filepath: str, qx1: int, qy1: int, qx2: int, qy2: int) -> list[tuple[Any, ...]]:
     """
     Query a misha 2D track file for objects intersecting a rectangle.
 
@@ -1179,7 +1261,7 @@ def query_2d_track_objects(filepath, qx1, qy1, qx2, qy2):
 # ---------------------------------------------------------------------------
 
 # Cache of IndexedTrack2DReader instances keyed by track directory path
-_indexed_2d_cache = {}
+_indexed_2d_cache: dict[str, IndexedTrack2DReader] = {}
 
 
 class IndexedTrack2DReader:
@@ -1205,16 +1287,16 @@ class IndexedTrack2DReader:
     __slots__ = ("_track_dir", "_dat_mmap", "_dat_file", "_pair_map",
                  "_is_points", "_loaded")
 
-    def __init__(self, track_dir):
+    def __init__(self, track_dir: str) -> None:
         self._track_dir = track_dir
-        self._dat_mmap = None
-        self._dat_file = None
-        self._pair_map = {}  # (chrom1_id, chrom2_id) -> (offset, length)
-        self._is_points = False
-        self._loaded = False
+        self._dat_mmap: mmap.mmap | None = None
+        self._dat_file: Any = None
+        self._pair_map: dict[tuple[int, int], tuple[int, int]] = {}  # (chrom1_id, chrom2_id) -> (offset, length)
+        self._is_points: bool = False
+        self._loaded: bool = False
         self._load()
 
-    def _load(self):
+    def _load(self) -> None:
         """Load the index and mmap the data file."""
         idx_path = os.path.join(self._track_dir, "track.idx")
         dat_path = os.path.join(self._track_dir, "track.dat")
@@ -1251,16 +1333,18 @@ class IndexedTrack2DReader:
         self._loaded = True
 
     @property
-    def loaded(self):
+    def loaded(self) -> bool:
         """Whether the indexed track was successfully loaded."""
         return self._loaded
 
     @property
-    def is_points(self):
+    def is_points(self) -> bool:
         """Whether the track stores points (True) or rectangles (False)."""
         return self._is_points
 
-    def get_pair_data(self, chrom1_id, chrom2_id):
+    def get_pair_data(
+        self, chrom1_id: int, chrom2_id: int,
+    ) -> tuple[bool, int, bytes, int] | None:
         """Return a buffer slice for a chromosome pair.
 
         Parameters
@@ -1293,6 +1377,7 @@ class IndexedTrack2DReader:
         # creates a copy, but the per-pair data is typically small
         # (KB to low MB) and this ensures the buffer is fully
         # independent — no lifecycle coupling with the mmap.
+        assert self._dat_mmap is not None
         pair_data = bytes(self._dat_mmap[offset:offset + length])
 
         # Parse the signature + header from the pair data
@@ -1314,7 +1399,7 @@ class IndexedTrack2DReader:
         root_chunk_fpos = struct.unpack_from("<q", pair_data, 12)[0]
         return (is_points, num_objs, pair_data, root_chunk_fpos)
 
-    def close(self):
+    def close(self) -> None:
         """Release the mmap and file handle."""
         if self._dat_mmap is not None:
             with contextlib.suppress(Exception):
@@ -1326,11 +1411,11 @@ class IndexedTrack2DReader:
             self._dat_file = None
         self._loaded = False
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.close()
 
 
-def _get_indexed_reader(track_dir):
+def _get_indexed_reader(track_dir: str) -> IndexedTrack2DReader | None:
     """Get or create a cached IndexedTrack2DReader for a track directory.
 
     Returns ``None`` if the track directory does not have an indexed
@@ -1352,14 +1437,14 @@ def _get_indexed_reader(track_dir):
     return None
 
 
-def clear_indexed_2d_cache():
+def clear_indexed_2d_cache() -> None:
     """Clear all cached IndexedTrack2DReader instances."""
     for reader in _indexed_2d_cache.values():
         reader.close()
     _indexed_2d_cache.clear()
 
 
-def open_2d_pair(track_path, c1, c2):
+def open_2d_pair(track_path: str, c1: str, c2: str) -> tuple[bool, int, bytes | mmap.mmap, int, Any] | None:
     """Open a 2D track chromosome pair, supporting both per-pair files and
     indexed format.
 
@@ -1408,10 +1493,10 @@ def open_2d_pair(track_path, c1, c2):
     if filepath is None:
         return None
 
-    file_is_points, num_objs, data = _read_file_header(filepath)
-    root_chunk_fpos = 0 if num_objs == 0 else struct.unpack_from("<q", data, 12)[0]
-    return (file_is_points, num_objs, data, root_chunk_fpos, data.close)
+    file_is_points, num_objs, mmap_data = _read_file_header(filepath)
+    root_chunk_fpos = 0 if num_objs == 0 else struct.unpack_from("<q", mmap_data, 12)[0]
+    return (file_is_points, num_objs, mmap_data, root_chunk_fpos, mmap_data.close)
 
 
-def _noop_close():
+def _noop_close() -> None:
     """No-op close function for indexed pair data (bytes don't need closing)."""

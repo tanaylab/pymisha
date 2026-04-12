@@ -1,6 +1,12 @@
 """Virtual track utilities and API."""
 
+from __future__ import annotations
+
 import hashlib
+from typing import Any
+
+import numpy as np
+import pandas as pd
 
 from . import _shared
 from ._shared import (
@@ -88,10 +94,10 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_EDIT_DISTANCE_FUNCS
 )
 
-_GLOBAL_PERCENTILE_CACHE = {}
+_GLOBAL_PERCENTILE_CACHE: dict[tuple[str, str, int], np.ndarray] = {}
 
 
-def _canonicalize_filter_df(df):
+def _canonicalize_filter_df(df: pd.DataFrame) -> pd.DataFrame:
     from .intervals import _normalize_chroms, gintervals_canonic
 
     if not isinstance(df, _pandas.DataFrame):
@@ -117,7 +123,7 @@ def _canonicalize_filter_df(df):
     return can[["chrom", "start", "end"]].reset_index(drop=True)
 
 
-def _resolve_filter_sources(filter_obj):
+def _resolve_filter_sources(filter_obj: pd.DataFrame | str | list[Any] | tuple[Any, ...] | None) -> pd.DataFrame:
     from .extract import gextract
     from .intervals import gintervals_all, gintervals_load, gintervals_ls
     from .tracks import gtrack_info
@@ -169,7 +175,7 @@ def _resolve_filter_sources(filter_obj):
     raise ValueError("filter must be a DataFrame, string, list/tuple, or None")
 
 
-def _filter_key(filter_df):
+def _filter_key(filter_df: pd.DataFrame | None) -> str | None:
     if filter_df is None or len(filter_df) == 0:
         return None
     # Vectorized hash: build byte string from arrays
@@ -180,7 +186,7 @@ def _filter_key(filter_df):
     return hashlib.sha1("".join(lines).encode()).hexdigest()
 
 
-def _filter_stats(filter_df):
+def _filter_stats(filter_df: pd.DataFrame | None) -> dict[str, int] | None:
     if filter_df is None or len(filter_df) == 0:
         return None
     total = int((filter_df["end"] - filter_df["start"]).sum())
@@ -188,7 +194,7 @@ def _filter_stats(filter_df):
     return {"num_chroms": chroms, "total_bases": total}
 
 
-def _subtract_masks(start, end, masks):
+def _subtract_masks(start: int, end: int, masks: list[tuple[int, int]] | None) -> list[tuple[int, int]]:
     if not masks:
         return [(start, end)]
     segs = [(start, end)]
@@ -212,7 +218,11 @@ def _subtract_masks(start, end, masks):
     return segs
 
 
-def _build_unmasked_segments(intervals, payload, filter_df):
+def _build_unmasked_segments(
+    intervals: pd.DataFrame,
+    payload: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> pd.DataFrame | None:
     from .intervals import gintervals_all
 
     sshift = int(payload.get("sshift", 0) or 0)
@@ -259,7 +269,8 @@ def _build_unmasked_segments(intervals, payload, filter_df):
         })
 
     # --- Per-row path (with mask subtraction) ---
-    mask_map = {}
+    assert filter_df is not None
+    mask_map: dict[str, list[tuple[int, int]]] = {}
     _f_chroms = filter_df["chrom"].astype(str).values
     _f_starts = filter_df["start"].values
     _f_ends = filter_df["end"].values
@@ -272,7 +283,7 @@ def _build_unmasked_segments(intervals, payload, filter_df):
         mask_map[chrom].sort()
 
     seg_rows = []
-    for idx, row in enumerate(intervals.itertuples(index=False)):
+    for row_idx, row in enumerate(intervals.itertuples(index=False)):
         chrom = str(row.chrom)
         start = int(row.start) + sshift
         end = int(row.end) + eshift
@@ -288,7 +299,7 @@ def _build_unmasked_segments(intervals, payload, filter_df):
         segments = _subtract_masks(start, end, mask_map.get(chrom))
         for s, e in segments:
             if e > s:
-                seg_rows.append((chrom, int(s), int(e), idx, int(e - s), int(start)))
+                seg_rows.append((chrom, int(s), int(e), row_idx, int(e - s), int(start)))
     if not seg_rows:
         return None
     return _pandas.DataFrame(
@@ -297,7 +308,11 @@ def _build_unmasked_segments(intervals, payload, filter_df):
     )
 
 
-def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
+def _compute_value_df_vtrack(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """Python fallback evaluator for value-based virtual tracks."""
     func = str(payload_eval.get("func", "avg")).lower()
     has_filter = filter_df is not None and len(filter_df) > 0
@@ -479,7 +494,11 @@ def _compute_value_df_vtrack(intervals, payload_eval, filter_df):
     return out
 
 
-def _compute_filtered_nearest(intervals, payload_eval, filter_df):
+def _compute_filtered_nearest(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """Nearest under filter: use only the first unmasked segment per interval."""
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -504,7 +523,11 @@ def _compute_filtered_nearest(intervals, payload_eval, filter_df):
     return out
 
 
-def _extract_raw_unmasked_values(intervals, payload_eval, filter_df):
+def _extract_raw_unmasked_values(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> tuple[dict[int, list[float]], np.ndarray]:
     """Extract raw bin values from unmasked segments, grouped by original interval.
 
     Returns (groups dict {orig_idx: list[float]}, out_array) where out_array is
@@ -556,14 +579,18 @@ def _extract_raw_unmasked_values(intervals, payload_eval, filter_df):
 
     mapped_orig = seg_orig_idx[seg_interval_ids[valid_vals]]
     mapped_vals = vals[valid_vals]
-    groups = {}
+    groups: dict[int, list[float]] = {}
     for oi, v in zip(mapped_orig, mapped_vals, strict=False):
         groups.setdefault(int(oi), []).append(float(v))
 
     return groups, out
 
 
-def _extract_raw_unmasked_values_with_positions(intervals, payload_eval, filter_df):
+def _extract_raw_unmasked_values_with_positions(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> tuple[dict[int, list[tuple[float, int]]], dict[int, int], np.ndarray]:
     """Extract raw bin values *and* their genomic start positions from unmasked segments.
 
     Returns (groups dict {orig_idx: list[(float_val, int_start)]}, base_starts dict,
@@ -625,7 +652,7 @@ def _extract_raw_unmasked_values_with_positions(intervals, payload_eval, filter_
     sorted_vals = mapped_vals[order]
     sorted_starts = mapped_starts[order]
 
-    groups = {}
+    groups: dict[int, list[tuple[float, int]]] = {}
     uniq, first_idx, counts = _numpy.unique(
         sorted_orig, return_index=True, return_counts=True
     )
@@ -651,7 +678,13 @@ def _extract_raw_unmasked_values_with_positions(intervals, payload_eval, filter_
     return groups, base_starts, out
 
 
-def _compute_filtered_extremum_pos(intervals, payload_eval, filter_df, mode, relative):
+def _compute_filtered_extremum_pos(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+    mode: str,
+    relative: bool,
+) -> np.ndarray:
     """Compute max.pos.* or min.pos.* under filter.
 
     For track sources (string), extracts raw bin values with positions and finds
@@ -712,14 +745,15 @@ def _compute_filtered_extremum_pos(intervals, payload_eval, filter_df, mode, rel
     # Recover the original DataFrame source from the already-converted payload.
     # At this point ``src`` is the _df2pymisha output (list of arrays).
     # Reconstruct the relevant columns.
-    src_arr = src  # list: [colnames, chrom_arr, start_arr, end_arr, val_arr, ...]
+    assert src is not None
+    src_arr: list[Any] = src  # list: [colnames, chrom_arr, start_arr, end_arr, val_arr, ...]
     src_chroms_raw = [str(c) for c in src_arr[1]]
     src_chroms = _normalize_chroms(src_chroms_raw)
     src_starts = _numpy.asarray(src_arr[2], dtype=int)
     src_ends = _numpy.asarray(src_arr[3], dtype=int)
     src_vals = _numpy.asarray(src_arr[4], dtype=float)
 
-    best_extremum_val = {}
+    best_extremum_val: dict[int, float] = {}
     for row in seg_df.itertuples(index=False):
         seg_chrom = str(row.chrom)
         seg_start = int(row.start)
@@ -753,7 +787,11 @@ def _compute_filtered_extremum_pos(intervals, payload_eval, filter_df, mode, rel
     return out
 
 
-def _compute_filtered_stddev(intervals, payload_eval, filter_df):
+def _compute_filtered_stddev(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """Stddev under filter: extract raw bin values and compute exact stddev."""
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
     for orig_idx, raw_vals in groups.items():
@@ -762,7 +800,11 @@ def _compute_filtered_stddev(intervals, payload_eval, filter_df):
     return out
 
 
-def _compute_filtered_quantile(intervals, payload_eval, filter_df):
+def _compute_filtered_quantile(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """Quantile under filter: extract raw bin values and compute exact quantile."""
     percentile = float(payload_eval.get("params", 0.5) or 0.5)
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
@@ -771,7 +813,7 @@ def _compute_filtered_quantile(intervals, payload_eval, filter_df):
     return out
 
 
-def _logsumexp(values):
+def _logsumexp(values: list[float] | np.ndarray) -> float:
     arr = _numpy.asarray(values, dtype=float)
     arr = arr[~_numpy.isnan(arr)]
     if arr.size == 0:
@@ -782,7 +824,11 @@ def _logsumexp(values):
     return float(m + _numpy.log(_numpy.exp(arr - m).sum()))
 
 
-def _compute_filtered_lse(intervals, payload_eval, filter_df):
+def _compute_filtered_lse(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """LSE under filter from raw unmasked source values."""
     if not isinstance(payload_eval.get("src"), str):
         raise NotImplementedError("lse under filter currently requires a track source")
@@ -792,7 +838,11 @@ def _compute_filtered_lse(intervals, payload_eval, filter_df):
     return out
 
 
-def _compute_filtered_segment_logsumexp(intervals, payload_eval, filter_df):
+def _compute_filtered_segment_logsumexp(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """Log-sum-exp composition over independently scored unmasked segments."""
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -811,7 +861,7 @@ def _compute_filtered_segment_logsumexp(intervals, payload_eval, filter_df):
         dtype=float,
     )
 
-    per_vals = [[] for _ in range(len(intervals))]
+    per_vals: list[list[float]] = [[] for _ in range(len(intervals))]
     for orig_idx, seg_val in zip(seg_df["orig_idx"], seg_vals, strict=False):
         per_vals[int(orig_idx)].append(float(seg_val))
 
@@ -821,7 +871,11 @@ def _compute_filtered_segment_logsumexp(intervals, payload_eval, filter_df):
     return out
 
 
-def _compute_filtered_pwm_max_pos(intervals, payload_eval, filter_df):
+def _compute_filtered_pwm_max_pos(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+) -> np.ndarray:
     """pwm.max.pos under filter: select position from segment with best pwm.max score."""
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -861,7 +915,7 @@ def _compute_filtered_pwm_max_pos(intervals, payload_eval, filter_df):
     return out
 
 
-def _global_percentile_reference_values(src, bin_size):
+def _global_percentile_reference_values(src: str, bin_size: int) -> np.ndarray:
     key = (str(_shared._GROOT), str(src), int(bin_size))
     cached = _GLOBAL_PERCENTILE_CACHE.get(key)
     if cached is not None:
@@ -885,7 +939,7 @@ def _global_percentile_reference_values(src, bin_size):
     return ref
 
 
-def _percentile_from_reference(values, ref_sorted):
+def _percentile_from_reference(values: np.ndarray, ref_sorted: np.ndarray) -> np.ndarray:
     out = _numpy.full(values.shape, _numpy.nan, dtype=float)
     if ref_sorted.size == 0:
         return out
@@ -897,7 +951,12 @@ def _percentile_from_reference(values, ref_sorted):
     return out
 
 
-def _compute_filtered_global_percentile(intervals, payload_eval, filter_df, func):
+def _compute_filtered_global_percentile(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+    func: str,
+) -> np.ndarray:
     """global.percentile* under filter using raw unmasked bins and global dense reference."""
     from .tracks import gtrack_info
 
@@ -912,6 +971,8 @@ def _compute_filtered_global_percentile(intervals, payload_eval, filter_df, func
         raise NotImplementedError("global.percentile* under filter requires a dense track source")
 
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
+    from collections.abc import Callable
+    stat_fn: Callable[..., Any]
     if func == "global.percentile":
         stat_fn = _numpy.mean
     elif func == "global.percentile.min":
@@ -928,7 +989,11 @@ def _compute_filtered_global_percentile(intervals, payload_eval, filter_df, func
     return _percentile_from_reference(stats, ref)
 
 
-def _compute_global_percentile_unfiltered(intervals, payload_eval, func):
+def _compute_global_percentile_unfiltered(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    func: str,
+) -> np.ndarray:
     """global.percentile* without filter using C++ per-interval stats + Python reference CDF."""
     from .tracks import gtrack_info
 
@@ -963,7 +1028,7 @@ def _compute_global_percentile_unfiltered(intervals, payload_eval, func):
     return _percentile_from_reference(stats, ref)
 
 
-def _project_intervals_by_dim(intervals, dim):
+def _project_intervals_by_dim(intervals: pd.DataFrame, dim: int) -> pd.DataFrame:
     """Project 2D intervals to 1D by selecting a dimension.
 
     Parameters
@@ -995,7 +1060,7 @@ def _project_intervals_by_dim(intervals, dim):
     raise ValueError(f"dim must be 1 or 2, got {dim}")
 
 
-def _compute_vtrack_values(vtrack_name, intervals):
+def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     """
     Compute values for a virtual track.
 
@@ -1125,10 +1190,10 @@ def _compute_vtrack_values(vtrack_name, intervals):
         dtype=float,
     )
 
-    per_vals = [[] for _ in range(len(intervals))]
-    per_lens = [[] for _ in range(len(intervals))]
-    per_starts = [[] for _ in range(len(intervals))]
-    per_base_starts = [None for _ in range(len(intervals))]
+    per_vals: list[list[float]] = [[] for _ in range(len(intervals))]
+    per_lens: list[list[int]] = [[] for _ in range(len(intervals))]
+    per_starts: list[list[int]] = [[] for _ in range(len(intervals))]
+    per_base_starts: list[int | None] = [None for _ in range(len(intervals))]
     for orig_idx, seg_len, seg_start, base_start, seg_val in zip(
         seg_df["orig_idx"],
         seg_df["seg_len"],
@@ -1186,13 +1251,13 @@ def _compute_vtrack_values(vtrack_name, intervals):
         elif func in _FILTER_FIRST_POS_REL_FUNCS:
             if _numpy.isnan(arr[0]):
                 continue
-            out[i] = float(arr[0] + per_starts[i][0] - per_base_starts[i])
+            out[i] = float(arr[0] + per_starts[i][0] - (per_base_starts[i] or 0))
         elif func in _FILTER_LAST_POS_ABS_FUNCS:
             out[i] = float(arr[-1])
         elif func in _FILTER_LAST_POS_REL_FUNCS:
             if _numpy.isnan(arr[-1]):
                 continue
-            out[i] = float(arr[-1] + per_starts[i][-1] - per_base_starts[i])
+            out[i] = float(arr[-1] + per_starts[i][-1] - (per_base_starts[i] or 0))
         elif func in _FILTER_SAMPLE_POS_ABS_FUNCS:
             candidates = arr[valid]
             if candidates.size == 0:
@@ -1205,11 +1270,19 @@ def _compute_vtrack_values(vtrack_name, intervals):
             seg_starts = _numpy.asarray(per_starts[i], dtype=float)[valid]
             abs_candidates = arr[valid] + seg_starts
             idx = int(_numpy.random.randint(abs_candidates.size))
-            out[i] = float(abs_candidates[idx] - per_base_starts[i])
+            out[i] = float(abs_candidates[idx] - (per_base_starts[i] or 0))
     return out
 
 
-def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0, **kwargs):
+def gvtrack_create(
+    vtrack_name: str,
+    src: pd.DataFrame | str | None,
+    func: str = "avg",
+    params: float | str | None = None,
+    sshift: int = 0,
+    eshift: int = 0,
+    **kwargs: Any,
+) -> None:
     """
     Create a virtual track.
 
@@ -1432,7 +1505,7 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
 
         if "spat_bin" in config and config.get("spat_bin") is not None:
             try:
-                spat_bin = int(config["spat_bin"])
+                spat_bin = int(config["spat_bin"])  # type: ignore[arg-type]
             except Exception as exc:
                 raise ValueError("spat_bin must be a positive integer") from exc
             if spat_bin <= 0:
@@ -1448,8 +1521,14 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
                 raise ValueError("direction must be 'above' or 'below'")
             config["direction"] = direction
 
+        # For direction="below", default score_min to score_thresh: windows
+        # already scoring below the threshold trivially need 0 edits and would
+        # dominate the minimum, making the result always 0.
+        if direction == "below" and config.get("score_min") is None:
+            config["score_min"] = config.get("score_thresh")
+
     # For PWM virtual tracks, if pssm is a DataFrame, ensure column order A, C, G, T
-    if config.get('func', '').startswith('pwm'):
+    if str(config.get('func', '')).startswith('pwm'):
         pssm = config.get('pssm')
         if isinstance(pssm, _pandas.DataFrame):
             # Check if we have A, C, G, T columns (case-insensitive)
@@ -1474,7 +1553,7 @@ def gvtrack_create(vtrack_name, src, func='avg', params=None, sshift=0, eshift=0
     _shared._VTRACKS[vtrack_name] = config
 
 
-def gvtrack_ls():
+def gvtrack_ls() -> list[str]:
     """
     List all currently defined virtual tracks.
 
@@ -1517,7 +1596,7 @@ def gvtrack_ls():
     return list(_shared._VTRACKS.keys())
 
 
-def gvtrack_info(vtrack_name):
+def gvtrack_info(vtrack_name: str) -> dict[str, Any]:
     """
     Return the definition of a virtual track.
 
@@ -1570,7 +1649,7 @@ def gvtrack_info(vtrack_name):
     return dict(_shared._VTRACKS[vtrack_name])
 
 
-def gvtrack_iterator(vtrack_name, dim=None, sshift=0, eshift=0):
+def gvtrack_iterator(vtrack_name: str, dim: int | None = None, sshift: int = 0, eshift: int = 0) -> None:
     """
     Define modification rules for the 1D iterator of a virtual track.
 
@@ -1649,7 +1728,13 @@ def gvtrack_iterator(vtrack_name, dim=None, sshift=0, eshift=0):
     _shared._VTRACKS[vtrack_name] = cfg
 
 
-def gvtrack_iterator_2d(vtrack_name, sshift1=0, eshift1=0, sshift2=0, eshift2=0):
+def gvtrack_iterator_2d(
+    vtrack_name: str,
+    sshift1: int = 0,
+    eshift1: int = 0,
+    sshift2: int = 0,
+    eshift2: int = 0,
+) -> None:
     """
     Define modification rules for the 2D iterator of a virtual track.
 
@@ -1709,7 +1794,7 @@ def gvtrack_iterator_2d(vtrack_name, sshift1=0, eshift1=0, sshift2=0, eshift2=0)
     _shared._VTRACKS[vtrack_name] = cfg
 
 
-def gvtrack_filter(vtrack_name, mask=None, **kwargs):
+def gvtrack_filter(vtrack_name: str, mask: pd.DataFrame | str | list[Any] | None = None, **kwargs: Any) -> None:
     """
     Attach or clear a genomic mask filter on a virtual track.
 
@@ -1814,7 +1899,7 @@ def gvtrack_filter(vtrack_name, mask=None, **kwargs):
     return
 
 
-def gvtrack_rm(vtrack_name):
+def gvtrack_rm(vtrack_name: str) -> None:
     """
     Remove a virtual track.
 
@@ -1858,7 +1943,7 @@ def gvtrack_rm(vtrack_name):
         del _shared._VTRACKS[vtrack_name]
 
 
-def gvtrack_clear():
+def gvtrack_clear() -> None:
     """
     Remove all virtual tracks.
 

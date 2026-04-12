@@ -1,5 +1,7 @@
 """Database creation from FASTA files (gdb_create)."""
 
+from __future__ import annotations
+
 import copy
 import gzip
 import hashlib
@@ -10,8 +12,10 @@ import struct
 import tarfile
 import tempfile
 import warnings
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from typing import IO, Any
 from urllib import request as _urlrequest
 from urllib.parse import urlparse as _urlparse
 
@@ -28,7 +32,7 @@ from ._crc64 import (
 )
 
 
-def _sanitize_fasta_header(header):
+def _sanitize_fasta_header(header: str) -> str:
     """Sanitize FASTA header to extract clean contig name.
 
     Mirrors the C++ sanitize_fasta_header logic from GenomeSeqMultiImport.cpp.
@@ -62,7 +66,7 @@ def _sanitize_fasta_header(header):
     return clean
 
 
-def _compute_index_checksum(entries):
+def _compute_index_checksum(entries: list[dict[str, Any]]) -> int:
     """Compute CRC64 checksum for index entries (matches C++ compute_index_checksum)."""
     crc = _crc64_init()
 
@@ -82,7 +86,7 @@ def _compute_index_checksum(entries):
     return _crc64_finalize(crc)
 
 
-def _write_index_file(index_path, entries):
+def _write_index_file(index_path: str, entries: list[dict[str, Any]]) -> None:
     """Write genome.idx file in MISHAIDX format."""
     checksum = _compute_index_checksum(entries)
 
@@ -112,14 +116,14 @@ def _write_index_file(index_path, entries):
             f.write(struct.pack("<Q", 0))  # reserved
 
 
-def _open_fasta(path):
+def _open_fasta(path: str | Path) -> IO[str]:
     """Open a FASTA file, handling gzip compression."""
     if str(path).endswith(".gz"):
         return gzip.open(path, "rt", encoding="utf-8")
     return open(path, encoding="utf-8")
 
 
-def _download_file(url, dst_path):
+def _download_file(url: str, dst_path: str | Path) -> None:
     """Download a URL to a local path."""
     parsed = _urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
@@ -139,16 +143,17 @@ def _download_file(url, dst_path):
             out.write(chunk)
 
 
-def _download_text(url):
+def _download_text(url: str) -> str:
     parsed = _urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError(f"Unsupported download URL scheme: {parsed.scheme!r}")
     req = _urlrequest.Request(url, method="GET")
     with _urlrequest.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+        data: bytes = resp.read()
+        return data.decode("utf-8", errors="replace")
 
 
-def _sha256_file(path):
+def _sha256_file(path: str | Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -156,7 +161,7 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
-def _parse_sha256_text(text):
+def _parse_sha256_text(text: str) -> str:
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -167,7 +172,7 @@ def _parse_sha256_text(text):
     raise ValueError("Could not parse SHA256 checksum text")
 
 
-def _safe_extract_tar(archive_path, dest_dir):
+def _safe_extract_tar(archive_path: str | Path, dest_dir: str | Path) -> None:
     """Extract a tar archive while preventing path traversal."""
     dest = Path(dest_dir).resolve(strict=False)
     with tarfile.open(archive_path, "r:gz") as tf:
@@ -184,17 +189,17 @@ def _safe_extract_tar(archive_path, dest_dir):
                 tf.extract(member, path=dest)
 
 
-def _parse_fasta_files(fasta_paths):
+def _parse_fasta_files(fasta_paths: list[str]) -> list[dict[str, Any]]:
     """Parse one or more FASTA files and return contig entries with sequences.
 
     Each entry contains: chromid, name, offset, length, _seq.
     Offset is temporary and recalculated after contig sorting.
     """
-    entries = []
+    entries: list[dict[str, Any]] = []
     current_offset = 0
     contig_index = -1
     in_sequence = False
-    cur_chunks = []
+    cur_chunks: list[bytes] = []
     cur_length = 0
 
     def finalize_contig():
@@ -252,7 +257,7 @@ def _parse_fasta_files(fasta_paths):
     return entries
 
 
-def _read_chrom_sizes_rows(chrom_sizes_path):
+def _read_chrom_sizes_rows(chrom_sizes_path: str | Path) -> list[tuple[str, int]]:
     """Read chrom_sizes.txt preserving row order."""
     rows = []
     with open(chrom_sizes_path, encoding="utf-8") as fh:
@@ -286,7 +291,7 @@ def _read_chrom_sizes_rows(chrom_sizes_path):
     return rows
 
 
-def _resolve_seq_file(seq_dir, chrom):
+def _resolve_seq_file(seq_dir: Path, chrom: str) -> tuple[Path, str]:
     """Resolve a per-chromosome .seq file path with chr-prefix fallback."""
     candidates = [chrom]
     if chrom.startswith("chr"):
@@ -305,7 +310,7 @@ def _resolve_seq_file(seq_dir, chrom):
     )
 
 
-def _copy_binary_file(src_path, dst_fh, chunk_size):
+def _copy_binary_file(src_path: str | Path, dst_fh: IO[bytes], chunk_size: int) -> int:
     copied = 0
     with open(src_path, "rb") as src_fh:
         while True:
@@ -317,7 +322,12 @@ def _copy_binary_file(src_path, dst_fh, chunk_size):
     return copied
 
 
-def _validate_indexed_genome(entries, seq_files, genome_seq_path, chunk_size):
+def _validate_indexed_genome(
+    entries: list[dict[str, Any]],
+    seq_files: list[Path],
+    genome_seq_path: Path,
+    chunk_size: int,
+) -> None:
     expected_total = sum(entry["length"] for entry in entries)
     actual_total = genome_seq_path.stat().st_size
     if expected_total != actual_total:
@@ -342,7 +352,7 @@ def _validate_indexed_genome(entries, seq_files, genome_seq_path, chunk_size):
                     remaining -= n
 
 
-def _interval_set_is_2d(intervals_dir):
+def _interval_set_is_2d(intervals_dir: Path) -> bool:
     for entry in intervals_dir.iterdir():
         if entry.name in {
             ".meta",
@@ -359,7 +369,7 @@ def _interval_set_is_2d(intervals_dir):
     return False
 
 
-def _convert_all_tracks_to_indexed(groot, verbose=False):
+def _convert_all_tracks_to_indexed(groot: str | Path, verbose: bool = False) -> None:
     from .tracks import (
         gtrack_2d_convert_to_indexed,
         gtrack_convert_to_indexed,
@@ -412,7 +422,11 @@ def _convert_all_tracks_to_indexed(groot, verbose=False):
         )
 
 
-def _convert_all_intervals_to_indexed(groot, remove_old_files=False, verbose=False):
+def _convert_all_intervals_to_indexed(
+    groot: str | Path,
+    remove_old_files: bool = False,
+    verbose: bool = False,
+) -> None:
     from .intervals import (
         gintervals_2d_convert_to_indexed,
         gintervals_convert_to_indexed,
@@ -455,7 +469,7 @@ def _convert_all_intervals_to_indexed(groot, remove_old_files=False, verbose=Fal
 
 
 @contextmanager
-def _db_conversion_context(groot):
+def _db_conversion_context(groot: str | Path) -> Generator[None, None, None]:
     from . import _shared
     from .db import gdb_init, gdb_reload, gdb_unload
 
@@ -488,7 +502,7 @@ def _db_conversion_context(groot):
                 _shared._VTRACKS = old_vtracks
 
 
-def gdb_create_linked(path, parent):
+def gdb_create_linked(path: str, parent: str) -> bool:
     """
     Create a linked database that reuses sequence data from a parent DB.
 
@@ -566,15 +580,15 @@ def gdb_create_linked(path, parent):
 
 
 def gdb_convert_to_indexed(
-    groot=None,
-    remove_old_files=False,
-    force=False,
-    validate=True,
-    convert_tracks=False,
-    convert_intervals=False,
-    verbose=False,
-    chunk_size=104857600,
-):
+    groot: str | None = None,
+    remove_old_files: bool = False,
+    force: bool = False,
+    validate: bool = True,
+    convert_tracks: bool = False,
+    convert_intervals: bool = False,
+    verbose: bool = False,
+    chunk_size: int = 104857600,
+) -> None:
     """
     Convert a per-chromosome database to indexed genome format.
 
@@ -675,8 +689,8 @@ def gdb_convert_to_indexed(
         seq_tmp = seq_dir / "genome.seq.tmp"
         idx_tmp = seq_dir / "genome.idx.tmp"
         chrom_sizes_tmp = db_root / "chrom_sizes.txt.tmp"
-        entries = []
-        source_seq_files = []
+        entries: list[dict[str, Any]] = []
+        source_seq_files: list[Path] = []
         offset = 0
 
         try:
@@ -746,8 +760,16 @@ def gdb_convert_to_indexed(
     return
 
 
-def gdb_create(groot, fasta, genes_file=None, annots_file=None,
-               annots_names=None, db_format="indexed", verbose=False, **kwargs):
+def gdb_create(
+    groot: str,
+    fasta: str | list[str],
+    genes_file: str | None = None,
+    annots_file: str | None = None,
+    annots_names: list[str] | None = None,
+    db_format: str = "indexed",
+    verbose: bool = False,
+    **kwargs: Any,
+) -> pd.DataFrame:
     """
     Create a new Genomic Database from FASTA file(s).
 
@@ -824,9 +846,9 @@ def gdb_create(groot, fasta, genes_file=None, annots_file=None,
         bad = ", ".join(sorted(kwargs))
         raise TypeError(f"Unexpected keyword argument(s): {bad}")
 
-    groot = Path(groot)
+    groot_path = Path(groot)
 
-    if groot.exists():
+    if groot_path.exists():
         raise FileExistsError(f"Directory already exists: {groot}")
 
     if db_format not in ("indexed", "per-chromosome"):
@@ -855,7 +877,7 @@ def gdb_create(groot, fasta, genes_file=None, annots_file=None,
 
     # Check for duplicate names
     names = [e["name"] for e in entries]
-    seen = {}
+    seen: dict[str, int] = {}
     for name in names:
         seen[name] = seen.get(name, 0) + 1
     dupes = {k: v for k, v in seen.items() if v > 1}
@@ -873,16 +895,16 @@ def gdb_create(groot, fasta, genes_file=None, annots_file=None,
         entry["chromid"] = i
 
     # Create directory structure
-    groot.mkdir(parents=True)
-    (groot / "seq").mkdir()
-    (groot / "tracks").mkdir()
-    (groot / "pssms").mkdir()
+    groot_path.mkdir(parents=True)
+    (groot_path / "seq").mkdir()
+    (groot_path / "tracks").mkdir()
+    (groot_path / "pssms").mkdir()
 
     if db_format == "indexed":
         # Indexed format: single genome.seq + genome.idx
         # Recalculate offsets and write genome.seq in sorted order without
         # materializing an additional full-genome byte string in memory.
-        genome_seq_path = groot / "seq" / "genome.seq"
+        genome_seq_path = groot_path / "seq" / "genome.seq"
         offset = 0
         with open(genome_seq_path, "wb") as seq_fh:
             for entry in sorted_entries:
@@ -892,25 +914,25 @@ def gdb_create(groot, fasta, genes_file=None, annots_file=None,
                 offset += entry["length"]
 
         # Write genome.idx
-        _write_index_file(str(groot / "seq" / "genome.idx"), sorted_entries)
+        _write_index_file(str(groot_path / "seq" / "genome.idx"), sorted_entries)
     else:
         # Per-chromosome format: one .seq file per contig
         offset = 0
         for entry in sorted_entries:
             entry["offset"] = offset
             seq_bytes = entry.pop("_seq", b"")
-            seq_path = groot / "seq" / f"{entry['name']}.seq"
+            seq_path = groot_path / "seq" / f"{entry['name']}.seq"
             with open(seq_path, "wb") as seq_fh:
                 seq_fh.write(seq_bytes)
             offset += entry["length"]
 
     # Write chrom_sizes.txt
-    with open(groot / "chrom_sizes.txt", "w") as f:
+    with open(groot_path / "chrom_sizes.txt", "w") as f:
         for entry in sorted_entries:
             f.write(f"{entry['name']}\t{entry['length']}\n")
 
     if verbose:
-        print(f"Created database at {groot}")
+        print(f"Created database at {groot_path}")
         print(f"  {len(sorted_entries)} contigs, {offset} total bases")
 
     # Return contig info
@@ -920,7 +942,12 @@ def gdb_create(groot, fasta, genes_file=None, annots_file=None,
     })
 
 
-def gdb_create_genome(genome, path=None, tmpdir=None, verify_checksum=True):
+def gdb_create_genome(
+    genome: str,
+    path: str | None = None,
+    tmpdir: str | None = None,
+    verify_checksum: bool = True,
+) -> None:
     """
     Download and initialize a prebuilt genome database.
 

@@ -1,5 +1,7 @@
 """Database directory management functions (gdir.*)."""
 
+from __future__ import annotations
+
 import shutil
 from pathlib import Path
 
@@ -8,11 +10,12 @@ from ._name_validation import validate_dotted_name
 from ._shared import _checkroot
 
 
-def _tracks_root():
+def _tracks_root() -> Path:
+    assert _shared._GROOT is not None
     return (Path(_shared._GROOT) / "tracks").resolve()
 
 
-def _resolve_within_tracks(base, relpath):
+def _resolve_within_tracks(base: Path, relpath: Path | str) -> tuple[Path, Path]:
     target = (base / relpath).resolve()
     tracks_root = _tracks_root()
     try:
@@ -24,7 +27,7 @@ def _resolve_within_tracks(base, relpath):
     return target, tracks_root
 
 
-def gdir_cwd():
+def gdir_cwd() -> str:
     """
     Return the current working directory in the genomic database.
 
@@ -52,10 +55,11 @@ def gdir_cwd():
     '...tracks'
     """
     _checkroot()
+    assert _shared._GWD is not None
     return _shared._GWD
 
 
-def gdir_cd(dir):
+def gdir_cd(dir: str) -> None:
     """
     Change the current working directory in the genomic database.
 
@@ -91,6 +95,7 @@ def gdir_cd(dir):
     if dir is None:
         raise ValueError("dir argument is required")
     _checkroot()
+    assert _shared._GWD is not None
 
     old_gwd = _shared._GWD
 
@@ -115,7 +120,7 @@ def gdir_cd(dir):
         raise
 
 
-def gdir_create(dir, show_warnings=True):
+def gdir_create(dir: str, show_warnings: bool = True) -> None:
     """
     Create a new directory in the genomic database.
 
@@ -156,6 +161,7 @@ def gdir_create(dir, show_warnings=True):
     >>> pm.gdir_create("my_subdir")  # doctest: +SKIP
     """
     _checkroot()
+    assert _shared._GWD is not None
 
     base = Path(_shared._GWD).resolve()
     target, tracks_root = _resolve_within_tracks(base, dir)
@@ -178,7 +184,7 @@ def gdir_create(dir, show_warnings=True):
     target.mkdir(exist_ok=False)
 
 
-def gdir_rm(dir, recursive=False, force=False):
+def gdir_rm(dir: str, recursive: bool = False, force: bool = False) -> None:
     """
     Delete a directory from the genomic database.
 
@@ -222,6 +228,7 @@ def gdir_rm(dir, recursive=False, force=False):
     >>> pm.gdir_rm("temp_dir")  # doctest: +SKIP
     """
     _checkroot()
+    assert _shared._GWD is not None
 
     base = Path(_shared._GWD).resolve()
     target, tracks_root = _resolve_within_tracks(base, dir)
@@ -256,7 +263,7 @@ def gdir_rm(dir, recursive=False, force=False):
     gdb_reload()
 
 
-def gtrack_create_dirs(track, mode="0777"):
+def gtrack_create_dirs(track: str, mode: str = "0777") -> None:
     """
     Create the directory hierarchy needed for a dotted track name.
 
@@ -288,6 +295,7 @@ def gtrack_create_dirs(track, mode="0777"):
     >>> pm.gtrack_create_dirs("proj.sample.my_track")  # doctest: +SKIP
     """
     _checkroot()
+    assert _shared._GWD is not None
     validate_dotted_name(track, "track name")
 
     parts = track.split(".")
@@ -309,7 +317,7 @@ def gtrack_create_dirs(track, mode="0777"):
             current.mkdir()
 
 
-def _check_not_inside_track(relpath):
+def _check_not_inside_track(relpath: str) -> None:
     """Raise if relpath is inside a .track directory."""
     parts = Path(relpath).parts
     for part in parts:

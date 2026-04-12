@@ -3648,6 +3648,7 @@ class TestGseqPwmEditsDirectionBelowStructure:
         result = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert isinstance(result, pd.DataFrame)
         expected_cols = {
@@ -3674,6 +3675,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "TT", pssm, score_thresh=-0.5,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert result["n_edits"].iloc[0] == 0
         assert result["edit_num"].iloc[0] == 0
@@ -3691,6 +3693,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=threshold,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         rows_with_edits = result[result["n_edits"] > 0]
         assert len(rows_with_edits) > 0, "Should need edits to bring score below threshold"
@@ -3709,6 +3712,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "ACG", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         edit_rows = result[result["edit_num"] > 0]
         assert len(edit_rows) > 0
@@ -3728,6 +3732,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "ACG", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         edit_rows = result[result["edit_num"] > 0]
         ws = result["window_seq"].iloc[0]
@@ -3752,6 +3757,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         real_edits = result[result["edit_num"] > 0]
         assert len(real_edits) > 0
@@ -3773,6 +3779,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         sub_rows = result[result["edit_num"] > 0]
         if "edit_type" in sub_rows.columns:
@@ -3796,6 +3803,7 @@ class TestGseqPwmEditsDirectionBelow:
         result = pm.gseq_pwm_edits(
             ["AC", "TT"], pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         # "AC" is perfect match → needs edits to bring below
         ac_rows = result[result["seq_idx"] == 1]
@@ -3821,6 +3829,7 @@ class TestGseqPwmEditsDirectionBelow:
             result = pm.gseq_pwm_edits(
                 seq, pssm, score_thresh=threshold,
                 prior=0, bidirect=False, direction="below",
+                score_min=float('-inf'),
             )
             expected = _manual_pwm_edit_distance_below(seq, pssm, threshold, scan_all=True)
             if len(result) > 0:
@@ -3843,6 +3852,7 @@ class TestGseqPwmEditsDirectionBelowBidirect:
         result = pm.gseq_pwm_edits(
             "GT", pssm, score_thresh=-1.0,
             prior=0, bidirect=True, direction="below",
+            score_min=float('-inf'),
         )
         assert len(result) > 0
         # Forward strand is already below threshold → 0 edits
@@ -3859,6 +3869,7 @@ class TestGseqPwmEditsDirectionBelowBidirect:
         result = pm.gseq_pwm_edits(
             "AC", pssm, score_thresh=-0.01,
             prior=0, bidirect=True, direction="below",
+            score_min=float('-inf'),
         )
         assert len(result) > 0
         # Reverse strand "GT" is already below -0.01 → 0 edits
@@ -3879,10 +3890,12 @@ class TestGseqPwmEditsDirectionBelowMaxEdits:
         r_unlim = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         r_max1 = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             max_edits=1, prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         # Both should have results for this threshold
         assert len(r_unlim) > 0
@@ -3910,6 +3923,7 @@ class TestGseqPwmEditsDirectionBelowAboveComplementary:
         r_below = pm.gseq_pwm_edits(
             "AC", pssm, score_thresh=threshold,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert r_above["n_edits"].iloc[0] == 0, \
             "AC is already above threshold, direction=above should need 0 edits"
@@ -3924,6 +3938,7 @@ class TestGseqPwmEditsDirectionBelowAboveComplementary:
         r_below_tt = pm.gseq_pwm_edits(
             "TT", pssm, score_thresh=threshold,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert r_above_tt["n_edits"].iloc[0] > 0, \
             "TT is below threshold, direction=above should need edits"
@@ -3946,6 +3961,7 @@ class TestGseqPwmEditsDirectionBelowLongerSeq:
         result = pm.gseq_pwm_edits(
             seq, pssm, score_thresh=threshold,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert len(result) > 0
         rows_with_edits = result[result["n_edits"] > 0]
@@ -3965,6 +3981,7 @@ class TestGseqPwmEditsDirectionBelowInformative:
         result = pm.gseq_pwm_edits(
             "AC", pssm, score_thresh=-0.5,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert len(result) > 0
         rows_with_edits = result[result["n_edits"] > 0]
@@ -3987,6 +4004,7 @@ class TestGseqPwmEditsDirectionBelowIndels:
         result = pm.gseq_pwm_edits(
             "ACGT", pssm, score_thresh=-1.0,
             max_indels=1, prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
         assert isinstance(result, pd.DataFrame)
         assert len(result) > 0
@@ -4044,6 +4062,7 @@ class TestVtrackDirectionBelowBasic:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("edist_below", test_interval, iterator=test_interval)
@@ -4062,6 +4081,7 @@ class TestVtrackDirectionBelowBasic:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=100.0,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("edist_below_easy", test_interval, iterator=test_interval)
@@ -4079,6 +4099,7 @@ class TestVtrackDirectionBelowBasic:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=-100.0,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("edist_below_imp", test_interval, iterator=test_interval)
@@ -4102,6 +4123,7 @@ class TestVtrackDirectionBelowBasic:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("edist_below_ref", intervals, iterator=intervals)
@@ -4137,6 +4159,7 @@ class TestVtrackDirectionBelowMaxEdits:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         # With max_edits=1
@@ -4144,6 +4167,7 @@ class TestVtrackDirectionBelowMaxEdits:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold, max_edits=1,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4171,6 +4195,7 @@ class TestVtrackDirectionBelowMaxEdits:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         for k in range(1, 4):
@@ -4178,6 +4203,7 @@ class TestVtrackDirectionBelowMaxEdits:
                               func="pwm.edit_distance",
                               pssm=pssm, score_thresh=threshold, max_edits=k,
                               direction="below",
+                              score_min=float('-inf'),
                               bidirect=False, extend=False, prior=0)
 
         vnames = ["ed_b_exact"] + [f"ed_b_max{k}" for k in range(1, 4)]
@@ -4212,18 +4238,21 @@ class TestVtrackDirectionBelowBidirectional:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, strand=1, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_rev", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, strand=-1, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_bidi", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=True, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4271,6 +4300,7 @@ class TestVtrackDirectionBelowComplementary:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4317,18 +4347,21 @@ class TestVtrackDirectionBelowPosAndMax:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_pos", None,
                           func="pwm.edit_distance.pos",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_max", None,
                           func="pwm.max.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("pwm_max_pos", None,
@@ -4400,6 +4433,7 @@ class TestVtrackDirectionBelowScoreFilters:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_lowfilt", None,
@@ -4455,6 +4489,7 @@ class TestVtrackDirectionBelow1bpIterator:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=True, prior=0)
 
         result = pm.gextract("ed_b_1bp", test_interval, iterator=1)
@@ -4497,6 +4532,7 @@ class TestVtrackDirectionBelowThresholdMonotonicity:
                               func="pwm.edit_distance",
                               pssm=pssm, score_thresh=thresh,
                               direction="below",
+                              score_min=float('-inf'),
                               bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(vnames, test_interval, iterator=test_interval)
@@ -4545,6 +4581,7 @@ class TestVtrackDirectionBelowLongerMotif:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("ed_b_6bp", test_interval, iterator=test_interval)
@@ -4575,12 +4612,14 @@ class TestVtrackDirectionBelowExtend:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=True, prior=0)
 
         pm.gvtrack_create("ed_b_noext", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4634,6 +4673,7 @@ class TestVtrackDirectionBelowZeroProbability:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("ed_b_zeros", test_interval, iterator=test_interval)
@@ -4662,6 +4702,7 @@ class TestVtrackDirectionBelowGscreen:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         test_intervals = pm.gintervals(["1"], [200], [300])
@@ -4695,6 +4736,7 @@ class TestVtrackDirectionBelowComparison:
         gseq_result = pm.gseq_pwm_edits(
             seq, pssm, score_thresh=threshold,
             prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
         )
 
         # vtrack
@@ -4702,6 +4744,7 @@ class TestVtrackDirectionBelowComparison:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
         vt_result = pm.gextract("ed_b_cmp", test_interval, iterator=test_interval)
 
@@ -4742,13 +4785,15 @@ class TestVtrackDirectionBelowIndels:
         pm.gvtrack_create("ed_b_sub", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=0,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=0,
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind1", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4785,7 +4830,8 @@ class TestVtrackDirectionBelowIndels:
             pm.gvtrack_create(f"ed_b_d{d}", None,
                               func="pwm.edit_distance",
                               pssm=pssm, score_thresh=threshold,
-                              direction="below", max_indels=d,
+                              direction="below",
+                              score_min=float('-inf'), max_indels=d,
                               bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4823,18 +4869,21 @@ class TestVtrackDirectionBelowIndels:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_1ind", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_2ind", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=2,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=2,
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4875,12 +4924,14 @@ class TestVtrackDirectionBelowIndels:
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_cap0", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=0,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=0,
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4906,7 +4957,8 @@ class TestVtrackDirectionBelowIndels:
             pm.gvtrack_create(f"ed_b_easy{d}", None,
                               func="pwm.edit_distance",
                               pssm=pssm, score_thresh=100.0,
-                              direction="below", max_indels=d,
+                              direction="below",
+                              score_min=float('-inf'), max_indels=d,
                               bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4931,19 +4983,22 @@ class TestVtrackDirectionBelowIndels:
         pm.gvtrack_create("ed_b_ind_fwd", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, strand=1, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind_rev", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, strand=-1, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind_bidi", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=True, extend=False, prior=0)
 
         result = pm.gextract(
@@ -4976,19 +5031,22 @@ class TestVtrackDirectionBelowIndels:
         pm.gvtrack_create("ed_b_ind_unlim", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind_max1", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1, max_edits=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1, max_edits=1,
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind_max3", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1, max_edits=3,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1, max_edits=3,
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5030,17 +5088,20 @@ class TestVtrackDirectionBelowIndels:
         pm.gvtrack_create("ed_b_con_sub", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=0,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=0,
                           bidirect=False, extend=False, prior=0)
         pm.gvtrack_create("ed_b_con_ind1", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=False, prior=0)
         pm.gvtrack_create("ed_b_con_ind2", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=2,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=2,
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5076,13 +5137,15 @@ class TestVtrackDirectionBelowIndels:
         pm.gvtrack_create("ed_b_ind_int", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("ed_b_ind_1bp", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
-                          direction="below", max_indels=1,
+                          direction="below",
+                          score_min=float('-inf'), max_indels=1,
                           bidirect=False, extend=True, prior=0)
 
         result_int = pm.gextract("ed_b_ind_int", test_interval, iterator=test_interval)
@@ -5132,6 +5195,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=high_thresh,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("v_lse_b_easy", test_interval, iterator=test_interval)
@@ -5157,6 +5221,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=low_thresh,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("v_lse_b_hard", test_interval, iterator=test_interval)
@@ -5173,6 +5238,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=100.0,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("v_lse_b_al", test_interval, iterator=test_interval)
@@ -5190,6 +5256,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=-1000.0,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract("v_lse_b_imp", test_interval, iterator=test_interval)
@@ -5219,6 +5286,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=low_thresh,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5243,6 +5311,7 @@ class TestVtrackLseDirectionBelow:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=high_thresh,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result2 = pm.gextract(
@@ -5284,12 +5353,14 @@ class TestVtrackLseDirectionBelowPos:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("v_lse_b_pos", None,
                           func="pwm.edit_distance.lse.pos",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5348,12 +5419,14 @@ class TestVtrackLseDirectionBelowConsistency:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("v_max_b_ed", None,
                           func="pwm.edit_distance",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5408,6 +5481,7 @@ class TestVtrackLseDirectionBelowThresholdMonotonicity:
                               func="pwm.edit_distance.lse",
                               pssm=pssm, score_thresh=thresh,
                               direction="below",
+                              score_min=float('-inf'),
                               bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(vnames, test_interval, iterator=test_interval)
@@ -5453,18 +5527,21 @@ class TestVtrackLseDirectionBelowBidirectional:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, strand=1, extend=False, prior=0)
 
         pm.gvtrack_create("v_lse_b_rev", None,
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, strand=-1, extend=False, prior=0)
 
         pm.gvtrack_create("v_lse_b_bidi", None,
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=True, extend=False, prior=0)
 
         result = pm.gextract(
@@ -5517,18 +5594,21 @@ class TestVtrackLseDirectionBelowMaxEdits:
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("v_lse_b_max1", None,
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold, max_edits=1,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         pm.gvtrack_create("v_lse_b_max5", None,
                           func="pwm.edit_distance.lse",
                           pssm=pssm, score_thresh=threshold, max_edits=5,
                           direction="below",
+                          score_min=float('-inf'),
                           bidirect=False, extend=False, prior=0)
 
         result = pm.gextract(

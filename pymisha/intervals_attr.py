@@ -5,12 +5,16 @@ The binary format uses null-terminated key-value pairs:
     key1\0value1\0key2\0value2\0...
 """
 
+from __future__ import annotations
+
 from pathlib import Path
+
+import pandas as pd
 
 from ._shared import _checkroot
 
 
-def _iattr_path(intervals_set):
+def _iattr_path(intervals_set: str) -> Path:
     """Resolve the filesystem path of the ``.iattr`` file for an interval set."""
     from .intervals import gintervals_dataset
 
@@ -28,7 +32,7 @@ def _iattr_path(intervals_set):
     return Path(db_root) / "tracks" / f"{path_part}.iattr"
 
 
-def _iattr_read(path):
+def _iattr_read(path: Path | str) -> dict[str, str]:
     """Read a binary ``.iattr`` file into a dict of ``{key: value}``."""
     path = Path(path)
     if not path.exists():
@@ -46,7 +50,7 @@ def _iattr_read(path):
     if len(parts) % 2 != 0:
         parts = parts[: len(parts) - 1]
 
-    result = {}
+    result: dict[str, str] = {}
     for i in range(0, len(parts), 2):
         key = parts[i].decode("utf-8")
         value = parts[i + 1].decode("utf-8")
@@ -54,7 +58,7 @@ def _iattr_read(path):
     return result
 
 
-def _iattr_write(path, attrs):
+def _iattr_write(path: Path | str, attrs: dict[str, str]) -> None:
     """Write a dict of ``{key: value}`` to a binary ``.iattr`` file."""
     path = Path(path)
     if not attrs:
@@ -62,7 +66,7 @@ def _iattr_write(path, attrs):
             path.unlink()
         return
 
-    chunks = []
+    chunks: list[bytes] = []
     for key, value in attrs.items():
         chunks.append(key.encode("utf-8"))
         chunks.append(b"\x00")
@@ -71,7 +75,7 @@ def _iattr_write(path, attrs):
     path.write_bytes(b"".join(chunks))
 
 
-def _check_writable(intervals_set):
+def _check_writable(intervals_set: str) -> None:
     """Check that an interval set belongs to the working database (not read-only)."""
     from . import _shared
     from .intervals import gintervals_dataset
@@ -83,7 +87,7 @@ def _check_writable(intervals_set):
         )
 
 
-def gintervals_attr_get(intervals_set, attr):
+def gintervals_attr_get(intervals_set: str, attr: str) -> str:
     """Return the value of an interval set attribute.
 
     Parameters
@@ -118,10 +122,10 @@ def gintervals_attr_get(intervals_set, attr):
     _checkroot()
 
     result = gintervals_attr_export(intervals_set, attr)
-    return result.iloc[0, 0]
+    return str(result.iloc[0, 0])
 
 
-def gintervals_attr_set(intervals_set, attr, value):
+def gintervals_attr_set(intervals_set: str, attr: str, value: str) -> None:
     """Assign a value to an interval set attribute.
 
     If *value* is an empty string the attribute is removed.
@@ -158,13 +162,14 @@ def gintervals_attr_set(intervals_set, attr, value):
         raise ValueError("Usage: gintervals_attr_set(intervals_set, attr, value)")
     _checkroot()
 
-    import pandas as pd
-
     table = pd.DataFrame({attr: [value]}, index=[intervals_set])
     gintervals_attr_import(table, remove_others=False)
 
 
-def gintervals_attr_export(intervals_set=None, attrs=None):
+def gintervals_attr_export(
+    intervals_set: str | list[str] | None = None,
+    attrs: str | list[str] | None = None,
+) -> pd.DataFrame:
     """Return interval set attributes as a DataFrame.
 
     Parameters
@@ -200,8 +205,6 @@ def gintervals_attr_export(intervals_set=None, attrs=None):
     >>> pm.gintervals_attr_export("annotations")  # doctest: +SKIP
     >>> pm.gintervals_attr_set("annotations", "color", "")
     """
-    import pandas as pd
-
     _checkroot()
     from .intervals import gintervals_exists, gintervals_ls
 
@@ -232,7 +235,7 @@ def gintervals_attr_export(intervals_set=None, attrs=None):
     if attrs is None:
         from collections import Counter
 
-        name_counts = Counter()
+        name_counts: Counter[str] = Counter()
         for d in all_attrs.values():
             name_counts.update(d.keys())
         if not name_counts:
@@ -256,7 +259,7 @@ def gintervals_attr_export(intervals_set=None, attrs=None):
     return pd.DataFrame(data, index=isets)
 
 
-def gintervals_attr_import(table, remove_others=False):
+def gintervals_attr_import(table: pd.DataFrame, remove_others: bool = False) -> None:
     """Import interval set attributes from a DataFrame.
 
     Parameters
@@ -293,8 +296,6 @@ def gintervals_attr_import(table, remove_others=False):
     >>> t = pd.DataFrame({"myattr": [""]}, index=["annotations"])
     >>> pm.gintervals_attr_import(t)
     """
-    import pandas as pd
-
     if table is None:
         raise ValueError("Usage: gintervals_attr_import(table, remove_others=False)")
     _checkroot()
@@ -332,7 +333,7 @@ def gintervals_attr_import(table, remove_others=False):
         path = _iattr_path(iset)
         existing = _iattr_read(path)
 
-        new_attrs = {} if remove_others else dict(existing)
+        new_attrs: dict[str, str] = {} if remove_others else dict(existing)
 
         for a in attr_names:
             val = table.loc[iset, a]

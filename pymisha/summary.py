@@ -1,5 +1,12 @@
 """Summary, quantile, and distribution APIs."""
 
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
 from . import _shared
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
@@ -16,28 +23,32 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
 )
+from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars, _resolve_user_vars
 from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 from .vtracks import _compute_vtrack_values
 
 
-def _interval_coord_cols(intervals):
+def _interval_coord_cols(intervals: pd.DataFrame) -> list[str]:
     """Return the coordinate column names for 1D or 2D intervals."""
     if _is_2d_intervals(intervals):
         return ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
     return ["chrom", "start", "end"]
 
 
-def _validate_expr_security(expr, track_names=None, vtrack_names=None, user_vars=None):
+def _validate_expr_security(
+    expr: str,
+    track_names: set[str] | None = None,
+    vtrack_names: set[str] | None = None,
+    user_vars: dict[str, Any] | None = None,
+) -> None:
     if track_names is None:
         track_names = set(_pymisha.pm_track_names())
     if vtrack_names is None:
         vtrack_names = set(_shared._VTRACKS.keys())
 
-    expr_eval, expr_tracks, expr_vtracks, _ = _parse_expr_vars(
-        expr, track_names, vtrack_names
-    )
+    expr_eval, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
     allowed_names = {
         "np",
         "numpy",
@@ -52,8 +63,17 @@ def _validate_expr_security(expr, track_names=None, vtrack_names=None, user_vars
     compile_safe_expression(expr_eval, allowed_names)
 
 
-def gdist(*args, intervals=None, include_lowest=False, iterator=None,
-          band=None, dataframe=False, names=None, vars=None, **kwargs):
+def gdist(
+    *args: str | np.ndarray | list[float],
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    iterator: Iterator | str = None,
+    band: tuple[int, int] | None = None,
+    dataframe: bool = False,
+    names: list[str] | None = None,
+    vars: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> np.ndarray | pd.DataFrame:
     """
     Calculate distribution of track expressions over bins.
 
@@ -145,18 +165,19 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
-            raise ValueError(f"Breaks at position {i+1} must be 1D array")
+            raise ValueError(f"Breaks at position {i + 1} must be 1D array")
         if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i+1} must have at least 2 elements")
+            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
 
         # Validate breaks are strictly increasing
         if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i+1} must be strictly increasing")
+            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
 
         exprs.append(expr)
         breaks_list.append(breaks.tolist())
 
     from .tracks import _check_computed_tracks
+
     _check_computed_tracks(exprs)
 
     track_names = set(_pymisha.pm_track_names())
@@ -171,8 +192,7 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
     for expr in exprs:
         try:
-            _validate_expr_security(expr, track_names=track_names, vtrack_names=vtrack_names,
-                                    user_vars=all_user_vars)
+            _validate_expr_security(expr, track_names=track_names, vtrack_names=vtrack_names, user_vars=all_user_vars)
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
@@ -188,8 +208,14 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     # Band or 2D intervals require extract-then-bin path
     if band is not None or _is_2d_intervals(intervals):
         result = _gdist_band_path(
-            exprs, breaks_list, n_bins, intervals, include_lowest, band,
-            progress=progress, progress_desc=progress_desc,
+            exprs,
+            breaks_list,
+            n_bins,
+            intervals,
+            include_lowest,
+            band,
+            progress=progress,
+            progress_desc=progress_desc,
         )
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -204,18 +230,11 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
         with _config_no_mt(_itr_id_map) as _base_cfg:
             config = dict(_base_cfg)
             if progress is not None:
-                config['progress'] = progress
+                config["progress"] = progress
             if progress_desc:
-                config['progress_desc'] = progress_desc
+                config["progress_desc"] = progress_desc
 
-            result = _pymisha.pm_dist(
-                exprs,
-                breaks_list,
-                _df2pymisha(intervals),
-                iterator,
-                include_lowest,
-                config
-            )
+            result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config)
 
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -224,8 +243,14 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
 
     # Streaming vtrack path: extract and bin values in chunks to keep memory bounded.
     result = _gdist_vtrack_streaming(
-        exprs, breaks_list, n_bins, intervals, include_lowest,
-        iterator=iterator, progress=progress, progress_desc=progress_desc,
+        exprs,
+        breaks_list,
+        n_bins,
+        intervals,
+        include_lowest,
+        iterator=iterator,
+        progress=progress,
+        progress_desc=progress_desc,
         user_vars=all_user_vars,
     )
 
@@ -235,18 +260,25 @@ def gdist(*args, intervals=None, include_lowest=False, iterator=None,
     return result
 
 
-_INTERVAL_META_COLS = {"chrom", "start", "end", "chrom1", "start1", "end1",
-                      "chrom2", "start2", "end2", "intervalID"}
+_INTERVAL_META_COLS = {"chrom", "start", "end", "chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"}
 
 
-def _gdist_band_path(exprs, breaks_list, n_bins, intervals, include_lowest, band,
-                     *, progress=None, progress_desc=None):
+def _gdist_band_path(
+    exprs: list[str],
+    breaks_list: list[list[float]],
+    n_bins: list[int],
+    intervals: pd.DataFrame,
+    include_lowest: bool,
+    band: tuple[int, int] | None,
+    *,
+    progress: Any = None,
+    progress_desc: str | None = None,
+) -> np.ndarray:
     """Compute distribution from 2D extraction with band filter."""
     counts = _numpy.zeros(n_bins, dtype=_numpy.int64)
 
     for i, expr in enumerate(exprs):
-        result = gextract(expr, intervals, band=band,
-                          progress=progress, progress_desc=progress_desc)
+        result = gextract(expr, intervals, band=band, progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
             continue
 
@@ -263,14 +295,12 @@ def _gdist_band_path(exprs, breaks_list, n_bins, intervals, include_lowest, band
                 counts += _numpy.bincount(valid_idx, minlength=counts.shape[0])
         else:
             # Multi-dim would require co-extraction which 2D doesn't support yet
-            raise NotImplementedError(
-                "Multi-expression gdist with band is not yet supported"
-            )
+            raise NotImplementedError("Multi-expression gdist with band is not yet supported")
 
     return counts
 
 
-def _bin_values(values, breaks, include_lowest):
+def _bin_values(values: np.ndarray, breaks: np.ndarray, include_lowest: bool) -> np.ndarray:
     """Assign values to bin indices following C++ BinFinder semantics.
 
     Bins are ``(breaks[i], breaks[i+1]]`` — open on left, closed on right.
@@ -281,7 +311,7 @@ def _bin_values(values, breaks, include_lowest):
     """
     breaks = _numpy.asarray(breaks, dtype=float)
     n_bins = len(breaks) - 1
-    indices = _numpy.searchsorted(breaks, values, side='right') - 1
+    indices = _numpy.searchsorted(breaks, values, side="right") - 1
 
     # Exclude values at or below breaks[0] (bins are open on the left)
     indices[values <= breaks[0]] = -1
@@ -302,10 +332,18 @@ def _bin_values(values, breaks, include_lowest):
     return indices.astype(_numpy.int32)
 
 
-def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
-                            include_lowest, *, iterator=None,
-                            progress=None, progress_desc=None,
-                            user_vars=None):
+def _gdist_vtrack_streaming(
+    exprs: list[str],
+    breaks_list: list[list[float]],
+    n_bins: list[int],
+    intervals: pd.DataFrame,
+    include_lowest: bool,
+    *,
+    iterator: Iterator | str = None,
+    progress: Any = None,
+    progress_desc: str | None = None,
+    user_vars: dict[str, Any] | None = None,
+) -> np.ndarray:
     """Streaming gdist for expressions containing virtual tracks.
 
     Instead of materializing all expression values and then binning, this
@@ -325,9 +363,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
     used_vtracks = set()
 
     for e in exprs:
-        new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(
-            e, track_names, vtrack_names
-        )
+        new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(e, track_names, vtrack_names)
         used_tracks.update(expr_tracks)
         used_vtracks.update(expr_vtracks)
         parsed.append((e, new_expr, expr_tracks, expr_vtracks))
@@ -335,9 +371,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
     # Get iterated intervals (physical tracks define the iterator if present)
     if used_tracks:
         track_exprs = list(used_tracks)
-        base_result = _pymisha.pm_extract(
-            track_exprs, _df2pymisha(intervals), iterator, CONFIG
-        )
+        base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
         if base_df is None or len(base_df) == 0:
             return _numpy.zeros(n_bins, dtype=int)
@@ -349,6 +383,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+
         iter_df = _iterated_intervals(intervals, iterator)
         track_arrays = {}
 
@@ -356,7 +391,7 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
         return _numpy.zeros(n_bins, dtype=int)
 
     n_rows = len(iter_df)
-    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)
+    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
 
     # Compile expressions
     compiled = []
@@ -389,37 +424,31 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
             sl = slice(start_idx, end_idx)
 
             local_ns = {
-                'np': _numpy,
-                'numpy': _numpy,
-                'CHROM': chrom_vals[sl],
-                'START': start_vals[sl],
-                'END': end_vals[sl],
+                "np": _numpy,
+                "numpy": _numpy,
+                "CHROM": chrom_vals[sl],
+                "START": start_vals[sl],
+                "END": end_vals[sl],
             }
 
             for tname, arr in track_arrays.items():
                 local_ns[_expr_safe_name(tname)] = arr[sl]
 
             if used_vtracks:
-                chunk_intervals = iter_df.iloc[start_idx:end_idx][
-                    ["chrom", "start", "end"]
-                ]
+                chunk_intervals = iter_df.iloc[start_idx:end_idx][["chrom", "start", "end"]]
                 for vt in used_vtracks:
-                    local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(
-                        vt, chunk_intervals
-                    )
+                    local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(vt, chunk_intervals)
 
             local_ns.update(user_vars)
 
             # Evaluate each expression and bin
             chunk_indices = []
             for i, code_obj in enumerate(compiled):
-                vals = eval(code_obj, {'__builtins__': {}}, local_ns)
+                vals = eval(code_obj, {"__builtins__": {}}, local_ns)
                 if _numpy.isscalar(vals):
                     vals = _numpy.full(end_idx - start_idx, vals)
                 vals = _numpy.asarray(vals, dtype=float)
-                chunk_indices.append(
-                    _bin_values(vals, breaks_arrays[i], include_lowest)
-                )
+                chunk_indices.append(_bin_values(vals, breaks_arrays[i], include_lowest))
 
             # Accumulate valid bin combinations
             chunk_len = end_idx - start_idx
@@ -445,7 +474,13 @@ def _gdist_vtrack_streaming(exprs, breaks_list, n_bins, intervals,
     return result
 
 
-def _array_to_dataframe(result, breaks_list, exprs, names, include_lowest=False):
+def _array_to_dataframe(
+    result: np.ndarray,
+    breaks_list: list[list[float]],
+    exprs: list[str],
+    names: list[str] | None,
+    include_lowest: bool = False,
+) -> pd.DataFrame:
     """Convert N-dimensional result array to DataFrame."""
     import itertools
 
@@ -456,29 +491,36 @@ def _array_to_dataframe(result, breaks_list, exprs, names, include_lowest=False)
         for i in range(len(breaks) - 1):
             # Format: "(low, high]" or "[low, high]" for first bin if include_lowest
             left = "[" if i == 0 and include_lowest else "("
-            labels.append(f"{left}{breaks[i]}, {breaks[i+1]}]")
+            labels.append(f"{left}{breaks[i]}, {breaks[i + 1]}]")
         bin_labels_list.append(labels)
 
     # Generate all combinations of bin labels
+    rows: list[Any]
     if len(exprs) == 1:
         rows = [(label, count) for label, count in zip(bin_labels_list[0], result.flatten(), strict=False)]
         col_names = names if names else exprs
-        df = _pandas.DataFrame(rows, columns=[col_names[0], 'n'])
+        df = _pandas.DataFrame(rows, columns=[col_names[0], "n"])
     else:
         rows = []
         for indices in itertools.product(*[range(len(labels)) for labels in bin_labels_list]):
-            row = [bin_labels_list[dim][idx] for dim, idx in enumerate(indices)]
+            row: list[Any] = [bin_labels_list[dim][idx] for dim, idx in enumerate(indices)]
             row.append(result[indices])
             rows.append(row)
 
         col_names = names if names else exprs
-        df = _pandas.DataFrame(rows, columns=list(col_names) + ['n'])
+        df = _pandas.DataFrame(rows, columns=list(col_names) + ["n"])
 
     return df
 
 
-def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, progress_desc=None,
-                               user_vars=None):
+def _gsummary_vtrack_streaming(
+    expr: str,
+    intervals: pd.DataFrame,
+    iterator: Iterator | str = None,
+    progress: Any = None,
+    progress_desc: str | None = None,
+    user_vars: dict[str, Any] | None = None,
+) -> pd.Series:
     """Streaming gsummary for expressions containing virtual tracks."""
     if user_vars is None:
         user_vars = {}
@@ -486,16 +528,12 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
 
-    new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(
-        expr, track_names, vtrack_names
-    )
+    new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
 
     # Get iterated intervals
     if expr_tracks:
         track_exprs = list(expr_tracks)
-        base_result = _pymisha.pm_extract(
-            track_exprs, _df2pymisha(intervals), iterator, CONFIG
-        )
+        base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
         if base_df is None or len(base_df) == 0:
             return _pandas.Series(
@@ -510,6 +548,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+
         iter_df = _iterated_intervals(intervals, iterator)
         track_arrays = {}
 
@@ -520,7 +559,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
         )
 
     n_rows = len(iter_df)
-    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)
+    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
 
     allowed_names = {
         "np",
@@ -556,28 +595,24 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
             sl = slice(start_idx, end_idx)
 
             local_ns = {
-                'np': _numpy,
-                'numpy': _numpy,
-                'CHROM': chrom_vals[sl],
-                'START': start_vals[sl],
-                'END': end_vals[sl],
+                "np": _numpy,
+                "numpy": _numpy,
+                "CHROM": chrom_vals[sl],
+                "START": start_vals[sl],
+                "END": end_vals[sl],
             }
 
             for tname, arr in track_arrays.items():
                 local_ns[_expr_safe_name(tname)] = arr[sl]
 
             if expr_vtracks:
-                chunk_intervals = iter_df.iloc[start_idx:end_idx][
-                    ["chrom", "start", "end"]
-                ]
+                chunk_intervals = iter_df.iloc[start_idx:end_idx][["chrom", "start", "end"]]
                 for vt in expr_vtracks:
-                    local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(
-                        vt, chunk_intervals
-                    )
+                    local_ns[_expr_safe_name(vt)] = _compute_vtrack_values(vt, chunk_intervals)
 
             local_ns.update(user_vars)
 
-            vals = eval(code_obj, {'__builtins__': {}}, local_ns)
+            vals = eval(code_obj, {"__builtins__": {}}, local_ns)
             if _numpy.isscalar(vals):
                 vals = _numpy.full(end_idx - start_idx, vals)
             vals = _numpy.asarray(vals, dtype=float)
@@ -606,9 +641,7 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
                     total_count_non_nan = valid_count + chunk_count
                     delta = chunk_mean - running_mean
                     running_mean += delta * (chunk_count / total_count_non_nan)
-                    running_m2 += chunk_m2 + (delta * delta) * (
-                        valid_count * chunk_count / total_count_non_nan
-                    )
+                    running_m2 += chunk_m2 + (delta * delta) * (valid_count * chunk_count / total_count_non_nan)
                     valid_count = total_count_non_nan
 
             if progress_cb:
@@ -637,7 +670,14 @@ def _gsummary_vtrack_streaming(expr, intervals, iterator=None, progress=None, pr
     )
 
 
-def _reservoir_merge_chunk(samples, sample_size, stream_count, chunk_values, sample_cap, rng):
+def _reservoir_merge_chunk(
+    samples: np.ndarray,
+    sample_size: int,
+    stream_count: int,
+    chunk_values: np.ndarray,
+    sample_cap: int,
+    rng: np.random.Generator,
+) -> tuple[int, int]:
     """Merge a chunk of values into a fixed-size uniform reservoir."""
     if chunk_values.size == 0:
         return sample_size, stream_count
@@ -645,7 +685,7 @@ def _reservoir_merge_chunk(samples, sample_size, stream_count, chunk_values, sam
     offset = 0
     if sample_size < sample_cap:
         take = min(sample_cap - sample_size, chunk_values.size)
-        samples[sample_size:sample_size + take] = chunk_values[:take]
+        samples[sample_size : sample_size + take] = chunk_values[:take]
         sample_size += take
         stream_count += take
         offset = take
@@ -673,8 +713,15 @@ def _reservoir_merge_chunk(samples, sample_size, stream_count, chunk_values, sam
     return sample_cap, new_total
 
 
-def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=None, progress_desc=None,
-                                  user_vars=None):
+def _gquantiles_vtrack_streaming(
+    expr: str,
+    pct: np.ndarray,
+    intervals: pd.DataFrame,
+    iterator: Iterator | str = None,
+    progress: Any = None,
+    progress_desc: str | None = None,
+    user_vars: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, bool]:
     """Streaming gquantiles for expressions containing virtual tracks.
 
     Uses chunked expression evaluation and bounded reservoir sampling to keep
@@ -686,16 +733,12 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
     track_names = set(_pymisha.pm_track_names())
     vtrack_names = set(_shared._VTRACKS.keys())
 
-    new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(
-        expr, track_names, vtrack_names
-    )
+    new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
 
     # Get iterated intervals
     if expr_tracks:
         track_exprs = list(expr_tracks)
-        base_result = _pymisha.pm_extract(
-            track_exprs, _df2pymisha(intervals), iterator, CONFIG
-        )
+        base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
         if base_df is None or len(base_df) == 0:
             return _numpy.full(pct.shape, _numpy.nan, dtype=float), False
@@ -707,6 +750,7 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+
         iter_df = _iterated_intervals(intervals, iterator)
         track_arrays = {}
 
@@ -714,8 +758,8 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
         return _numpy.full(pct.shape, _numpy.nan, dtype=float), False
 
     n_rows = len(iter_df)
-    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)
-    sample_cap = int(CONFIG.get("max_data_size", 10000000) or 10000000)
+    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
+    sample_cap = int(CONFIG.get("max_data_size", 10000000) or 10000000)  # type: ignore[call-overload]
     if sample_cap <= 0:
         sample_cap = 1
 
@@ -748,11 +792,11 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
             sl = slice(start_idx, end_idx)
 
             local_ns = {
-                'np': _numpy,
-                'numpy': _numpy,
-                'CHROM': chrom_vals[sl],
-                'START': start_vals[sl],
-                'END': end_vals[sl],
+                "np": _numpy,
+                "numpy": _numpy,
+                "CHROM": chrom_vals[sl],
+                "START": start_vals[sl],
+                "END": end_vals[sl],
             }
 
             for tname, arr in track_arrays.items():
@@ -765,7 +809,7 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
 
             local_ns.update(user_vars)
 
-            vals = eval(code_obj, {'__builtins__': {}}, local_ns)
+            vals = eval(code_obj, {"__builtins__": {}}, local_ns)
             if _numpy.isscalar(vals):
                 vals = _numpy.full(end_idx - start_idx, vals)
             vals = _numpy.asarray(vals, dtype=float)
@@ -795,10 +839,15 @@ def _gquantiles_vtrack_streaming(expr, pct, intervals, iterator=None, progress=N
     return quantiles, estimated
 
 
-def _extract_expr_values(expr, intervals, iterator=None, band=None,
-                         progress=None, progress_desc=None):
-    result = gextract(expr, intervals, iterator=iterator, band=band,
-                      progress=progress, progress_desc=progress_desc)
+def _extract_expr_values(
+    expr: str,
+    intervals: pd.DataFrame,
+    iterator: Iterator | str = None,
+    band: tuple[int, int] | tuple[float, float] | None = None,
+    progress: Any = None,
+    progress_desc: str | None = None,
+) -> np.ndarray:
+    result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc)
     if result is None:
         return _numpy.array([], dtype=float)
 
@@ -811,7 +860,7 @@ def _extract_expr_values(expr, intervals, iterator=None, band=None,
             return _numpy.array([], dtype=float)
         if len(data_cols) > 1:
             raise ValueError("Expected a single expression column for summary/quantiles")
-        return result[data_cols[0]].to_numpy(dtype=float, copy=False)
+        return _numpy.asarray(result[data_cols[0]].to_numpy(dtype=float, copy=False))
 
     if isinstance(result, _numpy.ndarray):
         return result.astype(float, copy=False)
@@ -819,7 +868,12 @@ def _extract_expr_values(expr, intervals, iterator=None, band=None,
     raise TypeError("Unexpected gextract result type for summary/quantiles")
 
 
-def _extract_values_direct(expr, intervals, iterator=None, band=None):
+def _extract_values_direct(
+    expr: str,
+    intervals: pd.DataFrame,
+    iterator: Iterator | str = None,
+    band: tuple[int, int] | tuple[float, float] | None = None,
+) -> np.ndarray:
     """Fast extraction path that bypasses gextract overhead.
 
     For simple track expressions (no virtual tracks, no band, no 2D),
@@ -841,17 +895,17 @@ def _extract_values_direct(expr, intervals, iterator=None, band=None):
         return _numpy.array([], dtype=float)
 
     col = expr if expr in df.columns else _bound_colname(expr, 40)
-    return df[col].to_numpy(dtype=float, copy=False)
+    return _numpy.asarray(df[col].to_numpy(dtype=float, copy=False))
 
 
-def _format_percentile(value):
+def _format_percentile(value: float) -> str:
     try:
         return f"{float(value):g}"
     except Exception:
         return str(value)
 
 
-def _gsummary_from_values(values):
+def _gsummary_from_values(values: np.ndarray) -> pd.Series:
     """Compute summary statistics from an array of values."""
     stats = _compute_summary_stats(values)
     return _pandas.Series(
@@ -860,7 +914,13 @@ def _gsummary_from_values(values):
     )
 
 
-def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
+def gsummary(
+    expr: str,
+    intervals: pd.DataFrame | str | None = None,
+    iterator: Iterator | str = None,
+    vars: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> pd.Series:
     """
     Calculate summary statistics of a track expression.
 
@@ -907,6 +967,7 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     from .tracks import _check_computed_tracks
+
     _check_computed_tracks(expr)
 
     if intervals is None:
@@ -934,8 +995,9 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
 
     # Band or 2D intervals require extract-then-summarize path
     if band is not None or _is_2d_intervals(intervals):
-        values = _extract_expr_values(expr, intervals, iterator=iterator, band=band,
-                                      progress=progress, progress_desc=progress_desc)
+        values = _extract_expr_values(
+            expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc
+        )
         return _gsummary_from_values(values)
 
     vtracks_used = _find_vtracks_in_expr(expr)
@@ -963,13 +1025,23 @@ def gsummary(expr, intervals=None, iterator=None, vars=None, **kwargs):
 
     # Streaming path for vtracks / user vars
     return _gsummary_vtrack_streaming(
-        expr, intervals, iterator=iterator,
-        progress=progress, progress_desc=progress_desc,
+        expr,
+        intervals,
+        iterator=iterator,
+        progress=progress,
+        progress_desc=progress_desc,
         user_vars=user_vars,
     )
 
 
-def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, **kwargs):
+def gquantiles(
+    expr: str,
+    percentiles: float | list[float] | np.ndarray = 0.5,
+    intervals: pd.DataFrame | str | None = None,
+    iterator: Iterator | str = None,
+    vars: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> pd.Series:
     """
     Calculate quantiles of a track expression.
 
@@ -1020,6 +1092,7 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     from .tracks import _check_computed_tracks
+
     _check_computed_tracks(expr)
 
     if intervals is None:
@@ -1053,8 +1126,9 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
 
     # Band or 2D intervals require extract-then-quantile path
     if band is not None or _is_2d_intervals(intervals):
-        values = _extract_expr_values(expr, intervals, iterator=iterator, band=band,
-                                      progress=progress, progress_desc=progress_desc)
+        values = _extract_expr_values(
+            expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc
+        )
         if values.size == 0 or _numpy.all(_numpy.isnan(values)):
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
         else:
@@ -1072,11 +1146,17 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
         return _pandas.Series(quantiles, index=pct)
 
     quantiles, estimated = _gquantiles_vtrack_streaming(
-        expr, pct, intervals, iterator=iterator, progress=progress, progress_desc=progress_desc,
+        expr,
+        pct,
+        intervals,
+        iterator=iterator,
+        progress=progress,
+        progress_desc=progress_desc,
         user_vars=user_vars,
     )
     if estimated:
         import warnings
+
         warnings.warn(
             "Data size exceeds the limit; quantiles are approximate. "
             "Adjust CONFIG['max_data_size'] to increase the limit.",
@@ -1086,7 +1166,9 @@ def gquantiles(expr, percentiles=0.5, intervals=None, iterator=None, vars=None, 
     return _pandas.Series(quantiles, index=pct)
 
 
-def gintervals_summary(expr, intervals, iterator=None, **kwargs):
+def gintervals_summary(
+    expr: str, intervals: pd.DataFrame | str | None, iterator: Iterator | str = None, **kwargs: Any
+) -> pd.DataFrame | None:
     """
     Compute summary statistics for each interval.
 
@@ -1130,6 +1212,7 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
 
     # Handle DataFrame-as-iterator
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    assert isinstance(intervals, _pandas.DataFrame)
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_summary")
@@ -1152,8 +1235,7 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
         else:
             out = _pymisha2df(result)
     else:
-        result = gextract(expr, intervals, iterator=iterator, band=band,
-                          progress=progress, progress_desc=progress_desc)
+        result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
             out = intervals[_interval_coord_cols(intervals)].copy()
             out["Total intervals"] = 0.0
@@ -1189,9 +1271,9 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
                     stats = grouped.agg(["min", "max", "sum", "mean", "std", "count"])
                     idx = total_counts.index.to_numpy(dtype=int) - 1
                     out.iloc[idx, out.columns.get_loc("Total intervals")] = total_counts.to_numpy(dtype=float)
-                    out.iloc[idx, out.columns.get_loc("NaN intervals")] = (
-                        total_counts.to_numpy(dtype=float) - stats["count"].to_numpy(dtype=float)
-                    )
+                    out.iloc[idx, out.columns.get_loc("NaN intervals")] = total_counts.to_numpy(dtype=float) - stats[
+                        "count"
+                    ].to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("Min")] = stats["min"].to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("Max")] = stats["max"].to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("Sum")] = stats["sum"].to_numpy(dtype=float)
@@ -1200,12 +1282,19 @@ def gintervals_summary(expr, intervals, iterator=None, **kwargs):
             out = out.reset_index(drop=True)
     if intervals_set_out is not None:
         from .intervals import gintervals_save
+
         gintervals_save(out, intervals_set_out)
         return None
     return out
 
 
-def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, **kwargs):
+def gintervals_quantiles(
+    expr: str,
+    percentiles: float | list[float] | np.ndarray = 0.5,
+    intervals: pd.DataFrame | str | None = None,
+    iterator: Iterator | str = None,
+    **kwargs: Any,
+) -> pd.DataFrame | None:
     """
     Compute quantiles for each interval.
 
@@ -1253,6 +1342,7 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
 
     # Handle DataFrame-as-iterator
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    assert isinstance(intervals, _pandas.DataFrame)
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_quantiles")
@@ -1276,8 +1366,7 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
         else:
             out = _pymisha2df(result)
     else:
-        result = gextract(expr, intervals, iterator=iterator, band=band,
-                          progress=progress, progress_desc=progress_desc)
+        result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
             out = intervals[_interval_coord_cols(intervals)].copy()
             for p in pct:
@@ -1324,12 +1413,20 @@ def gintervals_quantiles(expr, percentiles=0.5, intervals=None, iterator=None, *
 
     if intervals_set_out is not None:
         from .intervals import gintervals_save
+
         gintervals_save(out, intervals_set_out)
         return None
     return out
 
 
-def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None, **kwargs):
+def gpartition(
+    expr: str,
+    breaks: list[float] | np.ndarray,
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    iterator: Iterator | str = None,
+    **kwargs: Any,
+) -> pd.DataFrame | None:
     """
     Partition track expression values into bins and return corresponding intervals.
 
@@ -1387,6 +1484,7 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
     NaN values are also excluded.
     """
     from .intervals import gintervals_all
+
     _checkroot()
 
     if breaks is None:
@@ -1406,14 +1504,7 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
 
     with _config_no_mt(_itr_id_map) as _cfg:
-        result = _pymisha.pm_partition(
-            expr,
-            breaks_list,
-            _df2pymisha(intervals),
-            iterator,
-            include_lowest,
-            _cfg
-        )
+        result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator, include_lowest, _cfg)
 
     if result is None:
         return None
@@ -1423,13 +1514,16 @@ def gpartition(expr, breaks, intervals=None, include_lowest=False, iterator=None
     intervals_set_out = kwargs.get("intervals_set_out")
     if intervals_set_out is not None:
         from .intervals import gintervals_save
+
         gintervals_save(out[["chrom", "start", "end"]], intervals_set_out)
         return None
 
     return out
 
 
-def gsample(expr, n, intervals=None, iterator=None):
+def gsample(
+    expr: str, n: int, intervals: pd.DataFrame | str | None = None, iterator: Iterator | str = None
+) -> np.ndarray:
     """
     Sample values from a track expression using reservoir sampling.
 
@@ -1494,10 +1588,17 @@ def gsample(expr, n, intervals=None, iterator=None):
     if result is None:
         return _numpy.array([], dtype=_numpy.float64)
 
-    return result
+    return _numpy.asarray(result)
 
 
-def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False, names=None):
+def gcor(
+    *exprs: str,
+    intervals: pd.DataFrame | str | None = None,
+    iterator: Iterator | str = None,
+    method: str = "pearson",
+    details: bool = False,
+    names: list[str] | None = None,
+) -> np.ndarray | pd.DataFrame | None:
     """
     Compute correlation between pairs of track expressions.
 
@@ -1575,6 +1676,7 @@ def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False,
         raise ValueError("gcor requires an even number of track expressions (pairs)")
 
     from .tracks import _check_computed_tracks
+
     _check_computed_tracks(expr_list)
 
     if method not in {"pearson", "spearman", "spearman.exact"}:
@@ -1600,31 +1702,32 @@ def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False,
 
     # Generate pair names
     if names is None:
-        names = [
-            f"{expr_list[i * 2]}~{expr_list[i * 2 + 1]}"
-            for i in range(num_pairs)
-        ]
+        names = [f"{expr_list[i * 2]}~{expr_list[i * 2 + 1]}" for i in range(num_pairs)]
 
     if details:
         rows = []
         for _i, d in enumerate(result):
             if method == "pearson":
-                rows.append({
-                    "cor": d["cor"],
-                    "cov": d["cov"],
-                    "mean1": d["mean1"],
-                    "mean2": d["mean2"],
-                    "sd1": d["sd1"],
-                    "sd2": d["sd2"],
-                    "n": d["n"],
-                    "n.na": d["n.na"],
-                })
+                rows.append(
+                    {
+                        "cor": d["cor"],
+                        "cov": d["cov"],
+                        "mean1": d["mean1"],
+                        "mean2": d["mean2"],
+                        "sd1": d["sd1"],
+                        "sd2": d["sd2"],
+                        "n": d["n"],
+                        "n.na": d["n.na"],
+                    }
+                )
             else:
-                rows.append({
-                    "n": d["n"],
-                    "n.na": d["n.na"],
-                    "cor": d["cor"],
-                })
+                rows.append(
+                    {
+                        "n": d["n"],
+                        "n.na": d["n.na"],
+                        "cor": d["cor"],
+                    }
+                )
         return _pandas.DataFrame(rows, index=names)
 
     return _numpy.array([d["cor"] for d in result])
@@ -1634,15 +1737,14 @@ def gcor(*exprs, intervals=None, iterator=None, method="pearson", details=False,
 # gbins_summary / gbins_quantiles
 # ---------------------------------------------------------------------------
 
-def _parse_bin_args(args):
+
+def _parse_bin_args(args: tuple[str | np.ndarray | list[float], ...]) -> tuple[list[str], list[np.ndarray]]:
     """Parse variadic (bin_expr, breaks, ...) pairs.
 
     Returns (bin_exprs, breaks_list) with validated breaks.
     """
     if len(args) < 2 or len(args) % 2 != 0:
-        raise ValueError(
-            "Binning arguments must be pairs of (expression, breaks)"
-        )
+        raise ValueError("Binning arguments must be pairs of (expression, breaks)")
 
     bin_exprs = []
     breaks_list = []
@@ -1662,7 +1764,7 @@ def _parse_bin_args(args):
     return bin_exprs, breaks_list
 
 
-def _assign_bins(values, breaks, include_lowest):
+def _assign_bins(values: np.ndarray, breaks: np.ndarray, include_lowest: bool) -> np.ndarray:
     """Assign values to bins defined by breaks.
 
     Bins are (breaks[i], breaks[i+1]] (right-closed).
@@ -1673,7 +1775,7 @@ def _assign_bins(values, breaks, include_lowest):
     return _bin_values(values, breaks, include_lowest)
 
 
-def _compute_summary_stats(values):
+def _compute_summary_stats(values: np.ndarray) -> np.ndarray:
     """Compute the 7 summary stats for an array of values.
 
     Returns [total, nan_count, min, max, sum, mean, stddev].
@@ -1699,8 +1801,15 @@ def _compute_summary_stats(values):
     return _numpy.array([total, nan_count, min_val, max_val, sum_val, mean_val, std_val])
 
 
-def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
-                  iterator=None, band=None, **kwargs):
+def gbins_summary(
+    *args: str | np.ndarray | list[float],
+    expr: str | None = None,
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    iterator: Iterator | str = None,
+    band: tuple[float, float] | None = None,
+    **kwargs: Any,
+) -> np.ndarray:
     """Compute summary statistics per bin.
 
     Parameters
@@ -1754,7 +1863,10 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
     for e in all_exprs:
         if e not in expr_cache:
             expr_cache[e] = _extract_values_direct(
-                e, intervals, iterator=iterator, band=band,
+                e,
+                intervals,
+                iterator=iterator,
+                band=band,
             )
 
     n_bins = [len(b) - 1 for b in breaks_list]
@@ -1804,8 +1916,7 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
     result_flat[:, 0] = total_per_bin.astype(float)
 
     # NaN intervals per bin
-    nan_per_bin = _numpy.bincount(flat_idx, weights=nan_mask.astype(float),
-                                  minlength=total_flat_bins)
+    nan_per_bin = _numpy.bincount(flat_idx, weights=nan_mask.astype(float), minlength=total_flat_bins)
     result_flat[:, 1] = nan_per_bin
 
     # For min/max/sum/mean/std, work only with non-NaN values
@@ -1828,8 +1939,7 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
         ends[-1] = len(flat_sorted)
 
         # Sum per bin (vectorized)
-        sum_per_bin = _numpy.bincount(flat_valid, weights=vals_valid,
-                                      minlength=total_flat_bins)
+        sum_per_bin = _numpy.bincount(flat_valid, weights=vals_valid, minlength=total_flat_bins)
 
         # Mean per bin
         mean_per_bin = _numpy.full(total_flat_bins, _numpy.nan)
@@ -1855,18 +1965,23 @@ def gbins_summary(*args, expr=None, intervals=None, include_lowest=False,
         if _numpy.any(has_multiple):
             # Compute sum of (x - mean)^2 per bin
             deviations = vals_valid - mean_per_bin[flat_valid]
-            sq_dev_per_bin = _numpy.bincount(flat_valid, weights=deviations ** 2,
-                                             minlength=total_flat_bins)
-            std_per_bin[has_multiple] = _numpy.sqrt(
-                sq_dev_per_bin[has_multiple] / (valid_count[has_multiple] - 1)
-            )
+            sq_dev_per_bin = _numpy.bincount(flat_valid, weights=deviations**2, minlength=total_flat_bins)
+            std_per_bin[has_multiple] = _numpy.sqrt(sq_dev_per_bin[has_multiple] / (valid_count[has_multiple] - 1))
         result_flat[:, 6] = std_per_bin
 
     return result
 
 
-def gbins_quantiles(*args, expr=None, percentiles=0.5, intervals=None,
-                    include_lowest=False, iterator=None, band=None, **kwargs):
+def gbins_quantiles(
+    *args: str | np.ndarray | list[float],
+    expr: str | None = None,
+    percentiles: float | list[float] | np.ndarray = 0.5,
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    iterator: Iterator | str = None,
+    band: tuple[float, float] | None = None,
+    **kwargs: Any,
+) -> np.ndarray:
     """Compute quantiles per bin.
 
     Parameters
@@ -1927,7 +2042,10 @@ def gbins_quantiles(*args, expr=None, percentiles=0.5, intervals=None,
     for e in all_exprs:
         if e not in expr_cache:
             expr_cache[e] = _extract_values_direct(
-                e, intervals, iterator=iterator, band=band,
+                e,
+                intervals,
+                iterator=iterator,
+                band=band,
             )
 
     n_bins = [len(b) - 1 for b in breaks_list]

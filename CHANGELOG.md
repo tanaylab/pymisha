@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.24 (2026-04-12)
+
+### Features
+- **Comprehensive type annotations:** Added inline type annotations to all function signatures across all 26 modules (~500 functions). Created `py.typed` marker (PEP 561) and `pymisha/_types.py` with shared type aliases (`Intervals`, `PMDataFrame`, `Iterator`, `TrackExpr`, `Chroms`). Full mypy pass with zero errors.
+
+### Maintenance
+- **Dynamic `__version__`:** Replaced hardcoded version string with `importlib.metadata.version()` to stay in sync with `pyproject.toml` automatically.
+- **mypy in CI:** Added type checking step to GitHub Actions workflow.
+- **mypy config:** Enabled `check_untyped_defs` and `warn_unused_ignores` in `pyproject.toml`.
+
 ## v0.1.23 (2026-04-04)
 
 ### Performance

@@ -16,10 +16,13 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Testing
+# Testing / quality
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+.eggs/
 
 # Virtual environments
 venv/

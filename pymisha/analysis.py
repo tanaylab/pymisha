@@ -1,10 +1,14 @@
 """gsegment, gwilcox, gcis_decay, and gcompute_strands_autocorr implementations."""
 
+from __future__ import annotations
+
 import bisect
 import math
 import warnings
+from typing import Any
 
 import numpy as _numpy
+import pandas as pd
 
 from ._shared import (
     CONFIG,
@@ -18,7 +22,7 @@ from .extract import _maybe_load_intervals_set
 _APPROX_QNORM_WARNED = False
 
 
-def _pval_to_zscore(pval):
+def _pval_to_zscore(pval: float) -> float:
     """Convert a p-value to z-score using the normal distribution PPF.
 
     Equivalent to R's qnorm(pval). Uses the inverse error function
@@ -37,7 +41,7 @@ def _pval_to_zscore(pval):
     # Use scipy if available, otherwise fall back to approximation
     try:
         from scipy.stats import norm
-        return norm.ppf(pval)
+        return float(norm.ppf(pval))
     except ImportError:
         pass
 
@@ -65,8 +69,15 @@ def _pval_to_zscore(pval):
     return t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)
 
 
-def gsegment(expr, minsegment, maxpval=0.05, onetailed=True, intervals=None,
-             iterator=None, intervals_set_out=None):
+def gsegment(
+    expr: str,
+    minsegment: int,
+    maxpval: float = 0.05,
+    onetailed: bool = True,
+    intervals: pd.DataFrame | str | None = None,
+    iterator: int | None = None,
+    intervals_set_out: str | None = None,
+) -> pd.DataFrame | None:
     """
     Divide track expression into segments using Wilcoxon test.
 
@@ -145,9 +156,9 @@ def gsegment(expr, minsegment, maxpval=0.05, onetailed=True, intervals=None,
     return df
 
 
-def gwilcox(expr, winsize1, winsize2, maxpval=0.05, onetailed=True,
-            what2find=1, intervals=None, iterator=None,
-            intervals_set_out=None):
+def gwilcox(expr: str, winsize1: int, winsize2: int, maxpval: float = 0.05, onetailed: bool = True,
+            what2find: int = 1, intervals: pd.DataFrame | str | None = None, iterator: int | None = None,
+            intervals_set_out: str | None = None) -> pd.DataFrame | None:
     """
     Sliding-window Wilcoxon test over track expression values.
 
@@ -240,7 +251,7 @@ def gwilcox(expr, winsize1, winsize2, maxpval=0.05, onetailed=True,
 # gcis_decay helpers
 # ---------------------------------------------------------------------------
 
-def _val2bin(val, breaks, include_lowest):
+def _val2bin(val: float, breaks: list[float], include_lowest: bool) -> int:
     """Map *val* to a bin index given sorted *breaks*.
 
     Bins are half-open intervals ``(breaks[i], breaks[i+1]]``.
@@ -268,12 +279,12 @@ def _val2bin(val, breaks, include_lowest):
     return idx
 
 
-def _unify_overlaps_per_chrom(df):
+def _unify_overlaps_per_chrom(df: pd.DataFrame | None) -> dict[str, list[tuple[int, int]]]:
     """Sort intervals, merge overlapping ones, return dict[chrom -> sorted list of (start, end)].
 
     The input DataFrame must have columns ``chrom``, ``start``, ``end``.
     """
-    result = {}
+    result: dict[str, list[tuple[int, int]]] = {}
     if df is None or len(df) == 0:
         return result
     for chrom, group in df.groupby("chrom"):
@@ -297,12 +308,12 @@ def _unify_overlaps_per_chrom(df):
     return result
 
 
-def _intervals_per_chrom(df):
+def _intervals_per_chrom(df: pd.DataFrame | None) -> dict[str, list[tuple[int, int]]]:
     """Group non-overlapping intervals by chrom -> sorted list of (start, end).
 
     Used for domain intervals which must not overlap.
     """
-    result = {}
+    result: dict[str, list[tuple[int, int]]] = {}
     if df is None or len(df) == 0:
         return result
     for chrom, group in df.groupby("chrom"):
@@ -314,7 +325,7 @@ def _intervals_per_chrom(df):
     return result
 
 
-def _containing_interval(intervals_sorted, start, end):
+def _containing_interval(intervals_sorted: list[tuple[int, int]], start: int, end: int) -> int:
     """Return the index of the interval that fully contains [start, end), or -1.
 
     *intervals_sorted* is a sorted list of ``(istart, iend)`` tuples.
@@ -344,7 +355,12 @@ def _containing_interval(intervals_sorted, start, end):
 # ---------------------------------------------------------------------------
 
 
-def _containing_interval_vec(iv_starts, iv_ends, starts, ends):
+def _containing_interval_vec(
+    iv_starts: _numpy.ndarray,
+    iv_ends: _numpy.ndarray,
+    starts: _numpy.ndarray,
+    ends: _numpy.ndarray,
+) -> _numpy.ndarray:
     """Vectorized containment check: for each (start, end) pair, find the
     index of the interval that fully contains it, or -1.
 
@@ -384,7 +400,7 @@ def _containing_interval_vec(iv_starts, iv_ends, starts, ends):
     return _numpy.where(contained, idx_safe, -1)
 
 
-def _val2bin_vec(values, breaks_arr, include_lowest):
+def _val2bin_vec(values: _numpy.ndarray, breaks_arr: _numpy.ndarray, include_lowest: bool) -> _numpy.ndarray:
     """Vectorized binning: map values to bin indices.
 
     Bins are half-open ``(breaks[i], breaks[i+1]]``.
@@ -415,8 +431,16 @@ def _val2bin_vec(values, breaks_arr, include_lowest):
     return _numpy.where(valid, idx, -1)
 
 
-def gcis_decay(expr, breaks, src, domain, intervals=None,
-               include_lowest=False, iterator=None, band=None):
+def gcis_decay(
+    expr: str,
+    breaks: list[float],
+    src: pd.DataFrame,
+    domain: pd.DataFrame,
+    intervals: pd.DataFrame | str | None = None,
+    include_lowest: bool = False,
+    iterator: str | None = None,
+    band: tuple[int, int] | None = None,
+) -> _numpy.ndarray:
     """
     Calculate distribution of cis contact distances.
 
@@ -535,15 +559,16 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    if intervals is not None and "chrom" in intervals.columns:
-        intervals = intervals.copy()
-        intervals["chrom"] = _normalize_chroms(
-            intervals["chrom"].astype(str).tolist()
+    if isinstance(intervals, pd.DataFrame) and "chrom" in intervals.columns:
+        intervals_df: pd.DataFrame = intervals.copy()
+        intervals_df["chrom"] = _normalize_chroms(
+            intervals_df["chrom"].astype(str).tolist()
         )
+        intervals = intervals_df
 
     # Build chrom -> max_end mapping from intervals (ALLGENOME gives full chrom sizes)
-    chrom_sizes = {}
-    if intervals is not None and len(intervals) > 0:
+    chrom_sizes: dict[str, int] = {}
+    if isinstance(intervals, pd.DataFrame) and len(intervals) > 0:
         chrom_sizes = intervals.groupby("chrom")["end"].max().to_dict()
 
     chroms = list(chrom_sizes.keys())
@@ -657,26 +682,33 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
     class CisDecayResult(_numpy.ndarray):
         """ndarray subclass with breaks and label metadata."""
 
-        def __new__(cls, data, breaks_attr, bin_labels_attr):
+        def __new__(
+            cls,
+            data: Any,
+            breaks_attr: Any,
+            bin_labels_attr: Any,
+        ) -> CisDecayResult:
             obj = _numpy.asarray(data).view(cls)
             obj.breaks = breaks_attr
             obj.bin_labels = bin_labels_attr
             obj.col_labels = ["intra", "inter"]
             return obj
 
-        def __array_finalize__(self, obj):
+        def __array_finalize__(self, obj: Any) -> None:
             if obj is None:
                 return
             self.breaks = getattr(obj, "breaks", None)
             self.bin_labels = getattr(obj, "bin_labels", None)
             self.col_labels = getattr(obj, "col_labels", None)
 
-        def __repr__(self):
+        def __repr__(self) -> str:
             # Produce a readable table similar to R's print
             lines = []
-            header = "         " + "  ".join(f"{c:>8s}" for c in self.col_labels)
+            col_labels: list[Any] = self.col_labels or []
+            bin_labels: list[Any] = self.bin_labels or []
+            header = "         " + "  ".join(f"{c:>8s}" for c in col_labels)
             lines.append(header)
-            for i, label in enumerate(self.bin_labels):
+            for i, label in enumerate(bin_labels):
                 row = f"{label:>9s}" + "  ".join(
                     f"{self[i, j]:>8.0f}" for j in range(self.shape[1])
                 )
@@ -692,14 +724,14 @@ def gcis_decay(expr, breaks, src, domain, intervals=None,
 
 
 def gcompute_strands_autocorr(
-    file,
-    chrom,
-    binsize,
-    maxread=400,
-    cols_order=(9, 11, 13, 14),
-    min_coord=0,
-    max_coord=300_000_000,
-):
+    file: str,
+    chrom: str,
+    binsize: int,
+    maxread: int = 400,
+    cols_order: tuple[int, int, int, int] = (9, 11, 13, 14),
+    min_coord: int = 0,
+    max_coord: int = 300_000_000,
+) -> tuple[dict[str, float], pd.DataFrame]:
     """
     Compute auto-correlation between forward and reverse strands from a
     mapped-reads file.
@@ -788,20 +820,20 @@ def gcompute_strands_autocorr(
     if maxread <= 0:
         raise ValueError(f"Invalid maxread value {maxread}")
 
-    cols_order = list(cols_order)
-    if len(cols_order) != 4:
+    cols_order_list: list[int] = list(cols_order)
+    if len(cols_order_list) != 4:
         raise ValueError("cols_order must have exactly 4 elements")
     col_names = ["sequence", "chromosome", "coordinate", "strand"]
-    for i, c in enumerate(cols_order):
-        cols_order[i] = int(c)
-        if cols_order[i] <= 0:
+    for i, c in enumerate(cols_order_list):
+        cols_order_list[i] = int(c)
+        if cols_order_list[i] <= 0:
             raise ValueError(
                 f"Invalid columns order: {col_names[i]} column's order "
-                f"is {cols_order[i]}"
+                f"is {cols_order_list[i]}"
             )
     for i in range(4):
         for j in range(i + 1, 4):
-            if cols_order[i] == cols_order[j]:
+            if cols_order_list[i] == cols_order_list[j]:
                 raise ValueError(
                     f"Invalid columns order: {col_names[i]} column has "
                     f"the same order as {col_names[j]} column"
@@ -840,7 +872,7 @@ def gcompute_strands_autocorr(
     MAX_COV = 10
 
     # Convert 1-based cols_order to 0-based indices
-    col_indices = [c - 1 for c in cols_order]
+    col_indices = [c - 1 for c in cols_order_list]
 
     with open(file) as fh:
         for line in fh:
@@ -849,7 +881,7 @@ def gcompute_strands_autocorr(
                 continue
             fields = line.split("\t")
             # Extract the 4 required columns
-            strs = [None] * 4
+            strs: list[str | None] = [None] * 4
             valid = True
             for i in range(4):
                 idx = col_indices[i]
@@ -868,7 +900,7 @@ def gcompute_strands_autocorr(
 
             # Parse coordinate
             try:
-                coord = int(strs[COORD_COL])
+                coord = int(strs[COORD_COL])  # type: ignore[arg-type]
             except ValueError:
                 continue
 
@@ -877,7 +909,7 @@ def gcompute_strands_autocorr(
             if coord < min_coord or coord > max_coord:
                 continue
 
-            seq = strs[SEQ_COL]
+            seq = strs[SEQ_COL] or ""
             strand = strs[STRAND_COL]
 
             if strand in ("+", "F"):

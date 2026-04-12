@@ -1,11 +1,14 @@
 """Database-level read-only track attributes."""
 
+from __future__ import annotations
+
 import os
 import shutil
 import stat
 import subprocess
 import warnings
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -16,7 +19,7 @@ _RO_ATTRS_FILE = ".ro_attributes"
 _PY_RO_MAGIC = b"PYMISHA_ROATTRS_V1\0"
 
 
-def _is_trusted_executable(path):
+def _is_trusted_executable(path: str | Path) -> bool:
     try:
         st = os.stat(path)
     except OSError:
@@ -31,7 +34,7 @@ def _is_trusted_executable(path):
     return not st.st_mode & stat.S_IWGRP
 
 
-def _find_trusted_rscript():
+def _find_trusted_rscript() -> str | None:
     candidates = [
         Path("/usr/bin/Rscript"),
         Path("/bin/Rscript"),
@@ -46,22 +49,23 @@ def _find_trusted_rscript():
     return None
 
 
-def _readonly_attrs_path():
+def _readonly_attrs_path() -> Path:
     _checkroot()
+    assert _shared._GROOT is not None
     return Path(_shared._GROOT) / _RO_ATTRS_FILE
 
 
-def _dedupe_and_validate_attrs(attrs):
+def _dedupe_and_validate_attrs(attrs: Any) -> list[str]:
     if isinstance(attrs, str):
-        values = [attrs]
+        values: list[Any] = [attrs]
     else:
         try:
             values = list(attrs)
         except TypeError as exc:
             raise TypeError("attrs must be an iterable of attribute names or None") from exc
 
-    out = []
-    seen = set()
+    out: list[str] = []
+    seen: set[str] = set()
     for value in values:
         attr = str(value)
         if attr == "":
@@ -74,7 +78,7 @@ def _dedupe_and_validate_attrs(attrs):
     return out
 
 
-def _read_python_readonly_format(path):
+def _read_python_readonly_format(path: Path) -> list[str] | None:
     raw = path.read_bytes()
     if not raw.startswith(_PY_RO_MAGIC):
         return None
@@ -85,13 +89,13 @@ def _read_python_readonly_format(path):
     return payload.split("\n")
 
 
-def _coerce_readonly_obj(obj, filename):
+def _coerce_readonly_obj(obj: Any, filename: str) -> list[str]:
     if isinstance(obj, pd.DataFrame):
         if obj.shape[1] != 1:
             raise ValueError(
                 f"Invalid format of read-only attributes file {filename}"
             )
-        values = obj.iloc[:, 0].tolist()
+        values: list[Any] = obj.iloc[:, 0].tolist()
     elif isinstance(obj, pd.Series):
         values = obj.tolist()
     elif isinstance(obj, list | tuple | set):
@@ -99,8 +103,8 @@ def _coerce_readonly_obj(obj, filename):
     else:
         values = [obj]
 
-    attrs = []
-    seen = set()
+    attrs: list[str] = []
+    seen: set[str] = set()
     for val in values:
         if pd.isna(val):
             continue
@@ -117,7 +121,7 @@ def _coerce_readonly_obj(obj, filename):
     return attrs
 
 
-def _read_r_readonly_format(path):
+def _read_r_readonly_format(path: Path) -> list[str]:
     filename = str(path)
     try:
         import pyreadr
@@ -140,7 +144,7 @@ def _read_r_readonly_format(path):
     return _coerce_readonly_obj(first, filename)
 
 
-def gdb_get_readonly_attrs():
+def gdb_get_readonly_attrs() -> list[str] | None:
     """
     Return read-only track attributes for the current database.
 
@@ -178,7 +182,7 @@ def gdb_get_readonly_attrs():
     return attrs or None
 
 
-def gdb_set_readonly_attrs(attrs):
+def gdb_set_readonly_attrs(attrs: list[str] | tuple[str, ...] | str | None) -> None:
     """
     Set the list of read-only track attributes for the current database.
 

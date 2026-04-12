@@ -1,11 +1,13 @@
 """Shared CRC64-ECMA helpers (parity with C++ CRC64.h)."""
 
+from __future__ import annotations
+
 _CRC64_POLY = 0xC96C5795D7870F42
-_CRC64_TABLE = None
+_CRC64_TABLE: list[int] | None = None
 
 
-def _crc64_table():
-    table = []
+def _crc64_table() -> list[int]:
+    table: list[int] = []
     for i in range(256):
         crc = i
         for _ in range(8):
@@ -17,7 +19,7 @@ def _crc64_table():
     return table
 
 
-def crc64_incremental(crc, data):
+def crc64_incremental(crc: int, data: bytes | bytearray) -> int:
     global _CRC64_TABLE
     if _CRC64_TABLE is None:
         _CRC64_TABLE = _crc64_table()
@@ -26,9 +28,9 @@ def crc64_incremental(crc, data):
     return crc & 0xFFFFFFFFFFFFFFFF
 
 
-def crc64_init():
+def crc64_init() -> int:
     return 0xFFFFFFFFFFFFFFFF
 
 
-def crc64_finalize(crc):
+def crc64_finalize(crc: int) -> int:
     return (~crc) & 0xFFFFFFFFFFFFFFFF

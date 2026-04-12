@@ -2,7 +2,15 @@
 PyMisha - Python wrapper for the misha Genomic Data Analysis Toolkit
 """
 
-__version__ = '0.1.12'
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any
+
+try:
+    __version__ = version("pymisha")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 # Make numpy available for expressions
 import numpy as np  # noqa: F401
@@ -195,7 +203,7 @@ from .vtracks import (
 )
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
     # Expose live DB state variables instead of stale import-time snapshots.
     if name in {"_GROOT", "_UROOT", "_VTRACKS"}:
         return getattr(_shared, name)

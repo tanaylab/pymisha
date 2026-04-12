@@ -31,6 +31,9 @@ jobs:
       - name: Lint with ruff
         run: ruff check pymisha/
 
+      - name: Type check with mypy
+        run: python -m mypy pymisha/
+
       - name: Run tests
         run: pytest tests/ -x -q --override-ini="addopts="
 

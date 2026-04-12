@@ -7,9 +7,12 @@ The module-level mutable state (`CONFIG`, `_GROOT`, `_GWD`, `_GDATASETS`,
 Use PyMisha APIs from a single controlling thread or add external locking.
 """
 
+from __future__ import annotations
+
 import contextlib as _contextlib
 import sys as _sys
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as _numpy
 import pandas as _pandas
@@ -38,11 +41,11 @@ CONFIG = {
 }
 
 # Global state
-_GROOT = None    # Global database root
-_UROOT = None    # User database root
-_GWD = None      # Global working directory (tracks root or subdir)
-_GDATASETS = []  # Loaded dataset roots (in load order)
-_VTRACKS = {}    # Virtual tracks
+_GROOT: str | None = None    # Global database root
+_UROOT: str | None = None    # User database root
+_GWD: str | None = None      # Global working directory (tracks root or subdir)
+_GDATASETS: list[str] = []  # Loaded dataset roots (in load order)
+_VTRACKS: dict[str, dict[str, Any]] = {}    # Virtual tracks
 
 
 def gmax_processes(n=None):
