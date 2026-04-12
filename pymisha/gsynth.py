@@ -12,7 +12,7 @@ from typing import Any as _Any
 
 import numpy as _numpy
 import pandas as _pd
-import yaml as _yaml
+import yaml as _yaml  # type: ignore[import-untyped]
 
 from ._safe_pickle import restricted_load
 from ._shared import _checkroot, _df2pymisha, _pymisha
@@ -197,7 +197,7 @@ def gsynth_bin_map(breaks: list[float] | _numpy.ndarray, merge_ranges: list[dict
         to_lo, to_hi = (to_val, to_val) if _numpy.isscalar(to_val) else to_val
         to_mid = (float(to_lo) + float(to_hi)) / 2.0  # type: ignore[arg-type]
         target_bin = _numpy.searchsorted(breaks[:-1], to_mid, side="right") - 1
-        target_bin = int(_numpy.clip(target_bin, 0, num_bins - 1))
+        target_bin = int(_numpy.clip(target_bin, 0, num_bins - 1))  # type: ignore[assignment]
 
         # Verify target bin matches the specified range
         if not (breaks[target_bin] <= to_hi and breaks[target_bin + 1] >= to_lo):
@@ -343,7 +343,7 @@ def _extract_bin_data(
     _checkroot()
     all_chroms = gintervals_all()
     chrom_to_id = {name: i for i, name in enumerate(all_chroms["chrom"])}
-    iter_chroms = _numpy.array(
+    iter_chroms = _numpy.array(  # type: ignore[assignment]
         [chrom_to_id.get(str(c), -1) for c in chrom_strs], dtype=_numpy.int32
     )
 
