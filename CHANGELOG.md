@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.28 (2026-04-14)
+
+### Fixes
+- **mypy CI green:** Resolved 3 `no-any-return` errors from C++ bridge calls in `_crc64.py` and `sequence.py`.
+
 ## v0.1.27 (2026-04-14)
 
 ### Fixes

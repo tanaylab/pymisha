@@ -569,9 +569,10 @@ def gseq_kmer(
                 break
     if _use_cpp:
         try:
-            return _pymisha.pm_kmer_count_strings(
+            result: _numpy.ndarray = _pymisha.pm_kmer_count_strings(
                 list(seqs), kmer.upper(), mode, strand
             )
+            return result
         except AttributeError:
             pass
 
