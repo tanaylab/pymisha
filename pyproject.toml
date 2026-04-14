@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymisha"
-version = "0.1.26"
+version = "0.1.27"
 description = "Python interface for misha genomic databases with C++ streaming backends"
 readme = "README.md"
 license = {text = "MIT"}
@@ -58,7 +58,7 @@ Issues = "https://github.com/tanaylab/pymisha/issues"
 packages = ["pymisha"]
 
 [tool.setuptools.package-data]
-pymisha = ["py.typed", "examples/**/*"]
+pymisha = ["py.typed", "examples/**/*", "examples/**/.*"]
 
 [tool.ruff]
 line-length = 120

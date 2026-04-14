@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.27 (2026-04-14)
+
+### Fixes
+- **Example DB dotfiles in wheel:** Added `examples/**/.*` glob to package-data so `.attributes`, `.colnames`, and `.ro_attributes` files are included in wheels. Without these the bundled example DB was non-functional.
+
 ## v0.1.26 (2026-04-14)
 
 ### Features
