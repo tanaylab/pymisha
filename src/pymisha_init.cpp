@@ -83,6 +83,11 @@ PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args);
 PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
 PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args);
+PyObject *pm_pwm_score_strings(PyObject *self, PyObject *args);
+PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args);
+PyObject *pm_crc64_update(PyObject *self, PyObject *args);
+PyObject *pm_crc64_finalize(PyObject *self, PyObject *args);
+PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -137,6 +142,11 @@ static PyMethodDef module_methods[] = {
     {"pm_track2d_convert_to_indexed", pm_track2d_convert_to_indexed, METH_VARARGS, "Convert 2D track per-pair files to indexed format"},
     {"pm_track2d_index_info", pm_track2d_index_info, METH_VARARGS, "Get 2D track index info"},
     {"pm_gseq_pwm_edits", pm_gseq_pwm_edits, METH_VARARGS, "Get detailed PWM edit distance information"},
+    {"pm_pwm_score_strings", pm_pwm_score_strings, METH_VARARGS, "Score sequences with PWM scorer"},
+    {"pm_kmer_count_strings", pm_kmer_count_strings, METH_VARARGS, "Count k-mer occurrences in sequences"},
+    {"pm_crc64_update", pm_crc64_update, METH_VARARGS, "CRC64-ECMA incremental update"},
+    {"pm_crc64_finalize", pm_crc64_finalize, METH_VARARGS, "CRC64-ECMA finalize"},
+    {"pm_compute_strands_autocorr", pm_compute_strands_autocorr, METH_VARARGS, "Compute strand cross-correlation"},
     {NULL, NULL, 0, NULL}
 };
 

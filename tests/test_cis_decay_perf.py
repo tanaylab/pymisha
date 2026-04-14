@@ -46,7 +46,7 @@ def _reference_gcis_decay_slow(track, breaks, src, domain, include_lowest=False,
         _containing_interval,
         _intervals_per_chrom,
         _unify_overlaps_per_chrom,
-        _val2bin,
+        _val2bin_vec,
     )
     from pymisha.extract import _find_2d_track_file, _obj_in_band, _validate_band
     from pymisha.intervals import _normalize_chroms
@@ -55,6 +55,7 @@ def _reference_gcis_decay_slow(track, breaks, src, domain, include_lowest=False,
     import _pymisha
 
     breaks = [float(b) for b in breaks]
+    breaks_arr = np.array(breaks, dtype=float)
     n_bins = len(breaks) - 1
     intra = np.zeros(n_bins, dtype=np.float64)
     inter = np.zeros(n_bins, dtype=np.float64)
@@ -113,7 +114,7 @@ def _reference_gcis_decay_slow(track, breaks, src, domain, include_lowest=False,
                 continue
 
             distance = abs((s1 + e1 - s2 - e2) // 2)
-            idx = _val2bin(distance, breaks, include_lowest)
+            idx = int(_val2bin_vec(np.array([distance], dtype=float), breaks_arr, include_lowest)[0])
             if idx < 0:
                 continue
 

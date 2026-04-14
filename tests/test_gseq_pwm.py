@@ -124,7 +124,7 @@ class TestGseqPwmBasicScoring:
         expected = _log_sum_exp(scores)
 
         result = pm.gseq_pwm([seq], pssm, mode="lse", bidirect=False, prior=0.01)
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
     def test_max_mode(self):
         """Max mode returns the best single-position score."""
@@ -134,7 +134,7 @@ class TestGseqPwmBasicScoring:
         expected = max(scores)
 
         result = pm.gseq_pwm([seq], pssm, mode="max", bidirect=False, prior=0.01)
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
     def test_pos_mode(self):
         """Pos mode returns 1-based position of the best match."""
@@ -201,7 +201,7 @@ class TestGseqPwmBidirectional:
         expected = _log_sum_exp(fwd_scores + rev_scores)
 
         result = pm.gseq_pwm([seq], pssm, mode="lse", bidirect=True, prior=0.01)
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
     def test_bidirect_max(self):
         """Bidirectional max is the best score across both strands."""
@@ -213,7 +213,7 @@ class TestGseqPwmBidirectional:
         expected = max(max(fwd_scores), max(rev_scores))
 
         result = pm.gseq_pwm([seq], pssm, mode="max", bidirect=True, prior=0.01)
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
     def test_bidirect_count(self):
         """Bidirectional count sums hits from both strands."""
@@ -265,7 +265,7 @@ class TestGseqPwmStrand:
         result = pm.gseq_pwm(
             [seq], pssm, mode="lse", bidirect=False, strand=1, prior=0.01
         )
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
     def test_reverse_strand(self):
         """strand=-1 scores reverse complement strand only."""
@@ -278,7 +278,7 @@ class TestGseqPwmStrand:
         result = pm.gseq_pwm(
             [seq], pssm, mode="lse", bidirect=False, strand=-1, prior=0.01
         )
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
 
 class TestGseqPwmROI:
@@ -394,7 +394,7 @@ class TestGseqPwmNeutralChars:
             [seq], pssm, mode="max", bidirect=False, prior=0,
             neutral_chars=["N"], neutral_chars_policy="log_quarter"
         )
-        assert abs(result[0] - expected) < 1e-6
+        assert abs(result[0] - expected) < 1e-4
 
 
 class TestGseqPwmPSSMFormats:

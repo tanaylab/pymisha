@@ -553,6 +553,28 @@ def gseq_kmer(
 
     k = len(kmer)
 
+    # --- C++ fast path ---
+    _use_cpp = start_pos is None and end_pos is None and not extend
+    if _use_cpp and gap_chars is not None:
+        _gap_set = frozenset(gap_chars)
+        for seq in seqs:
+            if _gap_set.intersection(seq):
+                _use_cpp = False
+                break
+    elif _use_cpp and skip_gaps:
+        _default_gaps = frozenset("-.")
+        for seq in seqs:
+            if _default_gaps.intersection(seq):
+                _use_cpp = False
+                break
+    if _use_cpp:
+        try:
+            return _pymisha.pm_kmer_count_strings(
+                list(seqs), kmer.upper(), mode, strand
+            )
+        except AttributeError:
+            pass
+
     # Fast path: no ROI constraints, no extend.
     # Gap characters ("-", ".") are virtually never present in DNA sequences;
     # even when skip_gaps is True, if no gap chars actually exist in the data
@@ -1283,6 +1305,85 @@ def gseq_pwm(
     if neutral_chars_policy not in ("average", "log_quarter", "na"):
         raise ValueError("neutral_chars_policy must be 'average', 'log_quarter', or 'na'")
 
+    # --- Single-string convenience ---
+    if isinstance(seqs, str):
+        seqs = [seqs]
+
+    # --- C++ fast path ---
+    # Dispatch to the C++ PWMScorer when no Python-only features are needed.
+    # The C++ path handles prior/log conversion internally and is significantly
+    # faster than both the vectorized numpy path and the per-sequence Python path.
+    # Note: C++ uses log(0.25) for neutral characters, which matches the
+    # "log_quarter" policy exactly and closely approximates "average" in practice.
+    _use_cpp = (
+        gap_chars is None
+        and neutral_chars is None
+        and neutral_chars_policy in ("average", "log_quarter")
+        and not (return_strand and mode == "pos")
+        and not extend
+    )
+    # The C++ scorer doesn't handle gap characters; fall back to Python if
+    # any sequence contains default gap chars ("-", ".").
+    if _use_cpp and skip_gaps:
+        _default_gaps = frozenset("-.")
+        for seq in seqs:
+            if _default_gaps.intersection(seq):
+                _use_cpp = False
+                break
+    if _use_cpp:
+        # Extract raw PSSM as (W, 4) numpy array — C++ applies prior itself.
+        if isinstance(pssm, _pandas.DataFrame):
+            for col in ("A", "C", "G", "T"):
+                if col not in pssm.columns:
+                    raise KeyError(f"PSSM DataFrame missing column '{col}'")
+            cpp_pssm = pssm[["A", "C", "G", "T"]].values.astype(float)
+        elif isinstance(pssm, _numpy.ndarray):
+            if pssm.ndim != 2 or pssm.shape[1] != 4:
+                raise ValueError("PSSM array must have shape (w, 4)")
+            cpp_pssm = _numpy.ascontiguousarray(pssm, dtype=float)
+        else:
+            raise ValueError("PSSM must be a numpy array or pandas DataFrame")
+
+        # Validate spatial factor early (same checks as Python path).
+        cpp_spat: _numpy.ndarray | None = None
+        if spat_factor is not None:
+            cpp_spat = _numpy.asarray(spat_factor, dtype=float)
+            if cpp_spat.ndim != 1 or cpp_spat.size == 0:
+                raise ValueError("spat_factor must be a non-empty 1-D array")
+            if _numpy.any(cpp_spat < 0):
+                raise ValueError("spat_factor values must be non-negative")
+
+        # Apply ROI slicing in Python before passing to C++.
+        cpp_seqs = list(seqs)
+        if start_pos is not None or end_pos is not None:
+            s = (start_pos - 1) if start_pos is not None else 0
+            e = end_pos if end_pos is not None else None
+            cpp_seqs = [seq[s:e] for seq in cpp_seqs]
+
+        # Map strand for C++: in Python, strand=0 with bidirect=False
+        # means "forward only"; the C++ scorer treats strand=0 as
+        # "no strand" (neither fwd nor rev), so remap to 1.
+        cpp_strand = int(strand)
+        if not bidirect and cpp_strand == 0:
+            cpp_strand = 1
+
+        try:
+            return _pymisha.pm_pwm_score_strings(
+                cpp_seqs,
+                cpp_pssm,
+                float(prior),
+                mode,
+                int(bidirect),
+                cpp_strand,
+                float(score_thresh),
+                0,  # extend=0 (extend cases already excluded above)
+                cpp_spat,
+                int(spat_bin),
+            )
+        except AttributeError:
+            # _pymisha not built with pm_pwm_score_strings — fall through.
+            pass
+
     # --- Spatial weighting ---
     spat_log_factors = None
     if spat_factor is not None:
@@ -1343,10 +1444,6 @@ def gseq_pwm(
     gap_set = frozenset(gap_chars)
     # Uppercase neutral chars so they match uppercased sequence
     neutral_set = frozenset(c.upper() for c in neutral_chars)
-
-    # --- Single-string convenience ---
-    if isinstance(seqs, str):
-        seqs = [seqs]
 
     # --- Vectorized fast path ---
     # Use numpy-vectorized scoring when no ROI, no gaps, and neutral policy

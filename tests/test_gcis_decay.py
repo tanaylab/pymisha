@@ -46,7 +46,7 @@ def _reference_gcis_decay(track, breaks, src, domain, include_lowest=False):
         _containing_interval,
         _intervals_per_chrom,
         _unify_overlaps_per_chrom,
-        _val2bin,
+        _val2bin_vec,
     )
 
     src_per_chrom = _unify_overlaps_per_chrom(src)
@@ -55,6 +55,7 @@ def _reference_gcis_decay(track, breaks, src, domain, include_lowest=False):
     n_bins = len(breaks) - 1
     intra = np.zeros(n_bins, dtype=float)
     inter = np.zeros(n_bins, dtype=float)
+    breaks_arr = np.array(breaks, dtype=float)
 
     # Extract all cis contacts using ALLGENOME for chrom sizes
     all_genome = pm.gintervals_all()
@@ -78,7 +79,7 @@ def _reference_gcis_decay(track, breaks, src, domain, include_lowest=False):
                 continue
 
             distance = abs((s1 + e1 - s2 - e2) // 2)
-            idx = _val2bin(distance, breaks, include_lowest)
+            idx = int(_val2bin_vec(np.array([distance], dtype=float), breaks_arr, include_lowest)[0])
             if idx < 0:
                 continue
 
@@ -549,36 +550,6 @@ class TestGcisDecayRParity:
         assert result[:, 1].sum() == 0
         assert result[:, 0].sum() > 0
 
-
-class TestVal2bin:
-    """Unit tests for the _val2bin helper function."""
-
-    def test_basic_binning(self):
-        from pymisha.analysis import _val2bin
-        breaks = [0.0, 1.0, 2.0, 3.0]
-        assert _val2bin(0.5, breaks, False) == 0
-        assert _val2bin(1.0, breaks, False) == 0
-        assert _val2bin(1.5, breaks, False) == 1
-        assert _val2bin(2.5, breaks, False) == 2
-        assert _val2bin(3.0, breaks, False) == 2
-
-    def test_out_of_range(self):
-        from pymisha.analysis import _val2bin
-        breaks = [0.0, 1.0, 2.0]
-        assert _val2bin(-1.0, breaks, False) == -1
-        assert _val2bin(0.0, breaks, False) == -1  # not include_lowest
-        assert _val2bin(2.5, breaks, False) == -1
-
-    def test_include_lowest(self):
-        from pymisha.analysis import _val2bin
-        breaks = [0.0, 1.0, 2.0]
-        assert _val2bin(0.0, breaks, True) == 0
-        assert _val2bin(0.0, breaks, False) == -1
-
-    def test_nan(self):
-        from pymisha.analysis import _val2bin
-        breaks = [0.0, 1.0, 2.0]
-        assert _val2bin(float('nan'), breaks, False) == -1
 
 
 class TestContainingInterval:

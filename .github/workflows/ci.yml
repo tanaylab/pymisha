@@ -37,6 +37,42 @@ jobs:
       - name: Run tests
         run: pytest tests/ -x -q --override-ini="addopts=" --cov=pymisha --cov-report=term-missing
 
+  cpp-coverage:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev' || github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lcov
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas pyyaml pytest
+
+      - name: Build with coverage instrumentation
+        run: PYMISHA_COVERAGE=1 python setup.py build_ext --inplace
+
+      - name: Run tests
+        run: pytest tests/ -x -q --override-ini="addopts=" --tb=line
+
+      - name: Collect C++ coverage
+        run: |
+          GCDA_DIR=$(find build/ -name '*.gcda' -printf '%h\n' | sort -u | head -1)
+          lcov --capture --directory "$GCDA_DIR" -o cpp-coverage-raw.info --gcov-tool gcov -q
+          lcov --remove cpp-coverage-raw.info '/usr/*' '*/numpy/*' '*/python*' \
+            -o cpp-coverage.info -q
+          echo "### C++ Coverage" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          lcov --summary cpp-coverage.info 2>&1 | tail -3 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
   test-macos:
     # Only run macOS on PRs and main pushes, not dev pushes
     if: github.ref != 'refs/heads/dev'

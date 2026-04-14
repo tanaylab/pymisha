@@ -5,34 +5,120 @@
 #include <cstring>
 #include <limits>
 
+namespace {
+
+// Build reverse complement of a DNA string (already uppercased)
+std::string reverse_complement(const std::string &s) {
+    std::string rc(s.size(), 'N');
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c;
+        switch (s[s.size() - 1 - i]) {
+            case 'A': c = 'T'; break;
+            case 'T': c = 'A'; break;
+            case 'C': c = 'G'; break;
+            case 'G': c = 'C'; break;
+            default:  c = 'N'; break;
+        }
+        rc[i] = c;
+    }
+    return rc;
+}
+
+} // anonymous namespace
+
 KmerCounter::KmerCounter(const std::string &kmer, const std::string &genome_root,
                         CountMode mode, bool extend, char strand)
     : GenomeSeqScorer(genome_root, extend, strand), m_kmer(kmer), m_mode(mode)
 {
-    // Validate kmer
     if (m_kmer.empty())
     {
         TGLError("Kmer string cannot be empty");
     }
-
-    // Convert kmer to uppercase
     std::transform(m_kmer.begin(), m_kmer.end(), m_kmer.begin(),
                    [](unsigned char c) { return std::toupper(c); });
+    m_kmer_rc = reverse_complement(m_kmer);
 }
 
 KmerCounter::KmerCounter(const std::string &kmer, GenomeSeqFetch* shared_seqfetch,
                         CountMode mode, bool extend, char strand)
     : GenomeSeqScorer(shared_seqfetch, extend, strand), m_kmer(kmer), m_mode(mode)
 {
-    // Validate kmer
     if (m_kmer.empty())
     {
         TGLError("Kmer string cannot be empty");
     }
-
-    // Convert kmer to uppercase
     std::transform(m_kmer.begin(), m_kmer.end(), m_kmer.begin(),
                    [](unsigned char c) { return std::toupper(c); });
+    m_kmer_rc = reverse_complement(m_kmer);
+}
+
+KmerCounter::KmerCounter(const std::string &kmer, CountMode mode, char strand)
+    : GenomeSeqScorer(false, strand), m_kmer(kmer), m_mode(mode)
+{
+    if (m_kmer.empty())
+    {
+        TGLError("Kmer string cannot be empty");
+    }
+    std::transform(m_kmer.begin(), m_kmer.end(), m_kmer.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    m_kmer_rc = reverse_complement(m_kmer);
+}
+
+double KmerCounter::count_string(const char* seq, int seq_len)
+{
+    if (seq_len < (int)m_kmer.length())
+    {
+        return 0.0;
+    }
+
+    // Uppercase the input
+    std::string upper(seq, seq_len);
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+
+    const char* data = upper.data();
+    const char* kmer_data = m_kmer.data();
+    const char* rc_data = m_kmer_rc.data();
+    const size_t kmer_len = m_kmer.length();
+    const size_t last_pos = (size_t)seq_len - kmer_len;
+
+    size_t count = 0;
+
+    // Count forward matches
+    if (m_strand == 0 || m_strand == 1)
+    {
+        for (size_t pos = 0; pos <= last_pos; ++pos)
+        {
+            if (std::memcmp(data + pos, kmer_data, kmer_len) == 0)
+            {
+                ++count;
+            }
+        }
+    }
+
+    // Count reverse complement matches
+    if (m_strand == 0 || m_strand == -1)
+    {
+        for (size_t pos = 0; pos <= last_pos; ++pos)
+        {
+            if (std::memcmp(data + pos, rc_data, kmer_len) == 0)
+            {
+                ++count;
+            }
+        }
+    }
+
+    if (m_mode == FRACTION)
+    {
+        size_t valid_positions = (size_t)seq_len - kmer_len + 1;
+        if (m_strand == 0)
+        {
+            valid_positions *= 2;
+        }
+        return valid_positions > 0 ? (double)count / (double)valid_positions : 0.0;
+    }
+
+    return (double)count;
 }
 
 float KmerCounter::score_interval(const GInterval &interval, const GenomeChromKey &chromkey)

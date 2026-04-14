@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.26 (2026-04-14)
+
+### Features
+- **Bundled example database:** `gdb_init_examples()` now works on any machine after `pip install pymisha`. The example trackdb is shipped inside the wheel under `pymisha/examples/`.
+
 ## v0.1.25 (2026-04-12)
 
 ### Maintenance

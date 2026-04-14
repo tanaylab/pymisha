@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 import math
 import warnings
 from typing import Any
@@ -251,33 +250,6 @@ def gwilcox(expr: str, winsize1: int, winsize2: int, maxpval: float = 0.05, onet
 # gcis_decay helpers
 # ---------------------------------------------------------------------------
 
-def _val2bin(val: float, breaks: list[float], include_lowest: bool) -> int:
-    """Map *val* to a bin index given sorted *breaks*.
-
-    Bins are half-open intervals ``(breaks[i], breaks[i+1]]``.
-    When *include_lowest* is True the first bin becomes ``[breaks[0], breaks[1]]``.
-    Returns -1 when *val* falls outside all bins or is NaN.
-
-    This replicates the C++ ``BinFinder::val2bin`` logic (right=True).
-    """
-    if val != val:  # NaN check
-        return -1
-    n = len(breaks)
-    if n < 2:
-        return -1
-    if include_lowest and val == breaks[0]:
-        return 0
-    if val <= breaks[0] or val > breaks[-1]:
-        return -1
-    # Binary search: find rightmost break <= val
-    idx = bisect.bisect_left(breaks, val) - 1
-    # bisect_left gives the insertion point; the bin is idx clamped to [0, n-2]
-    if idx < 0:
-        idx = 0
-    if idx >= n - 1:
-        idx = n - 2
-    return idx
-
 
 def _unify_overlaps_per_chrom(df: pd.DataFrame | None) -> dict[str, list[tuple[int, int]]]:
     """Sort intervals, merge overlapping ones, return dict[chrom -> sorted list of (start, end)].
@@ -408,27 +380,9 @@ def _val2bin_vec(values: _numpy.ndarray, breaks_arr: _numpy.ndarray, include_low
 
     Returns ndarray of int64 bin indices, -1 for values outside all bins.
     """
-    n_bins = len(breaks_arr) - 1
+    from .summary import _bin_values
 
-    # searchsorted('right') maps value to the bin it falls in:
-    # For bins (b0, b1], (b1, b2], ..., (b_{n-1}, b_n]:
-    # searchsorted(breaks, val, 'right') - 1 gives the bin index
-    # But we need to handle edge cases:
-    #   val <= breaks[0] -> -1 (unless include_lowest and val == breaks[0])
-    #   val > breaks[-1] -> -1
-
-    idx = _numpy.searchsorted(breaks_arr, values, side="right").astype(_numpy.int64) - 1
-
-    # Valid bins: 0 <= idx < n_bins, and value > breaks[0] (or == if include_lowest)
-    valid = (idx >= 0) & (idx < n_bins) & (values > breaks_arr[0]) & (values <= breaks_arr[-1])
-
-    if include_lowest:
-        # Include values exactly at breaks[0] in bin 0
-        at_lowest = values == breaks_arr[0]
-        valid = valid | at_lowest
-        idx = _numpy.where(at_lowest & (idx < 0), 0, idx)
-
-    return _numpy.where(valid, idx, -1)
+    return _bin_values(values, breaks_arr, include_lowest).astype(_numpy.int64)
 
 
 def gcis_decay(
@@ -862,6 +816,25 @@ def gcompute_strands_autocorr(
         min_coord = 0
     if max_coord < 0 or max_coord > chromsize:
         max_coord = chromsize
+
+    # --- C++ fast path ---
+    try:
+        import _pymisha
+
+        stats_dict, (bin_arr, corr_arr) = _pymisha.pm_compute_strands_autocorr(
+            file,
+            chrom_norm,
+            chromsize,
+            binsize,
+            maxread,
+            tuple(cols_order_list),
+            min_coord,
+            max_coord,
+        )
+        bins_df = pd.DataFrame({"bin": bin_arr, "corr": corr_arr})
+        return stats_dict, bins_df
+    except AttributeError:
+        pass
 
     # --- build coverage arrays ---
     SEQ_COL, CHROM_COL, COORD_COL, STRAND_COL = 0, 1, 2, 3

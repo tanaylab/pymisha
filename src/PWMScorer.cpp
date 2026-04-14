@@ -142,6 +142,48 @@ PWMScorer::PWMScorer(const DnaPSSM& pssm, GenomeSeqFetch* shared_seqfetch, bool 
     }
 }
 
+PWMScorer::PWMScorer(const DnaPSSM& pssm, ScoringMode mode, char strand,
+                     const std::vector<float>& spat_factor, int spat_bin_size,
+                     float score_thresh, bool extend)
+    : GenomeSeqScorer((GenomeSeqFetch*)nullptr, extend, strand), m_pssm(pssm), m_mode(mode), m_score_thresh(score_thresh)
+{
+    if (!spat_factor.empty()) {
+        m_use_spat = true;
+        m_spat_bin_size = std::max(1, spat_bin_size);
+
+        // Precompute log of spatial factors
+        m_spat_log_factors.resize(spat_factor.size());
+        for (size_t i = 0; i < spat_factor.size(); ++i) {
+            m_spat_log_factors[i] = std::log(std::max(1e-30f, spat_factor[i]));
+        }
+    }
+}
+
+float PWMScorer::score_string(const char* seq, int seq_len)
+{
+    if (seq_len <= 0 || !seq) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
+    const size_t motif_len = m_pssm.size();
+    if ((size_t)seq_len < motif_len) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
+    // Convert raw char array to std::string for reuse of existing scoring methods
+    std::string target(seq, seq_len);
+
+    // Invalidate sliding window cache (each string is independent)
+    invalidate_cache();
+
+    // Use the existing scoring methods
+    if (m_use_spat) {
+        return score_with_spatial(target, (int64_t)motif_len);
+    } else {
+        return score_without_spatial(target, (int64_t)motif_len);
+    }
+}
+
 void PWMScorer::invalidate_cache()
 {
     m_slide.valid = false;

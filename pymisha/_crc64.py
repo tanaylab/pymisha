@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+# Try C++ fast path first, fall back to pure Python.
+try:
+    import _pymisha
+
+    _HAS_CPP_CRC64 = hasattr(_pymisha, "pm_crc64_update")
+except ImportError:
+    _HAS_CPP_CRC64 = False
+
 _CRC64_POLY = 0xC96C5795D7870F42
 _CRC64_TABLE: list[int] | None = None
 
@@ -20,6 +28,8 @@ def _crc64_table() -> list[int]:
 
 
 def crc64_incremental(crc: int, data: bytes | bytearray) -> int:
+    if _HAS_CPP_CRC64:
+        return _pymisha.pm_crc64_update(crc, data)
     global _CRC64_TABLE
     if _CRC64_TABLE is None:
         _CRC64_TABLE = _crc64_table()
@@ -33,4 +43,6 @@ def crc64_init() -> int:
 
 
 def crc64_finalize(crc: int) -> int:
+    if _HAS_CPP_CRC64:
+        return _pymisha.pm_crc64_finalize(crc)
     return (~crc) & 0xFFFFFFFFFFFFFFFF

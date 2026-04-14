@@ -32,8 +32,16 @@ public:
               const std::vector<float>& spat_factor = std::vector<float>(),
               int spat_bin_size = 1, float score_thresh = 0.0f);
 
+    // Constructor for string-only scoring (no genome database required)
+    PWMScorer(const DnaPSSM &pssm, ScoringMode mode = TOTAL_LIKELIHOOD, char strand = 1,
+              const std::vector<float>& spat_factor = std::vector<float>(),
+              int spat_bin_size = 1, float score_thresh = 0.0f, bool extend = true);
+
     // Score a genomic interval using the PWM
     float score_interval(const GInterval &interval, const GenomeChromKey &chromkey) override;
+
+    // Score a raw string (no genome database needed)
+    float score_string(const char* seq, int seq_len);
 
     // Invalidate sliding window cache
     void invalidate_cache();

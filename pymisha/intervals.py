@@ -1279,54 +1279,6 @@ def _sort_intervals(intervals: pd.DataFrame) -> pd.DataFrame:
     return intervals.sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
 
 
-def _unify_overlaps(intervals: pd.DataFrame | None, unify_touching: bool = True) -> pd.DataFrame | None:
-    if intervals is None or len(intervals) == 0:
-        return None
-
-    intervals = _sort_intervals(intervals[["chrom", "start", "end"]].copy())
-
-    result_chroms = []
-    result_starts = []
-    result_ends = []
-
-    cur_chrom = intervals.iloc[0]['chrom']
-    cur_start = intervals.iloc[0]['start']
-    cur_end = intervals.iloc[0]['end']
-
-    for i in range(1, len(intervals)):
-        row = intervals.iloc[i]
-        chrom = row['chrom']
-        start = row['start']
-        end = row['end']
-
-        if chrom == cur_chrom:
-            if unify_touching:
-                if cur_end >= start:
-                    cur_end = max(cur_end, end)
-                    continue
-            else:
-                if cur_end > start:
-                    cur_end = max(cur_end, end)
-                    continue
-
-        result_chroms.append(cur_chrom)
-        result_starts.append(cur_start)
-        result_ends.append(cur_end)
-
-        cur_chrom = chrom
-        cur_start = start
-        cur_end = end
-
-    result_chroms.append(cur_chrom)
-    result_starts.append(cur_start)
-    result_ends.append(cur_end)
-
-    return _pandas.DataFrame({
-        'chrom': result_chroms,
-        'start': result_starts,
-        'end': result_ends
-    })
-
 
 def _intervals_to_cpp(intervals: pd.DataFrame) -> Any:
     """Prepare intervals for C++ processing (convert Categorical chrom to string)."""

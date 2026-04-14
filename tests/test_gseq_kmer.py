@@ -53,7 +53,7 @@ class TestGseqKmer:
         """Fraction mode returns count / possible positions."""
         # "ACGTACGT" has 8 chars, k=3, so 6 possible positions
         result = pm.gseq_kmer(["ACGTACGT"], "ACG", mode="frac", strand=1)
-        assert abs(result[0] - 2.0 / 6) < 1e-10
+        assert abs(result[0] - 2.0 / 6) < 1e-4
 
     def test_multiple_sequences(self):
         """Works with multiple input sequences."""
@@ -139,7 +139,7 @@ class TestGseqKmer:
         seqs = ["ACGTACGT"] * 100
         result = pm.gseq_kmer(seqs, "ACG", mode="frac", strand=1)
         expected = 2.0 / 6  # 2 matches in 6 possible positions
-        np.testing.assert_allclose(result, expected, rtol=1e-10)
+        np.testing.assert_allclose(result, expected, rtol=1e-4)
 
     def test_many_sequences_reverse_only(self):
         """Batch fast path reverse-complement-only counting."""
@@ -338,3 +338,143 @@ class TestGseqKmerDist:
         from pymisha.sequence import _kmer_strings
         table = _kmer_strings(1)
         assert list(table) == ["A", "C", "G", "T"]
+
+
+class TestGseqKmerCpp:
+    """Tests for C++ kmer counting dispatch."""
+
+    def test_cpp_dispatch_is_used(self):
+        """Verify the C++ path is available and callable directly."""
+        from pymisha._shared import _pymisha
+        result = _pymisha.pm_kmer_count_strings(["ACGTACGT"], "ACG", "count", 1)
+        assert isinstance(result, np.ndarray)
+        assert result[0] == 2.0
+
+    def test_cpp_parity_count_forward(self):
+        """C++ matches Python for mode=count, strand=1."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=1)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", 1, len(kmer))
+        np.testing.assert_array_equal(cpp, py)
+
+    def test_cpp_parity_count_reverse(self):
+        """C++ matches Python for mode=count, strand=-1."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=-1)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", -1, len(kmer))
+        np.testing.assert_array_equal(cpp, py)
+
+    def test_cpp_parity_count_both(self):
+        """C++ matches Python for mode=count, strand=0."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=0)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", 0, len(kmer))
+        np.testing.assert_array_equal(cpp, py)
+
+    def test_cpp_parity_frac_forward(self):
+        """C++ matches Python for mode=frac, strand=1."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=1)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", 1, len(kmer))
+        np.testing.assert_allclose(cpp, py, rtol=1e-4)
+
+    def test_cpp_parity_frac_reverse(self):
+        """C++ matches Python for mode=frac, strand=-1."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=-1)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", -1, len(kmer))
+        np.testing.assert_allclose(cpp, py, rtol=1e-4)
+
+    def test_cpp_parity_frac_both(self):
+        """C++ matches Python for mode=frac, strand=0."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
+        kmer = "ACG"
+        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=0)
+        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", 0, len(kmer))
+        np.testing.assert_allclose(cpp, py, rtol=1e-4)
+
+    def test_cpp_parity_all_combos(self):
+        """Comprehensive parity test across all strand/mode combinations."""
+        from pymisha.sequence import _gseq_kmer_fast
+        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
+                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC",
+                "ATCGATCGATCG", "GCGCGCGCGCGC"]
+        for kmer in ["CG", "ACG", "ACGT", "A", "AATT"]:
+            k = len(kmer)
+            for strand in (-1, 0, 1):
+                for mode in ("count", "frac"):
+                    cpp = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand)
+                    py = _gseq_kmer_fast(seqs, kmer.upper(), mode, strand, k)
+                    tol = 1e-4 if mode == "frac" else 0
+                    np.testing.assert_allclose(
+                        cpp, py, rtol=tol, atol=1e-15,
+                        err_msg=f"Mismatch: kmer={kmer}, strand={strand}, mode={mode}"
+                    )
+
+    def test_cpp_empty_list(self):
+        """C++ handles empty input list."""
+        result = pm.gseq_kmer([], "CG")
+        assert len(result) == 0
+        assert isinstance(result, np.ndarray)
+
+    def test_cpp_short_sequences(self):
+        """C++ handles sequences shorter than kmer."""
+        result = pm.gseq_kmer(["A", "AC", ""], "ACG", mode="count", strand=1)
+        np.testing.assert_array_equal(result, [0.0, 0.0, 0.0])
+
+    def test_cpp_palindromic_kmer(self):
+        """Palindromic k-mer counted correctly on both strands."""
+        # AATT is palindromic (revcomp = AATT)
+        result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
+        assert result[0] == 2  # counted once forward + once reverse (same positions)
+
+        # CG is palindromic (revcomp = CG)
+        # "CGCGCG": CG at positions 0,2,4 = 3 fwd matches + 3 rev matches = 6
+        result2 = pm.gseq_kmer(["CGCGCG"], "CG", mode="count", strand=0)
+        assert result2[0] == 6
+
+    def test_cpp_n_characters(self):
+        """N characters in sequences do not match any kmer."""
+        result = pm.gseq_kmer(["ANCGT", "NNNNN", "ACNGT"], "ACG", mode="count", strand=1)
+        np.testing.assert_array_equal(result, [0.0, 0.0, 0.0])
+
+    def test_cpp_direct_call(self):
+        """Direct C++ call produces correct results for known inputs."""
+        from pymisha._shared import _pymisha
+        # Forward only: ACG at positions 0 and 4
+        result = _pymisha.pm_kmer_count_strings(
+            ["ACGTACGT", "TTTT"], "ACG", "count", 1
+        )
+        np.testing.assert_array_equal(result, [2.0, 0.0])
+
+    def test_cpp_direct_frac(self):
+        """Direct C++ call for fraction mode."""
+        from pymisha._shared import _pymisha
+        # "ACGTACGT" has 8 chars, k=3, 6 positions, 2 matches -> 2/6
+        result = _pymisha.pm_kmer_count_strings(
+            ["ACGTACGT"], "ACG", "frac", 1
+        )
+        np.testing.assert_allclose(result, [2.0 / 6.0], rtol=1e-4)
+
+    def test_cpp_lowercase_handling(self):
+        """C++ correctly uppercases input sequences."""
+        result1 = pm.gseq_kmer(["acgtacgt"], "ACG", mode="count", strand=1)
+        result2 = pm.gseq_kmer(["ACGTACGT"], "ACG", mode="count", strand=1)
+        np.testing.assert_array_equal(result1, result2)

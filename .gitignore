@@ -20,6 +20,10 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+cpp-coverage/
+cpp-coverage*.info
+*.gcda
+*.gcno
 .mypy_cache/
 .ruff_cache/
 .eggs/

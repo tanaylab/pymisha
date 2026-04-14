@@ -21,6 +21,10 @@ public:
     virtual float score_interval(const GInterval& interval, const GenomeChromKey& chromkey) = 0;
 
 protected:
+    // Default constructor for string-only scoring (no genome database)
+    GenomeSeqScorer(bool extend, char strand)
+        : m_extend(extend), m_strand(strand), m_seqfetch_ptr(nullptr) {}
+
     // Helper method to calculate appropriate interval based on extension setting
     GInterval calculate_expanded_interval(const GInterval& interval, const GenomeChromKey& chromkey, int64_t pattern_length);
 
