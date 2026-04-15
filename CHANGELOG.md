@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.29 (2026-04-15)
+
+### Features
+- **Genome editing:** Added `ggenome_implant()` and `ggenome_transplant()` for replacing intervals in a reference genome with donor sequences. Supports literal donor strings or extraction from a misha database, with optional trackdb creation and `.fai` index generation.
+
 ## v0.1.28 (2026-04-14)
 
 ### Fixes

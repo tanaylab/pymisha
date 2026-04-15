@@ -60,6 +60,10 @@ from .gdir import (
     gdir_rm,
     gtrack_create_dirs,
 )
+from .genome_edit import (
+    ggenome_implant,
+    ggenome_transplant,
+)
 from .gsynth import (
     GsynthModel,
     gsynth_bin_map,
@@ -394,6 +398,10 @@ __all__ = [
     'gsynth_save',
     'gsynth_load',
     'gsynth_convert',
+
+    # Genome editing functions
+    'ggenome_implant',
+    'ggenome_transplant',
 
 ]
 
