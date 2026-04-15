@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.30 (2026-04-15)
+
+### Performance
+- **ggenome_implant C++ fast path:** FASTA read/write/perturb loop now runs in C++ with 4 MB I/O buffers, matching the misha R package implementation.
+
 ## v0.1.29 (2026-04-15)
 
 ### Features

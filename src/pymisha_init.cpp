@@ -88,6 +88,7 @@ PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args);
 PyObject *pm_crc64_update(PyObject *self, PyObject *args);
 PyObject *pm_crc64_finalize(PyObject *self, PyObject *args);
 PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args);
+PyObject *pm_ggenome_implant(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -147,6 +148,7 @@ static PyMethodDef module_methods[] = {
     {"pm_crc64_update", pm_crc64_update, METH_VARARGS, "CRC64-ECMA incremental update"},
     {"pm_crc64_finalize", pm_crc64_finalize, METH_VARARGS, "CRC64-ECMA finalize"},
     {"pm_compute_strands_autocorr", pm_compute_strands_autocorr, METH_VARARGS, "Compute strand cross-correlation"},
+    {"pm_ggenome_implant", pm_ggenome_implant, METH_VARARGS, "Implant donor sequences into reference FASTA (C++ fast path)"},
     {NULL, NULL, 0, NULL}
 };
 

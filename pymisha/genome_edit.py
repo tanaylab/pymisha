@@ -18,14 +18,6 @@ _logger = _logging.getLogger(__name__)
 _LINE_WIDTH = 80
 
 
-def _write_fasta_chrom(fh, chrom: str, seq: str, line_width: int = _LINE_WIDTH) -> None:
-    """Write a single chromosome entry to an open FASTA file handle."""
-    fh.write(f">{chrom}\n")
-    for i in range(0, len(seq), line_width):
-        fh.write(seq[i : i + line_width])
-        fh.write("\n")
-
-
 def _read_fasta_chroms(fasta_path: str) -> dict[str, str]:
     """Read a FASTA file and return {chrom: sequence} dict.
 
@@ -33,70 +25,24 @@ def _read_fasta_chroms(fasta_path: str) -> dict[str, str]:
     For mammalian genomes (~3 GB) this is fine on current hardware.
     """
     chroms: dict[str, str] = {}
-    current_chrom: str | None = None
+    current: str | None = None
     chunks: list[str] = []
 
     with open(fasta_path) as fh:
         for line in fh:
             line = line.rstrip("\n")
             if line.startswith(">"):
-                if current_chrom is not None:
-                    chroms[current_chrom] = "".join(chunks)
-                current_chrom = line[1:].split()[0]
+                if current is not None:
+                    chroms[current] = "".join(chunks)
+                current = line[1:].split()[0]
                 chunks = []
             else:
-                chunks.append(line)
-    if current_chrom is not None:
-        chroms[current_chrom] = "".join(chunks)
+                chunks.append(line.upper())
+
+    if current is not None:
+        chroms[current] = "".join(chunks)
 
     return chroms
-
-
-def _create_fai(fasta_path: str) -> str:
-    """Create a samtools-style .fai index for a FASTA file.
-
-    Returns the path to the .fai file.
-    """
-    fai_path = fasta_path + ".fai"
-    entries: list[str] = []
-
-    with open(fasta_path, "rb") as fh:
-        chrom: str | None = None
-        seq_len = 0
-        offset = 0
-        line_bases = 0
-        line_width = 0
-
-        while True:
-            line = fh.readline()
-            if not line:
-                break
-            if line.startswith(b">"):
-                if chrom is not None:
-                    entries.append(
-                        f"{chrom}\t{seq_len}\t{offset}\t{line_bases}\t{line_width}"
-                    )
-                chrom = line[1:].rstrip().split()[0].decode("ascii")
-                seq_len = 0
-                offset = fh.tell()
-                line_bases = 0
-                line_width = 0
-            else:
-                stripped = line.rstrip(b"\r\n")
-                if line_bases == 0:
-                    line_bases = len(stripped)
-                    line_width = len(line)
-                seq_len += len(stripped)
-
-        if chrom is not None:
-            entries.append(
-                f"{chrom}\t{seq_len}\t{offset}\t{line_bases}\t{line_width}"
-            )
-
-    with open(fai_path, "w") as fh:
-        fh.write("\n".join(entries) + "\n")
-
-    return fai_path
 
 
 def ggenome_implant(
@@ -115,6 +61,8 @@ def ggenome_implant(
     Takes a reference genome (FASTA file or the current misha database),
     replaces the given intervals with donor sequences, and writes a new
     FASTA file.  Optionally creates a misha trackdb from the result.
+
+    The core FASTA read/perturb/write loop runs in C++ with buffered I/O.
 
     Parameters
     ----------
@@ -230,77 +178,48 @@ def ggenome_implant(
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    tmp_fasta: str | None = None
     if genome_fasta is None:
-        # Export the current misha db to a temp FASTA, read it in,
-        # then clean up.
         _checkroot()
         from .db import gdb_export_fasta as _export_fasta
 
-        tmp_fd, tmp_name = _tempfile.mkstemp(suffix=".fa", prefix="ggenome_ref_")
+        tmp_fd, tmp_fasta = _tempfile.mkstemp(suffix=".fa", prefix="ggenome_ref_")
         _os.close(tmp_fd)
-        try:
-            _export_fasta(tmp_name, overwrite=True)
-            ref_chroms = _read_fasta_chroms(tmp_name)
-        finally:
-            _os.unlink(tmp_name)
+        _export_fasta(tmp_fasta, overwrite=True)
+        ref_fasta_path = tmp_fasta
     else:
         fasta_path = _Path(genome_fasta).expanduser()
         if not fasta_path.exists():
             raise FileNotFoundError(f"Genome FASTA not found: {fasta_path}")
-        _logger.info("Reading reference from %s", fasta_path)
-        ref_chroms = _read_fasta_chroms(str(fasta_path))
+        ref_fasta_path = str(fasta_path)
 
-    # --- build perturbation index by chrom ---------------------------------
-    pert_by_chrom: dict[str, list[tuple[int, int, str]]] = {}
-    for i, (_, row) in enumerate(intervals.iterrows()):
-        chrom = str(row["chrom"])
-        start = int(row["start"])
-        end = int(row["end"])
-        if chrom not in ref_chroms:
-            raise ValueError(
-                f"Chromosome '{chrom}' from intervals not found in reference genome"
-            )
-        if start < 0 or end > len(ref_chroms[chrom]):
-            raise ValueError(
-                f"Interval {chrom}:{start}-{end} is out of bounds "
-                f"(chrom length: {len(ref_chroms[chrom])})"
-            )
-        pert_by_chrom.setdefault(chrom, []).append((start, end, donor_seqs[i]))
+    # --- C++ fast path: read FASTA, apply perturbations, write output + .fai
+    try:
+        import _pymisha
 
-    # Sort each chromosome's perturbations by start position descending
-    # (apply from end to preserve coordinates).
-    for chrom in pert_by_chrom:
-        pert_by_chrom[chrom].sort(key=lambda t: t[0], reverse=True)
+        fai_entries = _pymisha.pm_ggenome_implant(
+            ref_fasta_path,
+            str(output_path),
+            [str(c) for c in intervals["chrom"]],
+            [int(s) for s in intervals["start"]],
+            [int(e) for e in intervals["end"]],
+            donor_seqs,
+            line_width,
+        )
+    finally:
+        if tmp_fasta is not None:
+            _os.unlink(tmp_fasta)
 
-    # --- apply perturbations and write output ------------------------------
-    total_applied = 0
-    total_bases = 0
+    # Validate all interval chromosomes were found
+    fai_chroms = {e[0] for e in fai_entries}
+    missing = {str(c) for c in intervals["chrom"].unique()} - fai_chroms
+    if missing:
+        output_path.unlink(missing_ok=True)
+        raise ValueError(
+            f"Chromosome(s) not found in reference: {', '.join(sorted(missing))}"
+        )
 
-    with open(output_path, "w") as fh:
-        for chrom in ref_chroms:
-            seq = ref_chroms[chrom].upper()
-            perts = pert_by_chrom.get(chrom, [])
-
-            if perts:
-                seq_arr = bytearray(seq.encode("ascii"))
-                for start, end, donor_seq in perts:
-                    seq_arr[start:end] = donor_seq.encode("ascii")
-                    total_applied += 1
-                    total_bases += end - start
-                seq = seq_arr.decode("ascii")
-
-            _write_fasta_chrom(fh, chrom, seq, line_width)
-
-    _logger.info(
-        "Wrote %s: %d perturbations applied, %s bases modified",
-        output_path,
-        total_applied,
-        f"{total_bases:,}",
-    )
-
-    # --- create .fai index -------------------------------------------------
-    fai_path = _create_fai(str(output_path))
-    _logger.info("Created index: %s", fai_path)
+    _logger.info("Wrote %s", output_path)
 
     # --- optionally create trackdb -----------------------------------------
     if create_trackdb:
@@ -346,10 +265,11 @@ def ggenome_transplant(
         If a misha root, sequences are extracted via ``gseq_extract``.
         If a FASTA file (ends with ``.fa`` or ``.fasta``), sequences are read
         directly.
-    target_genome : str
-        Path to the reference FASTA that will be edited.
     output : str
         Output FASTA path.
+    target_genome : str, optional
+        Path to the reference FASTA that will be edited.  If ``None``, the
+        current misha database is used.
     create_trackdb : bool, default False
         Create a misha trackdb alongside the output FASTA.
     trackdb_path : str, optional
