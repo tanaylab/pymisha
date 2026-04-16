@@ -255,3 +255,46 @@ df <- gextract("vt_val", intervs, iterator=intervs)
             r_df.loc[valid, "vt_val"].values,
             rtol=1e-6
         )
+
+    def test_pwm_max_pos_strand_sign_matches_r(self):
+        """pwm.max.pos signed position matches R (regression for DnaPSSM::max_like_match best_dir bug).
+
+        The R-side fix is in commit b7d469a6. With bidirect=True, the sign of
+        pwm.max.pos encodes the best-scoring strand; previously best_dir was
+        overwritten at every iteration and reflected the last scanned position.
+        """
+        # Asymmetric PSSM so forward and reverse scores diverge meaningfully.
+        pssm = np.array([
+            [0.85, 0.05, 0.05, 0.05],
+            [0.05, 0.85, 0.05, 0.05],
+            [0.05, 0.05, 0.85, 0.05],
+            [0.05, 0.05, 0.05, 0.85],
+            [0.70, 0.10, 0.10, 0.10],
+            [0.10, 0.70, 0.10, 0.10],
+        ])
+        pssm_r = ", ".join(", ".join(f"{v:.6f}" for v in row) for row in pssm)
+        intervs = pm.gintervals("1", [10000, 50000, 100000], [11000, 51000, 101000])
+
+        pm.gvtrack_create(
+            "vt_pwm_pos", None, func="pwm.max.pos",
+            pssm=pssm, bidirect=True, prior=0.01,
+        )
+        py_res = pm.gextract("vt_pwm_pos", intervs, iterator=100)
+
+        r_df = _run_r_df(
+            f"""
+intervs <- gintervals("1", c(10000, 50000, 100000), c(11000, 51000, 101000))
+pssm <- matrix(c({pssm_r}), ncol=4, byrow=TRUE)
+colnames(pssm) <- c("A", "C", "G", "T")
+gvtrack.create("vt_pwm_pos", NULL, "pwm.max.pos",
+               params=list(pssm=pssm, bidirect=TRUE, prior=0.01))
+df <- gextract("vt_pwm_pos", intervs, iterator=100)
+"""
+        )
+
+        # Signed positions must match element-for-element (sign = strand).
+        np.testing.assert_allclose(
+            py_res["vt_pwm_pos"].values,
+            r_df["vt_pwm_pos"].values,
+            rtol=1e-6,
+        )

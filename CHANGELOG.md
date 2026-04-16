@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.31 (2026-04-16)
+
+### Fixes
+- **`pwm.max.pos` strand sign:** `DnaPSSM::max_like_match()` used to update `best_dir` at every iteration, so the returned strand reflected the last scanned position rather than the best-scoring one. Fixed to match R misha commit b7d469a6 (bug present since R misha v4.3.0). Added golden-master regression test against R misha for the signed position output.
+
 ## v0.1.30 (2026-04-15)
 
 ### Performance
