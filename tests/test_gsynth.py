@@ -6,6 +6,7 @@ import shutil
 import tempfile
 
 import numpy as np
+import pandas as pd
 import pytest
 import yaml
 
@@ -1234,6 +1235,115 @@ class TestGsynth0D:
         assert "Markov" in s
         assert "Dimensions: 0" in s
         assert "Total bins: 1" in s
+
+    def test_0d_non_first_chrom_only(self):
+        """Regression: 0D training on intervals that exclude chromkey ID 0
+        must still count k-mers. Previously ``_extract_bin_data`` hardcoded
+        ``iter_chroms`` to zero in the 0D branch, so the C++ backend routed
+        every entry to ``chrom_bins[0]`` and left other chroms' bins empty;
+        intervals on any non-first chromosome were silently dropped."""
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("X", 0, 100000),
+            iterator=1000,
+        )
+        assert model.total_kmers > 0
+        # Single bin in 0D must hold all counted k-mers
+        assert int(model.per_bin_kmers[0]) == model.total_kmers
+
+    def test_0d_multi_chrom_counts_all_chroms(self):
+        """Regression: 0D training on intervals spanning multiple chromosomes
+        must count k-mers from every chromosome in the input, not just the
+        one at chromkey ID 0. Training separately on each chrom and summing
+        should equal training on the union."""
+        chr1_intervs = pm.gintervals("1", 0, 100000)
+        chrX_intervs = pm.gintervals("X", 0, 100000)
+        multi = pd.concat([chr1_intervs, chrX_intervs], ignore_index=True)
+
+        m_chr1 = pm.gsynth_train(intervals=chr1_intervs, iterator=1000)
+        m_chrX = pm.gsynth_train(intervals=chrX_intervs, iterator=1000)
+        m_multi = pm.gsynth_train(intervals=multi, iterator=1000)
+
+        # Under the bug: m_chrX.total_kmers == 0 and
+        # m_multi.total_kmers == m_chr1.total_kmers (chrX silently dropped)
+        assert m_chrX.total_kmers > 0
+        assert m_multi.total_kmers == m_chr1.total_kmers + m_chrX.total_kmers
+
+        # Counts matrices for the single bin should sum across chroms
+        sum_counts = (
+            m_chr1.model_data["counts"][0].astype(np.int64)
+            + m_chrX.model_data["counts"][0].astype(np.int64)
+        )
+        np.testing.assert_array_equal(
+            m_multi.model_data["counts"][0].astype(np.int64),
+            sum_counts,
+        )
+
+    def test_0d_sample_on_non_first_chrom_uses_trained_cdf(self):
+        """Regression: sampling a 0D model on intervals from a chrom other
+        than chromkey ID 0 must use the trained Markov CDF. Under the
+        original bug, ``iter_chroms=0`` meant the sampler found no bin for
+        non-first-chrom positions and fell back to ``drand48()*4`` uniform
+        random instead of the trained CDF.
+
+        Train a model whose CDF is strongly non-uniform by picking a seed
+        genome where base frequencies in the training region deviate from
+        25%/25%/25%/25%. We then sample many bases on chrX and check that
+        the empirical base distribution matches the trained CDF (not
+        uniform). With the test DB's chr1 the A/T/C/G composition is
+        clearly unbalanced enough to detect.
+        """
+        # Train on chr1 (known to be AT-rich in the test DB).
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 100000),
+            iterator=1000,
+        )
+
+        # Marginal base frequencies over the trained CDF (uniform context
+        # weighting): average conditional next-base probability across
+        # every k-mer context in the single bin.
+        cdf_mat = model.model_data["cdf"][0]
+        probs = np.empty_like(cdf_mat)
+        probs[:, 0] = cdf_mat[:, 0]
+        probs[:, 1:] = np.diff(cdf_mat, axis=1)
+        train_marginal = probs.mean(axis=0)  # [A, C, G, T]
+
+        # Only run the non-uniformity assertion if the trained model
+        # really is non-uniform (skip on degenerate test fixtures).
+        max_dev = float(np.max(np.abs(train_marginal - 0.25)))
+        if max_dev < 0.02:
+            pytest.skip(
+                "Trained model marginal is too close to uniform "
+                "({max_dev=:.3f}) to distinguish trained CDF from uniform "
+                "fallback on this fixture."
+            )
+
+        # Sample a long stretch on chrX (a chromosome NOT in training and
+        # not at chromkey ID 0).
+        seq_len = 50000
+        seqs = pm.gsynth_sample(
+            model,
+            intervals=pm.gintervals("X", 0, seq_len),
+            seed=60427,
+        )
+        assert len(seqs) == 1 and len(seqs[0]) == seq_len
+
+        base_counts = np.array(
+            [seqs[0].count(b) for b in ("A", "C", "G", "T")],
+            dtype=np.float64,
+        )
+        empirical = base_counts / base_counts.sum()
+
+        # Under the bug, sampling on chrX falls back to uniform → empirical
+        # should be close to 0.25 for every base. With the fix, empirical
+        # should track the trained marginal.
+        dev_from_train = float(np.max(np.abs(empirical - train_marginal)))
+        dev_from_uniform = float(np.max(np.abs(empirical - 0.25)))
+        assert dev_from_train < dev_from_uniform, (
+            f"chrX sampled base frequencies {empirical.tolist()} are closer "
+            f"to uniform (0.25) than to the trained marginal "
+            f"{train_marginal.tolist()}; 0D chromid resolution is likely "
+            "regressing to the pre-fix behaviour."
+        )
 
 
 # ============================================================================

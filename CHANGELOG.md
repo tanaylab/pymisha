@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.32 (2026-04-19)
+
+### Fixes
+- **`gsynth_train` / `gsynth_sample` silently dropped non-first-chromosome intervals in 0D (unstratified) models.** `_extract_bin_data` hardcoded `iter_chroms` to zero for the 0D branch, so the C++ backend routed every iterator entry to `chrom_bins[0]` and left bins empty for every other chromosome. In training, k-mers on any chromosome other than chromkey ID 0 were silently uncounted (`chrX`-only training produced `total_kmers == 0`); in sampling, positions on such chromosomes fell back to `drand48() * 4` uniform random instead of the trained Markov CDF. Multi-dimensional models, `gsynth_random`, and `gsynth_replace_kmer` were not affected. Users who trained 0D (unstratified) models on intervals spanning multiple chromosomes should re-train and re-sample with this version.
+
 ## v0.1.31 (2026-04-16)
 
 ### Fixes

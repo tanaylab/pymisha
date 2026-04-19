@@ -268,11 +268,24 @@ def _extract_bin_data(
     """
     if not dim_specs:
         # 0D model: single bin
+        _checkroot()
         all_intervals = intervals if intervals is not None else gintervals_all()
         bin_indices = _numpy.zeros(len(all_intervals), dtype=_numpy.int32)
         iter_starts = all_intervals["start"].to_numpy(dtype=_numpy.int64)
-        _checkroot()
-        iter_chroms = _numpy.zeros(len(all_intervals), dtype=_numpy.int32)
+
+        # Resolve chromids via misha's internal chromkey order (same approach as
+        # the multi-D branch below). Previously iter_chroms was hardcoded to
+        # zero, so the C++ backend (PMGsynth.cpp) would route every iterator
+        # entry to chrom_bins[0] and leave chrom_bins[c] empty for every other
+        # chromosome. Intervals on any chromosome other than chromkey ID 0 were
+        # then silently dropped in training (no k-mers counted) and fell back
+        # to uniform random sampling instead of using the trained Markov CDF.
+        all_chroms = gintervals_all()
+        chrom_to_id = {str(name): i for i, name in enumerate(all_chroms["chrom"])}
+        iter_chroms = _numpy.array(
+            [chrom_to_id.get(str(c), -1) for c in all_intervals["chrom"]],
+            dtype=_numpy.int32,
+        )
         return bin_indices, iter_starts, iter_chroms, [0.0, 1.0], None, [1]
 
     # Extract track values for each dimension
