@@ -2655,3 +2655,125 @@ class TestGsynthVariableKParallel:
         assert len(seqs) == 1
         assert len(seqs[0]) == 10000
         assert all(c in "ACGT" for c in seqs[0])
+
+
+class TestGsynthIteratorAlignment:
+    """Regression tests for the iter_size inference bug (R misha #94).
+
+    gsynth_sample must honor the model's iterator value when intervals are
+    not aligned to the iterator bin boundary, instead of silently inferring
+    iter_size from the first same-chrom diff in iter_starts (which equals
+    the partial first bin width and triggers uniform-random fallback for
+    every position past that partial bin).
+    """
+
+    def test_sample_honors_iterator_on_unaligned_intervals(self):
+        """Force CDF rows to always emit base A, sample on an interval whose
+        start is not a multiple of the iterator (200), and assert that no
+        post-seed positions fall through to uniform-random sampling.
+
+        Before the fix: iter_size is inferred as iter_starts[1] - iter_starts[0]
+        which for an interval starting at 64 with iterator=200 equals 136.
+        Positions 200..335 only count as valid for offsets 0..135 within their
+        bin, so 336..399, 536..599 fall through to uniform random and emit
+        non-A bases. After the fix: zero non-A bases past seed.
+        """
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            train_intervals = pm.gintervals("1", 0, 50000)
+            model = pm.gsynth_train(
+                {"expr": "test_vt", "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0]},
+                intervals=train_intervals,
+                iterator=200,
+            )
+
+            # Force every CDF cell to 1.0: smallest base index (A=0) always
+            # wins because the sampler picks the first b with rand() < cdf[b].
+            for b in range(len(model.model_data["cdf"])):
+                model.model_data["cdf"][b][:] = 1.0
+
+            unaligned = pm.gintervals("1", 64, 664)
+            seqs = pm.gsynth_sample(
+                model,
+                output_format="vector",
+                intervals=unaligned,
+                iterator=200,
+                seed=60427,
+            )
+
+            assert len(seqs) == 1
+            s = seqs[0]
+            assert len(s) == 600
+
+            # First k=5 bases are uniform random (seed init), so skip them.
+            post_seed = s[5:]
+            non_A = sum(1 for c in post_seed if c != "A")
+            assert non_A == 0, (
+                f"Expected all 595 post-seed bases to be A, got {non_A} non-A. "
+                "iter_size was inferred from a partial first bin instead of "
+                "the model's iterator value."
+            )
+        finally:
+            pm.gvtrack_rm("test_vt")
+
+    def test_aligned_and_unaligned_produce_matching_forbidden_kmer_stats(self):
+        """Forbid C->G transitions in the CDF, sample aligned and unaligned
+        intervals over the same region, and assert both have zero CG bigrams
+        past the seeded prefix. Before the fix, the unaligned interval picks
+        up CG bigrams from the uniform-fallback regions where iter_size
+        truncates the bin coverage.
+        """
+        pm.gvtrack_create("test_vt", "dense_track", "avg")
+        try:
+            train_intervals = pm.gintervals("1", 0, 50000)
+            model = pm.gsynth_train(
+                {"expr": "test_vt", "breaks": [0, 0.2, 0.4, 0.6, 0.8, 1.0]},
+                intervals=train_intervals,
+                iterator=200,
+            )
+
+            # Forbid C -> G: zero cdf cells where context ends in C and next
+            # base is G, then renormalise. State row r encodes a k-mer; its
+            # last base is r % 4. Bases: A=0, C=1, G=2, T=3.
+            num_kmers = 4 ** model.k
+            state_ends_in_C = np.array(
+                [(r % 4) == 1 for r in range(num_kmers)]
+            )
+            for b in range(len(model.model_data["cdf"])):
+                cdf = model.model_data["cdf"][b].copy()
+                # Recover per-row probabilities from cumulative.
+                probs = np.zeros((num_kmers, 4))
+                probs[:, 0] = cdf[:, 0]
+                probs[:, 1] = cdf[:, 1] - cdf[:, 0]
+                probs[:, 2] = cdf[:, 2] - cdf[:, 1]
+                probs[:, 3] = 1.0 - cdf[:, 2]
+                probs[state_ends_in_C, 2] = 0.0
+                row_sums = probs.sum(axis=1)
+                nz = row_sums > 0
+                probs[nz] = probs[nz] / row_sums[nz, None]
+                new_cdf = np.cumsum(probs, axis=1)
+                new_cdf[:, 3] = 1.0
+                model.model_data["cdf"][b] = new_cdf
+
+            aligned = pm.gintervals("1", 0, 2000)
+            unaligned = pm.gintervals("1", 64, 2064)
+
+            seq_a = pm.gsynth_sample(
+                model, output_format="vector",
+                intervals=aligned, iterator=200, seed=60427,
+            )[0]
+            seq_u = pm.gsynth_sample(
+                model, output_format="vector",
+                intervals=unaligned, iterator=200, seed=60427,
+            )[0]
+
+            # Skip first k=5 seeded bases (uniform random).
+            tail_a = seq_a[5:]
+            tail_u = seq_u[5:]
+            assert tail_a.count("CG") == 0
+            assert tail_u.count("CG") == 0, (
+                f"Unaligned interval has {tail_u.count('CG')} CG bigrams; "
+                "expected 0 once iter_size honors the model's iterator."
+            )
+        finally:
+            pm.gvtrack_rm("test_vt")

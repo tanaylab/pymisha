@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.33 (2026-04-26)
+
+### Fixes
+- **`gsynth_sample` silently fell back to uniform-random sampling when intervals were not aligned to the iterator bin boundary.** `pm_gsynth_train` / `pm_gsynth_sample` inferred `iter_size` from the first same-chrom diff in `iter_starts`. For an interval whose start was not a multiple of the iterator (e.g. `iterator=200`, interval start at 64), `gextract` emits a partial first bin, so the inferred `iter_size` equalled the partial width (e.g. 136) instead of the true iterator. Every position past the partial bin then fell through `bin_idx = -1` and was sampled uniformly at random — including for k-mer constraints the caller explicitly tried to enforce. Matches R misha #94 (commit `02f7ad2f`). The fix:
+  - `pm_gsynth_train` / `pm_gsynth_sample` now require the iterator as an explicit positional argument; non-positive values raise.
+  - `GsynthModel` stores the training-time iterator (`model.iterator`) and `gsynth_sample` defaults to it when the caller does not pass `iterator=`.
+  - `.gsm` save/load and legacy pickle load preserve / backfill `model.iterator`.
+
+### Performance
+- **Drop `MAP_POPULATE` from `MmapFile`.** `MmapFile::open()` previously requested `MAP_POPULATE` on Linux, which forces synchronous page-in of the entire mapped file on every `mmap` call. Per-chromosome track files trigger a fresh `mmap` on every chrom transition during expression evaluation, so multi-track multi-chrom queries paid full page-walk cost per track per chrom. `MADV_SEQUENTIAL` (still set) is sufficient to drive read-ahead for the bin-scan access pattern. Matches R misha #96 (commit `eb30be95`); R measured ~10× speedups on realistic motif-extract workloads.
+
 ## v0.1.32 (2026-04-19)
 
 ### Fixes

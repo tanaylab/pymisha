@@ -63,12 +63,13 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PyObject *py_mask = NULL;
         double pseudocount = 1.0;
         int k = 5;
+        long long iter_size_arg = 0;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOdi",
+        if (!PyArg_ParseTuple(args, "OOOOOOOdiL",
                               &py_intervals, &py_bin_indices,
                               &py_iter_starts, &py_iter_chroms,
                               &py_breaks, &py_bin_map, &py_mask,
-                              &pseudocount, &k)) {
+                              &pseudocount, &k, &iter_size_arg)) {
             verror("Invalid arguments to pm_gsynth_train");
         }
 
@@ -77,6 +78,15 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
             verror("Markov order k must be in [1, %d], got %d",
                    StratifiedMarkovModel::MAX_K, k);
         }
+
+        // Validate iterator: callers must pass the iterator value used during
+        // bin extraction. Inferring it from iter_starts diffs silently breaks
+        // when intervals are not aligned to the iterator bin boundary (the
+        // first diff equals the partial first bin width, not the iterator).
+        if (iter_size_arg <= 0) {
+            verror("iterator must be a positive integer, got %lld", iter_size_arg);
+        }
+        int64_t iter_size = (int64_t)iter_size_arg;
 
         int num_kmers = 1 << (2 * k);  // 4^k
 
@@ -161,19 +171,6 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
                     mask_per_chrom[iv.chromid].push_back(iv);
                 }
             }
-        }
-
-        // --- Compute iterator bin size ---
-        int64_t iter_size = 0;
-        if (num_iter_positions > 0) {
-            for (int i = 1; i < num_iter_positions; ++i) {
-                if (iter_chroms[i] == iter_chroms[i - 1]) {
-                    iter_size = iter_starts[i] - iter_starts[i - 1];
-                    break;
-                }
-            }
-            // If only one position per chrom, cover the entire chromosome
-            if (iter_size <= 0) iter_size = INT64_MAX;
         }
 
         // --- Initialize model ---
@@ -440,13 +437,14 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         int n_samples = 1;
         PyObject *py_seed = NULL;
         int k = 5;
+        long long iter_size_arg = 0;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOi",
+        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOiL",
                               &py_cdf_list, &py_breaks,
                               &py_bin_indices, &py_iter_starts, &py_iter_chroms,
                               &py_intervals, &py_mask_copy,
                               &output_path, &output_format, &n_samples,
-                              &py_seed, &k)) {
+                              &py_seed, &k, &iter_size_arg)) {
             verror("Invalid arguments to pm_gsynth_sample");
         }
 
@@ -455,6 +453,13 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
             verror("Markov order k must be in [1, %d], got %d",
                    StratifiedMarkovModel::MAX_K, k);
         }
+
+        // Validate iterator: caller must pass the iterator value used during
+        // bin extraction (see pm_gsynth_train for rationale).
+        if (iter_size_arg <= 0) {
+            verror("iterator must be a positive integer, got %lld", iter_size_arg);
+        }
+        int64_t iter_size = (int64_t)iter_size_arg;
 
         int num_kmers = 1 << (2 * k);  // 4^k
 
@@ -530,19 +535,6 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
             verror("iter_chroms must be convertible to int32 array");
         }
         int32_t *iter_chroms = (int32_t *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_chroms);
-
-        // --- Compute iterator bin size ---
-        int64_t iter_size = 0;
-        if (num_iter_positions > 0) {
-            for (int i = 1; i < num_iter_positions; ++i) {
-                if (iter_chroms[i] == iter_chroms[i - 1]) {
-                    iter_size = iter_starts[i] - iter_starts[i - 1];
-                    break;
-                }
-            }
-            // If only one position per chrom, cover the entire chromosome
-            if (iter_size <= 0) iter_size = INT64_MAX;
-        }
 
         // --- Parse intervals ---
         const GenomeChromKey &chromkey = g_pmdb->chromkey();

@@ -2,8 +2,11 @@
  * MmapFile.h
  *
  * RAII wrapper for memory-mapped file I/O.
- * Provides a clean interface for mmap-based reads with platform-appropriate
- * hints (MAP_POPULATE on Linux, MADV_SEQUENTIAL/MADV_RANDOM).
+ * Provides a clean interface for mmap-based reads. Read-ahead is driven by
+ * MADV_SEQUENTIAL alone — MAP_POPULATE forces synchronous page-in of the
+ * entire mapped file on every mmap call, which is catastrophic for the
+ * common workload of re-mmapping a per-chrom track file at every chromosome
+ * transition (R misha #96).
  *
  * Usage:
  *   MmapFile mf;
@@ -63,9 +66,6 @@ public:
         m_size = st.st_size;
         if (m_size == 0) { ::close(m_fd); m_fd = -1; return true; }
         int flags = MAP_PRIVATE;
-#if !defined(__APPLE__)
-        flags |= MAP_POPULATE;  // eagerly page in on Linux (naryn pattern)
-#endif
         m_data = static_cast<uint8_t*>(mmap(nullptr, m_size, PROT_READ, flags, m_fd, 0));
         if (m_data == MAP_FAILED) { m_data = nullptr; ::close(m_fd); m_fd = -1; return false; }
         ::close(m_fd); m_fd = -1;  // fd not needed after mmap (naryn pattern)

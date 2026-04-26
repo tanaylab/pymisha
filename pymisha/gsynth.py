@@ -95,6 +95,7 @@ class GsynthModel:
     total_n: int = 0
     pseudocount: float = 1.0
     min_obs: int = 0
+    iterator: int | None = None
 
     @property
     def num_kmers(self) -> int:
@@ -229,6 +230,28 @@ def gsynth_bin_map(breaks: list[float] | _numpy.ndarray, merge_ranges: list[dict
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+# Sentinel passed to the C++ backend when no iterator constraint applies
+# (0D models, gsynth_random, legacy models). Equals INT64_MAX, which makes
+# `pos < bin_start + iter_size` true for every reachable position.
+_ITER_SIZE_NO_CONSTRAINT = 9223372036854775807
+
+
+def _resolve_iter_size(iterator: int | None) -> int:
+    """Resolve an iterator into a positive int suitable for the C backend.
+
+    The C side now requires the caller to pass the iterator value explicitly
+    instead of inferring it from ``iter_starts`` diffs (which is wrong when
+    intervals are not aligned to the iterator bin boundary). ``None`` means
+    "no constraint" and maps to the INT64_MAX sentinel.
+    """
+    if iterator is None:
+        return _ITER_SIZE_NO_CONSTRAINT
+    iter_int = int(iterator)
+    if iter_int <= 0:
+        raise ValueError(f"iterator must be a positive integer, got {iter_int}")
+    return iter_int
+
 
 def _extract_bin_data(
     dim_specs: list[dict[str, _Any]],
@@ -492,6 +515,7 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
         py_mask,
         float(pseudocount),
         int(k),
+        _resolve_iter_size(iterator),
     )
 
     # Return only what we need for merging (numpy arrays + scalars)
@@ -633,6 +657,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         int(n_samples),
         chunk_seed,
         int(k),
+        _resolve_iter_size(iterator),
     ))
 
 
@@ -850,6 +875,7 @@ def gsynth_train(
             total_n=int(result["total_n"]),
             pseudocount=pseudocount,
             min_obs=min_obs,
+            iterator=iterator,
         )
 
     # --- Single-process path (original logic) ---
@@ -869,6 +895,7 @@ def gsynth_train(
         py_mask,
         float(pseudocount),
         int(k),
+        _resolve_iter_size(iterator),
     )
 
     # Build model
@@ -892,6 +919,7 @@ def gsynth_train(
         total_n=int(result["total_n"]),
         pseudocount=pseudocount,
         min_obs=min_obs,
+        iterator=iterator,
     )
 
 
@@ -1030,6 +1058,13 @@ def gsynth_sample(
 
     model_k = model.k
 
+    # Default iterator to the value used during training (R parity:
+    # model$iterator). Without this, the C backend would error or use the
+    # INT64_MAX sentinel, and bin extraction in _extract_bin_data would emit
+    # rows at unexpected positions.
+    if iterator is None:
+        iterator = model.iterator
+
     if intervals is None:
         intervals = gintervals_all()
 
@@ -1138,6 +1173,7 @@ def gsynth_sample(
         int(n_samples),
         seed,
         int(model_k),
+        _resolve_iter_size(iterator),
     )
     return list(_raw) if _raw is not None else None
 
@@ -1307,6 +1343,9 @@ def gsynth_random(
 
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
+    # gsynth_random uses a single bin (no stratification), so no iterator
+    # constraint applies; the INT64_MAX sentinel disables the per-bin extent
+    # check in the C backend.
     _raw2 = _pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
@@ -1320,6 +1359,7 @@ def gsynth_random(
         int(n_samples),
         seed,
         int(random_k),
+        _ITER_SIZE_NO_CONSTRAINT,
     )
     return list(_raw2) if _raw2 is not None else None
 
@@ -1537,6 +1577,7 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
         "total_bins": int(total_bins),
         "pseudocount": float(model.pseudocount),
         "min_obs": int(model.min_obs),
+        "iterator": (int(model.iterator) if model.iterator is not None else None),
         "total_kmers": int(model.total_kmers),
         "total_masked": int(model.total_masked),
         "total_n": int(model.total_n),
@@ -1611,6 +1652,9 @@ def _load_legacy_pickle(path: str) -> GsynthModel:
     # Backfill k for models created before variable k was added
     if not hasattr(model, "k"):
         model.k = 5
+    # Backfill iterator for models saved before it was tracked.
+    if not hasattr(model, "iterator"):
+        model.iterator = None
     return model
 
 
@@ -1685,6 +1729,11 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
         total_n=int(metadata.get("total_n", 0)),
         pseudocount=float(metadata.get("pseudocount", 1.0)),
         min_obs=int(metadata.get("min_obs", 0)),
+        iterator=(
+            int(metadata["iterator"])
+            if metadata.get("iterator") is not None
+            else None
+        ),
     )
 
 
