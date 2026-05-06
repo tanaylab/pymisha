@@ -2779,6 +2779,206 @@ class TestGsynthIteratorAlignment:
             pm.gvtrack_rm("test_vt")
 
 
+class TestGsynthScore:
+    """gsynth_score: per-bp log-likelihood under a trained model
+    aggregated to a misha dense track (R misha 5.6.21 ba88e197 + 3fba28c2)."""
+
+    def setup_method(self):
+        for t in ("ts_score", "ts_score_strat"):
+            try:
+                pm.gtrack_rm(t, force=True)
+            except Exception:
+                pass
+
+    def teardown_method(self):
+        for t in ("ts_score", "ts_score_strat"):
+            try:
+                pm.gtrack_rm(t, force=True)
+            except Exception:
+                pass
+
+    def test_0d_score_writes_track(self):
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200
+        )
+        pm.gsynth_score(
+            model, "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            resolution=200,
+        )
+        out = pm.gextract(
+            "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            iterator=200,
+        )
+        assert len(out) == 10
+        # Bin 0 includes positions 0..4 which lack k-upstream context →
+        # NA. Subsequent bins should be valid log-probability sums (i.e.
+        # finite negative numbers).
+        assert np.isnan(out["ts_score"].iloc[0])
+        assert out["ts_score"].iloc[1:].notna().all()
+        # All per-bin values are negative log-probability sums.
+        assert (out["ts_score"].iloc[1:] < 0).all()
+
+    def test_score_resolution_default(self):
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200
+        )
+        pm.gsynth_score(
+            model, "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+        )
+        # Default resolution = model.iterator = 200
+        out = pm.gextract(
+            "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            iterator=200,
+        )
+        assert len(out) == 10
+
+    def test_score_mask_poisons_bins(self):
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200
+        )
+        pm.gsynth_score(
+            model, "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            mask=pm.gintervals("1", 600, 700),
+            resolution=200,
+        )
+        out = pm.gextract(
+            "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            iterator=200,
+        )
+        # Bin covering 600-800 should be NaN due to mask.
+        masked_bin = out[(out["start"] >= 600) & (out["start"] < 800)]
+        assert masked_bin["ts_score"].isna().all()
+
+    def test_score_invalid_policies_raise(self):
+        model = pm.gsynth_train(intervals=pm.gintervals("1", 0, 10000))
+        with pytest.raises(ValueError, match="sparse_policy"):
+            pm.gsynth_score(model, "ts_score", sparse_policy="bogus")
+        with pytest.raises(ValueError, match="n_policy"):
+            pm.gsynth_score(model, "ts_score", n_policy="bogus")
+        with pytest.raises(ValueError, match="resolution"):
+            pm.gsynth_score(model, "ts_score", resolution=-1)
+
+    def test_score_overwrite(self):
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 10000), iterator=200
+        )
+        pm.gsynth_score(
+            model, "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            resolution=200,
+        )
+        # Without overwrite, recreating should fail.
+        with pytest.raises(Exception):
+            pm.gsynth_score(
+                model, "ts_score",
+                intervals=pm.gintervals("1", 0, 2000),
+                resolution=200,
+            )
+        # With overwrite, it should succeed.
+        pm.gsynth_score(
+            model, "ts_score",
+            intervals=pm.gintervals("1", 0, 2000),
+            resolution=200,
+            overwrite=True,
+        )
+
+    def test_score_stratified_model(self):
+        model = pm.gsynth_train(
+            {"expr": "dense_track", "breaks": [0.0, 0.5, 1.0]},
+            intervals=pm.gintervals("1", 0, 10000),
+            iterator=200,
+        )
+        pm.gsynth_score(
+            model, "ts_score_strat",
+            intervals=pm.gintervals("1", 0, 5000),
+            resolution=500,
+        )
+        out = pm.gextract(
+            "ts_score_strat",
+            intervals=pm.gintervals("1", 0, 5000),
+            iterator=500,
+        )
+        # Some bins must be valid (those with full coverage and a known
+        # stratum) and the values should be negative log probabilities.
+        valid = out["ts_score_strat"].dropna()
+        assert len(valid) >= 1
+        assert (valid < 0).all()
+
+
+class TestGsynthDirichletPrior:
+    """Per-bin Dirichlet prior in gsynth_train (R misha 5.6.21)."""
+
+    def test_default_prior_is_marginal(self):
+        model = pm.gsynth_train(intervals=pm.gintervals("1", 0, 50000))
+        assert model.prior_mode == "marginal"
+        assert model.prior_matrix is not None
+        assert model.prior_matrix.shape == (1, 4)
+        # Rows sum to 1.
+        assert np.allclose(model.prior_matrix.sum(axis=1), 1.0)
+        # Marginal pi must reflect actual chr1 composition (non-uniform).
+        assert not np.allclose(model.prior_matrix[0], 0.25, atol=0.01)
+
+    def test_prior_uniform_recovers_legacy(self):
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000), prior="uniform"
+        )
+        assert model.prior_mode == "uniform"
+        assert np.allclose(model.prior_matrix, 0.25)
+
+    def test_prior_global_broadcasts(self):
+        # Stratified model so n_dims > 0 and there is more than one bin.
+        model = pm.gsynth_train(
+            {"expr": "dense_track", "breaks": [0.0, 0.5, 1.0]},
+            intervals=pm.gintervals("1", 0, 50000),
+            iterator=200,
+            prior="global",
+        )
+        assert model.prior_mode == "global"
+        # Global broadcasts the same pi to every bin.
+        assert model.prior_matrix.shape[0] == model.total_bins
+        for b in range(model.total_bins):
+            assert np.allclose(model.prior_matrix[b], model.prior_matrix[0])
+
+    def test_prior_explicit_round_trip(self):
+        custom = np.array([[0.4, 0.1, 0.1, 0.4]], dtype=float)
+        model = pm.gsynth_train(
+            intervals=pm.gintervals("1", 0, 50000), prior=custom
+        )
+        assert model.prior_mode == "explicit"
+        assert np.allclose(model.prior_matrix, custom)
+
+    def test_prior_explicit_wrong_shape_raises(self):
+        bad = np.array([[0.4, 0.1, 0.1, 0.4], [0.25, 0.25, 0.25, 0.25]])
+        with pytest.raises(ValueError, match="rows"):
+            pm.gsynth_train(
+                intervals=pm.gintervals("1", 0, 50000), prior=bad
+            )
+
+    def test_prior_round_trips_through_save_load(self, tmp_path):
+        model = pm.gsynth_train(intervals=pm.gintervals("1", 0, 50000))
+        path = tmp_path / "model.gsm"
+        pm.gsynth_save(model, str(path))
+        restored = pm.gsynth_load(str(path))
+        assert restored.prior_mode == model.prior_mode
+        assert np.allclose(restored.prior_matrix, model.prior_matrix)
+        # Sampling should produce the same sequence under the same seed.
+        seq1 = pm.gsynth_sample(
+            model, intervals=pm.gintervals("1", 0, 1000),
+            seed=7, output_format="vector",
+        )[0]
+        seq2 = pm.gsynth_sample(
+            restored, intervals=pm.gintervals("1", 0, 1000),
+            seed=7, output_format="vector",
+        )[0]
+        assert seq1 == seq2
+
+
 class TestGsynthPreserveN:
     """preserve_n: positions whose reference is N stay N in the output."""
 

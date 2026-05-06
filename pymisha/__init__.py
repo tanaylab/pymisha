@@ -73,6 +73,7 @@ from .gsynth import (
     gsynth_replace_kmer,
     gsynth_sample,
     gsynth_save,
+    gsynth_score,
     gsynth_train,
 )
 from .intervals import (
@@ -399,6 +400,7 @@ __all__ = [
     'gsynth_bin_map',
     'gsynth_train',
     'gsynth_sample',
+    'gsynth_score',
     'gsynth_random',
     'gsynth_replace_kmer',
     'gsynth_save',

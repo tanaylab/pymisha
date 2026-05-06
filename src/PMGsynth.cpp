@@ -64,14 +64,18 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         double pseudocount = 1.0;
         int k = 5;
         long long iter_size_arg = 0;
+        const char *prior_mode_arg = "uniform";
+        PyObject *py_prior_matrix = NULL;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOdiL",
+        if (!PyArg_ParseTuple(args, "OOOOOOOdiLsO",
                               &py_intervals, &py_bin_indices,
                               &py_iter_starts, &py_iter_chroms,
                               &py_breaks, &py_bin_map, &py_mask,
-                              &pseudocount, &k, &iter_size_arg)) {
+                              &pseudocount, &k, &iter_size_arg,
+                              &prior_mode_arg, &py_prior_matrix)) {
             verror("Invalid arguments to pm_gsynth_train");
         }
+        std::string prior_mode = prior_mode_arg ? prior_mode_arg : "uniform";
 
         // Validate k
         if (k < 1 || k > StratifiedMarkovModel::MAX_K) {
@@ -309,7 +313,47 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
             model.apply_bin_mapping(bin_map_vec);
         }
 
-        // --- Normalize and build CDF ---
+        // --- Resolve Dirichlet prior pi(b) -----------------------------------
+        // 'marginal' uses post-merge counts so it must run after apply_bin_mapping.
+        int marginal_fallbacks = 0;
+        if (prior_mode == "uniform") {
+            model.set_prior_uniform();
+        } else if (prior_mode == "marginal") {
+            marginal_fallbacks = model.set_prior_from_marginal();
+        } else if (prior_mode == "global") {
+            model.set_prior_from_global_marginal();
+        } else if (prior_mode == "explicit") {
+            if (!py_prior_matrix || py_prior_matrix == Py_None) {
+                verror("prior_mode='explicit' requires a non-None prior_matrix");
+            }
+            PMPY arr_prior(PyArray_FROM_OTF(py_prior_matrix, NPY_DOUBLE,
+                                             NPY_ARRAY_IN_ARRAY), true);
+            if (!arr_prior) {
+                PyErr_Clear();
+                verror("prior_matrix must be a numeric 2D array");
+            }
+            PyArrayObject *mat = (PyArrayObject *)(PyObject *)arr_prior;
+            if (PyArray_NDIM(mat) != 2 ||
+                PyArray_DIM(mat, 0) != num_bins ||
+                PyArray_DIM(mat, 1) != NUM_BASES) {
+                verror("prior_matrix must be %d x %d (got %d x %d)",
+                       num_bins, NUM_BASES,
+                       (int)PyArray_DIM(mat, 0), (int)PyArray_DIM(mat, 1));
+            }
+            double *mat_data = (double *)PyArray_DATA(mat);
+            std::vector<std::array<double, NUM_BASES>> pi_rows(num_bins);
+            // numpy is row-major by default for new arrays, so [b][a] = mat[b*4 + a]
+            for (int b = 0; b < num_bins; ++b) {
+                for (int a = 0; a < NUM_BASES; ++a) {
+                    pi_rows[b][a] = mat_data[b * NUM_BASES + a];
+                }
+            }
+            model.set_prior_explicit(pi_rows);
+        } else {
+            verror("Unknown prior_mode: %s", prior_mode.c_str());
+        }
+
+        // --- Normalize and build CDF (uses prior set above) ---
         model.normalize_and_build_cdf(pseudocount);
 
         // --- Build result dict ---
@@ -364,6 +408,21 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PMPY py_k(PyLong_FromLong(k), true);
         PMPY py_num_kmers(PyLong_FromLong(num_kmers), true);
 
+        // Resolved per-bin prior matrix (n_bins x 4, row-major for numpy).
+        npy_intp prior_dims[2] = {num_bins, NUM_BASES};
+        PMPY py_prior(PyArray_SimpleNew(2, prior_dims, NPY_DOUBLE), true);
+        {
+            const auto& prior_vec = model.get_prior();
+            double *prior_data = (double *)PyArray_DATA(
+                (PyArrayObject *)(PyObject *)py_prior);
+            for (int b = 0; b < num_bins; ++b) {
+                for (int a = 0; a < NUM_BASES; ++a) {
+                    prior_data[b * NUM_BASES + a] = prior_vec[b][a];
+                }
+            }
+        }
+        PMPY py_marginal_fallbacks(PyLong_FromLong(marginal_fallbacks), true);
+
         py_counts_list.to_be_stolen();
         py_cdf_list.to_be_stolen();
         py_pbk.to_be_stolen();
@@ -372,6 +431,8 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         py_n.to_be_stolen();
         py_k.to_be_stolen();
         py_num_kmers.to_be_stolen();
+        py_prior.to_be_stolen();
+        py_marginal_fallbacks.to_be_stolen();
 
         PyDict_SetItemString(result, "counts", py_counts_list);
         PyDict_SetItemString(result, "cdf", py_cdf_list);
@@ -381,6 +442,9 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         PyDict_SetItemString(result, "total_n", py_n);
         PyDict_SetItemString(result, "k", py_k);
         PyDict_SetItemString(result, "num_kmers", py_num_kmers);
+        PyDict_SetItemString(result, "prior", py_prior);
+        PyDict_SetItemString(result, "marginal_fallbacks",
+                             py_marginal_fallbacks);
 
         result.to_be_stolen();
         return (PyObject *)result;

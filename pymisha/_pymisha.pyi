@@ -499,11 +499,15 @@ def pm_gsynth_train(
     bin_map: Any,
     mask: Any,
     pseudocount: float,
+    k: int,
+    iter_size: int,
+    prior_mode: str,
+    prior_matrix: Any,
     /,
 ) -> Any:
-    """Train stratified Markov-5 model.
+    """Train stratified Markov model.
 
-    C++ signature: ``PyArg_ParseTuple(args, "OOOOOOOd", ...)``
+    C++ signature: ``PyArg_ParseTuple(args, "OOOOOOOdiLsO", ...)``
     """
 
 def pm_gsynth_sample(

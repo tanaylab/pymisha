@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.35 (2026-05-06)
+
+### Features
+- **Per-bin Dirichlet prior in `gsynth_train`.** New `prior=` argument selects how the per-bin prior `pi(b)` is resolved for the Bayesian posterior `P(a|c,b) = (N + alpha * pi_a(b)) / (sum_a N + alpha)` (with `alpha = pseudocount`):
+  - `"marginal"` (default) — per-bin empirical base composition computed on post-merge counts. Bins with zero observations fall back to uniform.
+  - `"global"` — pooled empirical base composition broadcast to every bin.
+  - `"uniform"` — `1/4` per base for every bin (legacy symmetric Laplace smoothing).
+  - array-like `(total_bins, 4)` — explicit per-bin pi.
+
+  The resolved prior is exposed as `model.prior_mode`, `model.prior_matrix`, and `model.marginal_fallbacks`, and is round-tripped through `gsynth_save`/`gsynth_load`. Legacy pickles backfill to `prior_mode='uniform'`. Matches R misha 5.6.21 (commits `1a49d803`..`e89b1738`).
+- **`gsynth_score()`** -- score reference sequence under a trained model and write per-bp summed log-probability into a misha dense track. Supports `mask=` (NA-poisons output bins overlapping mask intervals), `resolution=` (default `model.iterator`), `n_policy={"NA","uniform"}`, `sparse_policy={"NA","uniform"}`, `overwrite=`, and stratified or 0D models. Bin lookup is aligned to `pos - k` (training convention). Matches R misha 5.6.21 commits `ba88e197` and `3fba28c2`.
+
+### Fixes
+- **`gsynth_sample` on 0D models past `model.iterator` bp.** The 0D `_extract_bin_data` path emits a single iter entry per input interval (covering `iter_size` bp), so positions past the first `iter_size` bp on a sample interval fell back to uniform random sampling instead of the trained CDF. The sample path now passes the `INT64_MAX` `iter_size` sentinel for 0D models (matching `gsynth_random`), so the single bin always resolves correctly. The previously-skipped regression test `test_0d_sample_on_non_first_chrom_uses_trained_cdf` now exercises this path under the marginal prior and passes.
+
+### Notes
+- **gquantiles perf fixes (R `625438a7`, `9970dbf5`) not ported.** PyMisha's `pm_quantiles` uses `StreamPercentiler::get_percentile` (sort-once on the reservoir, then index by position), so it never had the O(k * N) `nth_element` suffix walk that R 5.6.20 introduced and 5.6.21 reverted. Same reasoning for the per-kid sort + parent k-way merge optimisation -- the existing implementation already sorts per-kid at access time.
+- **gintervals chrom-factor normalisation (R `ba88e197` part 1) not ported.** `pandas` interval frames use string `chrom` columns, so the R-only factor-level mismatch on bigset save/load doesn't have a pymisha analogue.
+
 ## v0.1.34 (2026-05-06)
 
 ### Fixes

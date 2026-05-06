@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging as _logging
+import math as _math
 import multiprocessing as _multiprocessing
 import os as _os
 import zipfile as _zipfile
@@ -63,7 +64,19 @@ class GsynthModel:
     total_n : int
         Positions skipped due to N bases.
     pseudocount : float
-        Pseudocount used for CDF normalization.
+        Pseudocount used for CDF normalization (Dirichlet concentration
+        ``alpha``).
+    prior_mode : str
+        How the per-bin Dirichlet prior was chosen during training.
+        One of ``"marginal"``, ``"uniform"``, ``"global"``, or
+        ``"explicit"``.
+    prior_matrix : numpy.ndarray or None
+        Resolved per-bin prior, shape ``(total_bins, 4)``. Each row sums
+        to 1. ``None`` for legacy models loaded without a prior; in that
+        case the model effectively used a uniform prior.
+    marginal_fallbacks : int
+        Number of bins whose posterior was forced back to uniform
+        (``prior_mode='marginal'`` and a bin had zero observations).
 
     See Also
     --------
@@ -96,6 +109,9 @@ class GsynthModel:
     pseudocount: float = 1.0
     min_obs: int = 0
     iterator: int | None = None
+    prior_mode: str = "uniform"
+    prior_matrix: _Any = None  # numpy array (total_bins, 4) or None
+    marginal_fallbacks: int = 0
 
     @property
     def num_kmers(self) -> int:
@@ -116,6 +132,18 @@ class GsynthModel:
         ]
         if self.min_obs > 0:
             lines.append(f"  Min observations: {self.min_obs}")
+        prior_line = f"  Prior: {self.prior_mode}"
+        if self.prior_matrix is not None:
+            mean_pi = _numpy.asarray(self.prior_matrix).mean(axis=0)
+            prior_line += (
+                f" (mean pi: A={mean_pi[0]:.3f} C={mean_pi[1]:.3f} "
+                f"G={mean_pi[2]:.3f} T={mean_pi[3]:.3f})"
+            )
+        if self.marginal_fallbacks > 0:
+            prior_line += (
+                f"; {self.marginal_fallbacks} bin(s) fell back to uniform"
+            )
+        lines.append(prior_line)
         for i, spec in enumerate(self.dim_specs):
             lines.append(f"  Dim {i + 1}: expr='{spec.get('expr', '')}', "
                          f"bins={spec.get('num_bins', '?')}")
@@ -503,7 +531,9 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
     bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes = \
         _extract_bin_data(parsed_specs, chunk_intervals, iterator)
 
-    # Call C++ backend
+    # Call C++ backend. Workers always train with a uniform prior — the
+    # CDF here is discarded and recomputed from the merged counts in
+    # _merge_train_results, where the requested prior is applied.
     py_mask = _df2pymisha(mask) if mask is not None else None
     result = _pymisha.pm_gsynth_train(
         _df2pymisha(chunk_intervals),
@@ -516,6 +546,8 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
         float(pseudocount),
         int(k),
         _resolve_iter_size(iterator),
+        "uniform",
+        None,
     )
 
     # Return only what we need for merging (numpy arrays + scalars)
@@ -533,10 +565,14 @@ def _merge_train_results(
     total_bins: int,
     pseudocount: float,
     k: int = 5,
+    prior_mode: str = "uniform",
+    prior_matrix: _numpy.ndarray | None = None,
 ) -> dict[str, _Any]:
     """Merge training results from multiple chunks.
 
-    Sums count arrays across chunks and recomputes CDFs.
+    Sums count arrays across chunks, resolves the per-bin Dirichlet prior
+    on the merged counts, and recomputes CDFs from the posterior
+    ``P(a|c,b) = (N + alpha * pi_a(b)) / (sum_a N + alpha)``.
 
     Parameters
     ----------
@@ -546,19 +582,23 @@ def _merge_train_results(
     total_bins : int
         Total number of flat bins.
     pseudocount : float
-        Pseudocount for CDF computation.
+        Dirichlet concentration alpha.
     k : int
         Markov order.
+    prior_mode : str
+        One of 'uniform', 'marginal', 'global', 'explicit'.
+    prior_matrix : numpy.ndarray, optional
+        Required when *prior_mode* is 'explicit'. Shape ``(total_bins, 4)``.
 
     Returns
     -------
     dict
         Merged result with 'counts', 'cdf', 'total_kmers',
-        'per_bin_kmers', 'total_masked', 'total_n'.
+        'per_bin_kmers', 'total_masked', 'total_n', 'prior',
+        'marginal_fallbacks'.
     """
     num_kmers = 4 ** k
 
-    # Initialize with zeros
     merged_counts = [_numpy.zeros((num_kmers, 4), dtype=_numpy.float64)
                      for _ in range(total_bins)]
     merged_total_kmers = 0
@@ -574,15 +614,56 @@ def _merge_train_results(
         for b in range(total_bins):
             merged_counts[b] += cr["counts"][b]
 
-    # Recompute CDFs from merged counts
+    # Resolve per-bin prior pi(b) -----------------------------------------
+    pi = _numpy.full((total_bins, 4), 0.25, dtype=_numpy.float64)
+    marginal_fallbacks = 0
+    if prior_mode == "uniform":
+        pass  # already 0.25
+    elif prior_mode == "marginal":
+        for b in range(total_bins):
+            sums = merged_counts[b].sum(axis=0)
+            total = sums.sum()
+            if total > 0:
+                pi[b] = sums / total
+            else:
+                marginal_fallbacks += 1
+    elif prior_mode == "global":
+        sums = _numpy.zeros(4, dtype=_numpy.float64)
+        for b in range(total_bins):
+            sums += merged_counts[b].sum(axis=0)
+        total = sums.sum()
+        if total > 0:
+            pi[:] = sums / total
+    elif prior_mode == "explicit":
+        if prior_matrix is None:
+            raise ValueError(
+                "prior_mode='explicit' requires prior_matrix"
+            )
+        prior_matrix = _numpy.asarray(prior_matrix, dtype=float)
+        if prior_matrix.shape != (total_bins, 4):
+            raise ValueError(
+                f"explicit prior_matrix must have shape ({total_bins}, 4), "
+                f"got {prior_matrix.shape}"
+            )
+        for b in range(total_bins):
+            row = prior_matrix[b].copy()
+            s = row.sum()
+            if s > 0:
+                pi[b] = row / s
+    else:
+        raise ValueError(f"Unknown prior_mode: {prior_mode!r}")
+
+    # Posterior CDF: (N + alpha*pi) / (sum_a N + alpha) -------------------
     merged_cdf = []
     for b in range(total_bins):
-        counts_b = merged_counts[b] + pseudocount
-        row_sums = counts_b.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0  # avoid division by zero
-        probs = counts_b / row_sums
+        counts_b = merged_counts[b]
+        n_total = counts_b.sum(axis=1, keepdims=True)
+        denom = n_total + pseudocount
+        # avoid division by zero (denom is alpha > 0 unless pseudocount==0)
+        denom = _numpy.where(denom == 0, 1.0, denom)
+        probs = (counts_b + pseudocount * pi[b]) / denom
         cdf = _numpy.cumsum(probs, axis=1)
-        cdf[:, -1] = 1.0  # ensure last column is exactly 1
+        cdf[:, -1] = 1.0
         merged_cdf.append(cdf)
 
     return {
@@ -592,6 +673,8 @@ def _merge_train_results(
         "per_bin_kmers": merged_per_bin_kmers,
         "total_masked": merged_total_masked,
         "total_n": merged_total_n,
+        "prior": pi,
+        "marginal_fallbacks": marginal_fallbacks,
     }
 
 
@@ -643,6 +726,13 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
+    # 0D: see the comment in gsynth_sample. dim_specs is empty for 0D.
+    iter_size_for_cpp = (
+        _ITER_SIZE_NO_CONSTRAINT
+        if not dim_specs
+        else _resolve_iter_size(iterator)
+    )
+
     # Call C++ backend (vector mode)
     return list(_pymisha.pm_gsynth_sample(
         cdf_list,
@@ -657,7 +747,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         int(n_samples),
         chunk_seed,
         int(k),
-        _resolve_iter_size(iterator),
+        iter_size_for_cpp,
         bool(preserve_n),
     ))
 
@@ -665,6 +755,39 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
 # ---------------------------------------------------------------------------
 # gsynth_train
 # ---------------------------------------------------------------------------
+
+
+_PRIOR_NAMED = {"uniform", "marginal", "global"}
+
+
+def _resolve_prior_arg(
+    prior: str | _numpy.ndarray | _pd.DataFrame,
+) -> tuple[str, _numpy.ndarray | None]:
+    """Normalise the *prior* argument to ``(prior_mode, prior_matrix)``.
+
+    Returns ``(prior_mode, None)`` for named modes; for an array-like
+    *prior* returns ``("explicit", numpy_array)`` shaped ``(total_bins, 4)``
+    in ``float64``. Validation of bin count is deferred to the C++ side
+    once the bin layout is known.
+    """
+    if isinstance(prior, str):
+        if prior not in _PRIOR_NAMED:
+            raise ValueError(
+                f"prior must be one of {sorted(_PRIOR_NAMED)} or a numpy "
+                f"array, got {prior!r}"
+            )
+        return prior, None
+
+    if isinstance(prior, _pd.DataFrame):
+        prior = prior.to_numpy()
+    arr = _numpy.asarray(prior, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise ValueError(
+            f"explicit prior must be a 2D array with 4 columns, got "
+            f"shape {arr.shape}"
+        )
+    return "explicit", arr
+
 
 def gsynth_train(
     *dim_specs: dict[str, _Any],
@@ -674,6 +797,7 @@ def gsynth_train(
     pseudocount: float = 1.0,
     min_obs: int = 0,
     k: int = 5,
+    prior: str | _numpy.ndarray | _pd.DataFrame = "marginal",
     allow_parallel: bool = True,
     num_cores: int | None = None,
     max_chunk_size: int | None = None,
@@ -729,6 +853,21 @@ def gsynth_train(
         Markov order (context length).  Must be in ``[1, 10]``.  The model
         stores ``4^k`` context states; higher values capture longer-range
         dependencies but require more training data and memory.
+    prior : str or array-like, default ``"marginal"``
+        Per-bin Dirichlet prior used in the posterior
+        ``P(a|c,b) = (N + alpha * pi_a(b)) / (sum_a N + alpha)`` (with
+        ``alpha = pseudocount``). Accepted values:
+
+        - ``"marginal"`` (default) -- per-bin empirical base composition
+          computed from post-merge counts; bins with zero observations
+          fall back to uniform.
+        - ``"global"`` -- pooled empirical base composition broadcast to
+          every bin.
+        - ``"uniform"`` -- ``1/4`` each base for every bin (legacy
+          symmetric Laplace smoothing).
+        - array-like, shape ``(total_bins, 4)`` -- explicit per-bin
+          ``pi``. Each row is renormalised to sum to 1; rows summing to
+          zero fall back to uniform.
     allow_parallel : bool, default True
         Whether to enable parallel chunking for large genomes.  When
         ``True`` and the total bases exceed *max_chunk_size*, intervals
@@ -784,6 +923,9 @@ def gsynth_train(
     k = int(k)
     if k < 1 or k > 10:
         raise ValueError(f"Markov order k must be in [1, 10], got {k}")
+
+    # Resolve prior argument.
+    prior_mode, prior_matrix_arg = _resolve_prior_arg(prior)
 
     # Validate dimension specs
     parsed_specs = []
@@ -857,8 +999,16 @@ def gsynth_train(
         with ctx.Pool(processes=effective_cores) as pool:
             chunk_results = pool.map(_worker_train_chunk, worker_args)
 
-        # Merge results from all chunks
-        result = _merge_train_results(chunk_results, total_bins, pseudocount, k=k)
+        # Merge results from all chunks (resolves prior on merged counts).
+        if prior_matrix_arg is not None and prior_matrix_arg.shape[0] != total_bins:
+            raise ValueError(
+                f"explicit prior must have {total_bins} rows (one per "
+                f"flat bin), got {prior_matrix_arg.shape[0]}"
+            )
+        result = _merge_train_results(
+            chunk_results, total_bins, pseudocount, k=k,
+            prior_mode=prior_mode, prior_matrix=prior_matrix_arg,
+        )
 
         return GsynthModel(
             k=k,
@@ -877,6 +1027,9 @@ def gsynth_train(
             pseudocount=pseudocount,
             min_obs=min_obs,
             iterator=iterator,
+            prior_mode=prior_mode,
+            prior_matrix=result["prior"],
+            marginal_fallbacks=int(result["marginal_fallbacks"]),
         )
 
     # --- Single-process path (original logic) ---
@@ -886,6 +1039,19 @@ def gsynth_train(
 
     # Call C++ backend
     py_mask = _df2pymisha(mask) if mask is not None else None
+    if prior_matrix_arg is not None:
+        # Total bins must match for explicit mode.
+        if prior_matrix_arg.shape[0] != total_bins:
+            raise ValueError(
+                f"explicit prior must have {total_bins} rows (one per "
+                f"flat bin), got {prior_matrix_arg.shape[0]}"
+            )
+        prior_arg_for_cpp = _numpy.ascontiguousarray(
+            prior_matrix_arg, dtype=_numpy.float64
+        )
+    else:
+        prior_arg_for_cpp = None
+
     result = _pymisha.pm_gsynth_train(
         _df2pymisha(intervals),
         bin_indices,
@@ -897,6 +1063,8 @@ def gsynth_train(
         float(pseudocount),
         int(k),
         _resolve_iter_size(iterator),
+        str(prior_mode),
+        prior_arg_for_cpp,
     )
 
     # Build model
@@ -921,6 +1089,9 @@ def gsynth_train(
         pseudocount=pseudocount,
         min_obs=min_obs,
         iterator=iterator,
+        prior_mode=prior_mode,
+        prior_matrix=result.get("prior"),
+        marginal_fallbacks=int(result.get("marginal_fallbacks", 0)),
     )
 
 
@@ -1169,6 +1340,19 @@ def gsynth_sample(
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
+    # 0D models have a single bin and no real stratification; the iter
+    # bookkeeping in C++ is per-interval (one entry per row), so passing
+    # a finite iter_size truncates the bin's effective span to that many
+    # bp on every sample interval — every position past the first
+    # iter_size bp would fall through to uniform random. Use the
+    # INT64_MAX sentinel for 0D so bin lookup always resolves to bin 0,
+    # matching gsynth_random.
+    iter_size_for_cpp = (
+        _ITER_SIZE_NO_CONSTRAINT
+        if model.n_dims == 0
+        else _resolve_iter_size(iterator)
+    )
+
     # Call C++ backend
     _raw = _pymisha.pm_gsynth_sample(
         cdf_list,
@@ -1183,7 +1367,7 @@ def gsynth_sample(
         int(n_samples),
         seed,
         int(model_k),
-        _resolve_iter_size(iterator),
+        iter_size_for_cpp,
         bool(preserve_n),
     )
     return list(_raw) if _raw is not None else None
@@ -1217,6 +1401,481 @@ def _write_fasta(output_path: str, intervals: _pd.DataFrame, sequences: list[str
                     f.write(sequences[seq_idx] + "\n")
                 seq_idx += 1
 
+
+
+# ---------------------------------------------------------------------------
+# gsynth_score
+# ---------------------------------------------------------------------------
+
+_DNA_BASE_CODE = _numpy.full(256, -1, dtype=_numpy.int8)
+for _b, _c in ((b"A", 0), (b"C", 1), (b"G", 2), (b"T", 3),
+               (b"a", 0), (b"c", 1), (b"g", 2), (b"t", 3)):
+    _DNA_BASE_CODE[_b[0]] = _c
+
+
+def _encode_codes(seq_bytes: _numpy.ndarray) -> _numpy.ndarray:
+    """Encode an ASCII byte array to int8 codes (0-3 for ACGT, -1 for N)."""
+    return _DNA_BASE_CODE[seq_bytes]
+
+
+def _build_log_p_from_cdf(
+    cdf_list: list[_numpy.ndarray],
+) -> tuple[list[_numpy.ndarray], list[bool]]:
+    """Convert per-bin cumulative CDFs to per-bin log-probability matrices
+    and detect sparse bins.
+
+    A sparse bin (zero-count under the original ``min_obs`` filter, used in
+    the R training path) is represented as a CDF with all-NaN cells. We
+    detect it by checking the first cell only — full-bin NaN is the only
+    way the value can be NaN given pseudocount > 0.
+    """
+    log_p_list: list[_numpy.ndarray] = []
+    bin_is_sparse: list[bool] = []
+    for cdf in cdf_list:
+        cdf = _numpy.asarray(cdf, dtype=_numpy.float64)
+        sparse = bool(_numpy.isnan(cdf[0, 0]))
+        probs = _numpy.empty_like(cdf)
+        probs[:, 0] = cdf[:, 0]
+        probs[:, 1:] = _numpy.diff(cdf, axis=1)
+        with _numpy.errstate(divide="ignore"):
+            log_p = _numpy.log(probs)
+        log_p_list.append(log_p)
+        bin_is_sparse.append(sparse)
+    return log_p_list, bin_is_sparse
+
+
+def _interval_lookup_arr(intervals: _pd.DataFrame, chrom: str) -> _numpy.ndarray:
+    """Return an int64 (N, 2) array of (start, end) for *chrom*, sorted."""
+    if intervals is None or len(intervals) == 0:
+        return _numpy.empty((0, 2), dtype=_numpy.int64)
+    rows = intervals[intervals["chrom"].astype(str) == str(chrom)]
+    if rows.empty:
+        return _numpy.empty((0, 2), dtype=_numpy.int64)
+    arr = rows[["start", "end"]].to_numpy(dtype=_numpy.int64)
+    return arr[arr[:, 0].argsort()]
+
+
+def gsynth_score(
+    model: GsynthModel,
+    track: str,
+    *,
+    description: str | None = None,
+    intervals: _pd.DataFrame | None = None,
+    mask: _pd.DataFrame | None = None,
+    resolution: int | None = None,
+    sparse_policy: str = "NA",
+    n_policy: str = "NA",
+    overwrite: bool = False,
+) -> None:
+    """Score reference sequence under a trained Markov model.
+
+    For every base pair *p* in the requested intervals the function looks
+    up the trained log-probability ``log P(seq[p] | seq[p-k..p-1], bin)``
+    where the stratification bin is taken from the iterator window whose
+    leftmost-context position contains ``p - k`` (matching the training
+    convention). The per-bp log-probabilities are summed into output bins
+    of width *resolution* and written to a new misha dense track.
+
+    Parameters
+    ----------
+    model : GsynthModel
+        Trained model from :func:`gsynth_train`.
+    track : str
+        Name of the output track (must not already exist unless
+        ``overwrite=True``).
+    description : str, optional
+        Human-readable description stored as a track attribute.
+    intervals : DataFrame, optional
+        Regions to score. Defaults to all chromosomes. Best results when
+        interval starts are aligned to multiples of ``model.iterator``;
+        otherwise the first stratum window is shorter than
+        ``model.iterator`` and its bin label may differ from training.
+    mask : DataFrame, optional
+        Optional intervals to NA-out in the output (e.g. repeats). Every
+        output bin containing a masked bp becomes ``NaN``.
+    resolution : int, optional
+        Output bin size in bp. Defaults to ``model.iterator``. ``1``
+        produces a per-bp track.
+    sparse_policy : {"NA", "uniform"}, default "NA"
+        How to score positions whose stratification bin is marked sparse
+        in the trained model. ``"NA"`` (default) propagates NA;
+        ``"uniform"`` contributes ``log(1/4)`` per bp.
+    n_policy : {"NA", "uniform"}, default "NA"
+        How to score positions whose k-mer context contains an N.
+        ``"NA"`` (default) or ``"uniform"`` (``log(1/4)`` per bp). The
+        predicted base itself is always NA when N -- the model has no
+        ``log P`` for non-ACGT bases.
+    overwrite : bool, default False
+        If ``True``, replace an existing track of the same name.
+
+    Returns
+    -------
+    None
+        The output is written as a misha dense track.
+
+    Raises
+    ------
+    TypeError
+        If *model* is not a :class:`GsynthModel`.
+    ValueError
+        If arguments are invalid (e.g. *resolution* not positive,
+        ``model.iterator`` missing, *sparse_policy* / *n_policy*
+        unknown).
+    """
+    from .sequence import gseq_extract
+    from .summary import _bin_values
+    from .tracks import gtrack_create_dense_direct, gtrack_rm
+
+    if not isinstance(model, GsynthModel):
+        raise TypeError("model must be a GsynthModel")
+    if sparse_policy not in ("NA", "uniform"):
+        raise ValueError(
+            f"sparse_policy must be 'NA' or 'uniform', got {sparse_policy!r}"
+        )
+    if n_policy not in ("NA", "uniform"):
+        raise ValueError(
+            f"n_policy must be 'NA' or 'uniform', got {n_policy!r}"
+        )
+    if resolution is not None and int(resolution) <= 0:
+        raise ValueError(f"resolution must be positive, got {resolution}")
+    if model.iterator is None:
+        raise ValueError(
+            "model.iterator is required to score; re-train the model "
+            "after upgrading"
+        )
+    iter_size = int(model.iterator)
+    k = int(model.k)
+    if resolution is None:
+        resolution = iter_size
+    resolution = int(resolution)
+    sparse_uniform = sparse_policy == "uniform"
+    n_uniform = n_policy == "uniform"
+    UNIFORM_LOGP = _math.log(0.25)
+
+    _checkroot()
+    chrom_sizes = gintervals_all()
+    chrom_size_map = dict(zip(
+        chrom_sizes["chrom"].astype(str),
+        chrom_sizes["end"].astype(int),
+        strict=False,
+    ))
+
+    if intervals is None:
+        intervals = chrom_sizes.copy()
+    intervals = _maybe_load_intervals_set(intervals)
+    intervals = intervals.reset_index(drop=True)
+
+    # Build log-probability arrays from the model CDFs.
+    log_p_list, bin_is_sparse = _build_log_p_from_cdf(model.model_data["cdf"])
+
+    # Extend each interval upstream by iter_size for stratum extraction so
+    # the first k bp of every interval get bin info from the prior iter
+    # window (matches R 3fba28c2). Clamped at 0.
+    strata_intervals = intervals.copy()
+    strata_intervals["start"] = (
+        strata_intervals["start"].astype(int) - iter_size
+    ).clip(lower=0)
+
+    # ----- Extract per-iter-window bin index for every input position ----
+    if model.n_dims == 0:
+        # 0D: a single bin covering everything. Build the iter grid by
+        # enumerating iter_size-aligned windows inside each strata
+        # interval (clamped to the chrom size). gextract isn't used
+        # because pymisha rejects literal expressions like "1".
+        chrom_arr = []
+        start_arr: list[int] = []
+        for _, iv in strata_intervals.iterrows():
+            chrom = str(iv["chrom"])
+            cz = int(chrom_size_map.get(chrom, 0))
+            if cz <= 0:
+                continue
+            iv_start = max(0, int(iv["start"]))
+            iv_end = min(cz, int(iv["end"]))
+            if iv_end <= iv_start:
+                continue
+            window_starts = _numpy.arange(
+                iv_start, iv_end, iter_size, dtype=_numpy.int64
+            )
+            chrom_arr.extend([chrom] * window_starts.size)
+            start_arr.extend(window_starts.tolist())
+        if not start_arr:
+            raise ValueError("No positions extracted; check intervals.")
+        iter_chroms_str = _numpy.asarray(chrom_arr)
+        iter_starts = _numpy.asarray(start_arr, dtype=_numpy.int64)
+        bin_indices = _numpy.zeros(iter_starts.size, dtype=_numpy.int32)
+    else:
+        exprs = [d["expr"] for d in model.dim_specs]
+        track_data = gextract(exprs, intervals=strata_intervals,
+                              iterator=iter_size)
+        if track_data is None or len(track_data) == 0:
+            raise ValueError("No track data extracted; check intervals.")
+        iter_chroms_str = track_data["chrom"].astype(str).to_numpy()
+        iter_starts = track_data["start"].to_numpy(dtype=_numpy.int64)
+
+        # Compute per-dimension bin indices and combine to a flat index.
+        bin_indices = _numpy.zeros(len(track_data), dtype=_numpy.int64)
+        valid = _numpy.ones(len(track_data), dtype=bool)
+        stride = 1
+        for d_idx in reversed(range(len(model.dim_specs))):
+            spec = model.dim_specs[d_idx]
+            breaks = _numpy.asarray(spec["breaks"], dtype=float)
+            n_bins = spec["num_bins"]
+            val_col = [c for c in track_data.columns
+                       if c not in {"chrom", "start", "end", "intervalID"}][d_idx]
+            values = track_data[val_col].to_numpy(dtype=float)
+            bidx = _bin_values(values, breaks, include_lowest=False)
+            bin_map = spec.get("bin_map")
+            if bin_map is not None:
+                bm = _numpy.asarray(bin_map, dtype=_numpy.int64)
+                ok = (bidx >= 0) & (bidx < len(bm))
+                bidx = _numpy.where(ok, bm[bidx], -1)
+            valid &= bidx >= 0
+            bin_indices += _numpy.where(bidx >= 0, bidx, 0) * stride
+            stride *= n_bins
+        bin_indices = _numpy.where(valid, bin_indices, -1).astype(_numpy.int32)
+
+    # Build per-chrom (start, bin_idx) lookup, sorted.
+    bins_per_chrom: dict[str, _numpy.ndarray] = {}
+    order_idx = _numpy.lexsort((iter_starts, iter_chroms_str))
+    iter_chroms_sorted = iter_chroms_str[order_idx]
+    iter_starts_sorted = iter_starts[order_idx]
+    bin_indices_sorted = bin_indices[order_idx]
+    unique_chroms, edges = _numpy.unique(iter_chroms_sorted, return_index=True)
+    edges = list(edges) + [len(iter_chroms_sorted)]
+    for i, c in enumerate(unique_chroms):
+        bins_per_chrom[str(c)] = _numpy.column_stack([
+            iter_starts_sorted[edges[i]:edges[i + 1]],
+            bin_indices_sorted[edges[i]:edges[i + 1]].astype(_numpy.int64),
+        ])
+
+    # Mask intervals per chrom (sorted).
+    mask_per_chrom: dict[str, _numpy.ndarray] = {}
+    if mask is not None and len(mask) > 0:
+        for c in mask["chrom"].astype(str).unique():
+            mask_per_chrom[c] = _interval_lookup_arr(mask, c)
+
+    # ----- Score per chromosome ----------------------------------------
+    out_intervals_chunks: list[_pd.DataFrame] = []
+    out_values_chunks: list[_numpy.ndarray] = []
+
+    chroms_to_process = list(chrom_size_map.keys())
+    nan_f = float("nan")
+
+    for chrom in chroms_to_process:
+        chrom_size = int(chrom_size_map[chrom])
+        if chrom_size <= 0:
+            continue
+        num_out_bins = (chrom_size + resolution - 1) // resolution
+        sums = _numpy.zeros(num_out_bins, dtype=_numpy.float64)
+        any_na = _numpy.zeros(num_out_bins, dtype=bool)
+        covered = _numpy.zeros(num_out_bins, dtype=_numpy.int64)
+
+        chrom_intervals = intervals[intervals["chrom"].astype(str) == chrom]
+        if not chrom_intervals.empty:
+            bins = bins_per_chrom.get(chrom)
+            mask_arr = mask_per_chrom.get(chrom)
+
+            for _, iv in chrom_intervals.iterrows():
+                start = max(0, int(iv["start"]))
+                end = min(chrom_size, int(iv["end"]))
+                if end <= start:
+                    continue
+
+                read_start = max(0, start - k)
+                seq_iv = _pd.DataFrame({
+                    "chrom": [chrom],
+                    "start": [read_start],
+                    "end": [end],
+                })
+                seq = gseq_extract(seq_iv)[0]
+                seq_bytes = _numpy.frombuffer(seq.encode("ascii"),
+                                              dtype=_numpy.uint8)
+                codes = _DNA_BASE_CODE[seq_bytes]
+
+                positions = _numpy.arange(start, end, dtype=_numpy.int64)
+                rel = positions - read_start
+                out_bin = positions // resolution
+
+                # Cover everything inside the input interval (R semantics).
+                _numpy.add.at(covered, out_bin, 1)
+
+                # Mask poisons unconditionally.
+                if mask_arr is not None and len(mask_arr):
+                    masked = _numpy.zeros(positions.shape[0], dtype=bool)
+                    for ms, me in mask_arr:
+                        if me <= start:
+                            continue
+                        if ms >= end:
+                            break
+                        lo = max(ms, start) - start
+                        hi = min(me, end) - start
+                        masked[lo:hi] = True
+                    if masked.any():
+                        _numpy.logical_or.at(any_na, out_bin[masked], True)
+
+                # k-bp upstream available?
+                no_ctx = rel < k
+                if no_ctx.any():
+                    _numpy.logical_or.at(any_na, out_bin[no_ctx], True)
+
+                # Predicted-base codes (-1 = N -> unconditional NA).
+                base_idx = codes[rel]
+                base_n = base_idx < 0
+                if base_n.any():
+                    _numpy.logical_or.at(any_na, out_bin[base_n], True)
+
+                # Compute k-mer context indices via sliding window.
+                if k > 0 and len(codes) >= k:
+                    win = _numpy.lib.stride_tricks.sliding_window_view(
+                        codes, k
+                    )
+                else:
+                    win = _numpy.empty((0, 0), dtype=codes.dtype)
+
+                # ctx_idx[i] for position i corresponds to seq[rel[i]-k:rel[i]]
+                ctx_idx = _numpy.full(positions.shape[0], -1, dtype=_numpy.int64)
+                ctx_n = _numpy.zeros(positions.shape[0], dtype=bool)
+                if win.size:
+                    valid_ctx = (~no_ctx)
+                    if valid_ctx.any():
+                        ctx_offsets = rel[valid_ctx] - k
+                        ctx_rows = win[ctx_offsets]
+                        # Encode as base-4 integer; -1 anywhere -> N context.
+                        weights = (1 << (2 * _numpy.arange(k - 1, -1, -1)))
+                        has_n = (ctx_rows < 0).any(axis=1)
+                        encoded = (ctx_rows * weights).sum(axis=1)
+                        encoded = _numpy.where(has_n, -1, encoded)
+                        ctx_idx[valid_ctx] = encoded
+                        ctx_tmp = _numpy.zeros(
+                            positions.shape[0], dtype=bool
+                        )
+                        ctx_tmp[valid_ctx] = has_n
+                        ctx_n = ctx_tmp
+
+                # Stratum bin lookup at pos - k.
+                bin_query = positions - k
+                stratum_bin = _numpy.full(positions.shape[0], -1,
+                                          dtype=_numpy.int64)
+                if bins is not None and len(bins):
+                    starts_col = bins[:, 0]
+                    bin_col = bins[:, 1]
+                    insert = _numpy.searchsorted(starts_col, bin_query,
+                                                 side="right") - 1
+                    valid_q = insert >= 0
+                    if valid_q.any():
+                        bin_first = starts_col[insert[valid_q]]
+                        candidate_bin = bin_col[insert[valid_q]]
+                        within = bin_query[valid_q] < bin_first + iter_size
+                        stratum_bin[valid_q] = _numpy.where(
+                            within, candidate_bin, -1
+                        )
+                stratum_invalid = (stratum_bin < 0)
+                # Context-N: use n_policy (uniform vs NA).
+                # Predicted-base-N: already poisoned above.
+                # Sparse bin: use sparse_policy.
+                # Strict valid: not no_ctx, not base_n, not ctx_n,
+                #               not stratum_invalid, not sparse.
+                sparse_arr = _numpy.zeros(positions.shape[0], dtype=bool)
+                if any(bin_is_sparse):
+                    sb = _numpy.asarray(bin_is_sparse)
+                    valid_b = ~stratum_invalid
+                    if valid_b.any():
+                        sparse_arr[valid_b] = sb[stratum_bin[valid_b]]
+
+                # Default: NA for invalid stratum, ctx-N if !n_uniform,
+                # sparse if !sparse_uniform.
+                contrib = _numpy.zeros(positions.shape[0], dtype=_numpy.float64)
+                # Position contributes only if not NA-poisoned and
+                # has a valid base.
+                base_ok = ~base_n
+                ctx_ok = ~no_ctx
+                # Ctx-N path
+                if n_uniform:
+                    ctx_n_contrib = ctx_n & base_ok & ctx_ok
+                else:
+                    bad = ctx_n & base_ok & ctx_ok
+                    if bad.any():
+                        _numpy.logical_or.at(any_na, out_bin[bad], True)
+                    ctx_n_contrib = _numpy.zeros_like(ctx_n)
+                # Stratum invalid: unconditional NA (no policy).
+                bad_stratum = (
+                    stratum_invalid & ~ctx_n & base_ok & ctx_ok
+                )
+                if bad_stratum.any():
+                    _numpy.logical_or.at(any_na, out_bin[bad_stratum], True)
+                # Sparse path
+                non_invalid = ~stratum_invalid & ~ctx_n & base_ok & ctx_ok
+                if sparse_uniform:
+                    sparse_contrib = sparse_arr & non_invalid
+                else:
+                    bad = sparse_arr & non_invalid
+                    if bad.any():
+                        _numpy.logical_or.at(any_na, out_bin[bad], True)
+                    sparse_contrib = _numpy.zeros_like(sparse_arr)
+                # Normal contribution
+                normal = non_invalid & ~sparse_arr
+                if normal.any():
+                    valid_idx = _numpy.where(normal)[0]
+                    bin_arr = stratum_bin[valid_idx].astype(int)
+                    cidx = ctx_idx[valid_idx].astype(int)
+                    bidx = base_idx[valid_idx].astype(int)
+                    raw = _numpy.empty(valid_idx.shape[0], dtype=_numpy.float64)
+                    for i, (bb, cc, ba) in enumerate(
+                        zip(bin_arr, cidx, bidx, strict=True)
+                    ):
+                        raw[i] = log_p_list[bb][cc, ba]
+                    nan_pos = _numpy.isnan(raw)
+                    if nan_pos.any():
+                        bad_pos = valid_idx[nan_pos]
+                        _numpy.logical_or.at(any_na, out_bin[bad_pos], True)
+                    raw = _numpy.where(nan_pos, 0.0, raw)
+                    contrib[valid_idx] = raw
+                if ctx_n_contrib.any():
+                    contrib[ctx_n_contrib] = UNIFORM_LOGP
+                if sparse_contrib.any():
+                    contrib[sparse_contrib] = UNIFORM_LOGP
+
+                _numpy.add.at(sums, out_bin, contrib)
+
+        # Build output bin intervals + values for this chrom.
+        bin_starts = _numpy.arange(num_out_bins, dtype=_numpy.int64) * resolution
+        bin_ends = _numpy.minimum(bin_starts + resolution, chrom_size)
+        values = _numpy.where(
+            (covered == 0) | any_na,
+            nan_f,
+            sums,
+        )
+        # Drop entirely-uncovered bins from the output to keep file sizes
+        # reasonable; misha fills uncovered positions with defval anyway.
+        nonempty = covered > 0
+        if not nonempty.any():
+            continue
+        idxs = _numpy.where(nonempty)[0]
+        out_intervals_chunks.append(_pd.DataFrame({
+            "chrom": [chrom] * idxs.size,
+            "start": bin_starts[idxs],
+            "end": bin_ends[idxs],
+        }))
+        out_values_chunks.append(values[idxs])
+
+    if not out_intervals_chunks:
+        raise ValueError("No bins were covered; check intervals.")
+
+    out_intervals = _pd.concat(out_intervals_chunks, ignore_index=True)
+    out_values = _numpy.concatenate(out_values_chunks)
+
+    if overwrite:
+        import contextlib as _contextlib_local
+        with _contextlib_local.suppress(FileNotFoundError, ValueError):
+            gtrack_rm(track, force=True)
+
+    gtrack_create_dense_direct(
+        track,
+        description if description is not None else f"gsynth_score({track})",
+        out_intervals,
+        out_values,
+        binsize=resolution,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1602,6 +2261,8 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
         "total_n": int(model.total_n),
         "per_bin_kmers": per_bin_kmers_list,
         "dim_specs": dim_specs_out,
+        "prior_mode": str(getattr(model, "prior_mode", "uniform")),
+        "marginal_fallbacks": int(getattr(model, "marginal_fallbacks", 0)),
         "data": {
             "counts": {
                 "dtype": "float64",
@@ -1618,6 +2279,25 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
         },
     }
 
+    prior_matrix = getattr(model, "prior_matrix", None)
+    prior_bytes: bytes | None = None
+    if prior_matrix is not None:
+        prior_arr = _numpy.ascontiguousarray(
+            _numpy.asarray(prior_matrix, dtype=_numpy.float64)
+        )
+        if prior_arr.shape != (total_bins, 4):
+            raise ValueError(
+                f"prior_matrix must have shape ({total_bins}, 4), got "
+                f"{prior_arr.shape}"
+            )
+        metadata["data"]["prior"] = {
+            "dtype": "float64",
+            "shape": [int(total_bins), 4],
+            "order": "C",
+            "file": "prior.bin",
+        }
+        prior_bytes = prior_arr.tobytes()
+
     # Stack arrays into contiguous float64
     counts_arr = _numpy.stack(model.model_data["counts"]).astype(_numpy.float64)
     cdf_arr = _numpy.stack(model.model_data["cdf"]).astype(_numpy.float64)
@@ -1631,6 +2311,8 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
             zf.writestr("metadata.yaml", metadata_bytes)
             zf.writestr("counts.bin", counts_bytes)
             zf.writestr("cdf.bin", cdf_bytes)
+            if prior_bytes is not None:
+                zf.writestr("prior.bin", prior_bytes)
     else:
         _os.makedirs(path, exist_ok=True)
         with open(_os.path.join(path, "metadata.yaml"), "wb") as f:
@@ -1639,6 +2321,9 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
             f.write(counts_bytes)
         with open(_os.path.join(path, "cdf.bin"), "wb") as f:
             f.write(cdf_bytes)
+        if prior_bytes is not None:
+            with open(_os.path.join(path, "prior.bin"), "wb") as f:
+                f.write(prior_bytes)
 
 
 def _load_legacy_pickle(path: str) -> GsynthModel:
@@ -1674,6 +2359,13 @@ def _load_legacy_pickle(path: str) -> GsynthModel:
     # Backfill iterator for models saved before it was tracked.
     if not hasattr(model, "iterator"):
         model.iterator = None
+    # Backfill prior fields for models saved before Dirichlet prior support.
+    if not hasattr(model, "prior_mode"):
+        model.prior_mode = "uniform"
+    if not hasattr(model, "prior_matrix"):
+        model.prior_matrix = None
+    if not hasattr(model, "marginal_fallbacks"):
+        model.marginal_fallbacks = 0
     return model
 
 
@@ -1735,6 +2427,17 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
         else None
     )
 
+    # Optional prior matrix (introduced in v0.1.34).
+    prior_matrix = None
+    data_section = metadata.get("data", {})
+    if isinstance(data_section, dict) and "prior" in data_section:
+        prior_meta = data_section["prior"]
+        prior_shape = tuple(prior_meta["shape"])
+        prior_matrix = _numpy.frombuffer(
+            read_file(prior_meta["file"]), dtype=_numpy.float64
+        ).reshape(prior_shape).copy()
+    prior_mode = str(metadata.get("prior_mode", "uniform"))
+
     return GsynthModel(
         k=model_k,
         n_dims=int(metadata.get("n_dims", 0)),
@@ -1753,6 +2456,9 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
             if metadata.get("iterator") is not None
             else None
         ),
+        prior_mode=prior_mode,
+        prior_matrix=prior_matrix,
+        marginal_fallbacks=int(metadata.get("marginal_fallbacks", 0)),
     )
 
 
