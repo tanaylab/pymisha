@@ -2777,3 +2777,49 @@ class TestGsynthIteratorAlignment:
             )
         finally:
             pm.gvtrack_rm("test_vt")
+
+
+class TestGsynthPreserveN:
+    """preserve_n: positions whose reference is N stay N in the output."""
+
+    def _find_n_interval(self):
+        ref = pm.gseq_extract(pm.gintervals(["X"], [0], [200000]))[0]
+        idx = ref.find("N")
+        assert idx >= 0, "expected at least one N in chrX:0-200000 example db"
+        start = max(0, idx - 50)
+        end = min(200000, idx + 200)
+        return start, end, ref[start:end]
+
+    def test_default_preserves_n(self):
+        start, end, ref_slice = self._find_n_interval()
+        intervals = pm.gintervals(["X"], [start], [end])
+        model = pm.gsynth_train(intervals=intervals)
+        seq = pm.gsynth_sample(
+            model, output_format="vector", intervals=intervals, seed=42
+        )[0]
+        for i, c in enumerate(ref_slice):
+            if c in "Nn":
+                assert seq[i] == c, f"position {i} should be {c}, got {seq[i]}"
+
+    def test_preserve_n_false_fabricates_acgt(self):
+        start, end, ref_slice = self._find_n_interval()
+        intervals = pm.gintervals(["X"], [start], [end])
+        model = pm.gsynth_train(intervals=intervals)
+        seq = pm.gsynth_sample(
+            model, output_format="vector", intervals=intervals,
+            preserve_n=False, seed=42,
+        )[0]
+        n_count = sum(1 for c in seq if c in "Nn")
+        ref_n = sum(1 for c in ref_slice if c in "Nn")
+        assert ref_n > 0
+        assert n_count == 0
+
+    def test_random_preserves_n(self):
+        start, end, ref_slice = self._find_n_interval()
+        intervals = pm.gintervals(["X"], [start], [end])
+        seq = pm.gsynth_random(
+            intervals=intervals, output_format="vector", seed=42
+        )[0]
+        for i, c in enumerate(ref_slice):
+            if c in "Nn":
+                assert seq[i] == c

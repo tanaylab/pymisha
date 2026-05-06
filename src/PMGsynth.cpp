@@ -438,15 +438,17 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         PyObject *py_seed = NULL;
         int k = 5;
         long long iter_size_arg = 0;
+        int preserve_n_arg = 1;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOiL",
+        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOiLp",
                               &py_cdf_list, &py_breaks,
                               &py_bin_indices, &py_iter_starts, &py_iter_chroms,
                               &py_intervals, &py_mask_copy,
                               &output_path, &output_format, &n_samples,
-                              &py_seed, &k, &iter_size_arg)) {
+                              &py_seed, &k, &iter_size_arg, &preserve_n_arg)) {
             verror("Invalid arguments to pm_gsynth_sample");
         }
+        bool preserve_n = (preserve_n_arg != 0);
 
         // Validate k
         if (k < 1 || k > StratifiedMarkovModel::MAX_K) {
@@ -619,18 +621,26 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
 
                 int64_t interval_len = interval_end - interval_start;
 
-                // Load original sequence for mask_copy
+                // Load original sequence whenever we need to consult it:
+                // for mask_copy regions, or for preserve_n's per-position
+                // N check.
                 std::vector<char> original_seq;
-                if (!mask_copy_ivs.empty()) {
+                if (!mask_copy_ivs.empty() || preserve_n) {
                     GInterval read_iv(chromid, interval_start, interval_end, 0);
                     seqfetch.read_interval(read_iv, chromkey, original_seq);
                 }
 
                 for (int sample_idx = 0; sample_idx < n_samples; ++sample_idx) {
+                    // Bin queries use pos - k (the leftmost base of the
+                    // (k+1)-mer context), matching the convention used by
+                    // training. The first sampled position is
+                    // interval_start + k, so the first query is at
+                    // interval_start.
                     size_t bin_cursor = 0;
+                    int64_t first_query = interval_start;
                     if (!bins.empty()) {
                         while (bin_cursor + 1 < bins.size() &&
-                               interval_start >= bins[bin_cursor + 1].first) {
+                               first_query >= bins[bin_cursor + 1].first) {
                             ++bin_cursor;
                         }
                     }
@@ -650,10 +660,19 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                         if (is_position_masked(pos, mask_copy_ivs, mask_cursor) &&
                             i < (int64_t)original_seq.size()) {
                             synth_seq[i] = original_seq[i];
-                        } else {
-                            synth_seq[i] = StratifiedMarkovModel::decode_base(
-                                static_cast<int>(drand48() * NUM_BASES));
+                            continue;
                         }
+                        // preserve_n: keep N (or n) from the reference rather
+                        // than fabricating an ACGT base at a gap position.
+                        if (preserve_n && i < (int64_t)original_seq.size()) {
+                            char orig = original_seq[i];
+                            if (orig == 'N' || orig == 'n') {
+                                synth_seq[i] = orig;
+                                continue;
+                            }
+                        }
+                        synth_seq[i] = StratifiedMarkovModel::decode_base(
+                            static_cast<int>(drand48() * NUM_BASES));
                     }
 
                     // Sample remaining using Markov chain
@@ -671,15 +690,29 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                             continue;
                         }
 
-                        // Find bin for this position
+                        // preserve_n: keep N (or n) from the reference rather
+                        // than fabricating an ACGT base at a gap position.
+                        if (preserve_n && rel_pos < (int64_t)original_seq.size()) {
+                            char orig = original_seq[rel_pos];
+                            if (orig == 'N' || orig == 'n') {
+                                synth_seq[rel_pos] = orig;
+                                continue;
+                            }
+                        }
+
+                        // Find bin for this position. Use pos - k (the
+                        // context-leftmost base) to match training, which
+                        // attributes each (k+1)-mer event to bin_at(pos - k).
+                        int64_t bin_query_pos = pos - k;
                         int bin_idx = -1;
                         if (!bins.empty()) {
                             while (bin_cursor + 1 < bins.size() &&
-                                   pos >= bins[bin_cursor + 1].first) {
+                                   bin_query_pos >= bins[bin_cursor + 1].first) {
                                 ++bin_cursor;
                             }
-                            if (pos >= bins[bin_cursor].first &&
-                                pos < bins[bin_cursor].first + iter_size) {
+                            if (bin_query_pos >= bins[bin_cursor].first &&
+                                bin_query_pos <
+                                    bins[bin_cursor].first + iter_size) {
                                 bin_idx = bins[bin_cursor].second;
                             }
                         }

@@ -518,11 +518,14 @@ def pm_gsynth_sample(
     output_format: int,
     n_samples: int,
     seed: int | None,
+    k: int,
+    iter_size: int,
+    preserve_n: bool,
     /,
 ) -> Any:
     """Sample synthetic genome.
 
-    C++ signature: ``PyArg_ParseTuple(args, "OOOOOOOsiiO", ...)``
+    C++ signature: ``PyArg_ParseTuple(args, "OOOOOOOsiiOiLp", ...)``
     """
 
 def pm_gsynth_replace_kmer(

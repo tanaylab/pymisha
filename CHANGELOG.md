@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.34 (2026-05-06)
+
+### Fixes
+- **`gsynth_sample` stratum bin lookup off by `k` bp at every iter-window boundary.** `pm_gsynth_sample` queried `bin_at(pos)` at the predicted-base position, but training attributes each `(k+1)`-mer event to `bin_at(pos - k)` (the leftmost base of the context window). At iter-window boundaries the sampler therefore picked up the *next* bin's CDF for the last `k` predicted positions, so cross-bin context dependencies were silently miscounted. Realigned the sample-time bin lookup to `pos - k` to match the convention used by `gsynth_train` and the cached `.gsm` model. Cached models stay valid; downstream tracks built from `gsynth_sample` should be regenerated. Matches R misha commit `3fba28c2`.
+
+### Features
+- **`gsynth_sample` and `gsynth_random` now preserve reference `N` positions by default (`preserve_n=True`).** Centromeres, telomeric Ns and other gap regions are written verbatim into the output instead of being filled with a fabricated ACGT base. `mask_copy` regions still take precedence. Pass `preserve_n=False` to recover the previous behaviour. Matches R misha #109 (commit `e90314be`).
+- **`gintervals()` accepts BED-style character strand input.** Strand values can now be `"+"`, `"-"`, `"."`, `"*"`, or `""` (mapped to `1`/`-1`/`0`/`0`/`0`) in addition to numeric `-1`/`0`/`1`. Output remains numeric. Matches R misha #104 (commit `1de5131e`).
+- **`gintervals_import_bed()`, `gintervals_import_gff()`, `gintervals_import_vcf()`.** Three new file-format importers that preserve common metadata columns and normalise chromosome names through the active database's chromosome-alias mechanism:
+  - `gintervals_import_bed(file, name=True, score=True, strand=True)` -- BED is already 0-based half-open, coordinates are passed through. Optionally keeps the BED4/BED5/BED6 metadata columns.
+  - `gintervals_import_gff(file, feature=None, strand=True, attrs=True)` -- GFF/GTF is 1-based closed; converts to 0-based half-open by subtracting 1 from `start`. Optional feature-type filter; keeps `source`, `type`, `score`, optional raw `attrs`.
+  - `gintervals_import_vcf(file, info=True)` -- sets `start = POS - 1` and `end = POS - 1 + len(REF)`. Keeps `id`, `ref`, `alt`, `qual`, `filter`, optional raw `info`.
+
+  Matches R misha #105 (commit `da592845`).
+
 ## v0.1.33 (2026-04-26)
 
 ### Fixes

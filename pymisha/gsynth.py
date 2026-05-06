@@ -615,7 +615,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
     """
     (chunk_intervals_dict, dim_specs_list, cdf_list_data,
      iterator, mask_copy_dict, n_samples, chunk_seed,
-     sample_bin_merge, k) = args
+     sample_bin_merge, k, preserve_n) = args
 
     import pandas as pd
     chunk_intervals = pd.DataFrame(chunk_intervals_dict)
@@ -658,6 +658,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         chunk_seed,
         int(k),
         _resolve_iter_size(iterator),
+        bool(preserve_n),
     ))
 
 
@@ -936,6 +937,7 @@ def gsynth_sample(
     intervals: _pd.DataFrame | None = None,
     iterator: int | None = None,
     mask_copy: _pd.DataFrame | None = None,
+    preserve_n: bool = True,
     n_samples: int = 1,
     seed: int | None = None,
     bin_merge: list[_Any] | None = None,
@@ -984,6 +986,14 @@ def gsynth_sample(
         verbatim instead of being sampled.  Useful for keeping repetitive
         or regulatory regions intact.  Should be non-overlapping and sorted
         by start position within each chromosome.
+    preserve_n : bool, default True
+        When ``True`` (default), positions whose original reference is
+        ``N`` (or lowercase ``n``) are written to the output verbatim
+        rather than filled with a random ACGT base. Case is preserved.
+        ``mask_copy`` regions take precedence: inside a ``mask_copy``
+        interval the original byte is copied regardless. Set to
+        ``False`` to recover the pre-0.1.34 behaviour of fabricating
+        ACGT at every position.
     n_samples : int, default 1
         Number of independent samples to generate per interval.  When
         ``n_samples > 1`` and ``output_format="fasta"``, headers include a
@@ -1097,7 +1107,7 @@ def gsynth_sample(
         worker_args = [
             (chunk.to_dict(orient="list"), dim_specs_list,
              cdf_list, iterator, mask_copy_dict, n_samples,
-             chunk_seeds[i], bin_merge, model_k)
+             chunk_seeds[i], bin_merge, model_k, preserve_n)
             for i, chunk in enumerate(chunks)
         ]
 
@@ -1174,6 +1184,7 @@ def gsynth_sample(
         seed,
         int(model_k),
         _resolve_iter_size(iterator),
+        bool(preserve_n),
     )
     return list(_raw) if _raw is not None else None
 
@@ -1219,6 +1230,7 @@ def gsynth_random(
     output: str | None = None,
     output_format: str = "fasta",
     mask_copy: _pd.DataFrame | None = None,
+    preserve_n: bool = True,
     n_samples: int = 1,
     seed: int | None = None,
 ) -> list[str] | None:
@@ -1249,6 +1261,12 @@ def gsynth_random(
     mask_copy : DataFrame, optional
         Intervals where the original reference sequence is preserved
         instead of being randomly generated.
+    preserve_n : bool, default True
+        When ``True`` (default), positions whose original reference is
+        ``N`` (or lowercase ``n``) are written to the output verbatim
+        rather than filled with a random ACGT base. ``mask_copy``
+        intervals take precedence. Set to ``False`` to recover the
+        pre-0.1.34 behaviour.
     n_samples : int, default 1
         Number of independent samples to generate per interval.
     seed : int, optional
@@ -1360,6 +1378,7 @@ def gsynth_random(
         seed,
         int(random_k),
         _ITER_SIZE_NO_CONSTRAINT,
+        bool(preserve_n),
     )
     return list(_raw2) if _raw2 is not None else None
 

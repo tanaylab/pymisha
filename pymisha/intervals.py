@@ -244,11 +244,72 @@ def _load_index_entries_2d(idx_path: Path) -> list[tuple[int, int, int, int]]:
     return entries
 
 
+_STRAND_CHAR_MAP = {
+    "+": 1,
+    "-": -1,
+    ".": 0,
+    "*": 0,
+    "": 0,
+}
+
+
+def _normalize_strand_value(value: Any) -> int:
+    """Normalize a single strand value to ``-1``, ``0``, or ``1``.
+
+    Accepts numeric ``-1``/``0``/``1`` and the BED-style character
+    encodings ``"+"``/``"-"``/``"."``/``"*"``/``""``. Anything else
+    raises ``ValueError``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid strand value {value!r}")
+    if isinstance(value, (int, _numpy.integer)):
+        if value in (-1, 0, 1):
+            return int(value)
+        raise ValueError(f"Invalid strand value {value!r}: must be -1, 0, or 1")
+    if isinstance(value, float) and not _numpy.isnan(value):
+        ivalue = int(value)
+        if float(ivalue) == value and ivalue in (-1, 0, 1):
+            return ivalue
+        raise ValueError(f"Invalid strand value {value!r}: must be -1, 0, or 1")
+    if isinstance(value, str):
+        if value in _STRAND_CHAR_MAP:
+            return _STRAND_CHAR_MAP[value]
+        # Allow numeric strings like "1", "-1", "0".
+        try:
+            ivalue = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid strand value {value!r}: expected '+'/'-'/'.'"
+                f"/'*'/'' or -1/0/1"
+            ) from exc
+        if ivalue in (-1, 0, 1):
+            return ivalue
+        raise ValueError(f"Invalid strand value {value!r}: must be -1, 0, or 1")
+    raise ValueError(f"Invalid strand value {value!r}")
+
+
+def _normalize_strand_column(values: Any) -> list[int]:
+    """Normalize a sequence of strand values to numeric -1/0/1.
+
+    Accepts a list/Series/array of mixed input (numeric, strings,
+    pandas Categorical). Returns a list of ``int``.
+    """
+    if isinstance(values, _pandas.Series):
+        if isinstance(values.dtype, _pandas.CategoricalDtype):
+            values = values.astype(object)
+        values = values.tolist()
+    elif hasattr(values, "tolist"):
+        values = values.tolist()
+    else:
+        values = list(values)
+    return [_normalize_strand_value(v) for v in values]
+
+
 def gintervals(
     chroms: str | int | list[Any],
     starts: int | list[int] = 0,
     ends: int | list[int] = -1,
-    strand: int | list[int] | None = None,
+    strand: int | str | list[int | str] | None = None,
 ) -> pd.DataFrame:
     """
     Create a 1D intervals DataFrame.
@@ -266,8 +327,10 @@ def gintervals(
     ends : int or list of int, default -1
         End coordinates (0-based, exclusive). ``-1`` means full chromosome
         length.
-    strand : int or list of int, optional
-        Strand information (``-1``, ``0``, or ``1``).
+    strand : int, str, or list, optional
+        Strand information. Accepts numeric ``-1``/``0``/``1`` or the
+        BED-style characters ``"+"``/``"-"``/``"."``/``"*"``/``""``
+        (``"."``/``"*"``/``""`` map to ``0``). Output is always numeric.
         Note: this interval convention differs from liftover chain tables,
         where strand fields are encoded as ``0`` (``+``) or ``1`` (``-``).
 
@@ -308,7 +371,7 @@ def gintervals(
 
     result_strands = None
     if strand is not None:
-        if isinstance(strand, int):
+        if isinstance(strand, (int, str, _numpy.integer)):
             strand = [strand]
         strand = list(strand)
         n = len(result_chroms)
@@ -317,11 +380,7 @@ def gintervals(
         if len(strand) != n:
             raise ValueError("strand must have the same length as other arguments")
 
-        result_strands = []
-        for s in strand:
-            if s not in (-1, 0, 1):
-                raise ValueError(f"Invalid strand value {s}: must be -1, 0, or 1")
-            result_strands.append(s)
+        result_strands = _normalize_strand_column(strand)
 
     df = _pandas.DataFrame({
         'chrom': result_chroms,
@@ -1065,6 +1124,325 @@ def gintervals_from_bed(path: str | Path, has_strand: bool = False) -> pd.DataFr
         return None
 
     return gintervals_from_tuples(rows)
+
+
+def _open_text_for_import(path: Path) -> IO[str]:
+    """Open a BED/GFF/VCF file as text, transparently handling .gz."""
+    if str(path).endswith(".gz"):
+        return cast(IO[str], gzip.open(path, "rt"))
+    return path.open("rt")
+
+
+def _read_table_filtered(path: Path, header_pattern: re.Pattern[str]) -> pd.DataFrame:
+    """Read a tab-delimited file, skipping header lines that match
+    *header_pattern* on column 1. Returns a DataFrame with all-string
+    columns; later importers coerce as needed.
+    """
+    rows: list[list[str]] = []
+    max_cols = 0
+    with _open_text_for_import(path) as fh:
+        for raw in fh:
+            line = raw.rstrip("\n").rstrip("\r")
+            if not line:
+                continue
+            first = line.split("\t", 1)[0].strip()
+            if header_pattern.match(first):
+                continue
+            parts = line.split("\t")
+            rows.append(parts)
+            if len(parts) > max_cols:
+                max_cols = len(parts)
+    if not rows:
+        return _pandas.DataFrame()
+    for r in rows:
+        if len(r) < max_cols:
+            r.extend([""] * (max_cols - len(r)))
+    cols = [f"V{i + 1}" for i in range(max_cols)]
+    return _pandas.DataFrame(rows, columns=cols, dtype=object)
+
+
+def _sort_intervals_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort an intervals DataFrame by (chromid, start, end) without
+    stripping extra columns, mirroring R's ``.gsort_intervals_df``.
+    """
+    if df.empty:
+        return df.reset_index(drop=True)
+    allchroms = gintervals_all()["chrom"].astype(str).tolist()
+    chrom_order = {c: i for i, c in enumerate(allchroms)}
+    chromid = df["chrom"].astype(str).map(
+        lambda c: chrom_order.get(c, len(chrom_order))
+    )
+    df = df.assign(_chromid=chromid)
+    df = df.sort_values(by=["_chromid", "start", "end"], kind="mergesort")
+    return df.drop(columns=["_chromid"]).reset_index(drop=True)
+
+
+_BED_HEADER_RE = re.compile(r"^(track|browser|#|$)")
+_GFF_HEADER_RE = re.compile(r"^#")
+_VCF_HEADER_RE = re.compile(r"^#")
+
+
+def gintervals_import_bed(
+    file: str | Path,
+    *,
+    name: bool = True,
+    score: bool = True,
+    strand: bool = True,
+) -> pd.DataFrame:
+    """
+    Import intervals from a BED file.
+
+    Reads a BED (or BED.gz) file and returns a misha 1D intervals
+    DataFrame. ``track``/``browser``/``#`` header lines are skipped
+    automatically. Chromosome names are normalised through the active
+    database's chromosome-alias mechanism, so ``chr1`` <-> ``1`` works
+    transparently.
+
+    BED is already 0-based half-open, so coordinates are kept as-is.
+
+    Parameters
+    ----------
+    file : str or Path
+        Path to a BED file (``.bed`` or ``.bed.gz``).
+    name : bool, default True
+        If True and a 4th column exists, include it as ``name``.
+    score : bool, default True
+        If True and a 5th column exists, include it as ``score``
+        (numeric).
+    strand : bool, default True
+        If True and a 6th column exists, include it as ``strand``
+        (mapped to ``1``/``-1``/``0``).
+
+    Returns
+    -------
+    DataFrame
+        Sorted intervals with columns ``chrom``, ``start``, ``end`` and
+        any of the optional metadata columns described above.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *file* does not exist.
+    ValueError
+        If the file has fewer than three columns or contains no records.
+
+    See Also
+    --------
+    gintervals_import_gff : Import GFF/GTF.
+    gintervals_import_vcf : Import VCF.
+    gintervals_from_bed : Older 3-column BED reader.
+    """
+    _checkroot()
+    path = Path(file)
+    if not path.exists():
+        raise FileNotFoundError(f"BED file {path} does not exist")
+
+    table = _read_table_filtered(path, _BED_HEADER_RE)
+    if table.empty:
+        raise ValueError(
+            f"BED file {path} appears to be empty or contains no data intervals"
+        )
+    if table.shape[1] < 3:
+        raise ValueError(
+            f"BED file {path} appears to be malformed (less than 3 columns)"
+        )
+
+    n_cols = table.shape[1]
+    starts = _pandas.to_numeric(table.iloc[:, 1], errors="coerce")
+    ends = _pandas.to_numeric(table.iloc[:, 2], errors="coerce")
+    if starts.isna().any() or ends.isna().any():
+        raise ValueError(f"Non-numeric coordinates detected in BED file {path}")
+
+    out = _pandas.DataFrame({
+        "chrom": _normalize_chroms(table.iloc[:, 0].astype(str).tolist()),
+        "start": starts.astype("int64"),
+        "end": ends.astype("int64"),
+    })
+
+    if n_cols >= 6 and strand:
+        out["strand"] = _normalize_strand_column(table.iloc[:, 5])
+    if n_cols >= 4 and name:
+        out["name"] = table.iloc[:, 3].astype(str).values
+    if n_cols >= 5 and score:
+        out["score"] = _pandas.to_numeric(
+            table.iloc[:, 4].astype(str), errors="coerce"
+        )
+
+    return _sort_intervals_df(out)
+
+
+def gintervals_import_gff(
+    file: str | Path,
+    *,
+    feature: str | list[str] | None = None,
+    strand: bool = True,
+    attrs: bool = True,
+) -> pd.DataFrame:
+    """
+    Import intervals from a GFF/GTF file.
+
+    GFF/GTF coordinates are 1-based and inclusive on both ends. The
+    importer converts to 0-based half-open by subtracting 1 from
+    ``start`` and leaving ``end`` as-is. Chromosome names are normalised
+    through the active database's chromosome-alias mechanism.
+
+    Parameters
+    ----------
+    file : str or Path
+        Path to a GFF/GTF file (``.gff``, ``.gtf``, or ``.gz``).
+    feature : str or list of str, optional
+        If given, keep only records whose feature type (column 3) is in
+        *feature*.
+    strand : bool, default True
+        If True, include the ``strand`` column (numeric).
+    attrs : bool, default True
+        If True, include the raw attribute string as ``attrs`` (not
+        parsed).
+
+    Returns
+    -------
+    DataFrame
+        Sorted intervals with columns ``chrom``, ``start``, ``end``, and
+        optionally ``strand``, ``source``, ``type``, ``score``,
+        ``attrs``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *file* does not exist.
+    ValueError
+        If the file is empty, malformed, or no records of the requested
+        feature type are found.
+    """
+    _checkroot()
+    path = Path(file)
+    if not path.exists():
+        raise FileNotFoundError(f"GFF file {path} does not exist")
+
+    table = _read_table_filtered(path, _GFF_HEADER_RE)
+    if table.empty:
+        raise ValueError(
+            f"GFF file {path} appears to be empty or contains no records"
+        )
+    if table.shape[1] < 8:
+        raise ValueError(
+            f"GFF file {path} appears to be malformed (expected at least 8 "
+            f"tab-separated columns, got {table.shape[1]})"
+        )
+
+    if feature is not None:
+        feature_list = [feature] if isinstance(feature, str) else list(feature)
+        keep = table.iloc[:, 2].isin(feature_list)
+        table = table.loc[keep].reset_index(drop=True)
+        if table.empty:
+            raise ValueError(
+                f"No records of feature type(s) {', '.join(feature_list)} "
+                f"found in GFF file {path}"
+            )
+
+    starts1 = _pandas.to_numeric(table.iloc[:, 3], errors="coerce")
+    ends1 = _pandas.to_numeric(table.iloc[:, 4], errors="coerce")
+    if starts1.isna().any() or ends1.isna().any():
+        raise ValueError(f"Non-numeric coordinates detected in GFF file {path}")
+
+    out = _pandas.DataFrame({
+        "chrom": _normalize_chroms(table.iloc[:, 0].astype(str).tolist()),
+        "start": (starts1 - 1).astype("int64"),
+        "end": ends1.astype("int64"),
+    })
+    if strand:
+        out["strand"] = _normalize_strand_column(table.iloc[:, 6])
+    out["source"] = table.iloc[:, 1].astype(str).values
+    out["type"] = table.iloc[:, 2].astype(str).values
+    out["score"] = _pandas.to_numeric(
+        table.iloc[:, 5].astype(str), errors="coerce"
+    )
+    if attrs and table.shape[1] >= 9:
+        out["attrs"] = table.iloc[:, 8].astype(str).values
+
+    return _sort_intervals_df(out)
+
+
+def gintervals_import_vcf(
+    file: str | Path,
+    *,
+    info: bool = True,
+) -> pd.DataFrame:
+    """
+    Import intervals from a VCF file.
+
+    VCF is 1-based; this importer sets ``start = POS - 1`` and
+    ``end = POS - 1 + len(REF)``, yielding a 0-based half-open span
+    covering the reference allele. Multi-allelic records are kept on a
+    single row; the ``alt`` column contains the original
+    comma-separated string.
+
+    Chromosome names are normalised through the active database's
+    chromosome-alias mechanism.
+
+    Parameters
+    ----------
+    file : str or Path
+        Path to a VCF file (``.vcf`` or ``.vcf.gz``).
+    info : bool, default True
+        If True, include the raw INFO column as ``info`` (not parsed).
+
+    Returns
+    -------
+    DataFrame
+        Sorted intervals with columns ``chrom``, ``start``, ``end``,
+        ``id``, ``ref``, ``alt``, ``qual``, ``filter`` and optionally
+        ``info``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *file* does not exist.
+    ValueError
+        If the file is empty, malformed, or contains an empty REF allele.
+    """
+    _checkroot()
+    path = Path(file)
+    if not path.exists():
+        raise FileNotFoundError(f"VCF file {path} does not exist")
+
+    table = _read_table_filtered(path, _VCF_HEADER_RE)
+    if table.empty:
+        raise ValueError(
+            f"VCF file {path} appears to be empty or contains no records"
+        )
+    if table.shape[1] < 5:
+        raise ValueError(
+            f"VCF file {path} appears to be malformed (expected at least 5 "
+            f"tab-separated columns, got {table.shape[1]})"
+        )
+
+    pos = _pandas.to_numeric(table.iloc[:, 1], errors="coerce")
+    if pos.isna().any():
+        raise ValueError(f"Non-numeric POS detected in VCF file {path}")
+    ref = table.iloc[:, 3].astype(str)
+    ref_len = ref.str.len()
+    if (ref_len < 1).any():
+        raise ValueError(f"Empty REF allele detected in VCF file {path}")
+
+    out = _pandas.DataFrame({
+        "chrom": _normalize_chroms(table.iloc[:, 0].astype(str).tolist()),
+        "start": (pos - 1).astype("int64"),
+        "end": (pos - 1 + ref_len).astype("int64"),
+    })
+    out["id"] = table.iloc[:, 2].astype(str).values
+    out["ref"] = ref.values
+    out["alt"] = table.iloc[:, 4].astype(str).values
+    if table.shape[1] >= 6:
+        out["qual"] = _pandas.to_numeric(
+            table.iloc[:, 5].astype(str), errors="coerce"
+        )
+    if table.shape[1] >= 7:
+        out["filter"] = table.iloc[:, 6].astype(str).values
+    if info and table.shape[1] >= 8:
+        out["info"] = table.iloc[:, 7].astype(str).values
+
+    return _sort_intervals_df(out)
 
 
 def gintervals_window(
