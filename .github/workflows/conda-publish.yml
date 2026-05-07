@@ -42,8 +42,11 @@ jobs:
           activate-environment: build
 
       - name: Install conda-build and anaconda-client
+        # conda-build must live alongside the conda CLI (base env);
+        # installing into the activated `build` env leaves
+        # `conda build` undefined.
         run: |
-          conda install -y conda-build anaconda-client
+          conda install -n base -y conda-build anaconda-client
 
       - name: Extract version
         id: version

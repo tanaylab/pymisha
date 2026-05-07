@@ -10,6 +10,7 @@ import zipfile as _zipfile
 from dataclasses import dataclass as _dataclass
 from dataclasses import field as _field
 from typing import Any as _Any
+from typing import cast
 
 import numpy as _numpy
 import pandas as _pd
@@ -1415,7 +1416,7 @@ for _b, _c in ((b"A", 0), (b"C", 1), (b"G", 2), (b"T", 3),
 
 def _encode_codes(seq_bytes: _numpy.ndarray) -> _numpy.ndarray:
     """Encode an ASCII byte array to int8 codes (0-3 for ACGT, -1 for N)."""
-    return _DNA_BASE_CODE[seq_bytes]
+    return _numpy.asarray(_DNA_BASE_CODE[seq_bytes])
 
 
 def _build_log_p_from_cdf(
@@ -1452,7 +1453,7 @@ def _interval_lookup_arr(intervals: _pd.DataFrame, chrom: str) -> _numpy.ndarray
     if rows.empty:
         return _numpy.empty((0, 2), dtype=_numpy.int64)
     arr = rows[["start", "end"]].to_numpy(dtype=_numpy.int64)
-    return arr[arr[:, 0].argsort()]
+    return _numpy.asarray(arr[arr[:, 0].argsort()])
 
 
 def gsynth_score(
@@ -1562,8 +1563,13 @@ def gsynth_score(
 
     if intervals is None:
         intervals = chrom_sizes.copy()
-    intervals = _maybe_load_intervals_set(intervals)
-    intervals = intervals.reset_index(drop=True)
+    intervals_loaded = _maybe_load_intervals_set(intervals)
+    if not isinstance(intervals_loaded, _pd.DataFrame):
+        raise TypeError(
+            "intervals must resolve to a DataFrame (got "
+            f"{type(intervals_loaded).__name__})"
+        )
+    intervals = intervals_loaded.reset_index(drop=True)
 
     # Build log-probability arrays from the model CDFs.
     log_p_list, bin_is_sparse = _build_log_p_from_cdf(model.model_data["cdf"])
@@ -1640,12 +1646,14 @@ def gsynth_score(
     iter_chroms_sorted = iter_chroms_str[order_idx]
     iter_starts_sorted = iter_starts[order_idx]
     bin_indices_sorted = bin_indices[order_idx]
-    unique_chroms, edges = _numpy.unique(iter_chroms_sorted, return_index=True)
-    edges = list(edges) + [len(iter_chroms_sorted)]
+    unique_chroms, edges_arr = _numpy.unique(
+        iter_chroms_sorted, return_index=True
+    )
+    edge_list: list[int] = [int(x) for x in edges_arr] + [len(iter_chroms_sorted)]
     for i, c in enumerate(unique_chroms):
         bins_per_chrom[str(c)] = _numpy.column_stack([
-            iter_starts_sorted[edges[i]:edges[i + 1]],
-            bin_indices_sorted[edges[i]:edges[i + 1]].astype(_numpy.int64),
+            iter_starts_sorted[edge_list[i]:edge_list[i + 1]],
+            bin_indices_sorted[edge_list[i]:edge_list[i + 1]].astype(_numpy.int64),
         ])
 
     # Mask intervals per chrom (sorted).
@@ -2290,7 +2298,8 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
                 f"prior_matrix must have shape ({total_bins}, 4), got "
                 f"{prior_arr.shape}"
             )
-        metadata["data"]["prior"] = {
+        data_section = cast("dict[str, _Any]", metadata["data"])
+        data_section["prior"] = {
             "dtype": "float64",
             "shape": [int(total_bins), 4],
             "order": "C",

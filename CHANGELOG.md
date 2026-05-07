@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.36 (2026-05-07)
+
+### CI fixes
+- **mypy: clean type errors introduced in v0.1.34/v0.1.35.** Type-correct fixes only; no functional changes.
+  - `gintervals_from_tuples` cast its `list[int]` strands to the wider `list[int | str]` accepted by `gintervals` after the character-strand widening in v0.1.34.
+  - Wrap a couple of fancy-indexed `_DNA_BASE_CODE[seq_bytes]` and `arr[arr[:, 0].argsort()]` returns in `_numpy.asarray` so mypy recognises the ndarray result.
+  - `_extract_bin_data`'s string lookup branch in `gsynth_score` now narrows the result of `_maybe_load_intervals_set` (which can return a name string) to `DataFrame` before calling `reset_index`.
+  - Replace `unique(..., return_index=True) -> list(...)` reassignment with a fresh `edge_list: list[int]` to avoid the array→list type clash.
+  - Use `cast(dict[str, Any], metadata["data"])` to type-check the prior-bin nested dict assignment in `gsynth_save`.
+- **conda publish: install `conda-build` in the `base` env, not the activated `build` env.** The recent `setup-miniconda@v3` change leaves the activated env without the `conda build` subcommand if `conda-build` is installed there, which was causing every `conda build` step to fail with "argument COMMAND: invalid choice: 'build'" since v0.1.34. Install with `-n base` so the subcommand is registered against the conda CLI.
+
 ## v0.1.35 (2026-05-06)
 
 ### Features

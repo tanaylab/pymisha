@@ -1053,7 +1053,10 @@ def gintervals_from_strings(regions: str | list[str]) -> pd.DataFrame:
         else:
             strands.append(0)
 
-    return gintervals(chroms, starts, ends, strands if has_strand else None)
+    return gintervals(
+        chroms, starts, ends,
+        cast(list[int | str], strands) if has_strand else None,
+    )
 
 
 def gintervals_from_bed(path: str | Path, has_strand: bool = False) -> pd.DataFrame | None:
