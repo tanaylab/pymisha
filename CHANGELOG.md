@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.37 (2026-05-07)
+
+### CI fixes
+- **mypy under numpy 2.2.x in CI.** `_numpy.where(...)` returns a generic-shape `ndarray[tuple[int, ...], ...]` that mypy (with the typing tightening that landed in numpy 2.2) refuses to assign back to a variable previously bound to a 1-D `ndarray[tuple[int], ...]`. Two `_numpy.where(...)` results in `gsynth_score` (the per-flat-bin index in `_extract_bin_data` and the NaN-masked `raw` log-p) are now wrapped in `cast(ndarray, ...)`. Newer numpy (≥2.4) didn't reproduce this locally, hence the slip.
+
 ## v0.1.36 (2026-05-07)
 
 ### CI fixes

@@ -1638,7 +1638,10 @@ def gsynth_score(
             valid &= bidx >= 0
             bin_indices += _numpy.where(bidx >= 0, bidx, 0) * stride
             stride *= n_bins
-        bin_indices = _numpy.where(valid, bin_indices, -1).astype(_numpy.int32)
+        bin_indices = cast(
+            _numpy.ndarray,
+            _numpy.where(valid, bin_indices, -1).astype(_numpy.int32),
+        )
 
     # Build per-chrom (start, bin_idx) lookup, sorted.
     bins_per_chrom: dict[str, _numpy.ndarray] = {}
@@ -1836,7 +1839,7 @@ def gsynth_score(
                     if nan_pos.any():
                         bad_pos = valid_idx[nan_pos]
                         _numpy.logical_or.at(any_na, out_bin[bad_pos], True)
-                    raw = _numpy.where(nan_pos, 0.0, raw)
+                    raw = cast(_numpy.ndarray, _numpy.where(nan_pos, 0.0, raw))
                     contrib[valid_idx] = raw
                 if ctx_n_contrib.any():
                     contrib[ctx_n_contrib] = UNIFORM_LOGP
