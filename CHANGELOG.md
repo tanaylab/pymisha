@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.38 (2026-05-07)
+
+### CI fixes
+- **conda publish: install `anaconda-client` in the activated build env, not base.** v0.1.36 moved `conda-build` to `-n base` so the `conda build` subcommand resolves; that surfaced the symmetric issue on the upload step, where the workflow's `defaults.run.shell: bash -el {0}` activates the `build` env, and `anaconda` (provided by `anaconda-client`) wasn't on its PATH. With v0.1.36/v0.1.37 conda builds, packages built fine but the upload step bailed with `anaconda: command not found`. Split the install: `conda-build` in base (next to the conda CLI), `anaconda-client` in the activated env.
+
 ## v0.1.37 (2026-05-07)
 
 ### CI fixes

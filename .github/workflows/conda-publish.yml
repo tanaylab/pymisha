@@ -42,11 +42,13 @@ jobs:
           activate-environment: build
 
       - name: Install conda-build and anaconda-client
-        # conda-build must live alongside the conda CLI (base env);
-        # installing into the activated `build` env leaves
-        # `conda build` undefined.
+        # conda-build must live alongside the conda CLI (base env), or
+        # `conda build` is undefined. anaconda-client provides the
+        # `anaconda` upload binary, which has to live in the activated
+        # `build` env because that's where the upload step runs.
         run: |
-          conda install -n base -y conda-build anaconda-client
+          conda install -n base -y conda-build
+          conda install -y anaconda-client
 
       - name: Extract version
         id: version
