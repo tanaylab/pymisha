@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.39 (2026-05-13)
+
+### Fixes
+- **`gpartition`, `gquantiles`, `gscreen`, `gintervals_quantiles` with `±inf` breaks routed every value to the last bin.** `BinFinder` used a uniform-binsize fast path that hit `Inf/Inf = NaN` on breaks like `c(-inf, x, inf)` and silently misrouted output. The binary-search path is now used whenever the binsize is non-finite. (R misha #110.)
+
+### Features
+- **`gtrack_copy` now supports cross-database copy.** New optional arguments:
+  - `db=` — destination database root. Accepts the active `GROOT`, any member of `GDATASETS`, or a valid unloaded misha root (`chrom_sizes.txt` + `tracks/`). Cross-genome destinations work.
+  - `overwrite=` — replace an existing destination track.
+  - `src` accepts a single track name or an iterable. With an iterable, `dest=` becomes a namespace prefix (`"ns"` -> `ns.track1`, `ns.track2`, ...); `dest=None` keeps each track's name.
+
+  Format mismatches between source and destination (per-chromosome vs indexed) are converted on the fly. Chromosome-order differences are remapped per file, with chr-prefix canonicalization. Chromosomes present in source but not destination are dropped with a warning; the copy refuses to create an empty track. 2D tracks (`rectangles`, `points`) require identical chromosome order. `gtrack_copy` now returns the list of created destination track names. (R misha 5.6.28.)
+
+### Performance
+- **`gdb_init` on fragmented assemblies (>1000 contigs, no `chr` prefix, no mito chrom) no longer creates a `chr<name>` alias for every contig.** Ensembl-style mammalian or insect genomes are unaffected; only genomes like Phylo447 (2.4M `scaffold_*` contigs) avoid the alias blowup. (R misha #112.)
+
 ## v0.1.38 (2026-05-07)
 
 ### CI fixes

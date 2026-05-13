@@ -184,6 +184,28 @@ def pm_track_convert_to_indexed(
     C++ signature: ``PyArg_ParseTuple(args, "s|p", &track, &remove_old)``
     """
 
+def pm_track_split_indexed_to_per_chrom(
+    track_dir: str, chrom_names: Sequence[str], remove_indexed: bool = ..., /
+) -> None:
+    """Split a 1D indexed track back into per-chromosome files.
+
+    Used by ``gtrack_copy`` for cross-db format conversion.
+
+    C++ signature: ``PyArg_ParseTuple(args, "sO|p", &track_dir, &py_chrom_names, &remove_indexed)``
+    """
+
+def pm_track_pack_per_chrom_to_indexed(
+    track_dir: str, chrom_names: Sequence[str], track_type: str, /
+) -> None:
+    """Pack per-chromosome files in a track directory into track.idx + track.dat.
+
+    Takes explicit args so it works without active GROOT context. Per-chrom
+    files are preserved alongside the indexed pair (pymisha read-path
+    requirement).
+
+    C++ signature: ``PyArg_ParseTuple(args, "sOs", &track_dir, &py_chrom_names, &track_type)``
+    """
+
 def pm_track_create_empty_indexed(track: str, /) -> None:
     """Create empty indexed track (empty track.idx + track.dat).
 

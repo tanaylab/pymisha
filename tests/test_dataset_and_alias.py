@@ -21,6 +21,90 @@ def test_chrom_alias_chr_prefix():
     assert intervals.iloc[0]["chrom"] == "1"
 
 
+def _make_synthetic_groot(tmp_path: Path, names: list[str], size: int = 1000) -> Path:
+    """Build a minimal groot with the given canonical chrom names."""
+    root = tmp_path / "synthetic_groot"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "tracks").mkdir(exist_ok=True)
+    with (root / "chrom_sizes.txt").open("w") as fh:
+        for name in names:
+            fh.write(f"{name}\t{size}\n")
+    return root
+
+
+def _restore_example_db():
+    pm.gdb_init(str(TEST_DB))
+
+
+def test_chrom_alias_skipped_on_large_fragmented_assembly(tmp_path):
+    """Regression: R misha #112 part 2.
+
+    On a fragmented assembly with > 1000 contigs whose names carry no "chr"
+    prefix and no mitochondrial pattern, the "chr"+name aliases are skipped.
+    Memory and lookup-time savings on assemblies like Phylo447 (2.4M scaffolds).
+    """
+    names = [f"scaffold_{i}" for i in range(1001)]
+    groot = _make_synthetic_groot(tmp_path, names)
+    try:
+        pm.gdb_init(str(groot))
+        # Canonical names must still resolve.
+        result = pm.gintervals("scaffold_500", 0, 100)
+        assert result.iloc[0]["chrom"] == "scaffold_500"
+        # "chr"+name alias should NOT have been created.
+        with pytest.raises((ValueError, RuntimeError, Exception)):
+            pm.gintervals("chrscaffold_500", 0, 100)
+    finally:
+        _restore_example_db()
+
+
+def test_chrom_alias_kept_on_small_assembly(tmp_path):
+    """Boundary: with n <= 1000 contigs the chr-prefix alias is still added."""
+    names = [f"scaffold_{i}" for i in range(1000)]
+    groot = _make_synthetic_groot(tmp_path, names)
+    try:
+        pm.gdb_init(str(groot))
+        # Both canonical and "chr"+name should resolve.
+        result = pm.gintervals("scaffold_500", 0, 100)
+        assert result.iloc[0]["chrom"] == "scaffold_500"
+        result_chr = pm.gintervals("chrscaffold_500", 0, 100)
+        assert result_chr.iloc[0]["chrom"] == "scaffold_500"
+    finally:
+        _restore_example_db()
+
+
+def test_chrom_alias_kept_when_mito_present(tmp_path):
+    """When the genome has a mito-pattern chrom, chr-prefix aliases are kept."""
+    names = [f"scaffold_{i}" for i in range(1001)] + ["MT"]
+    groot = _make_synthetic_groot(tmp_path, names)
+    try:
+        pm.gdb_init(str(groot))
+        # MT-presence keeps the chr-prefix alias path enabled.
+        result_chr = pm.gintervals("chrscaffold_500", 0, 100)
+        assert result_chr.iloc[0]["chrom"] == "scaffold_500"
+        # Mito itself resolves through M / chrM aliases.
+        m_result = pm.gintervals("chrM", 0, 100)
+        assert m_result.iloc[0]["chrom"] == "MT"
+    finally:
+        _restore_example_db()
+
+
+def test_chrom_alias_kept_when_chr_prefix_present(tmp_path):
+    """When at least one chrom carries the chr prefix, aliases are kept even for >1000 contigs."""
+    names = ["chr1"] + [f"scaffold_{i}" for i in range(1001)]
+    groot = _make_synthetic_groot(tmp_path, names)
+    try:
+        pm.gdb_init(str(groot))
+        # chr1's unprefixed alias resolves.
+        r1 = pm.gintervals("1", 0, 100)
+        assert r1.iloc[0]["chrom"] == "chr1"
+        # And since chr-prefix is present anywhere, the chr-prefix alias path
+        # is enabled for non-prefixed names too.
+        r2 = pm.gintervals("chrscaffold_500", 0, 100)
+        assert r2.iloc[0]["chrom"] == "scaffold_500"
+    finally:
+        _restore_example_db()
+
+
 def test_dataset_load_force_and_resolution(tmp_path):
     dataset_root = _copy_db(tmp_path)
 

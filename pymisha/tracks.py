@@ -18,7 +18,9 @@ import re
 import shutil
 import struct
 import tempfile
+import warnings
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -2006,37 +2008,301 @@ def gtrack_mv(src: str, dest: str) -> None:
     _pymisha.pm_dbreload()
 
 
-def gtrack_copy(src: str, dest: str) -> None:
-    """
-    Create a copy of an existing track.
+_TRACK_INTERNAL_FILES = frozenset(
+    {"track.idx", "track.dat", ".attributes", "vars", ".meta"}
+)
 
-    Copies a track's on-disk directory to the current writable database
-    root. The source track may reside in a different database when
-    multiple databases are connected.
+
+def _db_chrom_names_at(root: str | Path) -> list[str]:
+    """Read chromosome names from chrom_sizes.txt at the given DB root."""
+    path = Path(root) / "chrom_sizes.txt"
+    if not path.exists():
+        raise ValueError(f"chrom_sizes.txt missing in {root}")
+    names: list[str] = []
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                parts = line.split()
+            names.append(parts[0])
+    return names
+
+
+def _resolve_dest_db(db: str | None) -> Path:
+    """Resolve a destination DB root for cross-database track copy.
+
+    NULL means the current writable DB (UROOT or GROOT). Otherwise the
+    given path must either be one of the currently-loaded roots (GROOT
+    or a loaded dataset) or look like a valid misha DB (chrom_sizes.txt
+    and tracks/ both present).
+    """
+    if db is None:
+        root = _target_root()
+        if not root:
+            raise ValueError("Database not initialized. Call gdb_init() first.")
+        return Path(root)
+    resolved = Path(db).expanduser().resolve(strict=True)
+    groot = _shared._GROOT
+    gdatasets = list(_shared._GDATASETS or [])
+    loaded = [str(Path(p).resolve()) for p in [groot] + gdatasets if p]
+    if str(resolved) in loaded:
+        return resolved
+    if not (resolved / "chrom_sizes.txt").exists():
+        raise ValueError(
+            f"Destination db {resolved} does not contain a chrom_sizes.txt file."
+        )
+    if not (resolved / "tracks").is_dir():
+        raise ValueError(
+            f"Destination db {resolved} does not contain a tracks/ directory."
+        )
+    return resolved
+
+
+def _dest_db_loaded(dest_db: Path) -> bool:
+    groot = _shared._GROOT
+    gdatasets = list(_shared._GDATASETS or [])
+    loaded = [str(Path(p).resolve()) for p in [groot] + gdatasets if p]
+    return str(dest_db.resolve()) in loaded
+
+
+def _copy_track_dir(src_dir: Path, dest_dir: Path) -> None:
+    """Copy the full source track directory into dest_dir.
+
+    Tolerates a pre-existing empty dest_dir (used so cross-db conversion
+    helpers can register the destination before writing into it).
+    """
+    if dest_dir.exists():
+        for entry in src_dir.iterdir():
+            target = dest_dir / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, target)
+            else:
+                shutil.copy2(entry, target)
+    else:
+        shutil.copytree(src_dir, dest_dir)
+
+
+def _match_chrom_alias(filename: str, dest_chroms: list[str]) -> str | None:
+    """Return dest's canonical name for a per-chrom file, tolerating chr prefix variation."""
+    if filename in dest_chroms:
+        return filename
+    if filename.startswith("chr"):
+        stripped = filename[3:]
+        if stripped in dest_chroms:
+            return stripped
+    else:
+        prefixed = "chr" + filename
+        if prefixed in dest_chroms:
+            return prefixed
+    return None
+
+
+def _gtrack_copy_pipeline(
+    src_dir: Path,
+    dest_dir: Path,
+    src_chroms: list[str],
+    dest_chroms: list[str],
+    src_indexed: bool,
+    dest_indexed: bool,
+    track_type: str,
+    destname: str,
+    dest_db: Path,
+) -> None:
+    """Pipeline: copy dir -> [decode if src indexed] -> [drop unmapped] -> [encode if dest indexed]."""
+    same_order = src_chroms == dest_chroms
+
+    if same_order and src_indexed == dest_indexed:
+        _copy_track_dir(src_dir, dest_dir)
+        return
+
+    if track_type in ("rectangles", "points"):
+        # 2D guard already enforced above; only format conversion remains.
+        if src_indexed and not dest_indexed:
+            raise NotImplementedError(
+                f"Cross-db copy of indexed 2D track {destname!r} into a per-chromosome database is not yet supported."
+            )
+        _copy_track_dir(src_dir, dest_dir)
+        if dest_indexed and not src_indexed:
+            if dest_db.resolve() != Path(_shared._GROOT or "").resolve():
+                raise NotImplementedError(
+                    f"Cross-db copy of 2D track {destname!r} with format conversion "
+                    "to a non-active dataset is not yet supported."
+                )
+            gtrack_2d_convert_to_indexed(destname, remove_old=True)
+        return
+
+    # 1D pipeline.
+    _copy_track_dir(src_dir, dest_dir)
+
+    if src_indexed:
+        _pymisha.pm_track_split_indexed_to_per_chrom(
+            str(dest_dir), list(src_chroms), True
+        )
+
+    files_in_dir = [p.name for p in dest_dir.iterdir()]
+    dest_with_variants = set(dest_chroms)
+    for c in dest_chroms:
+        if c.startswith("chr"):
+            dest_with_variants.add(c[3:])
+        else:
+            dest_with_variants.add("chr" + c)
+    candidates_for_drop = [f for f in files_in_dir if f not in _TRACK_INTERNAL_FILES]
+    dropped = [f for f in candidates_for_drop if f not in dest_with_variants]
+    if dropped:
+        warnings.warn(
+            f"gtrack_copy({destname!r}): dropped chromosomes not present in destination: "
+            + ", ".join(dropped),
+            stacklevel=3,
+        )
+        for f in dropped:
+            (dest_dir / f).unlink()
+
+    remaining = [
+        p.name for p in dest_dir.iterdir() if p.name not in _TRACK_INTERNAL_FILES
+    ]
+    if candidates_for_drop and not remaining:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise ValueError(
+            f"gtrack_copy({destname!r}): no chromosomes from source database are present in destination; "
+            "refusing to create empty track."
+        )
+
+    # Canonicalize remaining per-chrom filenames to dest's preferred form.
+    for f in list(remaining):
+        canonical = _match_chrom_alias(f, dest_chroms)
+        if canonical is not None and canonical != f:
+            (dest_dir / f).rename(dest_dir / canonical)
+
+    if dest_indexed:
+        if track_type not in ("dense", "sparse", "array"):
+            raise NotImplementedError(
+                f"Cross-db copy of {track_type} track {destname!r} with format "
+                "conversion to a non-active dataset is not yet supported."
+            )
+        _pymisha.pm_track_pack_per_chrom_to_indexed(
+            str(dest_dir), list(dest_chroms), track_type
+        )
+
+
+def _gtrack_copy_one(
+    srcname: str, destname: str, dest_db: Path, overwrite: bool
+) -> str:
+    if not _track_exists(srcname):
+        raise ValueError(f"Track '{srcname}' does not exist")
+
+    src_db_raw = gtrack_dataset(srcname)
+    src_db = Path(src_db_raw) if src_db_raw else Path(_shared._GROOT or "")
+
+    if srcname == destname and src_db.resolve() == dest_db.resolve():
+        raise ValueError(
+            f"Source and destination are the same track: {srcname}"
+        )
+
+    src_dir = Path(_pymisha.pm_track_path(srcname))
+    dest_dir = (
+        dest_db / "tracks" / f"{destname.replace('.', '/')}.track"
+    )
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest_dir.exists():
+        if not overwrite:
+            raise ValueError(
+                f"Track {destname!r} already exists in {dest_db}; use overwrite=True to replace."
+            )
+        shutil.rmtree(dest_dir)
+
+    src_indexed = (src_dir / "track.idx").exists()
+    dest_indexed = _db_is_indexed(str(dest_db))
+    src_chroms = _db_chrom_names_at(src_db)
+    dest_chroms = _db_chrom_names_at(dest_db)
+
+    info = gtrack_info(srcname)
+    track_type = info.get("type", "")
+
+    if track_type in ("rectangles", "points") and src_chroms != dest_chroms:
+        raise ValueError(
+            f"Cross-db copy of 2D track {srcname!r} requires identical chromosome order in source and destination."
+        )
+
+    dest_db_loaded = _dest_db_loaded(dest_db)
+
+    try:
+        _gtrack_copy_pipeline(
+            src_dir,
+            dest_dir,
+            src_chroms,
+            dest_chroms,
+            src_indexed,
+            dest_indexed,
+            track_type,
+            destname,
+            dest_db,
+        )
+    except Exception:
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+
+    if dest_db_loaded:
+        _pymisha.pm_dbreload()
+
+    return destname
+
+
+def gtrack_copy(
+    src: str | Iterable[str],
+    dest: str | None = None,
+    db: str | None = None,
+    overwrite: bool = False,
+) -> list[str]:
+    """
+    Copy one or more tracks, optionally to a different database.
+
+    Transparently handles format mismatches (per-chromosome vs indexed)
+    and chromosome-order differences between source and destination
+    databases. Chromosomes that exist in the source database but not in
+    the destination are dropped with a warning.
+
+    For 2D tracks (rectangles, points), cross-database copy requires
+    identical chromosome order in source and destination.
 
     Parameters
     ----------
-    src : str
-        Name of the source track.
-    dest : str
-        Name for the new copy.
+    src : str or iterable of str
+        Source track name(s). Either a single name or an iterable of names.
+    dest : str, optional
+        Destination name. For a single source, this is the destination
+        track name (defaults to *src*). For a sequence of sources, this
+        is interpreted as a namespace prefix (e.g. ``"ns"`` produces
+        ``"ns.track1"``, ``"ns.track2"``, ...). ``None`` keeps each
+        track's original name.
+    db : str, optional
+        Destination database root. Must be the active GROOT, a member of
+        the loaded datasets, or a path that looks like a valid misha
+        database (contains ``chrom_sizes.txt`` and ``tracks/``). ``None``
+        means the current writable database.
+    overwrite : bool, default False
+        If True, replace an existing destination track.
 
     Returns
     -------
-    None
+    list[str]
+        The created destination track names.
 
     Raises
     ------
     ValueError
-        If source and destination are identical, the source track does
-        not exist, or the destination track already exists.
+        Source track does not exist; destination already exists with
+        ``overwrite=False``; 2D track copy with mismatched chromosome
+        order; or destination database invalid.
 
     See Also
     --------
     gtrack_mv : Rename / move a track within the same database.
     gtrack_rm : Delete a track.
-    gtrack_exists : Test whether a track exists.
-    gtrack_ls : List available tracks.
 
     Examples
     --------
@@ -2048,23 +2314,50 @@ def gtrack_copy(src: str, dest: str) -> None:
     >>> pm.gtrack_rm("dense_track_copy", force=True)  # doctest: +SKIP
     """
     _checkroot()
-    _validate_track_name(src)
-    _validate_track_name(dest)
-    if src == dest:
-        raise ValueError("Source and destination track names are the same")
-    if not _track_exists(src):
-        raise ValueError(f"Track '{src}' does not exist")
-    if _track_exists(dest):
-        raise ValueError(f"Track '{dest}' already exists")
 
-    src_dir = Path(_pymisha.pm_track_path(src))
-    dest_dir = _track_dir_for_create(dest)
-    dest_dir.parent.mkdir(parents=True, exist_ok=True)
-    if dest_dir.exists():
-        raise ValueError(f"Destination track directory already exists: {dest_dir}")
+    if isinstance(src, str):
+        srcnames = [src]
+        single = True
+    else:
+        srcnames = list(src)
+        single = False
 
-    shutil.copytree(src_dir, dest_dir)
-    _pymisha.pm_dbreload()
+    if not srcnames:
+        return []
+
+    for s in srcnames:
+        _validate_track_name(s)
+
+    if dest is None:
+        destnames = list(srcnames)
+    elif single:
+        if not isinstance(dest, str):
+            raise ValueError(
+                "When copying a single track, 'dest' must be a single name or None."
+            )
+        destnames = [dest]
+    else:
+        if not isinstance(dest, str):
+            raise ValueError(
+                "When copying multiple tracks, 'dest' must be a single namespace prefix or None."
+            )
+        prefix = dest.rstrip(".")
+        destnames = [f"{prefix}.{s}" for s in srcnames]
+
+    for d in destnames:
+        _validate_track_name(d)
+
+    dest_db = _resolve_dest_db(db)
+    tracks_dir = dest_db / "tracks"
+    if not tracks_dir.exists():
+        tracks_dir.mkdir(parents=True, exist_ok=True)
+    if not os.access(str(tracks_dir), os.W_OK):
+        raise PermissionError(f"No write permission to copy track to {tracks_dir}")
+
+    created: list[str] = []
+    for s, d in zip(srcnames, destnames, strict=True):
+        created.append(_gtrack_copy_one(s, d, dest_db, overwrite))
+    return created
 
 
 def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:

@@ -226,3 +226,66 @@ class TestGpartitionMatchesR:
         _check_partition_invariants(result, breaks)
         # Test DB has chroms 1, 2, X
         assert set(result["chrom"].unique()) == {"1", "2", "X"}
+
+
+class TestGpartitionInfBreaks:
+    """Regression tests for BinFinder ±Inf break handling (R misha #110)."""
+
+    def test_partition_with_inf_breaks_distinguishes_both_bins(self):
+        """gpartition with [-inf, x, inf] breaks must populate both bins.
+
+        Before the BinFinder fix, the per-step diff between adjacent breaks
+        was Inf, m_binsize stayed Inf, and val2bin's uniform-binsize fast
+        path computed Inf/Inf -> NaN -> (int)NaN, silently routing every
+        value to the last bin.
+        """
+        intervals = pm.gintervals("1", 0, 5000)
+        cut_at = 0.1  # dense_track values span ~[0, 0.2]
+
+        result = pm.gpartition(
+            "dense_track",
+            [-np.inf, cut_at, np.inf],
+            intervals,
+            include_lowest=True,
+            iterator=50,
+        )
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+        # Both bins must actually appear; the buggy "always last bin"
+        # behaviour would give a single unique bin.
+        assert set(result["bin"].unique()) == {1, 2}
+
+        # Cross-check total bp per bin against a manual pandas cut.
+        raw = pm.gextract(
+            "dense_track", intervals, iterator=50, colnames=["x"]
+        )
+        expected_bin = pd.cut(
+            raw["x"],
+            bins=[-np.inf, cut_at, np.inf],
+            include_lowest=True,
+            right=True,
+            labels=[1, 2],
+        ).astype("Int64")
+        expected_bp = (
+            (raw["end"] - raw["start"]).groupby(expected_bin, observed=True).sum()
+        )
+        actual_bp = (
+            (result["end"] - result["start"]).groupby(result["bin"]).sum()
+        )
+        assert int(actual_bp.loc[1]) == int(expected_bp.loc[1])
+        assert int(actual_bp.loc[2]) == int(expected_bp.loc[2])
+
+    def test_partition_with_inf_breaks_three_bins(self):
+        """[-inf, a, b, inf] with three resulting bins must all be reachable."""
+        intervals = pm.gintervals("1", 0, 5000)
+        breaks = [-np.inf, 0.05, 0.15, np.inf]
+
+        result = pm.gpartition(
+            "dense_track", breaks, intervals, include_lowest=True, iterator=50
+        )
+
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+        # All three bins must actually appear.
+        assert set(result["bin"].unique()) == {1, 2, 3}

@@ -48,6 +48,8 @@ PyObject *pm_track_path(PyObject *self, PyObject *args);
 PyObject *pm_track_dataset(PyObject *self, PyObject *args);
 PyObject *pm_normalize_chroms(PyObject *self, PyObject *args);
 PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args);
+PyObject *pm_track_split_indexed_to_per_chrom(PyObject *self, PyObject *args);
+PyObject *pm_track_pack_per_chrom_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track_create_empty_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track_create_sparse(PyObject *self, PyObject *args);
 PyObject *pm_track_create_dense(PyObject *self, PyObject *args);
@@ -108,6 +110,8 @@ static PyMethodDef module_methods[] = {
     {"pm_track_dataset", pm_track_dataset, METH_VARARGS, "Get track dataset root"},
     {"pm_normalize_chroms", pm_normalize_chroms, METH_VARARGS, "Normalize chromosome names"},
     {"pm_track_convert_to_indexed", pm_track_convert_to_indexed, METH_VARARGS, "Convert track to indexed format"},
+    {"pm_track_split_indexed_to_per_chrom", pm_track_split_indexed_to_per_chrom, METH_VARARGS, "Split indexed track back into per-chromosome files"},
+    {"pm_track_pack_per_chrom_to_indexed", pm_track_pack_per_chrom_to_indexed, METH_VARARGS, "Pack per-chromosome files into indexed format (explicit args)"},
     {"pm_track_create_empty_indexed", pm_track_create_empty_indexed, METH_VARARGS, "Create empty indexed track"},
     {"pm_track_create_sparse", pm_track_create_sparse, METH_VARARGS, "Create sparse track from intervals+values"},
     {"pm_track_create_dense", pm_track_create_dense, METH_VARARGS, "Create dense track from intervals+values"},

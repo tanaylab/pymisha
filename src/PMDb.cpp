@@ -92,6 +92,37 @@ void PMDb::load_chrom_sizes() {
         chrom_names.push_back(chrom_name);
     }
 
+    // Pre-scan for the chr-prefix-alias skip heuristic (R misha #112):
+    // On fragmented assemblies (e.g. 2.4M-contig scaffold_* genomes) the
+    // "chr"+name aliases blow up the alias map for no user benefit, since
+    // nobody types `chrscaffold_12345`. Skip them when the genome has more
+    // than 1000 contigs AND no canonical name carries a "chr" prefix AND
+    // no name is a mitochondrial pattern. Small genomes and any Ensembl/UCSC
+    // style assembly with mito stay unaffected.
+    bool has_chr_prefix_any = false;
+    bool has_mito_any = false;
+    for (const auto &chrom_name : chrom_names) {
+        if (chrom_name.compare(0, 3, "chr") == 0) {
+            has_chr_prefix_any = true;
+        }
+        std::string unpref = chrom_name;
+        if (chrom_name.compare(0, 3, "chr") == 0 && chrom_name.size() > 3) {
+            unpref = chrom_name.substr(3);
+        }
+        std::string up_unpref = unpref;
+        std::transform(up_unpref.begin(), up_unpref.end(), up_unpref.begin(), ::toupper);
+        std::string up_chrom = chrom_name;
+        std::transform(up_chrom.begin(), up_chrom.end(), up_chrom.begin(), ::toupper);
+        if (up_unpref == "M" || up_unpref == "MT" ||
+            up_chrom == "CHRM" || up_chrom == "CHRMT") {
+            has_mito_any = true;
+        }
+        if (has_chr_prefix_any && has_mito_any)
+            break;
+    }
+    const bool add_chr_prefix_aliases =
+        has_chr_prefix_any || has_mito_any || chrom_names.size() <= 1000;
+
     // Add aliases (chr prefix + mitochondrial aliases)
     for (const auto &chrom_name : chrom_names) {
         int id = m_chromkey.chrom2id(chrom_name);
@@ -104,9 +135,12 @@ void PMDb::load_chrom_sizes() {
                 unprefixed = chrom_name.substr(3);
                 m_chromkey.add_chrom_alias(unprefixed, id);
             }
-        } else {
+        } else if (add_chr_prefix_aliases) {
             m_chromkey.add_chrom_alias("chr" + chrom_name, id);
         }
+
+        if (!has_mito_any)
+            continue;
 
         std::string upper_unprefixed = unprefixed;
         std::transform(upper_unprefixed.begin(), upper_unprefixed.end(),
