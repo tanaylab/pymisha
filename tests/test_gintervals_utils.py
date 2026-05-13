@@ -553,3 +553,30 @@ class TestGintervalsRandom:
     def test_invalid_chromosomes_raises(self):
         with pytest.raises((ValueError, Exception)):
             pm.gintervals_random(100, 50, chromosomes=["nonexistent_chrom"])
+
+    def test_contig_exactly_size_plus_2dist_accepted(self):
+        """Regression for R misha 5.6.30 #1b41bceb: contig of length exactly
+        size + 2*dist_from_edge has a single valid start at `dist_from_edge`
+        and must not be rejected as 'too short'."""
+        # Example DB chrom 1 is 500k. Choose size=200_000, dist=150_000
+        # so that size + 2*dist = 500_000 == chrom length.
+        result = pm.gintervals_random(
+            200_000, 5, dist_from_edge=150_000, chromosomes=["1"]
+        )
+        assert len(result) == 5
+        # The single valid start position is `dist_from_edge`.
+        assert (result["start"] == 150_000).all()
+        assert (result["end"] == 350_000).all()
+        assert (result["chrom"] == "1").all()
+
+    def test_size_equals_chrom_length_dist_zero(self):
+        """Regression for R misha 5.6.30 #1b41bceb: gintervals_random(L, n,
+        dist_from_edge=0) on a length-L contig must produce intervals at
+        [0, L), not error with 'chromosome is too short'."""
+        # Example DB chrom 1 is exactly 500_000 bp.
+        result = pm.gintervals_random(
+            500_000, 3, dist_from_edge=0, chromosomes=["1"]
+        )
+        assert len(result) == 3
+        assert (result["start"] == 0).all()
+        assert (result["end"] == 500_000).all()

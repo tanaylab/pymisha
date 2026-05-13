@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.41 (2026-05-13)
+
+### Testing
+- **`gintervals_random` regression tests** for the R 5.6.30 `1b41bceb` edge case: contigs of length exactly `size + 2*dist_from_edge` (a single valid start position is available) and contigs of length exactly equal to `size` with `dist_from_edge=0`. PyMisha's pure-Python implementation already handles these correctly - the C++ bug never made it to the Python port. (R misha 5.6.30.)
+
 ## v0.1.40 (2026-05-13)
 
 ### Features
