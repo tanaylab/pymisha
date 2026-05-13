@@ -222,7 +222,7 @@ class TestDirectCppCalls:
 
     def test_pm_seed(self):
         """pm_seed sets the C++ random number generator seed."""
-        _pymisha.pm_seed(42)
+        _pymisha.pm_seed(60427)
         # No return value — just verify it doesn't crash
         _pymisha.pm_seed(0)
         _pymisha.pm_seed(2**31 - 1)

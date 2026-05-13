@@ -4628,7 +4628,7 @@ def gintervals_random(
     >>> _ = pm.gdb_init_examples()
     >>> pm.gintervals_random(100, 1000)  # doctest: +SKIP
     >>> pm.gintervals_random(100, 1000, chromosomes=["1"])  # doctest: +SKIP
-    >>> import numpy as np; np.random.seed(42)
+    >>> import numpy as np; np.random.seed(60427)
     >>> pm.gintervals_random(100, 50)  # doctest: +SKIP
 
     See Also

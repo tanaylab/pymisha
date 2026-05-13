@@ -338,7 +338,7 @@ class TestQuadTreeBinaryCompat:
         _cleanup_track(tname)
         try:
             n = 100
-            rng = np.random.RandomState(42)
+            rng = np.random.RandomState(60427)
             starts1 = rng.randint(0, 400000, size=n)
             starts2 = rng.randint(0, 400000, size=n)
             # Make small non-overlapping rectangles

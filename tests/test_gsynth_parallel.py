@@ -217,7 +217,7 @@ class TestMergeTrainResults:
 
     def test_cdf_valid(self):
         """CDF should be monotonically increasing, ending at 1.0."""
-        c1 = [np.random.RandomState(42).rand(1024, 4) * 100]
+        c1 = [np.random.RandomState(60427).rand(1024, 4) * 100]
         result = _merge_train_results(
             [{
                 "counts": c1,
@@ -370,7 +370,7 @@ class TestGsynthSampleParallel:
         seqs = pm.gsynth_sample(
             trained_model,
             intervals=pm.gintervals(["1"], [0], [1000]),
-            seed=42,
+            seed=60427,
             allow_parallel=False,
         )
         assert len(seqs) == 1
@@ -381,7 +381,7 @@ class TestGsynthSampleParallel:
         seqs = pm.gsynth_sample(
             trained_model,
             intervals=pm.gintervals(["1"], [0], [1000]),
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
         )
@@ -396,7 +396,7 @@ class TestGsynthSampleParallel:
         seqs = pm.gsynth_sample(
             trained_model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -422,7 +422,7 @@ class TestGsynthSampleParallel:
                 output=fasta_path,
                 output_format="fasta",
                 intervals=intervals,
-                seed=42,
+                seed=60427,
                 allow_parallel=True,
                 num_cores=2,
                 max_chunk_size=100,
@@ -453,7 +453,7 @@ class TestGsynthSampleParallel:
             trained_model,
             intervals=intervals,
             n_samples=3,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -469,7 +469,7 @@ class TestGsynthSampleParallel:
         seqs1 = pm.gsynth_sample(
             trained_model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -478,7 +478,7 @@ class TestGsynthSampleParallel:
         seqs2 = pm.gsynth_sample(
             trained_model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -493,7 +493,7 @@ class TestGsynthSampleParallel:
         seqs1 = pm.gsynth_sample(
             trained_model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -519,7 +519,7 @@ class TestGsynthSampleParallel:
             trained_model,
             intervals=intervals,
             mask_copy=mask_copy,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -532,7 +532,7 @@ class TestGsynthSampleParallel:
         seqs = pm.gsynth_sample(
             trained_model,
             intervals=pm.gintervals_all(),
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=1,
             max_chunk_size=100,
@@ -563,7 +563,7 @@ class TestGsynthParallelIntegration:
         seqs = pm.gsynth_sample(
             model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -587,14 +587,14 @@ class TestGsynthParallelIntegration:
         seqs_serial = pm.gsynth_sample(
             model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=False,
         )
 
         seqs_parallel = pm.gsynth_sample(
             model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,
@@ -622,7 +622,7 @@ class TestGsynthParallelIntegration:
         seqs = pm.gsynth_sample(
             model,
             intervals=intervals,
-            seed=42,
+            seed=60427,
             allow_parallel=True,
             num_cores=2,
             max_chunk_size=100,

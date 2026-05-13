@@ -1028,7 +1028,7 @@ class TestGseqPwmBulkScoring:
     """
 
     @staticmethod
-    def _make_random_seqs(n, length, seed=42):
+    def _make_random_seqs(n, length, seed=60427):
         """Generate n random DNA sequences of given length."""
         rng = np.random.RandomState(seed)
         bases = list("ACGT")

@@ -38,7 +38,7 @@ class TestGsample:
     def test_different_seeds_different_samples(self):
         """Different random seeds produce different samples."""
         intervals = pm.gintervals(1, 0, 10000)
-        np.random.seed(42)
+        np.random.seed(60427)
         r1 = pm.gsample("dense_track", 50, intervals)
         np.random.seed(123)
         r2 = pm.gsample("dense_track", 50, intervals)

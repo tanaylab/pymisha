@@ -17,6 +17,7 @@
 #include "BufferedFile.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -25,6 +26,67 @@
 // Defined in PMStubs.cpp
 extern void convert_py_intervals(PyObject *py_intervals,
                                  std::vector<GInterval> &intervals);
+
+// ============================================================================
+// FASTA helper + .fai support
+// ============================================================================
+
+struct FaiEntry {
+    std::string name;
+    long long   length;
+    long long   offset;
+    int         linebases;
+    int         linewidth;
+};
+
+// Write a single FASTA record and record a FaiEntry describing it.
+// header_byte_offset is the byte position of the start of the header line
+// (taken from fasta_ofs.tellp() BEFORE writing the header). offset stored in
+// `out` is the position of the first sequence base, matching samtools faidx.
+static void write_fasta_record(std::ofstream &ofs,
+                               const std::string &name,
+                               const std::vector<char> &seq,
+                               int line_width,
+                               long long header_byte_offset,
+                               FaiEntry *out) {
+    ofs << ">" << name << "\n";
+    for (size_t i = 0; i < seq.size(); i += line_width) {
+        size_t len = std::min(static_cast<size_t>(line_width), seq.size() - i);
+        ofs.write(&seq[i], len);
+        ofs << "\n";
+    }
+    if (out) {
+        out->name   = name;
+        out->length = static_cast<long long>(seq.size());
+        out->offset = header_byte_offset + 1 +
+                      static_cast<long long>(name.size()) + 1;
+        out->linebases = (out->length > 0)
+                            ? std::min<int>(line_width, static_cast<int>(out->length))
+                            : 0;
+        out->linewidth = (out->length > 0) ? out->linebases + 1 : 0;
+    }
+}
+
+// Flush a collected vector of FaiEntry to <fasta_path>.fai (samtools format).
+// On failure to open the file, sets a Python RuntimeError and returns; the
+// caller should check PyErr_Occurred().
+static void flush_fai(const std::string &fasta_path,
+                      const std::vector<FaiEntry> &entries) {
+    std::string fai_path = fasta_path + ".fai";
+    FILE *ffai = std::fopen(fai_path.c_str(), "w");
+    if (!ffai) {
+        PyErr_Format(PyExc_RuntimeError,
+                     "Failed to open .fai file for writing: %s",
+                     fai_path.c_str());
+        return;
+    }
+    for (const auto &e : entries) {
+        std::fprintf(ffai, "%s\t%lld\t%lld\t%d\t%d\n",
+                     e.name.c_str(), e.length, e.offset,
+                     e.linebases, e.linewidth);
+    }
+    std::fclose(ffai);
+}
 
 // ============================================================================
 // pm_gsynth_train
@@ -664,6 +726,7 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         }
 
         std::vector<std::string> collected_seqs;
+        std::vector<FaiEntry> fai_entries;
 
         // --- Sample per chromosome ---
         for (int chromid = 0; chromid < num_chroms; ++chromid) {
@@ -818,12 +881,11 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                         if (n_samples > 1) {
                             header += "_sample" + std::to_string(sample_idx + 1);
                         }
-                        fasta_ofs << ">" << header << "\n";
-                        for (int64_t i = 0; i < interval_len; i += 60) {
-                            int64_t len = std::min<int64_t>(60, interval_len - i);
-                            fasta_ofs.write(&synth_seq[i], len);
-                            fasta_ofs << "\n";
-                        }
+                        long long header_offset = static_cast<long long>(fasta_ofs.tellp());
+                        FaiEntry entry;
+                        write_fasta_record(fasta_ofs, header, synth_seq, 60,
+                                           header_offset, &entry);
+                        fai_entries.push_back(entry);
                     } else {
                         seq_bfile.write(&synth_seq[0], synth_seq.size());
                     }
@@ -835,6 +897,12 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         // Close files
         if (output_format == 1) fasta_ofs.close();
         else if (output_format == 0) seq_bfile.close();
+
+        // Write samtools-compatible .fai index alongside the FASTA.
+        if (output_format == 1) {
+            flush_fai(output_path, fai_entries);
+            if (PyErr_Occurred()) return NULL;
+        }
 
         // Return result
         if (output_format == 2) {

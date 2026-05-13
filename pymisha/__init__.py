@@ -67,7 +67,9 @@ from .genome_edit import (
 from .gsynth import (
     GsynthModel,
     gsynth_bin_map,
+    gsynth_cell_merge,
     gsynth_convert,
+    gsynth_forbid_kmer,
     gsynth_load,
     gsynth_random,
     gsynth_replace_kmer,
@@ -398,11 +400,13 @@ __all__ = [
     # Genome synthesis functions
     'GsynthModel',
     'gsynth_bin_map',
+    'gsynth_cell_merge',
     'gsynth_train',
     'gsynth_sample',
     'gsynth_score',
     'gsynth_random',
     'gsynth_replace_kmer',
+    'gsynth_forbid_kmer',
     'gsynth_save',
     'gsynth_load',
     'gsynth_convert',

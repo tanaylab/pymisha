@@ -6,9 +6,12 @@ import logging as _logging
 import math as _math
 import multiprocessing as _multiprocessing
 import os as _os
+import sys as _sys
+import warnings as _warnings
 import zipfile as _zipfile
 from dataclasses import dataclass as _dataclass
 from dataclasses import field as _field
+from dataclasses import replace as _dc_replace
 from typing import Any as _Any
 from typing import cast
 
@@ -280,6 +283,322 @@ def _resolve_iter_size(iterator: int | None) -> int:
     if iter_int <= 0:
         raise ValueError(f"iterator must be a positive integer, got {iter_int}")
     return iter_int
+
+
+def _compute_flat_indices(
+    per_dim_indices: _numpy.ndarray,
+    dim_sizes: list[int] | _numpy.ndarray,
+) -> _numpy.ndarray:
+    """Flatten per-dimension 1-based bin indices to 1-based flat indices.
+
+    Matches R ``.compute_flat_indices`` semantics. Strides are
+    ``(1, s0, s0*s1, ..., s0*s1*...*s_{n-2})``: dimension 0 is
+    fastest-varying (column-major).
+    Rows containing any sentinel ``-1`` propagate to ``-1`` in the output.
+
+    Parameters
+    ----------
+    per_dim_indices : ndarray, shape (n_positions, n_dims)
+        1-based per-dimension bin indices. Any value ``< 1`` is treated
+        as invalid (``-1`` is the canonical sentinel; ``0`` also works).
+    dim_sizes : list[int]
+        Number of bins in each dimension.
+
+    Returns
+    -------
+    ndarray, shape (n_positions,)
+        1-based flat indices. ``-1`` where any dimension was invalid.
+    """
+    per_dim = _numpy.asarray(per_dim_indices, dtype=_numpy.int64)
+    if per_dim.ndim == 1:
+        per_dim = per_dim.reshape(-1, 1)
+    n_positions, n_dims = per_dim.shape
+    if n_dims != len(dim_sizes):
+        raise ValueError(
+            f"per_dim_indices has {n_dims} columns but dim_sizes has {len(dim_sizes)} entries"
+        )
+
+    flat = _numpy.full(n_positions, -1, dtype=_numpy.int64)
+    valid = (per_dim >= 1).all(axis=1)
+    if not valid.any():
+        return flat
+
+    sizes = _numpy.asarray(dim_sizes, dtype=_numpy.int64)
+    # strides = (1, s0, s0*s1, ...)
+    strides = _numpy.concatenate(([1], _numpy.cumprod(sizes[:-1]))).astype(_numpy.int64)
+    valid_per_dim = per_dim[valid]
+    # flat_1based = sum((idx_d - 1) * stride_d) + 1
+    flat_valid = (valid_per_dim - 1) @ strides + 1
+    flat[valid] = flat_valid
+    return flat
+
+
+def _cell_merge_normalize(
+    cell_merge: _Any,
+    n_dims: int,
+) -> list[dict[str, list[float]]]:
+    """Normalize cell_merge user input to a list-of-dicts canonical form.
+
+    Accepts None / empty list / list-of-dicts / pandas DataFrame.
+    Mirrors R synth.R .cell_merge_normalize.
+    """
+    if cell_merge is None:
+        return []
+    if isinstance(cell_merge, list) and len(cell_merge) == 0:
+        return []
+
+    if isinstance(cell_merge, _pd.DataFrame):
+        from_cols = [f"from_{d}" for d in range(1, n_dims + 1)]
+        to_cols = [f"to_{d}" for d in range(1, n_dims + 1)]
+        missing = [c for c in from_cols + to_cols if c not in cell_merge.columns]
+        if missing:
+            raise ValueError(
+                f"cell_merge DataFrame missing required columns: {', '.join(missing)}"
+            )
+        out: list[dict[str, list[float]]] = []
+        for _, row in cell_merge.iterrows():
+            out.append({
+                "from": [float(row[c]) for c in from_cols],
+                "to": [float(row[c]) for c in to_cols],
+            })
+        return out
+
+    if not isinstance(cell_merge, list):
+        raise ValueError("cell_merge must be a list of entries or a DataFrame")
+
+    out_list: list[dict[str, list[float]]] = []
+    for i, entry in enumerate(cell_merge, start=1):
+        if not isinstance(entry, dict) or "from" not in entry or "to" not in entry:
+            raise ValueError(
+                f"cell_merge entry {i} must be a dict with 'from' and 'to' keys"
+            )
+        try:
+            from_vec = list(entry["from"])
+            to_vec = list(entry["to"])
+        except TypeError as exc:
+            raise ValueError(
+                f"cell_merge entry {i}: 'from' and 'to' must each have length {n_dims} (n_dims)"
+            ) from exc
+        if len(from_vec) != n_dims or len(to_vec) != n_dims:
+            raise ValueError(
+                f"cell_merge entry {i}: 'from' and 'to' must each have length {n_dims} (n_dims)"
+            )
+        out_list.append({"from": [float(x) for x in from_vec], "to": [float(x) for x in to_vec]})
+    return out_list
+
+
+def _cell_merge_sample_bin_maps(
+    model: _Any,
+    bin_merge: list[_Any] | None,
+) -> list[_numpy.ndarray]:
+    """Compute sample-time per-dim bin_maps honouring optional bin_merge overrides.
+
+    Mirrors R synth.R .cell_merge_sample_bin_maps. Each element is a length-num_bins
+    1-based bin_map (input bin -> target bin).
+    """
+    n_dims = model.n_dims
+    if bin_merge is not None and (not isinstance(bin_merge, list) or len(bin_merge) != n_dims):
+        raise ValueError(
+            f"bin_merge must be a list with {n_dims} elements (one per dimension)"
+        )
+
+    out: list[_numpy.ndarray] = []
+    for d in range(n_dims):
+        spec = model.dim_specs[d]
+        dim_merge = None if bin_merge is None else bin_merge[d]
+        if dim_merge is None:
+            # Pymisha stores bin_map as 0-based (gsynth_bin_map output) when a
+            # training-time bin_merge was given, else None (no remap). Either
+            # way, convert to a 1-based identity-or-remap map of length num_bins.
+            stored = spec.get("bin_map")
+            num_bins = int(spec["num_bins"])
+            if stored is None:
+                out.append(_numpy.arange(1, num_bins + 1, dtype=_numpy.int64))
+            else:
+                out.append(_numpy.asarray(stored, dtype=_numpy.int64) + 1)
+        else:
+            # gsynth_bin_map returns a 0-based map of length num_bins;
+            # we want 1-based to match R semantics inside cell_merge.
+            bm_0based = gsynth_bin_map(spec["breaks"], dim_merge)
+            bm_1based = _numpy.asarray(bm_0based, dtype=_numpy.int64) + 1
+            out.append(bm_1based)
+    return out
+
+
+def gsynth_cell_merge(
+    model: GsynthModel,
+    cell_merge: list[dict[str, _Any]] | _pd.DataFrame,
+    bin_merge: list[_Any] | None = None,
+) -> _pd.DataFrame:
+    """Resolve per-joint-cell CDF redirects to flat indices.
+
+    Each ``cell_merge`` entry redirects one source training cell (joint
+    Cartesian position across all stratification dimensions) to a target
+    training cell whose Cartesian position cannot be expressed as a per-axis
+    merge. Use with :func:`gsynth_sample` (``cell_merge=`` argument) to
+    redirect under-trained joint cells to a nearest-sufficient neighbor at
+    sample time, without retraining.
+
+    Parameters
+    ----------
+    model : GsynthModel
+        Trained stratified model (``n_dims >= 1``).
+    cell_merge : list[dict] or DataFrame
+        Each entry has ``from`` and ``to`` keys, each a length-``n_dims``
+        vector in value space. DataFrame form expects columns
+        ``from_1, to_1, ..., from_<n_dims>, to_<n_dims>``.
+    bin_merge : list, optional
+        Sample-time bin_merge override (same shape as
+        :func:`gsynth_sample`'s ``bin_merge``). Source/target values are
+        looked up after applying these per-dim merges, so coordinates
+        reference the cells whose CDFs actually exist at sample time.
+
+    Returns
+    -------
+    DataFrame
+        One row per redirect with columns
+        ``source_flat, target_flat, from_1, to_1, ..., from_<n_dims>, to_<n_dims>``.
+        ``source_flat`` / ``target_flat`` are 1-based flat indices into
+        ``model.model_data['cdf']``.
+
+    Raises
+    ------
+    TypeError
+        If ``model`` is not a :class:`GsynthModel`.
+    ValueError
+        On 0D model, malformed ``cell_merge``, or out-of-range values.
+
+    See Also
+    --------
+    gsynth_sample : Applies the redirect via ``cell_merge=``.
+    gsynth_bin_map : Per-axis bin merging.
+    """
+    if not isinstance(model, GsynthModel):
+        raise TypeError("model must be a GsynthModel")
+    n_dims = model.n_dims
+    if n_dims is None or n_dims < 1:
+        raise ValueError("gsynth_cell_merge requires a stratified model (n_dims >= 1)")
+
+    entries = _cell_merge_normalize(cell_merge, n_dims)
+    cols = ["source_flat", "target_flat"]
+    for d in range(1, n_dims + 1):
+        cols.extend([f"from_{d}", f"to_{d}"])
+
+    if not entries:
+        empty = {c: _pd.Series(dtype="int64") for c in cols}
+        return _pd.DataFrame(empty, columns=cols)
+
+    sample_bin_maps = _cell_merge_sample_bin_maps(model, bin_merge)
+    dim_sizes = list(model.dim_sizes)
+
+    n_entries = len(entries)
+    source_dims = _numpy.full((n_entries, n_dims), -1, dtype=_numpy.int64)
+    target_dims = _numpy.full((n_entries, n_dims), -1, dtype=_numpy.int64)
+
+    for d in range(n_dims):
+        spec = model.dim_specs[d]
+        breaks = _numpy.asarray(spec["breaks"], dtype=float)
+        num_bins = int(spec["num_bins"])
+
+        from_vals = _numpy.array([e["from"][d] for e in entries], dtype=float)
+        to_vals = _numpy.array([e["to"][d] for e in entries], dtype=float)
+
+        # findInterval(rightmost.closed=TRUE) -> 1-based bin via searchsorted.
+        from_bins = _numpy.searchsorted(breaks, from_vals, side="right")
+        to_bins = _numpy.searchsorted(breaks, to_vals, side="right")
+        # Clamp upper edge: values equal to breaks[-1] land in last bin.
+        from_bins = _numpy.where(from_vals == breaks[-1], num_bins, from_bins)
+        to_bins = _numpy.where(to_vals == breaks[-1], num_bins, to_bins)
+
+        bad_from = (from_bins < 1) | (from_bins > num_bins)
+        bad_to = (to_bins < 1) | (to_bins > num_bins)
+        if bad_from.any():
+            bad = _numpy.where(bad_from)[0] + 1
+            raise ValueError(
+                f"cell_merge: 'from' values out of range in dimension {d + 1} "
+                f"(entries {', '.join(str(int(x)) for x in bad)})"
+            )
+        if bad_to.any():
+            bad = _numpy.where(bad_to)[0] + 1
+            raise ValueError(
+                f"cell_merge: 'to' values out of range in dimension {d + 1} "
+                f"(entries {', '.join(str(int(x)) for x in bad)})"
+            )
+
+        # Remap through sample-time bin_map (1-based -> 1-based).
+        bm = sample_bin_maps[d]  # 1-based length-num_bins
+        source_dims[:, d] = bm[from_bins - 1]
+        target_dims[:, d] = bm[to_bins - 1]
+
+    source_flat = _compute_flat_indices(source_dims, dim_sizes)
+    target_flat = _compute_flat_indices(target_dims, dim_sizes)
+
+    out = {
+        "source_flat": source_flat.astype(_numpy.int64),
+        "target_flat": target_flat.astype(_numpy.int64),
+    }
+    for d in range(n_dims):
+        out[f"from_{d + 1}"] = source_dims[:, d].astype(_numpy.int64)
+        out[f"to_{d + 1}"] = target_dims[:, d].astype(_numpy.int64)
+    return _pd.DataFrame(out, columns=cols)
+
+
+def _apply_cell_merge_to_cdf_list(
+    model: GsynthModel,
+    cell_merge: list[dict[str, _Any]] | _pd.DataFrame | None,
+    bin_merge: list[_Any] | None,
+) -> list[_numpy.ndarray]:
+    """Return a (possibly modified) cdf_list with cell_merge redirects applied.
+
+    Always returns a shallow copy of ``model.model_data["cdf"]`` so the model
+    is never mutated. When ``cell_merge`` is None or empty, returns the copy
+    unchanged.
+
+    Emits warnings for:
+
+    - self-redirects (``source_flat == target_flat``) -- dropped
+    - duplicate source cells across entries -- last entry wins
+    """
+    cdf_list = list(model.model_data["cdf"])
+    if cell_merge is None:
+        return cdf_list
+
+    resolved = gsynth_cell_merge(model, cell_merge, bin_merge=bin_merge)
+    if len(resolved) == 0:
+        return cdf_list
+
+    # Drop self-redirects.
+    self_mask = resolved["source_flat"] == resolved["target_flat"]
+    if self_mask.any():
+        _warnings.warn(
+            f"cell_merge: dropped {int(self_mask.sum())} self-redirect(s)",
+            UserWarning,
+            stacklevel=3,
+        )
+        resolved = resolved[~self_mask]
+
+    # Duplicate source -> last entry wins.
+    dup_mask = resolved["source_flat"].duplicated(keep="last")
+    if dup_mask.any():
+        _warnings.warn(
+            f"cell_merge: duplicate source cell in {int(dup_mask.sum())} entr(ies); "
+            "later entries win",
+            UserWarning,
+            stacklevel=3,
+        )
+        resolved = resolved[~dup_mask]
+
+    # Apply redirects: source/target are 1-based.
+    # KNOWN GAP vs R: R also warns when the target_flat bin's CDF is itself
+    # sparse-fallback (uniform 0.25 per base). PyMisha does not detect this
+    # yet; redirecting to a sparse target produces silent uniform sampling.
+    # See R synth.R:2017 for reference.
+    for _, row in resolved.iterrows():
+        src = int(row["source_flat"]) - 1
+        tgt = int(row["target_flat"]) - 1
+        cdf_list[src] = cdf_list[tgt]
+
+    return cdf_list
 
 
 def _extract_bin_data(
@@ -1113,6 +1432,7 @@ def gsynth_sample(
     n_samples: int = 1,
     seed: int | None = None,
     bin_merge: list[_Any] | None = None,
+    cell_merge: list[dict[str, _Any]] | _pd.DataFrame | None = None,
     allow_parallel: bool = True,
     num_cores: int | None = None,
     max_chunk_size: int | None = None,
@@ -1181,6 +1501,17 @@ def gsynth_sample(
         :func:`gsynth_bin_map`.  This allows redirecting sparse bins to
         better-populated ones at sampling time without retraining the
         model.
+    cell_merge : list[dict] or DataFrame, optional
+        Per-joint-cell CDF redirects applied on top of ``bin_merge``. Each
+        entry redirects one source training cell to a target training cell
+        whose Cartesian position cannot be expressed as a per-axis merge.
+        See :func:`gsynth_cell_merge` for the spec format.
+
+        Self-redirects (``source_flat == target_flat``) are dropped with a
+        warning. Duplicate source cells across entries also warn; the last
+        entry wins. The redirect is applied via list-element copy on the
+        in-process ``cdf_list``, so there is no array duplication (though
+        parallel workers re-pickle the cdf_list and lose this saving).
     allow_parallel : bool, default True
         Whether to enable parallel chunking for large genomes.  When
         ``True`` and the total bases exceed *max_chunk_size*, intervals
@@ -1220,7 +1551,7 @@ def gsynth_sample(
     >>> seqs = pm.gsynth_sample(
     ...     model,
     ...     intervals=pm.gintervals(["1"], [0], [1000]),
-    ...     seed=42,
+    ...     seed=60427,
     ... )
     >>> len(seqs[0])
     1000
@@ -1252,6 +1583,11 @@ def gsynth_sample(
 
     intervals = _maybe_load_intervals_set(intervals)
 
+    # Apply per-joint-cell CDF redirects (cell_merge) on top of bin_merge.
+    # Returns a (possibly modified) shallow copy of model.model_data["cdf"];
+    # both the parallel and serial paths below consume this same list.
+    cdf_list = _apply_cell_merge_to_cdf_list(model, cell_merge, bin_merge)
+
     # Check whether to parallelize
     do_parallel, effective_cores = _should_parallelize(
         intervals, allow_parallel, num_cores, max_chunk_size
@@ -1274,7 +1610,6 @@ def gsynth_sample(
         dim_specs_list = [
             dict(sp.items()) for sp in model.dim_specs
         ]
-        cdf_list = model.model_data["cdf"]
 
         worker_args = [
             (chunk.to_dict(orient="list"), dim_specs_list,
@@ -1335,8 +1670,9 @@ def gsynth_sample(
         _extract_bin_data(model.dim_specs, intervals, iterator,
                           sample_bin_merge=bin_merge)
 
-    # Get CDF list from model
-    cdf_list = model.model_data["cdf"]
+    # cdf_list was computed once near the top (with cell_merge redirects
+    # applied, if any); reuse it here so the serial path stays consistent
+    # with the parallel path.
 
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
@@ -1964,7 +2300,7 @@ def gsynth_random(
 
     >>> seqs = pm.gsynth_random(
     ...     intervals=pm.gintervals(["1"], [0], [1000]),
-    ...     seed=42,
+    ...     seed=60427,
     ... )
     >>> len(seqs[0])
     1000
@@ -2177,6 +2513,159 @@ def gsynth_replace_kmer(
     )
     return list(_raw3) if _raw3 is not None else None
 
+
+# ---------------------------------------------------------------------------
+# gsynth_forbid_kmer — analytical pattern forbid via transition zeroing
+# ---------------------------------------------------------------------------
+
+def gsynth_forbid_kmer(
+    model: GsynthModel,
+    pattern: str,
+    check: bool = True,
+) -> GsynthModel:
+    """Return a new model whose samples avoid ``pattern`` as a substring.
+
+    Analytically equivalent to rejection sampling on the output. Implemented
+    by zeroing every transition whose ``(k+1)``-mer ``state||next`` contains
+    ``pattern`` and renormalising per state-row. Pattern length is capped at
+    ``model.k + 1`` (longer patterns span multiple transitions and cannot be
+    forbidden locally).
+
+    Useful for CpG-null, motif-null, or repeat-class-null synthetic
+    backgrounds from a standard :func:`gsynth_train` model without
+    retraining.
+
+    Parameters
+    ----------
+    model : GsynthModel
+        Trained model.
+    pattern : str
+        Uppercase DNA (``ACGT`` only). Length ``<= model.k + 1``.
+    check : bool, default True
+        If True, prints a summary to stderr.
+
+    Returns
+    -------
+    GsynthModel
+        A new model. The input is not mutated.
+
+    Raises
+    ------
+    TypeError
+        If ``model`` is not a :class:`GsynthModel`.
+    ValueError
+        If ``pattern`` is empty, contains non-ACGT, or is longer than
+        ``model.k + 1``.
+
+    Notes
+    -----
+    States whose k-mer already contains ``pattern`` (reachable only via the
+    uniform-random seeding step in :func:`gsynth_sample`) fall back to
+    uniform sampling so the chain can slide the pattern out of the state
+    window. The forbid guarantee resumes once the window no longer
+    contains the pattern.
+
+    See Also
+    --------
+    gsynth_sample, gsynth_train
+    """
+    if not isinstance(model, GsynthModel):
+        raise TypeError("model must be a GsynthModel")
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError(f"pattern must be non-empty DNA over ACGT (got: {pattern!r})")
+    pattern = pattern.upper()
+    if not all(c in "ACGT" for c in pattern):
+        raise ValueError(f"pattern must be non-empty DNA over ACGT (got: '{pattern}')")
+    L = len(pattern)
+    k = int(model.k) if model.k is not None else 5
+    if k + 1 < L:
+        raise ValueError(
+            f"pattern length {L} exceeds model.k + 1 = {k + 1}; cannot forbid "
+            f"a pattern longer than a single transition"
+        )
+
+    base_map = {"A": 0, "C": 1, "G": 2, "T": 3}
+    pat_vec = _numpy.array([base_map[c] for c in pattern], dtype=_numpy.int8)
+    n_states = 4 ** k
+
+    # flag_mat[state, next] = True iff the (k+1)-mer state||next contains
+    # `pattern` as any L-length substring. (k+2-L) sliding windows.
+    flag_mat = _numpy.zeros((n_states, 4), dtype=bool)
+    n_windows = k + 2 - L
+    for state in range(n_states):
+        state_bases = _numpy.empty(k, dtype=_numpy.int8)
+        tmp = state
+        for i in range(k - 1, -1, -1):
+            state_bases[i] = tmp % 4
+            tmp //= 4
+        for next_base in range(4):
+            full = _numpy.concatenate([state_bases, [next_base]])
+            hit = False
+            for start in range(n_windows):
+                if _numpy.array_equal(full[start:start + L], pat_vec):
+                    hit = True
+                    break
+            flag_mat[state, next_base] = hit
+
+    legal_next = ~flag_mat
+    trapped_state = legal_next.sum(axis=1) == 0  # row has no legal next base
+
+    # Build new counts/cdf lists without mutating the input model.
+    out_counts: list[_numpy.ndarray | None] = []
+    out_cdf:    list[_numpy.ndarray | None] = []
+
+    n_zeroed_cells = 0
+    n_affected_bins = 0
+    n_empty_rows = 0
+
+    for co_in in model.model_data["counts"]:
+        if co_in is None:
+            out_counts.append(None)
+            out_cdf.append(None)
+            continue
+        co = _numpy.asarray(co_in, dtype=float).copy()
+        z_here = int(((co != 0) & flag_mat).sum())
+        if z_here > 0:
+            n_affected_bins += 1
+            n_zeroed_cells += z_here
+        co[flag_mat] = 0.0
+
+        rs = co.sum(axis=1)
+        probs = _numpy.zeros_like(co)
+        nz = rs > 0
+        probs[nz] = co[nz] / rs[nz][:, None]
+        empty_rows = _numpy.where(~nz)[0]
+        if empty_rows.size > 0:
+            n_empty_rows += int(empty_rows.size)
+            for r in empty_rows:
+                if trapped_state[r]:
+                    probs[r] = 0.25
+                else:
+                    legal = legal_next[r]
+                    n_legal = int(legal.sum())
+                    probs[r, legal] = 1.0 / n_legal
+                    probs[r, ~legal] = 0.0
+
+        new_cdf = _numpy.cumsum(probs, axis=1)
+        new_cdf[:, -1] = 1.0
+
+        out_counts.append(co)
+        out_cdf.append(new_cdf)
+
+    if check:
+        print(
+            f"gsynth_forbid_kmer('{pattern}'): zeroed {n_zeroed_cells:,} "
+            f"transitions across {n_affected_bins} bins; "
+            f"{n_empty_rows} empty rows used uniform fallback.",
+            file=_sys.stderr,
+        )
+
+    # Clone the model with new counts/cdf. dataclasses.replace preserves every
+    # other field (total_kmers, total_n, prior_*, etc.) without manual listing.
+    new_data = dict(model.model_data)
+    new_data["counts"] = out_counts
+    new_data["cdf"] = out_cdf
+    return _dc_replace(model, model_data=new_data)
 
 
 # ---------------------------------------------------------------------------

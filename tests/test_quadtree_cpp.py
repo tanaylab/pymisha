@@ -491,7 +491,7 @@ class TestLargeDataset:
 
     def test_many_rects(self):
         """Test with many rectangles to stress the quad-tree."""
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(60427)
         n = 500
         rects = []
         for i in range(n):

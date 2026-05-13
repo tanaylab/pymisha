@@ -31,7 +31,7 @@ import pymisha as pm
 # ---------------------------------------------------------------------------
 
 
-def _random_dna_sequences(n, min_len=20, max_len=50, seed=42):
+def _random_dna_sequences(n, min_len=20, max_len=50, seed=60427):
     """Generate n random DNA sequences with lengths in [min_len, max_len]."""
     rng = np.random.RandomState(seed)
     bases = list("ACGT")
@@ -42,7 +42,7 @@ def _random_dna_sequences(n, min_len=20, max_len=50, seed=42):
     return seqs
 
 
-def _random_pssm(width=6, seed=42):
+def _random_pssm(width=6, seed=60427):
     """Generate a random PSSM (frequency matrix) of shape (width, 4)."""
     rng = np.random.RandomState(seed)
     return rng.dirichlet([1, 1, 1, 1], size=width)
@@ -100,8 +100,8 @@ class TestModeParity:
 
     @pytest.fixture(autouse=True)
     def _setup(self):
-        self.pssm = _random_pssm(width=6, seed=42)
-        self.seqs = _random_dna_sequences(10, min_len=20, max_len=50, seed=42)
+        self.pssm = _random_pssm(width=6, seed=60427)
+        self.seqs = _random_dna_sequences(10, min_len=20, max_len=50, seed=60427)
 
     @pytest.mark.parametrize("mode", ["lse", "max", "pos", "count"])
     def test_forward_only_parity(self, mode):
@@ -446,8 +446,8 @@ class TestGseqPwmDispatch:
 
     @pytest.fixture(autouse=True)
     def _setup(self):
-        self.pssm = _random_pssm(width=6, seed=42)
-        self.seqs = _random_dna_sequences(10, min_len=20, max_len=50, seed=42)
+        self.pssm = _random_pssm(width=6, seed=60427)
+        self.seqs = _random_dna_sequences(10, min_len=20, max_len=50, seed=60427)
 
     def test_default_uses_cpp_lse(self):
         """gseq_pwm lse without Python-only features should match direct C++."""
@@ -532,8 +532,8 @@ class TestPerformance:
 
     def test_cpp_faster_than_python(self):
         """Time 1000 sequences through C++ vs Python, log speedup ratio."""
-        pssm = _random_pssm(width=8, seed=42)
-        seqs = _random_dna_sequences(1000, min_len=50, max_len=100, seed=42)
+        pssm = _random_pssm(width=8, seed=60427)
+        seqs = _random_dna_sequences(1000, min_len=50, max_len=100, seed=60427)
 
         # Warm up
         _cpp_score(seqs[:10], pssm, bidirect=False, strand=1)

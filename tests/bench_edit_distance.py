@@ -78,7 +78,7 @@ def bench(func, label, n_warmup=2, n_reps=5):
             "min_s": round(mn, 6), "n_reps": n_reps}
 
 
-def generate_random_seq(length, seed=42):
+def generate_random_seq(length, seed=60427):
     """Generate a random DNA sequence of given length."""
     rng = np.random.RandomState(seed)
     bases = np.array(list("ACGT"))

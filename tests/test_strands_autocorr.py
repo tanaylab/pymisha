@@ -145,7 +145,7 @@ class TestComputeStrandsAutocorr:
         # Use seq_len=0 trick: for reverse, coord+len(seq) = coord, so
         # both land in the same bin.
         rows = []
-        np.random.seed(42)
+        np.random.seed(60427)
         for i in range(500):
             coord = np.random.randint(10000, 100000)
             rows.append(("A", "1", coord, "+"))

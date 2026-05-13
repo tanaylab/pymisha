@@ -536,9 +536,9 @@ class TestGintervalsRandom:
 
     def test_reproducible_with_seed(self):
         """Same seed produces same intervals."""
-        np.random.seed(42)
+        np.random.seed(60427)
         result1 = pm.gintervals_random(100, 50, dist_from_edge=0)
-        np.random.seed(42)
+        np.random.seed(60427)
         result2 = pm.gintervals_random(100, 50, dist_from_edge=0)
         pd.testing.assert_frame_equal(result1, result2)
 

@@ -431,10 +431,10 @@ class TestGsynthSample:
 
             ivs = pm.gintervals("1", 0, 500)
             r1 = pm.gsynth_sample(
-                model, intervals=ivs, iterator=200, seed=42
+                model, intervals=ivs, iterator=200, seed=60427
             )
             r2 = pm.gsynth_sample(
-                model, intervals=ivs, iterator=200, seed=42
+                model, intervals=ivs, iterator=200, seed=60427
             )
             assert r1 == r2
         finally:
@@ -452,7 +452,7 @@ class TestGsynthSample:
 
             ivs = pm.gintervals("1", 0, 500)
             r1 = pm.gsynth_sample(
-                model, intervals=ivs, iterator=200, seed=42
+                model, intervals=ivs, iterator=200, seed=60427
             )
             r2 = pm.gsynth_sample(
                 model, intervals=ivs, iterator=200, seed=123
@@ -473,7 +473,7 @@ class TestGsynthRandom:
     def test_random_vector_mode(self):
         """Random sequences returned as list of strings."""
         ivs = pm.gintervals("1", 0, 1000)
-        result = pm.gsynth_random(intervals=ivs, seed=42)
+        result = pm.gsynth_random(intervals=ivs, seed=60427)
 
         assert isinstance(result, list)
         assert len(result) >= 1
@@ -488,7 +488,7 @@ class TestGsynthRandom:
         result = pm.gsynth_random(
             intervals=ivs,
             nuc_probs={"A": 0.5, "C": 0.0, "G": 0.0, "T": 0.5},
-            seed=42,
+            seed=60427,
         )
         seq = result[0]
         # After the initial 5 seed bases (which use uniform random),
@@ -504,8 +504,8 @@ class TestGsynthRandom:
     def test_random_seed_reproducible(self):
         """Same seed gives identical random output."""
         ivs = pm.gintervals("1", 0, 1000)
-        r1 = pm.gsynth_random(intervals=ivs, seed=42)
-        r2 = pm.gsynth_random(intervals=ivs, seed=42)
+        r1 = pm.gsynth_random(intervals=ivs, seed=60427)
+        r2 = pm.gsynth_random(intervals=ivs, seed=60427)
         assert r1 == r2
 
 
@@ -681,8 +681,8 @@ class TestGsynthMultiDimStress:
             )
 
             ivs = pm.gintervals("1", 0, 5000)
-            s1 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=42)
-            s2 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=42)
+            s1 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=60427)
+            s2 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=60427)
             assert s1 == s2
         finally:
             pm.gvtrack_rm("g_frac")
@@ -879,7 +879,7 @@ class TestGsynthBinMergeAdvanced:
                 model,
                 intervals=pm.gintervals("1", 0, 2000),
                 iterator=200,
-                seed=42,
+                seed=60427,
             )
             assert len(seqs_no_merge[0]) == 2000
 
@@ -888,7 +888,7 @@ class TestGsynthBinMergeAdvanced:
                 model,
                 intervals=pm.gintervals("1", 0, 2000),
                 iterator=200,
-                seed=42,
+                seed=60427,
                 bin_merge=[[{"from": (0.4, 0.5), "to": (0.3, 0.4)}]],
             )
             assert len(seqs_with_merge[0]) == 2000
@@ -931,13 +931,13 @@ class TestGsynthBinMergeAdvanced:
                 model,
                 intervals=pm.gintervals("1", 0, 2000),
                 iterator=200,
-                seed=42,
+                seed=60427,
             )
             seqs_none = pm.gsynth_sample(
                 model,
                 intervals=pm.gintervals("1", 0, 2000),
                 iterator=200,
-                seed=42,
+                seed=60427,
                 bin_merge=[None],
             )
             assert seqs_default == seqs_none
@@ -1083,8 +1083,8 @@ class TestGsynthSaveLoadAdvanced:
                 loaded = pm.gsynth_load(path)
 
                 ivs = pm.gintervals("1", 0, 1000)
-                s1 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=42)
-                s2 = pm.gsynth_sample(loaded, intervals=ivs, iterator=200, seed=42)
+                s1 = pm.gsynth_sample(model, intervals=ivs, iterator=200, seed=60427)
+                s2 = pm.gsynth_sample(loaded, intervals=ivs, iterator=200, seed=60427)
                 assert s1 == s2
             finally:
                 shutil.rmtree(path, ignore_errors=True)
@@ -1140,7 +1140,7 @@ class TestGsynth0D:
         seqs = pm.gsynth_sample(
             model,
             intervals=pm.gintervals("1", 0, 10000),
-            seed=42,
+            seed=60427,
         )
         assert len(seqs) == 1
         assert len(seqs[0]) == 10000
@@ -1911,7 +1911,7 @@ class TestGsynthRandomAdvanced:
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 10000),
             nuc_probs={"A": 0.1, "C": 0.4, "G": 0.4, "T": 0.1},
-            seed=42,
+            seed=60427,
         )
         chars = list(seqs[0])
         gc = sum(1 for c in chars if c in "GC")
@@ -1923,7 +1923,7 @@ class TestGsynthRandomAdvanced:
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 1000),
             nuc_probs={"A": 1, "C": 1, "G": 1, "T": 1},
-            seed=42,
+            seed=60427,
         )
         assert len(seqs[0]) == 1000
         assert all(c in "ACGT" for c in seqs[0])
@@ -1933,7 +1933,7 @@ class TestGsynthRandomAdvanced:
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 500),
             n_samples=5,
-            seed=42,
+            seed=60427,
         )
         assert len(seqs) == 5
         for s in seqs:
@@ -1950,7 +1950,7 @@ class TestGsynthRandomAdvanced:
                 intervals=pm.gintervals("1", 0, 1000),
                 output=path,
                 output_format="fasta",
-                seed=42,
+                seed=60427,
             )
             assert os.path.exists(path)
             with open(path) as f:
@@ -1965,7 +1965,7 @@ class TestGsynthRandomAdvanced:
     def test_random_multi_intervals(self):
         """Random generation for multiple intervals returns correct number."""
         ivs = pm.gintervals(["1", "2"], [0, 0], [500, 500])
-        seqs = pm.gsynth_random(intervals=ivs, seed=42)
+        seqs = pm.gsynth_random(intervals=ivs, seed=60427)
         assert len(seqs) == 2
         assert len(seqs[0]) == 500
         assert len(seqs[1]) == 500
@@ -1974,7 +1974,7 @@ class TestGsynthRandomAdvanced:
         """Default probs produce roughly uniform base distribution."""
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 40000),
-            seed=42,
+            seed=60427,
         )
         chars = list(seqs[0])
         total = len(chars)
@@ -1987,7 +1987,7 @@ class TestGsynthRandomAdvanced:
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 1000),
             nuc_probs={"A": 0.5, "C": 0.5},
-            seed=42,
+            seed=60427,
         )
         # Should still produce valid output
         assert len(seqs[0]) == 1000
@@ -1998,7 +1998,7 @@ class TestGsynthRandomAdvanced:
         seqs = pm.gsynth_random(
             intervals=pm.gintervals("1", 0, 10000),
             nuc_probs={"A": 0.5, "C": 0.0, "G": 0.0, "T": 0.5},
-            seed=42,
+            seed=60427,
         )
         chars = list(seqs[0][5:])  # skip initial 5 seed bases
         gc = sum(1 for c in chars if c in "GC")
@@ -2017,7 +2017,7 @@ class TestGsynthRandomAdvanced:
                 output=fasta_path,
                 output_format="fasta",
                 mask_copy=mask_copy,
-                seed=42,
+                seed=60427,
             )
             with open(fasta_path) as f:
                 lines = f.readlines()
@@ -2387,7 +2387,7 @@ class TestGsynthVariableKSampling:
         seqs = pm.gsynth_sample(
             model,
             intervals=pm.gintervals("1", 0, 5000),
-            seed=42,
+            seed=60427,
         )
         assert len(seqs) == 1
         assert len(seqs[0]) == 5000
@@ -2403,7 +2403,7 @@ class TestGsynthVariableKSampling:
         seqs = pm.gsynth_sample(
             model,
             intervals=pm.gintervals("1", 0, 10000),
-            seed=42,
+            seed=60427,
         )
         assert len(seqs[0]) == 10000
 
@@ -2415,8 +2415,8 @@ class TestGsynthVariableKSampling:
             k=3,
         )
         ivs = pm.gintervals("1", 0, 5000)
-        s1 = pm.gsynth_sample(model, intervals=ivs, seed=42)
-        s2 = pm.gsynth_sample(model, intervals=ivs, seed=42)
+        s1 = pm.gsynth_sample(model, intervals=ivs, seed=60427)
+        s2 = pm.gsynth_sample(model, intervals=ivs, seed=60427)
         assert s1 == s2
 
     def test_sample_different_seeds_variable_k(self):
@@ -2427,7 +2427,7 @@ class TestGsynthVariableKSampling:
             k=3,
         )
         ivs = pm.gintervals("1", 0, 5000)
-        s1 = pm.gsynth_sample(model, intervals=ivs, seed=42)
+        s1 = pm.gsynth_sample(model, intervals=ivs, seed=60427)
         s2 = pm.gsynth_sample(model, intervals=ivs, seed=123)
         assert s1 != s2
 
@@ -2649,7 +2649,7 @@ class TestGsynthVariableKParallel:
         seqs = pm.gsynth_sample(
             model,
             intervals=pm.gintervals("1", 0, 10000),
-            seed=42,
+            seed=60427,
             allow_parallel=True,
         )
         assert len(seqs) == 1
@@ -2995,7 +2995,7 @@ class TestGsynthPreserveN:
         intervals = pm.gintervals(["X"], [start], [end])
         model = pm.gsynth_train(intervals=intervals)
         seq = pm.gsynth_sample(
-            model, output_format="vector", intervals=intervals, seed=42
+            model, output_format="vector", intervals=intervals, seed=60427
         )[0]
         for i, c in enumerate(ref_slice):
             if c in "Nn":
@@ -3007,7 +3007,7 @@ class TestGsynthPreserveN:
         model = pm.gsynth_train(intervals=intervals)
         seq = pm.gsynth_sample(
             model, output_format="vector", intervals=intervals,
-            preserve_n=False, seed=42,
+            preserve_n=False, seed=60427,
         )[0]
         n_count = sum(1 for c in seq if c in "Nn")
         ref_n = sum(1 for c in ref_slice if c in "Nn")
@@ -3018,7 +3018,7 @@ class TestGsynthPreserveN:
         start, end, ref_slice = self._find_n_interval()
         intervals = pm.gintervals(["X"], [start], [end])
         seq = pm.gsynth_random(
-            intervals=intervals, output_format="vector", seed=42
+            intervals=intervals, output_format="vector", seed=60427
         )[0]
         for i, c in enumerate(ref_slice):
             if c in "Nn":

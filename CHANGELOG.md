@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.40 (2026-05-13)
+
+### Features
+- **`gsynth_forbid_kmer(model, pattern)`** returns a new model whose samples avoid `pattern` as a substring (subject to a seeding caveat for the first `k` bp of each interval). Useful for CpG-null or motif-null synthetic backgrounds. Pattern length is capped at `model.k + 1`. (R misha 5.6.16.)
+- **`gsynth_cell_merge()` + `gsynth_sample(cell_merge=)`.** Per-joint-cell CDF redirects let you reassign under-trained joint cells to a nearest-sufficient neighbor at sample time without retraining. Accepts a list of `{"from": [...], "to": [...]}` dicts or a DataFrame with `from_<d>` / `to_<d>` columns. Warns on self-redirects (dropped) and duplicate sources (later entry wins). (R misha 5.6.16.)
+- **`gsynth_sample(output_format="fasta")` and `gsynth_random(output_format="fasta")` now write a samtools-compatible `.fai`** alongside the FASTA (`<output>.fai`). Removes the need to call `samtools faidx` by hand. The `gsynth_random` `.fai` is a pymisha-only extension (R only added it to `gsynth.sample()`). (R misha 5.6.16.)
+
+### Testing
+- Project-wide RNG seed convention: every random seed in production code, tests, benchmarks, and doctest examples now uses `60427` (was a mix of `42` and `60427`).
+
 ## v0.1.39 (2026-05-13)
 
 ### Fixes

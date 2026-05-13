@@ -38,7 +38,7 @@ def _create_test_pssm():
     ])
 
 
-def _make_random_pssm(nrow, ncol=4, seed=42):
+def _make_random_pssm(nrow, ncol=4, seed=60427):
     """Create a random normalized PSSM (rows sum to 1)."""
     rng = np.random.RandomState(seed)
     mat = rng.random((nrow, ncol))
@@ -288,7 +288,7 @@ class TestPwmSlidingWindowShifts:
 
     def test_iterator_20_with_shifts(self):
         """iterator=20 with sshift=-250, eshift=250 on large region."""
-        pssm = _make_random_pssm(20, seed=42)
+        pssm = _make_random_pssm(20, seed=60427)
 
         pm.gvtrack_create(
             "pwm_iter20_shift", None, func="pwm",
@@ -308,7 +308,7 @@ class TestPwmSlidingWindowShifts:
 
     def test_iterator_20_without_shifts(self):
         """iterator=20 without shifts on large region."""
-        pssm = _make_random_pssm(20, seed=42)
+        pssm = _make_random_pssm(20, seed=60427)
 
         pm.gvtrack_create(
             "pwm_iter20_no_shift", None, func="pwm",
