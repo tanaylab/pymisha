@@ -27,6 +27,15 @@
 
 using namespace std;
 
+// Thread-local override for the directory pm_track_create_* should mkdir into.
+// When non-empty, track_name_to_dir() returns this exact path instead of the
+// path computed from the track name. Set/cleared by pm_set_create_dir_override
+// and pm_clear_create_dir_override. Mirrors R misha .create_dir_override
+// (R 5.6.30 81635130) and enables atomic gtrack.create via tmp dir + rename.
+namespace pymisha_track_create {
+    thread_local std::string g_create_dir_override;
+}
+
 namespace {
 
 struct TrackRec {
@@ -52,6 +61,9 @@ static bool db_is_indexed()
 
 static string track_name_to_dir(const string &track_name)
 {
+    if (!pymisha_track_create::g_create_dir_override.empty())
+        return pymisha_track_create::g_create_dir_override;
+
     if (!g_pmdb || !g_pmdb->is_initialized())
         TGLError("Database not initialized. Call gdb_init() first.");
 
@@ -705,4 +717,22 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
         PyMisha::handle_error("Out of memory");
         return_err();
     }
+}
+
+PyObject *pm_set_create_dir_override(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *path = nullptr;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return nullptr;
+    pymisha_track_create::g_create_dir_override.assign(path);
+    Py_RETURN_NONE;
+}
+
+PyObject *pm_clear_create_dir_override(PyObject *self, PyObject *args)
+{
+    (void)self;
+    (void)args;
+    pymisha_track_create::g_create_dir_override.clear();
+    Py_RETURN_NONE;
 }

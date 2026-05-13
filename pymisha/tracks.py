@@ -15,6 +15,7 @@ import lzma
 import math
 import os
 import re
+import secrets
 import shutil
 import struct
 import tempfile
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from . import _shared
+from ._db_trash import _gdb_trash
 from ._name_validation import validate_dotted_name
 from ._safe_pickle import restricted_load, restricted_loads
 from ._shared import (
@@ -478,6 +480,44 @@ def _db_is_indexed(root: str | None) -> bool:
     return (seq_dir / "genome.idx").exists() and (seq_dir / "genome.seq").exists()
 
 
+@contextlib.contextmanager
+def _atomic_track_create(track: str):
+    """Run a track-create body atomically: tmp dir + rename on success.
+
+    Yields the tmp directory the writer should mkdir into. While the
+    context is active, the C++ create_dir_override slot is set so
+    pm_track_create_* writers target the tmp path; Python-side writers
+    must use the yielded path explicitly. On clean exit, the tmp dir is
+    renamed to the final track dir (so concurrent gdb scans never see a
+    partial track). On exception (including KeyboardInterrupt) the tmp
+    dir is trashed and the original exception is re-raised. Pre-checks
+    that the track does not already exist before doing any work.
+    Mirrors R misha .gtrack.create_atomic (R 5.6.30 a7f6bb95, 81635130).
+    """
+    if _track_exists(track):
+        raise ValueError(f"Track '{track}' already exists")
+
+    track_dir = _track_dir_for_create(track)
+    parent = track_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    rand = secrets.token_hex(4)
+    tmp_dir = parent / f".{track_dir.name}.tmp.{os.getpid()}.{rand}"
+
+    _pymisha.pm_set_create_dir_override(str(tmp_dir))
+    try:
+        yield tmp_dir
+        if not tmp_dir.exists():
+            raise RuntimeError(
+                f"track writer did not produce expected directory: {tmp_dir}"
+            )
+        os.rename(tmp_dir, track_dir)
+    except BaseException:
+        _gdb_trash(tmp_dir, async_unlink=True)
+        raise
+    finally:
+        _pymisha.pm_clear_create_dir_override()
+
+
 def _normalize_intervals_df(intervals: Any) -> pd.DataFrame:
     if intervals is None:
         raise ValueError("intervals cannot be None")
@@ -837,7 +877,6 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     """
     _checkroot()
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     data = _normalize_intervals_df(intervals)
     vals = np.asarray(values, dtype=np.float64)
@@ -856,19 +895,21 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     if bool(overlap.fillna(False).any()):
         raise ValueError("Sparse intervals must be sorted and non-overlapping per chromosome")
 
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
-    try:
+    with _atomic_track_create(track):
         _pymisha.pm_track_create_sparse(track, _df2pymisha(data))
+
+    try:
         _pymisha.pm_dbreload()
         _set_created_attrs(track, description, f'gtrack.create_sparse("{track}", description, intervals, values)')
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-            _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise
 
 
@@ -936,7 +977,6 @@ def gtrack_create_dense(
     """
     _checkroot()
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     binsize = int(binsize)
     if binsize <= 0:
@@ -953,10 +993,10 @@ def gtrack_create_dense(
     if len(data) == 0:
         raise ValueError("No intervals map to known chromosomes")
 
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
-    try:
+    with _atomic_track_create(track):
         _pymisha.pm_track_create_dense(track, _df2pymisha(data), int(binsize), float(defval))
+
+    try:
         _pymisha.pm_dbreload()
         _set_created_attrs(
             track,
@@ -968,10 +1008,12 @@ def gtrack_create_dense(
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-            _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise
 
 
@@ -1024,7 +1066,6 @@ def gtrack_create_dense_direct(
     """
     _checkroot()
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     binsize = int(binsize)
     if binsize <= 0:
@@ -1050,12 +1091,11 @@ def gtrack_create_dense_direct(
         for c, e in zip(chrom_sizes_df["chrom"], chrom_sizes_df["end"], strict=False)
     }
 
-    track_dir = _track_dir_for_create(track)
-    track_dir.mkdir(parents=True, exist_ok=True)
-    vars_dir = track_dir / "vars"
-    vars_dir.mkdir(exist_ok=True)
+    with _atomic_track_create(track) as track_dir:
+        track_dir.mkdir(parents=True, exist_ok=True)
+        vars_dir = track_dir / "vars"
+        vars_dir.mkdir(exist_ok=True)
 
-    try:
         # Group intervals by chromosome
         grouped = data.groupby("chrom", sort=False)
 
@@ -1070,7 +1110,7 @@ def gtrack_create_dense_direct(
                 grp_vals = grp["value"].values.astype(np.float64)
 
                 # Use an accumulator in float64 to collect weighted contributions.
-                # Initialize to 0.0 — we merge with defval after all intervals.
+                # Initialize to 0.0 - we merge with defval after all intervals.
                 accum = np.zeros(num_bins, dtype=np.float64)
                 touched = np.zeros(num_bins, dtype=np.bool_)
 
@@ -1147,17 +1187,19 @@ def gtrack_create_dense_direct(
         with open(track_dir / ".attributes", "wb") as f:
             f.write(b"".join(parts))
 
-        if reload:
+    if reload:
+        try:
             _pymisha.pm_dbreload()
             if _db_is_indexed(_shared._GROOT):
                 gtrack_convert_to_indexed(track, remove_old=False)
                 _pymisha.pm_dbreload()
-    except Exception:
-        if track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-        if reload:
-            _pymisha.pm_dbreload()
-        raise
+        except Exception as exc:
+            warnings.warn(
+                f"post-create steps failed for track '{track}': {exc}; "
+                "the track was created but may have incomplete attributes",
+                stacklevel=2,
+            )
+            raise
 
 
 def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> None:
@@ -1315,7 +1357,6 @@ def gtrack_smooth(
         raise ValueError(f"Invalid algorithm '{alg}'. Use 'LINEAR_RAMP' or 'MEAN'.")
 
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     all_intervs = gintervals_all()
 
@@ -1329,15 +1370,14 @@ def gtrack_smooth(
     # Handle DataFrame-as-iterator
     all_intervs, iter_val, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iter_val)
 
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
-
-    try:
+    with _atomic_track_create(track):
         _pymisha.pm_smooth(
             track, str(expr), _df2pymisha(all_intervs),
             iter_val, float(winsize), float(weight_thr),
             int(bool(smooth_nans)), alg,
         )
+
+    try:
         _pymisha.pm_dbreload()
         created_by = (
             f'gtrack.smooth({track}, description, {str(expr)}, {winsize}, '
@@ -1352,10 +1392,12 @@ def gtrack_smooth(
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-            _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise
 
 
@@ -1423,7 +1465,6 @@ def gtrack_create(
     if expr is None:
         raise ValueError("expr cannot be None")
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     if band is not None:
         from .extract import _validate_band
@@ -1455,11 +1496,10 @@ def gtrack_create(
     # Handle DataFrame-as-iterator
     all_intervs, iterator, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iterator)
 
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
+    with _config_no_mt(_itr_id_map) as _cfg, _atomic_track_create(track):
+        _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _cfg)
+
     try:
-        with _config_no_mt(_itr_id_map) as _cfg:
-            _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _cfg)
         _pymisha.pm_dbreload()
         _set_created_attrs(
             track,
@@ -1474,10 +1514,12 @@ def gtrack_create(
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-            _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise
 
 
@@ -2164,7 +2206,7 @@ def _gtrack_copy_pipeline(
         p.name for p in dest_dir.iterdir() if p.name not in _TRACK_INTERNAL_FILES
     ]
     if candidates_for_drop and not remaining:
-        shutil.rmtree(dest_dir, ignore_errors=True)
+        _gdb_trash(dest_dir, async_unlink=True)
         raise ValueError(
             f"gtrack_copy({destname!r}): no chromosomes from source database are present in destination; "
             "refusing to create empty track."
@@ -2212,7 +2254,10 @@ def _gtrack_copy_one(
             raise ValueError(
                 f"Track {destname!r} already exists in {dest_db}; use overwrite=True to replace."
             )
-        shutil.rmtree(dest_dir)
+        if not _gdb_trash(dest_dir, async_unlink=True):
+            raise RuntimeError(
+                f"failed to remove existing destination: {dest_dir}"
+            )
 
     src_indexed = (src_dir / "track.idx").exists()
     dest_indexed = _db_is_indexed(str(dest_db))
@@ -2243,7 +2288,7 @@ def _gtrack_copy_one(
         )
     except Exception:
         if dest_dir.exists():
-            shutil.rmtree(dest_dir, ignore_errors=True)
+            _gdb_trash(dest_dir, async_unlink=True)
         raise
 
     if dest_db_loaded:
@@ -2427,7 +2472,10 @@ def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:
     if not force:
         raise ValueError("Set force=True to delete a track")
 
-    shutil.rmtree(track_dir, ignore_errors=True)
+    if not _gdb_trash(track_dir, async_unlink=True):
+        raise RuntimeError(
+            f"failed to remove track directory: {track_dir}"
+        )
     _cleanup_empty_track_parents(track_dir, db_root)
     _pymisha.pm_dbreload()
 
@@ -3654,7 +3702,6 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
 
     _checkroot()
     _validate_track_name(track)
-    _ensure_track_absent(track)
 
     intervals_df, chrom_sizes_df = _normalize_2d_intervals(intervals)
     values_arr = np.asarray(values, dtype=np.float32)
@@ -3675,7 +3722,7 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
         for c, e in zip(chrom_sizes_df["chrom"], chrom_sizes_df["end"], strict=False)
     }
 
-    # Sort by (chrom1, chrom2, start1, start2) — same as R
+    # Sort by (chrom1, chrom2, start1, start2) - same as R
     intervals_df["_orig_idx"] = np.arange(len(intervals_df))
     intervals_df = intervals_df.sort_values(
         ["chrom1", "chrom2", "start1", "start2"]
@@ -3683,12 +3730,9 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
     orig_idx = intervals_df["_orig_idx"].values
     intervals_df = intervals_df.drop(columns=["_orig_idx"])
 
-    # Create track directory
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
-    track_dir.mkdir(parents=True, exist_ok=True)
+    with _atomic_track_create(track) as track_dir:
+        track_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
         # Group by chromosome pair and write per-pair files
         for (c1, c2), group in intervals_df.groupby(["chrom1", "chrom2"]):
             cs1 = chrom_size.get(str(c1))
@@ -3721,6 +3765,7 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
             filename = os.path.join(str(track_dir), f"{c1}-{c2}")
             write_2d_track_file(filename, objs, arena, is_points=is_points)
 
+    try:
         _pymisha.pm_dbreload()
         _set_created_attrs(
             track,
@@ -3729,10 +3774,12 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
         )
         if _db_is_indexed(_shared._GROOT):
             gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-        _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise
 
 
@@ -3887,7 +3934,12 @@ def gtrack_2d_import_contacts(
     """
     _checkroot()
     _validate_track_name(track)
-    _ensure_track_absent(track)
+
+    # Pre-check existence early to avoid heavy work on a doomed call.
+    # The atomic wrapper later re-checks; this is for symmetry with
+    # the previous _ensure_track_absent placement.
+    if _track_exists(track):
+        raise ValueError(f"Track '{track}' already exists")
 
     # Accept a single file path as a convenience
     if isinstance(contacts, str):
@@ -4095,11 +4147,9 @@ def gtrack_2d_import_contacts(
     orig_idx = intervals_norm["_orig_idx"].values
     intervals_norm = intervals_norm.drop(columns=["_orig_idx"])
 
-    track_dir = _track_dir_for_create(track)
-    created_new = not track_dir.exists()
-    track_dir.mkdir(parents=True, exist_ok=True)
+    with _atomic_track_create(track) as track_dir:
+        track_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
         for (c1, c2), group in intervals_norm.groupby(["chrom1", "chrom2"]):
             cs1 = chrom_size.get(str(c1))
             cs2 = chrom_size.get(str(c2))
@@ -4128,6 +4178,7 @@ def gtrack_2d_import_contacts(
                     is_points=True,
                 )
 
+    try:
         _pymisha.pm_dbreload()
 
         contacts_str = '", "'.join(contacts)
@@ -4140,8 +4191,10 @@ def gtrack_2d_import_contacts(
         )
         if _db_is_indexed(_shared._GROOT):
             gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
-    except Exception:
-        if created_new and track_dir.exists():
-            shutil.rmtree(track_dir, ignore_errors=True)
-        _pymisha.pm_dbreload()
+    except Exception as exc:
+        warnings.warn(
+            f"post-create steps failed for track '{track}': {exc}; "
+            "the track was created but may have incomplete attributes",
+            stacklevel=2,
+        )
         raise

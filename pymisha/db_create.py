@@ -369,103 +369,164 @@ def _interval_set_is_2d(intervals_dir: Path) -> bool:
     return False
 
 
-def _convert_all_tracks_to_indexed(groot: str | Path, verbose: bool = False) -> None:
-    from .tracks import (
-        gtrack_2d_convert_to_indexed,
-        gtrack_convert_to_indexed,
-        gtrack_info,
-        gtrack_ls,
-    )
+def _convert_one_track_worker(
+    args: tuple[str, str],
+) -> tuple[str, str, str | None]:
+    """Pool worker: convert a single track to indexed format.
 
-    converted_1d = 0
-    converted_2d = 0
-    failed = 0
-    tracks = gtrack_ls() or []
+    Re-inits the DB inside the worker so fork inheritance doesn't alias
+    parent C++ singletons. Returns (track, status, error_msg|None).
+    """
+    track, groot = args
+    try:
+        from .db import gdb_init
+        from .tracks import (
+            gtrack_2d_convert_to_indexed,
+            gtrack_convert_to_indexed,
+            gtrack_info,
+        )
 
-    for track in tracks:
+        gdb_init(groot)
         track_dir = Path(groot) / "tracks" / f"{track.replace('.', '/')}.track"
         if not track_dir.is_dir():
-            continue
+            return (track, "skipped", None)
         if (track_dir / "track.idx").exists():
-            continue
-
+            return (track, "skipped", None)
         try:
             info = gtrack_info(track)
         except Exception as exc:
-            warnings.warn(f"Skipping track '{track}': failed to read info ({exc})", stacklevel=2)
-            failed += 1
-            continue
-
+            return (track, "failed", f"read info: {exc}")
         track_type = info.get("type")
-
-        # 1D tracks
         if track_type in {"dense", "sparse", "array"}:
-            try:
-                gtrack_convert_to_indexed(track, remove_old=False)
-                converted_1d += 1
-            except Exception as exc:
-                warnings.warn(f"Failed to convert track '{track}': {exc}", stacklevel=2)
-                failed += 1
-        # 2D tracks
-        elif track_type in {"rectangles", "points"}:
-            try:
-                gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
-                converted_2d += 1
-            except Exception as exc:
-                warnings.warn(f"Failed to convert 2D track '{track}': {exc}", stacklevel=2)
-                failed += 1
+            gtrack_convert_to_indexed(track, remove_old=False)
+            return (track, "converted_1d", None)
+        if track_type in {"rectangles", "points"}:
+            gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
+            return (track, "converted_2d", None)
+        return (track, "skipped", None)
+    except Exception as exc:
+        return (track, "failed", str(exc))
 
+
+def _convert_all_tracks_to_indexed(
+    groot: str | Path, verbose: bool = False, threads: int = 1
+) -> None:
+    import multiprocessing as mp
+    import sys
+
+    from .tracks import gtrack_ls
+
+    tracks = gtrack_ls() or []
+    if not tracks:
+        if verbose:
+            print("No tracks to convert.")
+        return
+
+    args_list = [(t, str(groot)) for t in tracks]
+    if threads <= 1 or len(args_list) <= 1 or sys.platform == "win32":
+        results = [_convert_one_track_worker(a) for a in args_list]
+    else:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(threads) as pool:
+            results = pool.map(_convert_one_track_worker, args_list)
+
+    converted_1d = sum(1 for _, s, _ in results if s == "converted_1d")
+    converted_2d = sum(1 for _, s, _ in results if s == "converted_2d")
+    failures = [(t, e) for t, s, e in results if s == "failed"]
+    for t, e in failures:
+        warnings.warn(f"Failed to convert track '{t}': {e}", stacklevel=2)
     if verbose:
         print(
             f"Converted tracks to indexed format: "
-            f"{converted_1d} 1D + {converted_2d} 2D converted, {failed} failed"
+            f"{converted_1d} 1D + {converted_2d} 2D converted, "
+            f"{len(failures)} failed"
         )
+
+
+def _convert_one_intervals_worker(
+    args: tuple[str, str, bool],
+) -> tuple[str, str, str | None]:
+    """Pool worker: convert a single intervals set to indexed format.
+
+    Re-inits the DB inside the worker. Returns (intervals_set, status, error_msg|None).
+    """
+    intervals_set, groot, remove_old_files = args
+    try:
+        from .db import gdb_init
+        from .intervals import (
+            gintervals_2d_convert_to_indexed,
+            gintervals_convert_to_indexed,
+            gintervals_ls,
+        )
+
+        gdb_init(groot)
+        # Defensive: re-verify the set exists post-fork.
+        if intervals_set not in (gintervals_ls() or []):
+            return (intervals_set, "skipped", None)
+        intervals_dir = (
+            Path(groot) / "tracks" / f"{intervals_set.replace('.', '/')}.interv"
+        )
+        if not intervals_dir.is_dir():
+            return (intervals_set, "skipped", None)
+        if _interval_set_is_2d(intervals_dir):
+            if (intervals_dir / "intervals2d.idx").exists():
+                return (intervals_set, "skipped", None)
+            gintervals_2d_convert_to_indexed(
+                intervals_set,
+                remove_old=remove_old_files,
+                force=False,
+            )
+        else:
+            if (intervals_dir / "intervals.idx").exists():
+                return (intervals_set, "skipped", None)
+            gintervals_convert_to_indexed(
+                intervals_set,
+                remove_old=remove_old_files,
+                force=False,
+            )
+        return (intervals_set, "converted", None)
+    except Exception as exc:
+        return (intervals_set, "failed", str(exc))
 
 
 def _convert_all_intervals_to_indexed(
     groot: str | Path,
     remove_old_files: bool = False,
     verbose: bool = False,
+    threads: int = 1,
 ) -> None:
-    from .intervals import (
-        gintervals_2d_convert_to_indexed,
-        gintervals_convert_to_indexed,
-        gintervals_ls,
-    )
+    import multiprocessing as mp
+    import sys
 
-    converted = 0
-    failed = 0
+    from .intervals import gintervals_ls
+
     interval_sets = gintervals_ls() or []
+    if not interval_sets:
+        if verbose:
+            print("No interval sets to convert.")
+        return
 
-    for intervals_set in interval_sets:
-        intervals_dir = Path(groot) / "tracks" / f"{intervals_set.replace('.', '/')}.interv"
-        if not intervals_dir.is_dir():
-            continue
+    args_list = [
+        (iset, str(groot), bool(remove_old_files)) for iset in interval_sets
+    ]
+    if threads <= 1 or len(args_list) <= 1 or sys.platform == "win32":
+        results = [_convert_one_intervals_worker(a) for a in args_list]
+    else:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(threads) as pool:
+            results = pool.map(_convert_one_intervals_worker, args_list)
 
-        try:
-            if _interval_set_is_2d(intervals_dir):
-                if (intervals_dir / "intervals2d.idx").exists():
-                    continue
-                gintervals_2d_convert_to_indexed(
-                    intervals_set,
-                    remove_old=bool(remove_old_files),
-                    force=False,
-                )
-            else:
-                if (intervals_dir / "intervals.idx").exists():
-                    continue
-                gintervals_convert_to_indexed(
-                    intervals_set,
-                    remove_old=bool(remove_old_files),
-                    force=False,
-                )
-            converted += 1
-        except Exception as exc:
-            warnings.warn(f"Failed to convert intervals set '{intervals_set}': {exc}", stacklevel=2)
-            failed += 1
-
+    converted = sum(1 for _, s, _ in results if s == "converted")
+    failures = [(t, e) for t, s, e in results if s == "failed"]
+    for t, e in failures:
+        warnings.warn(
+            f"Failed to convert intervals set '{t}': {e}", stacklevel=2
+        )
     if verbose:
-        print(f"Converted interval sets to indexed format: {converted} converted, {failed} failed")
+        print(
+            f"Converted interval sets to indexed format: "
+            f"{converted} converted, {len(failures)} failed"
+        )
 
 
 @contextmanager
@@ -588,6 +649,8 @@ def gdb_convert_to_indexed(
     convert_intervals: bool = False,
     verbose: bool = False,
     chunk_size: int = 104857600,
+    *,
+    threads: int | None = None,
 ) -> None:
     """
     Convert a per-chromosome database to indexed genome format.
@@ -610,6 +673,13 @@ def gdb_convert_to_indexed(
         If True, prints conversion progress.
     chunk_size : int, default 104857600
         I/O chunk size for reading sequence files.
+    threads : int or None, optional
+        Number of worker processes for per-track / per-intervals
+        conversion. ``None`` (default) resolves to
+        ``min(os.cpu_count() or 1, 8)``. ``1`` keeps the serial path.
+        Values > 1 fork a `multiprocessing.Pool`; per-task failures
+        are emitted as warnings rather than aborting. Falls back to
+        serial on Windows.
 
     Returns
     -------
@@ -618,8 +688,8 @@ def gdb_convert_to_indexed(
     Raises
     ------
     ValueError
-        If ``chunk_size`` is not positive, or no database is active and
-        ``groot`` is not specified.
+        If ``chunk_size`` is not positive, ``threads`` is not a positive
+        integer, or no database is active and ``groot`` is not specified.
     FileNotFoundError
         If the database directory, ``seq/`` directory, or
         ``chrom_sizes.txt`` does not exist.
@@ -652,6 +722,13 @@ def gdb_convert_to_indexed(
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
+
+    if threads is None:
+        threads = min(os.cpu_count() or 1, 8)
+    if not isinstance(threads, int) or threads < 1:
+        raise ValueError(
+            f"threads must be a positive integer, got {threads!r}"
+        )
 
     if groot is None:
         if _shared._GROOT is None:
@@ -749,12 +826,15 @@ def gdb_convert_to_indexed(
             print("Converting tracks/intervals to indexed format...")
         with _db_conversion_context(db_root):
             if convert_tracks:
-                _convert_all_tracks_to_indexed(db_root, verbose=verbose)
+                _convert_all_tracks_to_indexed(
+                    db_root, verbose=verbose, threads=threads,
+                )
             if convert_intervals:
                 _convert_all_intervals_to_indexed(
                     db_root,
                     remove_old_files=remove_old_files,
                     verbose=verbose,
+                    threads=threads,
                 )
 
     return

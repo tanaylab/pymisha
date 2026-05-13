@@ -76,6 +76,11 @@ def gdb_init(path: str, userpath: str | None = None):
     _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _pymisha.pm_dbsetdatasets([])
 
+    from pymisha._db_trash import _gdb_trash_sweep_old
+    tracks_dir = db_path / "tracks"
+    if tracks_dir.is_dir():
+        _gdb_trash_sweep_old(tracks_dir, max_age_hours=24.0)
+
 
 def gdb_reload():
     """

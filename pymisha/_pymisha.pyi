@@ -241,6 +241,24 @@ def pm_track_create_expr(
     C++ signature: ``PyArg_ParseTuple(args, "ssO|OO", ...)``
     """
 
+def pm_set_create_dir_override(path: str, /) -> None:
+    """Set thread-local override path for next pm_track_create_*.
+
+    When set to a non-empty path, ``pm_track_create_*`` entries will mkdir
+    into that path instead of the directory derived from the track name.
+    Used by ``_atomic_track_create`` to write into a sibling tmp dir and
+    rename atomically on success.
+
+    C++ signature: ``PyArg_ParseTuple(args, "s", &path)``
+    """
+
+def pm_clear_create_dir_override() -> None:
+    """Clear thread-local create_dir_override.
+
+    After clearing, ``pm_track_create_*`` reverts to the default behavior of
+    computing the track directory from the track name.
+    """
+
 def pm_modify(
     track: str,
     expr: str,

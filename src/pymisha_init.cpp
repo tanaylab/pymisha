@@ -54,6 +54,8 @@ PyObject *pm_track_create_empty_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track_create_sparse(PyObject *self, PyObject *args);
 PyObject *pm_track_create_dense(PyObject *self, PyObject *args);
 PyObject *pm_track_create_expr(PyObject *self, PyObject *args);
+PyObject *pm_set_create_dir_override(PyObject *self, PyObject *args);
+PyObject *pm_clear_create_dir_override(PyObject *self, PyObject *args);
 PyObject *pm_intervals_all(PyObject *self, PyObject *args);
 PyObject *pm_iterate(PyObject *self, PyObject *args);
 PyObject *pm_seed(PyObject *self, PyObject *args);
@@ -116,6 +118,8 @@ static PyMethodDef module_methods[] = {
     {"pm_track_create_sparse", pm_track_create_sparse, METH_VARARGS, "Create sparse track from intervals+values"},
     {"pm_track_create_dense", pm_track_create_dense, METH_VARARGS, "Create dense track from intervals+values"},
     {"pm_track_create_expr", pm_track_create_expr, METH_VARARGS, "Create track from expression in streaming mode"},
+    {"pm_set_create_dir_override", pm_set_create_dir_override, METH_VARARGS, "Set thread-local override path for next pm_track_create_*"},
+    {"pm_clear_create_dir_override", pm_clear_create_dir_override, METH_VARARGS, "Clear thread-local create_dir_override"},
     {"pm_intervals_all", pm_intervals_all, METH_VARARGS, "Get all genome intervals"},
     {"pm_iterate", pm_iterate, METH_VARARGS, "Iterate intervals with iterator policy"},
     {"pm_seed", pm_seed, METH_VARARGS, "Set random seed"},

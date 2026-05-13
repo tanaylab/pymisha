@@ -558,3 +558,49 @@ class TestTrackFormatConversion:
             with contextlib.suppress(Exception):
                 pm.gvtrack_rm(vt)
             _cleanup_track(track)
+
+
+class TestGdbConvertThreads:
+    def test_threads_in_signature_with_correct_default(self):
+        import inspect
+        sig = inspect.signature(pm.gdb_convert_to_indexed)
+        assert "threads" in sig.parameters
+        assert sig.parameters["threads"].default is None
+
+    def test_threads_zero_raises(self, tmp_path, restore_db):
+        # Build a minimal indexed DB so the early validation passes.
+        root = tmp_path / "db"
+        chrom_rows = [("chr1", "AC" * 10)]
+        _write_per_chrom_db(root, chrom_rows)
+        pm.gdb_convert_to_indexed(groot=str(root))
+        with pytest.raises(ValueError, match="threads must be"):
+            pm.gdb_convert_to_indexed(
+                groot=str(root),
+                threads=0,
+                convert_tracks=False,
+                convert_intervals=False,
+            )
+
+    def test_threads_1_uses_serial_path(self, tmp_path, restore_db, monkeypatch):
+        # With threads=1, Pool must not be instantiated.
+        import multiprocessing
+        called = []
+        original_pool = multiprocessing.context.ForkContext.Pool
+
+        def spy_pool(self, *a, **k):
+            called.append(True)
+            return original_pool(self, *a, **k)
+
+        monkeypatch.setattr(
+            multiprocessing.context.ForkContext, "Pool", spy_pool
+        )
+        root = tmp_path / "db"
+        chrom_rows = [("chr1", "AC" * 10)]
+        _write_per_chrom_db(root, chrom_rows)
+        pm.gdb_convert_to_indexed(
+            groot=str(root),
+            threads=1,
+            convert_tracks=False,
+            convert_intervals=False,
+        )
+        assert called == []

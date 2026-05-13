@@ -26,6 +26,7 @@ from ._crc64 import (
 from ._crc64 import (
     crc64_init as _crc64_init,
 )
+from ._db_trash import _gdb_trash
 from ._name_validation import validate_dotted_name
 from ._shared import (
     CONFIG,
@@ -4803,7 +4804,6 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
     gintervals_ls : List named interval sets.
     """
     _checkroot()
-    import shutil
 
     from . import _shared
     assert _shared._GROOT is not None
@@ -4819,7 +4819,10 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
 
     # Remove the file (or directory for big interval sets)
     if interv_path.is_dir():
-        shutil.rmtree(interv_path)
+        if not _gdb_trash(interv_path, async_unlink=True):
+            raise RuntimeError(
+                f"failed to remove intervals directory: {interv_path}"
+            )
     else:
         interv_path.unlink()
         # Also remove companion .iattr file for small interval sets

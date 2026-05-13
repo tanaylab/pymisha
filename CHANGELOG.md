@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.42 (2026-05-14)
+
+### Robustness
+- **`gtrack_rm` and `gintervals_rm` return in microseconds even on directories with millions of files.** The doomed directory is renamed to a hidden `.trash.<base>.<pid>.<rand>` sibling and the actual filesystem cleanup runs in a detached background process. Falls back to synchronous unlink when atomic rename is not available (cross-filesystem). The cross-database overwrite path in `gtrack_copy` uses the same mechanism. Stale `.trash.*` and `.<name>.tmp.*` entries are swept on `gdb_init` (24h cutoff). (R misha 5.6.30.)
+- **`gtrack_create_*` is now atomic.** An interrupted create no longer leaves a partial track directory that blocks re-creation. Writers mkdir into a hidden `.<base>.tmp.<pid>.<rand>` directory and `os.rename` to the final name on success; on failure the tmp dir is trashed. Concurrent rescans (`gtrack_ls`) skip in-flight tmp dirs. Applies to `gtrack_create_sparse`, `gtrack_create_dense`, `gtrack_create_dense_direct`, `gtrack_smooth`, `gtrack_create`, `gtrack_2d_create`, and `gtrack_2d_import_contacts`. Functions that delegate (`gtrack_import`, `gtrack_import_set`, `gtrack_import_mappedseq`, `gtrack_create_pwm_energy`, `gtrack_2d_import`) inherit atomicity from the wrapped writers they call. (R misha 5.6.30.)
+- **`gdb_convert_to_indexed(threads=N)` runs per-track conversions in parallel.** Default `threads` is `min(os.cpu_count(), 8)`. Per-track failures surface as warnings without aborting the batch. Falls back to serial on Windows and when `threads == 1`. (R misha 5.6.30.)
+
 ## v0.1.41 (2026-05-13)
 
 ### Testing
