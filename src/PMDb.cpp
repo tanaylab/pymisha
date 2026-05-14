@@ -14,6 +14,7 @@
 #include <unordered_set>
 
 #include "PMDb.h"
+#include "PMDataFrame.h"
 #include "TGLException.h"
 
 // Global database instance
@@ -27,6 +28,8 @@ void PMDb::init(const std::string &groot, const std::string &uroot) {
     if (m_initialized) {
         unload();
     }
+
+    invalidate_caches();
 
     m_groot = groot;
     m_uroot = uroot;
@@ -52,11 +55,14 @@ void PMDb::reload() {
         TGLError("Database not initialized. Call gdb_init() first.");
     }
 
+    invalidate_caches();
+
     // Re-scan tracks
     rebuild_track_cache();
 }
 
 void PMDb::unload() {
+    invalidate_caches();
     m_groot.clear();
     m_uroot.clear();
     m_datasets.clear();
@@ -64,6 +70,43 @@ void PMDb::unload() {
     m_track_db.clear();
     m_chromkey = GenomeChromKey();  // Reset
     m_initialized = false;
+}
+
+void PMDb::invalidate_caches() {
+    m_intervals_all_names.clear();
+    m_intervals_all_names.shrink_to_fit();
+    m_intervals_all_sizes.clear();
+    m_intervals_all_sizes.shrink_to_fit();
+    m_intervals_all_built = false;
+}
+
+PyObject *PMDb::get_intervals_all_py() const {
+    // See PMDb.h for the cache-vectors-not-pyobject rationale.
+    if (!m_intervals_all_built) {
+        const GenomeChromKey &ck = m_chromkey;
+        uint64_t n = ck.get_num_chroms();
+        m_intervals_all_names.resize(n);
+        m_intervals_all_sizes.resize(n);
+        for (uint64_t i = 0; i < n; ++i) {
+            m_intervals_all_names[i] = ck.id2chrom(i);
+            m_intervals_all_sizes[i] = (int64_t)ck.get_chrom_size(i);
+        }
+        m_intervals_all_built = true;
+    }
+
+    uint64_t n = m_intervals_all_names.size();
+    PMDataFrame df(n, 3, "intervals");
+    df.init_col(0, "chrom", PMDataFrame::STR);
+    df.init_col(1, "start", PMDataFrame::LONG);
+    df.init_col(2, "end", PMDataFrame::LONG);
+    for (uint64_t i = 0; i < n; ++i) {
+        df.val_str(i, 0, m_intervals_all_names[i].c_str());
+        df.val_long(i, 1, 0);
+        df.val_long(i, 2, (long)m_intervals_all_sizes[i]);
+    }
+    PMPY result = df.construct_py(true);
+    result.to_be_stolen();
+    return (PyObject *)result;
 }
 
 void PMDb::load_chrom_sizes() {

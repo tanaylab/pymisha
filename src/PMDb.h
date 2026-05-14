@@ -8,11 +8,14 @@
 #ifndef PMDB_H_
 #define PMDB_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <set>
 #include <mutex>
 #include <unordered_map>
+
+#include <Python.h>
 
 #include "GenomeChromKey.h"
 
@@ -25,6 +28,15 @@ public:
     void init(const std::string &groot, const std::string &uroot);
     void reload();
     void unload();
+
+    // Cache invalidation (called by init/reload/unload internally; also
+    // safe to call from anything that mutates the chromosome key).
+    void invalidate_caches();
+
+    // Build (and cache) the chrom/start/end DataFrame used by
+    // pm_intervals_all. Returns a NEW reference: callers may either steal it
+    // (e.g. PyTuple_SetItem) or Py_DECREF when done.
+    PyObject *get_intervals_all_py() const;
 
     // State accessors
     bool is_initialized() const { return m_initialized; }
@@ -57,6 +69,26 @@ private:
     GenomeChromKey m_chromkey;
     mutable std::set<std::string> m_track_cache;  // Cached track names
     mutable std::unordered_map<std::string, std::string> m_track_db; // Track -> db root
+
+    // pm_intervals_all cache.
+    //
+    // Rationale (E.1.2): on million-contig databases the current
+    // pm_intervals_all rebuild dominates (millions of string copies +
+    // pandas allocations). Since the chromosome key is fixed between
+    // gdb_init/gdb_reload calls, we can serve repeated calls from cache.
+    //
+    // We cache the raw name/size vectors (not the PyObject) and rebuild a
+    // fresh PMDataFrame on each call. This is intentional:
+    //   1. Each caller gets independent numpy arrays so in-place mutation
+    //      of the returned DataFrame can never corrupt the cache.
+    //   2. Avoids any Py reference juggling across the cached PyObject's
+    //      lifetime (which would be entangled with PMDb's lifetime even
+    //      after Python shutdown).
+    //   3. The cost is just N PyUnicode_FromString + 2 numpy allocations -
+    //      orders of magnitude cheaper than ck.id2chrom() / id2size().
+    mutable std::vector<std::string> m_intervals_all_names;
+    mutable std::vector<int64_t> m_intervals_all_sizes;
+    mutable bool m_intervals_all_built{false};
 
     // Load chromosome sizes from chrom_sizes.txt
     void load_chrom_sizes();

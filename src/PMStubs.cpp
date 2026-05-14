@@ -2648,7 +2648,10 @@ PyObject *pm_track_path(PyObject *self, PyObject *args)
     }
 }
 
-// Get all genome intervals
+// Get all genome intervals. Delegates to PMDb's cache of the chrom name/size
+// vectors (E.1.2 - R 5.6.30 ce788e75): on million-contig databases the
+// per-call rebuild of these strings is the dominant cost. We still construct
+// a fresh PMDataFrame each call (so callers cannot mutate the cached state).
 PyObject *pm_intervals_all(PyObject *self, PyObject *args)
 {
     try {
@@ -2658,24 +2661,7 @@ PyObject *pm_intervals_all(PyObject *self, PyObject *args)
             verror("Database not initialized. Call gdb_init() first.");
         }
 
-        const GenomeChromKey &chromkey = g_pmdb->chromkey();
-        uint64_t num_chroms = chromkey.get_num_chroms();
-
-        // Create DataFrame with one row per chromosome
-        PMDataFrame df(num_chroms, 3, "intervals");
-        df.init_col(0, "chrom", PMDataFrame::STR);
-        df.init_col(1, "start", PMDataFrame::LONG);
-        df.init_col(2, "end", PMDataFrame::LONG);
-
-        for (uint64_t i = 0; i < num_chroms; ++i) {
-            df.val_str(i, 0, chromkey.id2chrom(i).c_str());
-            df.val_long(i, 1, 0);
-            df.val_long(i, 2, chromkey.get_chrom_size(i));
-        }
-
-        PMPY result = df.construct_py(true);
-        result.to_be_stolen();
-        return (PyObject *)result;
+        return g_pmdb->get_intervals_all_py();
 
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());

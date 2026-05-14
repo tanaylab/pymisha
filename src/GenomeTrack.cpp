@@ -75,6 +75,13 @@ const pair<int, int> GenomeTrack::get_chromid_2d(const GenomeChromKey &chromkey,
 
 string GenomeTrack::find_existing_1d_filename(const GenomeChromKey &chromkey, const string &track_dir, int chromid)
 {
+    // Short-circuit for indexed tracks: per-chrom files never exist; the
+    // canonical 1d filename is the only one that matters. Skip the
+    // O(N_aliases) alias scan and the per-candidate access() syscalls.
+    if (get_track_index(track_dir) != nullptr) {
+        return get_1d_filename(chromkey, chromid);
+    }
+
     const string &base = get_1d_filename(chromkey, chromid);
     vector<string> candidates;
     candidates.push_back(base);

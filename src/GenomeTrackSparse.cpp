@@ -31,11 +31,15 @@ void GenomeTrackSparse::init_read(const char *filename, int chromid)
     uint64_t header_start = 0;
     uint64_t total_bytes = 0;
 
+    // E.1.4: get_track_index() already caches loaded indexes and returns
+    // nullptr silently when no track.idx exists (TrackIndex::load returns
+    // false on ENOENT). Calling it directly avoids a redundant per-chrom
+    // stat(track.idx) syscall on the hot read path; critical for
+    // million-contig genomes on NFS.
     const std::string track_dir = GenomeTrack::get_track_dir(filename);
-    const std::string idx_path = track_dir + "/track.idx";
+    auto idx = get_track_index(track_dir);
 
-    struct stat idx_st;
-    if (stat(idx_path.c_str(), &idx_st) == 0) {
+    if (idx) {
         const std::string dat_path = track_dir + "/track.dat";
 
         if (!m_dat_open || m_dat_path != dat_path || m_dat_mode != "rb") {
@@ -46,10 +50,6 @@ void GenomeTrackSparse::init_read(const char *filename, int chromid)
             m_dat_path = dat_path;
             m_dat_mode = "rb";
         }
-
-        auto idx = get_track_index(track_dir);
-        if (!idx)
-            TGLError<GenomeTrackSparse>("Failed to load track index for %s", track_dir.c_str());
 
         auto entry = idx->get_entry(chromid);
         if (!entry || entry->length == 0) {

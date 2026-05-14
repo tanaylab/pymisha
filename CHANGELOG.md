@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.48 (2026-05-14)
+
+### Performance
+- **`pm_intervals_all` caches its result on `PMDb`.** Repeat calls return in microseconds instead of rebuilding the chrom-intervals DataFrame each time. Cache invalidated on `gdb_init` / `gdb_reload`. (R misha 5.6.30 `ce788e75`.)
+- **`find_existing_1d_filename` short-circuits for indexed tracks.** Skips the O(N_aliases) chromAlias scan + per-candidate `access()` syscalls when the track has an index. Hot read paths on indexed million-contig databases no longer pay the alias-search cost per chromosome transition. (R misha 5.6.30 `b340ccfa`.)
+- **Eliminated redundant `stat(track.idx)` calls inside `init_read`.** Both `GenomeTrackFixedBin::init_read` and `GenomeTrackSparse::init_read` now ask `get_track_index()` directly (which caches its own stat result) instead of stat-then-load. Removes ~2 stat syscalls per chromosome transition. (R misha 5.6.30 `1db467d1`.)
+
+### Notes
+- **R 5.6.30 `5a9828e6` (GenomeChromKey caching) and `327bcbb2` (scanner index-aware iterator setup) are N/A in pymisha:** the singleton `PMDb` already caches the chrom-key for the database lifetime, and the scanner's bin-size discovery loop already breaks after the first non-empty chromosome, making it constant work. Verified by measurement.
+
 ## v0.1.47 (2026-05-14)
 
 ### Fixes
