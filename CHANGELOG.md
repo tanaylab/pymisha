@@ -1,10 +1,18 @@
 # Changelog
 
+## v0.1.53 (2026-05-14)
+
+### Features
+- **`gtrack_create_dense(func=)` knob for per-bin aggregation.** Seven reductions: `weighted.mean` (default, byte-identical to prior output), `weighted.sum`, `max`, `min`, `median`, `count`, `coverage`. The `coverage` mode with `values=[1]*N` and `defval=0` produces a one-call ChIP-seq-style pileup track from BED inputs. `defval` acts as a synthetic uncovered contribution for every func except `count`. (R misha 5.6.32 `068a02a2`, `5e69c2c8`.)
+
+### Notes
+- **R 5.6.32 `1b4f5065` (unsigned-wrap guard) is N/A in pymisha:** the `ov_end > ov_start` guard was already present at `src/PMTrackCreate.cpp:637`; the bug never existed here. Wrap-regression test added as a sentinel.
+
 ## v0.1.52 (2026-05-14)
 
 ### Fixes
 - **`gdb_install_intervals` now produces the full TSS/UTR sets on NCBI and UCSC backends.** `_install_genes` previously filtered only Ensembl/GENCODE feature names (`transcript`, `five_prime_utr`, `three_prime_utr`); production NCBI GFF3 uses `mRNA` + `five_prime_UTR` + `three_prime_UTR`, and UCSC's `ncbiRefSeq.gtf.gz` uses `5UTR` + `3UTR`. The NCBI path was producing empty TSS+UTR sets; UCSC was producing empty UTR sets. The synthetic test fixture used GENCODE naming and hid the bug.
-- **`pwm.edit_distance` family: `direction="below"` + `bidirect=True` now takes MAX across strands (was MIN).** A genomic substitution affects both strands, so disrupting a motif site needs both strands below threshold — the harder strand bounds the answer. (R misha 5.6.10 `19c51158`.)
+- **`pwm.edit_distance` family: `direction="below"` + `bidirect=True` now takes MAX across strands (was MIN).** A genomic substitution affects both strands, so disrupting a motif site needs both strands below threshold; the harder strand bounds the answer. (R misha 5.6.10 `19c51158`.)
 - **`pwm.edit_distance` family: removed hidden `score_min = score_thresh` default for `direction="below"`.** The hidden default was a footgun: users pre-filtering for strong matches and then calling edit distance got unexpected NAs. `score_min` now defaults to no filter for both directions; pass it explicitly when needed. (R misha 5.6.10 `88e49b62`.)
 
 ### Performance

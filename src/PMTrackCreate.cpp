@@ -546,6 +546,110 @@ PyObject *pm_track_create_sparse(PyObject *self, PyObject *args)
     }
 }
 
+// Per-bin aggregation knob added in R misha 5.6.32 (068a02a2, 5e69c2c8).
+// WMEAN keeps the historical streaming-sum fast path; the others collect
+// contributions into a small per-bin vector and reduce.
+enum class DenseAggFunc {
+    WMEAN,
+    WSUM,
+    MAX,
+    MIN,
+    WMEDIAN,
+    COUNT,
+    COVERAGE,
+};
+
+static DenseAggFunc parse_dense_agg_func(const char *s)
+{
+    if (!strcmp(s, "weighted.mean"))   return DenseAggFunc::WMEAN;
+    if (!strcmp(s, "weighted.sum"))    return DenseAggFunc::WSUM;
+    if (!strcmp(s, "max"))             return DenseAggFunc::MAX;
+    if (!strcmp(s, "min"))             return DenseAggFunc::MIN;
+    if (!strcmp(s, "weighted.median")) return DenseAggFunc::WMEDIAN;
+    if (!strcmp(s, "count"))           return DenseAggFunc::COUNT;
+    if (!strcmp(s, "coverage"))        return DenseAggFunc::COVERAGE;
+    verror("Unknown func '%s' for gtrack_create_dense", s);
+    return DenseAggFunc::WMEAN;  // unreachable
+}
+
+namespace {
+struct Contribution {
+    double value;
+    double overlap;  // base-pair overlap with the bin
+};
+}  // namespace
+
+static float reduce_bin(DenseAggFunc func, vector<Contribution> &contribs, double bin_width)
+{
+    if (contribs.empty()) {
+        return (func == DenseAggFunc::COUNT)
+                   ? 0.0f
+                   : std::numeric_limits<float>::quiet_NaN();
+    }
+
+    switch (func) {
+    case DenseAggFunc::WMEAN: {
+        double sum = 0.0, w = 0.0;
+        for (const auto &c : contribs) {
+            sum += c.value * c.overlap;
+            w   += c.overlap;
+        }
+        return w > 0.0 ? (float)(sum / w)
+                       : std::numeric_limits<float>::quiet_NaN();
+    }
+    case DenseAggFunc::WSUM: {
+        double sum = 0.0;
+        for (const auto &c : contribs)
+            sum += c.value * c.overlap;
+        return (float)sum;
+    }
+    case DenseAggFunc::MAX: {
+        double m = contribs[0].value;
+        for (size_t i = 1; i < contribs.size(); ++i)
+            if (contribs[i].value > m) m = contribs[i].value;
+        return (float)m;
+    }
+    case DenseAggFunc::MIN: {
+        double m = contribs[0].value;
+        for (size_t i = 1; i < contribs.size(); ++i)
+            if (contribs[i].value < m) m = contribs[i].value;
+        return (float)m;
+    }
+    case DenseAggFunc::WMEDIAN: {
+        // Lower weighted median: sort by value asc, accumulate overlap;
+        // return first value whose running overlap reaches total/2.
+        std::sort(contribs.begin(), contribs.end(),
+                  [](const Contribution &a, const Contribution &b) {
+                      return a.value < b.value;
+                  });
+        double total = 0.0;
+        for (const auto &c : contribs) total += c.overlap;
+        if (total <= 0.0)
+            return std::numeric_limits<float>::quiet_NaN();
+        double half = total / 2.0;
+        double acc = 0.0;
+        for (const auto &c : contribs) {
+            acc += c.overlap;
+            if (acc >= half) return (float)c.value;
+        }
+        return (float)contribs.back().value;  // defensive
+    }
+    case DenseAggFunc::COUNT:
+        return (float)contribs.size();
+    case DenseAggFunc::COVERAGE: {
+        // sum(v_i * ov_i / bin_width). With v=1 and defval=0 this is the
+        // average per-base signal in the bin (ChIP-seq pileup).
+        if (bin_width <= 0.0)
+            return std::numeric_limits<float>::quiet_NaN();
+        double sum = 0.0;
+        for (const auto &c : contribs)
+            sum += c.value * (c.overlap / bin_width);
+        return (float)sum;
+    }
+    }
+    return std::numeric_limits<float>::quiet_NaN();  // unreachable
+}
+
 PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
 {
     try {
@@ -555,12 +659,16 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         PyObject *py_data = nullptr;
         unsigned binsize = 0;
         double defval = std::numeric_limits<double>::quiet_NaN();
+        const char *func_str = nullptr;
 
-        if (!PyArg_ParseTuple(args, "sOId", &track, &py_data, &binsize, &defval))
+        if (!PyArg_ParseTuple(args, "sOIds", &track, &py_data, &binsize, &defval, &func_str))
             verror("Invalid arguments to pm_track_create_dense");
 
         if (binsize == 0)
             verror("binsize must be positive");
+
+        const DenseAggFunc func = parse_dense_agg_func(func_str);
+        const bool is_wmean = (func == DenseAggFunc::WMEAN);
 
         string track_name(track);
         if (g_pmdb->track_exists(track_name))
@@ -589,6 +697,12 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
             // chunk-for-chunk into track.dat. Mirrors R misha 5.6.30 b2ca08cc.
             writer.reset(new IndexedTrackWriter(track_dir, MishaTrackType::DENSE, num_chroms));
         }
+
+        // Per-bin contribution buffer reused across bins (only allocated
+        // when we leave the streaming weighted.mean fast path).
+        vector<Contribution> contribs;
+        if (!is_wmean)
+            contribs.reserve(64);
 
         for (int chromid = 0; chromid < (int)num_chroms; ++chromid) {
             uint64_t chrom_size = chromkey.get_chrom_size(chromid);
@@ -628,29 +742,55 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
                 while (cur_idx < chrom_end && (uint64_t)recs[cur_idx].end <= start)
                     ++cur_idx;
 
-                double sum = 0;
-                uint64_t covered = 0;
-                size_t j = cur_idx;
-                while (j < chrom_end && (uint64_t)recs[j].start < end) {
-                    uint64_t ov_start = std::max(start, (uint64_t)recs[j].start);
-                    uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
-                    if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
-                        uint64_t ov = ov_end - ov_start;
-                        sum += (double)recs[j].value * (double)ov;
-                        covered += ov;
-                    }
-                    ++j;
-                }
-
                 uint64_t width = end - start;
-                if (covered < width && !std::isnan(defval)) {
-                    uint64_t unc = width - covered;
-                    sum += defval * (double)unc;
-                    covered += unc;
+                float out;
+
+                if (is_wmean) {
+                    // Historical streaming-sum fast path. Byte-identical
+                    // to pre-5.6.32 output.
+                    double sum = 0;
+                    uint64_t covered = 0;
+                    size_t j = cur_idx;
+                    while (j < chrom_end && (uint64_t)recs[j].start < end) {
+                        uint64_t ov_start = std::max(start, (uint64_t)recs[j].start);
+                        uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
+                        if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
+                            uint64_t ov = ov_end - ov_start;
+                            sum += (double)recs[j].value * (double)ov;
+                            covered += ov;
+                        }
+                        ++j;
+                    }
+                    if (covered < width && !std::isnan(defval)) {
+                        uint64_t unc = width - covered;
+                        sum += defval * (double)unc;
+                        covered += unc;
+                    }
+                    out = covered ? (float)(sum / (double)covered)
+                                  : std::numeric_limits<float>::quiet_NaN();
+                } else {
+                    contribs.clear();
+                    uint64_t covered = 0;
+                    size_t j = cur_idx;
+                    while (j < chrom_end && (uint64_t)recs[j].start < end) {
+                        uint64_t ov_start = std::max(start, (uint64_t)recs[j].start);
+                        uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
+                        if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
+                            uint64_t ov = ov_end - ov_start;
+                            contribs.push_back({(double)recs[j].value, (double)ov});
+                            covered += ov;
+                        }
+                        ++j;
+                    }
+                    // Synthetic uncovered contribution at defval, except for COUNT
+                    // (which reports only real interval count).
+                    if (covered < width && !std::isnan(defval) && func != DenseAggFunc::COUNT) {
+                        uint64_t unc = width - covered;
+                        contribs.push_back({defval, (double)unc});
+                    }
+                    out = reduce_bin(func, contribs, (double)width);
                 }
 
-                float out = covered ? (float)(sum / (double)covered)
-                                    : std::numeric_limits<float>::quiet_NaN();
                 batch.push_back(out);
                 if (batch.size() >= 10000)
                     flush_batch();

@@ -221,11 +221,11 @@ def pm_track_create_sparse(track: str, data: Any, /) -> None:
     """
 
 def pm_track_create_dense(
-    track: str, data: Any, binsize: int, defval: float, /
+    track: str, data: Any, binsize: int, defval: float, func: str, /
 ) -> None:
     """Create dense track from intervals+values.
 
-    C++ signature: ``PyArg_ParseTuple(args, "sOId", &track, &py_data, &binsize, &defval)``
+    C++ signature: ``PyArg_ParseTuple(args, "sOIds", &track, &py_data, &binsize, &defval, &func)``
     """
 
 def pm_track_create_expr(

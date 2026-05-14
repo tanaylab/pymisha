@@ -914,6 +914,17 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
         raise
 
 
+_CREATE_DENSE_FUNCS = (
+    "weighted.mean",
+    "weighted.sum",
+    "max",
+    "min",
+    "median",
+    "count",
+    "coverage",
+)
+
+
 def gtrack_create_dense(
     track: str,
     description: str,
@@ -921,14 +932,16 @@ def gtrack_create_dense(
     values: Any,
     binsize: int,
     defval: float = np.nan,
+    func: str = "weighted.mean",
 ) -> None:
     """
     Create a Dense (fixed-bin) track from intervals and values.
 
     Creates a new Dense track whose genome is tiled into fixed-size bins.
-    Each bin stores a single numeric value. Bins not covered by any of
-    the supplied intervals are filled with *defval*. The description is
-    stored as a track attribute.
+    Each bin stores a single numeric value reduced from the intervals
+    overlapping that bin, plus an optional synthetic uncovered
+    contribution at value *defval*. The description is stored as a track
+    attribute.
 
     Parameters
     ----------
@@ -946,7 +959,29 @@ def gtrack_create_dense(
     binsize : int
         Bin size in base pairs. Must be a positive integer.
     defval : float, default numpy.nan
-        Default value for bins not covered by any interval.
+        Default value for bins not covered by any interval. Acts as a
+        synthetic contribution with value=defval and
+        overlap=uncovered_bases for every ``func`` except ``count``.
+    func : str, default "weighted.mean"
+        Per-bin reduction over the intervals overlapping each bin. One
+        of:
+
+        ``"weighted.mean"``
+            ``sum(v_i * ov_i) / sum(ov_i)`` (default; byte-identical to
+            the historical behavior).
+        ``"weighted.sum"``
+            ``sum(v_i * ov_i)`` - coverage-weighted integral.
+        ``"max"`` / ``"min"``
+            Unweighted reduction over interval values touching the bin.
+        ``"median"``
+            Overlap-weighted (lower) median by coverage mass.
+        ``"count"``
+            Number of intervals touching the bin. Empty bin = 0.
+            ``defval`` does not contribute.
+        ``"coverage"``
+            ``sum(v_i * ov_i / binsize)`` - per-base average signal in
+            the bin. With ``values=[1]*N`` and ``defval=0`` this
+            produces a ChIP-seq-style pileup track in one call.
 
     Returns
     -------
@@ -956,7 +991,8 @@ def gtrack_create_dense(
     ------
     ValueError
         If the track already exists, binsize is not positive, values
-        length does not match intervals, or no intervals map to known
+        length does not match intervals, ``func`` is not one of the
+        seven supported reductions, or no intervals map to known
         chromosomes.
 
     See Also
@@ -979,6 +1015,12 @@ def gtrack_create_dense(
     _checkroot()
     _validate_track_name(track)
 
+    if not isinstance(func, str) or func not in _CREATE_DENSE_FUNCS:
+        raise ValueError(
+            f"Invalid 'func': must be one of {_CREATE_DENSE_FUNCS}, got {func!r}"
+        )
+    func_canonical = "weighted.median" if func == "median" else func
+
     binsize = int(binsize)
     if binsize <= 0:
         raise ValueError("binsize must be a positive integer")
@@ -995,17 +1037,29 @@ def gtrack_create_dense(
         raise ValueError("No intervals map to known chromosomes")
 
     with _atomic_track_create(track):
-        _pymisha.pm_track_create_dense(track, _df2pymisha(data), int(binsize), float(defval))
+        _pymisha.pm_track_create_dense(
+            track, _df2pymisha(data), int(binsize), float(defval), func_canonical
+        )
 
     # On indexed DBs the C++ writer (pm_track_create_dense) already
     # produced track.dat + track.idx directly, so we skip the post-create
     # convert step. Byte-identical to the per-chrom + convert pipeline.
+    if func == "weighted.mean":
+        created_by = (
+            f'gtrack.create_dense("{track}", description, intervals, values, '
+            f"{binsize}, {defval:g})"
+        )
+    else:
+        created_by = (
+            f'gtrack.create_dense("{track}", description, intervals, values, '
+            f'{binsize}, {defval:g}, func="{func}")'
+        )
     try:
         _pymisha.pm_dbreload()
         _set_created_attrs(
             track,
             description,
-            f'gtrack.create_dense("{track}", description, intervals, values, {binsize}, {defval:g})',
+            created_by,
         )
         gtrack_attr_set(track, "type", "dense")
         gtrack_attr_set(track, "binsize", str(binsize))
