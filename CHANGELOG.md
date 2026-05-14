@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.50 (2026-05-14)
+
+### Performance
+- **`gtrack_create_sparse` and `gtrack_create_dense` stream directly to `track.dat` + `track.idx` on indexed databases.** Removed the per-chromosome intermediate files + post-create `gtrack_convert_to_indexed` step. Saves ~2.5M filesystem operations per track on million-contig genomes. Byte-identical regression tests guard the on-disk layout. `gtrack_liftover` inherits the optimization (it calls `gtrack_create_sparse`). Non-indexed databases keep the previous per-chromosome write path. (R misha 5.6.30 `94a6446d`, `b2ca08cc`, `18985be4`.)
+
+### Notes
+- **R 5.6.30 `747b0076` (TrackIndexWriter refactor) is N/A in pymisha:** the abstraction never existed here; the new direct-write path adds an `IndexedTrackWriter` helper inside `PMTrackCreate.cpp` rather than refactoring shared code.
+
 ## v0.1.49 (2026-05-14)
 
 ### Fixes

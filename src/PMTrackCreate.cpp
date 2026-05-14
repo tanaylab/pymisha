@@ -5,25 +5,32 @@
  */
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 #include <climits>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <Python.h>
 
 #include "pymisha.h"
 #include "PMDataFrame.h"
 #include "PMDb.h"
+#include "CRC64.h"
 #include "GenomeTrack.h"
 #include "GenomeTrackFixedBin.h"
 #include "GenomeTrackSparse.h"
 #include "PMTrackExpressionScanner.h"
 #include "PMTrackExpressionIterator.h"
+#include "TrackIndex.h"
 
 using namespace std;
 
@@ -90,6 +97,215 @@ static int col_idx(PMDataFrame &df, const char *name)
     TGLError("Input data frame is missing '%s' column", name);
     return -1;
 }
+
+// Indexed 1D-track direct writer.
+//
+// Produces track.dat + track.idx with the SAME byte layout that the
+// per-chrom + pm_track_convert_to_indexed pipeline would produce. The
+// .dat contents are a chromid-ordered concatenation of the per-chrom
+// file bytes (signature + payload). Chroms with no payload contribute
+// 0 bytes and get length=0 in the index. The .idx file is the 36-byte
+// header (TrackIdxHeader from PMTrackIndexedFormat.cpp) followed by
+// num_chroms 24-byte contig entries; CRC64-ECMA is over (chrom_id,
+// offset, length) per entry in chromid order. See PMTrackIndexedFormat.cpp.
+struct IndexedTrackWriter {
+    static constexpr size_t HEADER_BYTES = 36;          // matches TrackIdxHeader
+    static constexpr size_t HEADER_TO_CHECKSUM = 28;    // bytes before checksum field
+    static constexpr size_t ENTRY_BYTES = 24;
+
+    string dat_path;
+    string idx_path;
+    string dat_tmp;
+    string idx_tmp;
+    FILE *dat_fp;
+    FILE *idx_fp;
+    vector<TrackContigEntry> entries;
+    uint64_t current_offset;
+    MishaTrackType track_type;
+    uint32_t num_chroms;
+    bool finished;
+
+    IndexedTrackWriter(const string &track_dir, MishaTrackType type, uint32_t nchroms)
+        : dat_path(track_dir + "/track.dat"),
+          idx_path(track_dir + "/track.idx"),
+          dat_tmp(track_dir + "/track.dat.tmp"),
+          idx_tmp(track_dir + "/track.idx.tmp"),
+          dat_fp(nullptr), idx_fp(nullptr),
+          current_offset(0), track_type(type), num_chroms(nchroms),
+          finished(false)
+    {
+        dat_fp = fopen(dat_tmp.c_str(), "wb");
+        if (!dat_fp)
+            TGLError<GenomeTrack>("Failed to create %s: %s", dat_tmp.c_str(), strerror(errno));
+        idx_fp = fopen(idx_tmp.c_str(), "wb");
+        if (!idx_fp) {
+            fclose(dat_fp); dat_fp = nullptr;
+            unlink(dat_tmp.c_str());
+            TGLError<GenomeTrack>("Failed to create %s: %s", idx_tmp.c_str(), strerror(errno));
+        }
+        entries.reserve(num_chroms);
+        write_initial_header();
+    }
+
+    ~IndexedTrackWriter()
+    {
+        // Cleanup on early destruction (exception path).
+        if (!finished) {
+            if (dat_fp) fclose(dat_fp);
+            if (idx_fp) fclose(idx_fp);
+            unlink(dat_tmp.c_str());
+            unlink(idx_tmp.c_str());
+        }
+    }
+
+    void write_initial_header()
+    {
+        // Matches TrackIdxHeader (PMTrackIndexedFormat.cpp): packed 36 bytes,
+        // checksum zero for now and rewritten after entries are computed.
+#pragma pack(push, 1)
+        struct DiskHeader {
+            char magic[8];
+            uint32_t version;
+            uint32_t track_type_raw;
+            uint32_t num_contigs;
+            uint64_t flags;
+            uint64_t checksum;
+        };
+#pragma pack(pop)
+        DiskHeader hdr;
+        const char magic[8] = {'M','I','S','H','A','T','D','X'};
+        memcpy(hdr.magic, magic, 8);
+        hdr.version = 1;
+        hdr.track_type_raw = static_cast<uint32_t>(track_type);
+        hdr.num_contigs = num_chroms;
+        hdr.flags = 0x01; // IS_LITTLE_ENDIAN
+        hdr.checksum = 0;
+
+        if (fwrite(&hdr, sizeof(hdr), 1, idx_fp) != 1)
+            TGLError<GenomeTrack>("Failed to write index header to %s", idx_tmp.c_str());
+    }
+
+    // Append a chromosome chunk to track.dat. payload is the exact bytes
+    // a per-chrom file would have contained (signature + records or
+    // signature + binsize + bins). Pass length=0 to record an empty
+    // chrom entry without writing any bytes.
+    void append_chrom(int chromid, const void *payload, uint64_t length)
+    {
+        TrackContigEntry entry;
+        entry.chrom_id = (uint32_t)chromid;
+        entry.offset = current_offset;
+        entry.length = length;
+        entry.reserved = 0;
+
+        if (length > 0) {
+            if (fwrite(payload, 1, length, dat_fp) != length)
+                TGLError<GenomeTrack>("Failed to write chrom payload to %s: %s",
+                                      dat_tmp.c_str(), strerror(errno));
+            current_offset += length;
+        }
+        entries.push_back(entry);
+
+#pragma pack(push, 1)
+        struct DiskContigEntry {
+            uint32_t chrom_id;
+            uint64_t offset;
+            uint64_t length;
+            uint32_t reserved;
+        };
+#pragma pack(pop)
+        DiskContigEntry de;
+        de.chrom_id = entry.chrom_id;
+        de.offset = entry.offset;
+        de.length = entry.length;
+        de.reserved = entry.reserved;
+        if (fwrite(&de, sizeof(de), 1, idx_fp) != 1)
+            TGLError<GenomeTrack>("Failed to write index entry to %s", idx_tmp.c_str());
+    }
+
+    // Streaming chunk write (no temporary buffer). Used by dense path
+    // which streams floats into track.dat directly. Caller must call
+    // begin_chrom() and end_chrom() around the chunk writes.
+    void begin_chrom(int chromid)
+    {
+        TrackContigEntry entry;
+        entry.chrom_id = (uint32_t)chromid;
+        entry.offset = current_offset;
+        entry.length = 0;
+        entry.reserved = 0;
+        entries.push_back(entry);
+    }
+
+    void stream_bytes(const void *data, size_t n)
+    {
+        if (n == 0) return;
+        if (fwrite(data, 1, n, dat_fp) != n)
+            TGLError<GenomeTrack>("Failed to write chrom payload to %s: %s",
+                                  dat_tmp.c_str(), strerror(errno));
+        current_offset += n;
+    }
+
+    void end_chrom()
+    {
+        TrackContigEntry &entry = entries.back();
+        entry.length = current_offset - entry.offset;
+
+#pragma pack(push, 1)
+        struct DiskContigEntry {
+            uint32_t chrom_id;
+            uint64_t offset;
+            uint64_t length;
+            uint32_t reserved;
+        };
+#pragma pack(pop)
+        DiskContigEntry de;
+        de.chrom_id = entry.chrom_id;
+        de.offset = entry.offset;
+        de.length = entry.length;
+        de.reserved = entry.reserved;
+        if (fwrite(&de, sizeof(de), 1, idx_fp) != 1)
+            TGLError<GenomeTrack>("Failed to write index entry to %s", idx_tmp.c_str());
+    }
+
+    void finish()
+    {
+        if ((uint32_t)entries.size() != num_chroms)
+            TGLError<GenomeTrack>("IndexedTrackWriter: wrote %u entries, expected %u",
+                                  (unsigned)entries.size(), (unsigned)num_chroms);
+
+        misha::CRC64 crc64;
+        uint64_t checksum = crc64.init_incremental();
+        for (const auto &entry : entries) {
+            checksum = crc64.compute_incremental(checksum,
+                (const unsigned char*)&entry.chrom_id, sizeof(entry.chrom_id));
+            checksum = crc64.compute_incremental(checksum,
+                (const unsigned char*)&entry.offset, sizeof(entry.offset));
+            checksum = crc64.compute_incremental(checksum,
+                (const unsigned char*)&entry.length, sizeof(entry.length));
+        }
+        checksum = crc64.finalize_incremental(checksum);
+
+        if (fseek(idx_fp, (long)HEADER_TO_CHECKSUM, SEEK_SET) != 0)
+            TGLError<GenomeTrack>("Failed to seek to checksum in %s", idx_tmp.c_str());
+        if (fwrite(&checksum, sizeof(checksum), 1, idx_fp) != 1)
+            TGLError<GenomeTrack>("Failed to write checksum to %s", idx_tmp.c_str());
+
+        fflush(dat_fp);
+        fflush(idx_fp);
+        fsync(fileno(dat_fp));
+        fsync(fileno(idx_fp));
+        fclose(dat_fp); dat_fp = nullptr;
+        fclose(idx_fp); idx_fp = nullptr;
+
+        if (rename(dat_tmp.c_str(), dat_path.c_str()) != 0)
+            TGLError<GenomeTrack>("Failed to rename %s -> %s: %s",
+                                  dat_tmp.c_str(), dat_path.c_str(), strerror(errno));
+        if (rename(idx_tmp.c_str(), idx_path.c_str()) != 0)
+            TGLError<GenomeTrack>("Failed to rename %s -> %s: %s",
+                                  idx_tmp.c_str(), idx_path.c_str(), strerror(errno));
+
+        finished = true;
+    }
+};
 
 static void parse_track_data(PyObject *py_df, vector<TrackRec> &out)
 {
@@ -255,23 +471,64 @@ PyObject *pm_track_create_sparse(PyObject *self, PyObject *args)
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
         const bool indexed_db = db_is_indexed();
-        vector<bool> created(chromkey.get_num_chroms(), false);
+        const uint32_t num_chroms = (uint32_t)chromkey.get_num_chroms();
 
-        GenomeTrackSparse gtrack;
-        int cur_chromid = -1;
-        for (const auto &r : recs) {
-            if (cur_chromid != r.chromid) {
-                cur_chromid = r.chromid;
-                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
-                gtrack.init_write(path.c_str(), cur_chromid);
-                created[cur_chromid] = true;
+        if (indexed_db) {
+            // Direct write of track.dat + track.idx, bypassing per-chrom
+            // files. Byte-identical to the per-chrom + convert pipeline:
+            // for each chrom with data we emit [sparse signature (4 bytes,
+            // little-endian int -8)] + N x [start(8) end(8) value(4)] in
+            // chromid order; empty chroms contribute zero bytes. Mirrors
+            // R misha 5.6.30 94a6446d.
+            IndexedTrackWriter writer(track_dir, MishaTrackType::SPARSE, num_chroms);
+
+            const int32_t sig = GenomeTrack::FORMAT_SIGNATURES[GenomeTrack::SPARSE];
+            size_t cursor = 0;
+            for (int chromid = 0; chromid < (int)num_chroms; ++chromid) {
+                size_t begin = cursor;
+                while (begin < recs.size() && recs[begin].chromid < chromid)
+                    ++begin;
+                size_t end = begin;
+                while (end < recs.size() && recs[end].chromid == chromid)
+                    ++end;
+                cursor = end;
+
+                if (begin == end) {
+                    // Empty chrom: no per-chrom file would be created in
+                    // indexed mode, so contribute zero bytes here.
+                    writer.append_chrom(chromid, nullptr, 0);
+                    continue;
+                }
+
+                writer.begin_chrom(chromid);
+                writer.stream_bytes(&sig, sizeof(sig));
+                for (size_t i = begin; i < end; ++i) {
+                    const TrackRec &r = recs[i];
+                    int64_t s = r.start;
+                    int64_t e = r.end;
+                    float v = r.value;
+                    writer.stream_bytes(&s, sizeof(s));
+                    writer.stream_bytes(&e, sizeof(e));
+                    writer.stream_bytes(&v, sizeof(v));
+                }
+                writer.end_chrom();
             }
-            GInterval interv(cur_chromid, r.start, r.end);
-            gtrack.write_next_interval(interv, r.value);
-        }
-
-        if (!indexed_db) {
-            for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+            writer.finish();
+        } else {
+            vector<bool> created(num_chroms, false);
+            GenomeTrackSparse gtrack;
+            int cur_chromid = -1;
+            for (const auto &r : recs) {
+                if (cur_chromid != r.chromid) {
+                    cur_chromid = r.chromid;
+                    string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
+                    gtrack.init_write(path.c_str(), cur_chromid);
+                    created[cur_chromid] = true;
+                }
+                GInterval interv(cur_chromid, r.start, r.end);
+                gtrack.write_next_interval(interv, r.value);
+            }
+            for (int chromid = 0; chromid < (int)num_chroms; ++chromid) {
                 if (created[chromid])
                     continue;
                 string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
@@ -318,14 +575,32 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         parse_track_data(py_data, recs);
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        const bool indexed_db = db_is_indexed();
+        const uint32_t num_chroms = (uint32_t)chromkey.get_num_chroms();
         size_t data_idx = 0;
 
-        for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+        // Optional indexed writer (constructed only when indexed_db).
+        unique_ptr<IndexedTrackWriter> writer;
+        if (indexed_db) {
+            // Direct write of track.dat + track.idx. Dense per-chrom files
+            // contain [binsize uint32 (4 bytes)] + [chrom_size/binsize x
+            // float32] with NO format signature byte (see
+            // GenomeTrackFixedBin::init_write). We mirror that byte layout
+            // chunk-for-chunk into track.dat. Mirrors R misha 5.6.30 b2ca08cc.
+            writer.reset(new IndexedTrackWriter(track_dir, MishaTrackType::DENSE, num_chroms));
+        }
+
+        for (int chromid = 0; chromid < (int)num_chroms; ++chromid) {
             uint64_t chrom_size = chromkey.get_chrom_size(chromid);
-            string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
 
             GenomeTrackFixedBin gtrack;
-            gtrack.init_write(path.c_str(), binsize, chromid);
+            if (indexed_db) {
+                writer->begin_chrom(chromid);
+                writer->stream_bytes(&binsize, sizeof(binsize));
+            } else {
+                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
+                gtrack.init_write(path.c_str(), binsize, chromid);
+            }
 
             while (data_idx < recs.size() && recs[data_idx].chromid < chromid)
                 ++data_idx;
@@ -337,6 +612,16 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
             size_t cur_idx = chrom_begin;
             vector<float> batch;
             batch.reserve(10000);
+
+            auto flush_batch = [&]() {
+                if (batch.empty()) return;
+                if (indexed_db) {
+                    writer->stream_bytes(batch.data(), batch.size() * sizeof(float));
+                } else {
+                    gtrack.write_next_bins(batch.data(), batch.size());
+                }
+                batch.clear();
+            };
 
             for (uint64_t start = 0; start < chrom_size; start += binsize) {
                 uint64_t end = std::min(start + (uint64_t)binsize, chrom_size);
@@ -367,15 +652,18 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
                 float out = covered ? (float)(sum / (double)covered)
                                     : std::numeric_limits<float>::quiet_NaN();
                 batch.push_back(out);
-                if (batch.size() >= 10000) {
-                    gtrack.write_next_bins(batch.data(), batch.size());
-                    batch.clear();
-                }
+                if (batch.size() >= 10000)
+                    flush_batch();
             }
 
-            if (!batch.empty())
-                gtrack.write_next_bins(batch.data(), batch.size());
+            flush_batch();
+
+            if (indexed_db)
+                writer->end_chrom();
         }
+
+        if (indexed_db)
+            writer->finish();
 
         return_none();
     } catch (TGLException &e) {

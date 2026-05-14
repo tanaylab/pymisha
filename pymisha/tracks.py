@@ -898,11 +898,12 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     with _atomic_track_create(track):
         _pymisha.pm_track_create_sparse(track, _df2pymisha(data))
 
+    # On indexed DBs the C++ writer (pm_track_create_sparse) already
+    # produced track.dat + track.idx directly, so we skip the post-create
+    # convert step. Byte-identical to the per-chrom + convert pipeline.
     try:
         _pymisha.pm_dbreload()
         _set_created_attrs(track, description, f'gtrack.create_sparse("{track}", description, intervals, values)')
-        if _db_is_indexed(_shared._GROOT):
-            gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
     except Exception as exc:
         warnings.warn(
@@ -996,6 +997,9 @@ def gtrack_create_dense(
     with _atomic_track_create(track):
         _pymisha.pm_track_create_dense(track, _df2pymisha(data), int(binsize), float(defval))
 
+    # On indexed DBs the C++ writer (pm_track_create_dense) already
+    # produced track.dat + track.idx directly, so we skip the post-create
+    # convert step. Byte-identical to the per-chrom + convert pipeline.
     try:
         _pymisha.pm_dbreload()
         _set_created_attrs(
@@ -1005,8 +1009,6 @@ def gtrack_create_dense(
         )
         gtrack_attr_set(track, "type", "dense")
         gtrack_attr_set(track, "binsize", str(binsize))
-        if _db_is_indexed(_shared._GROOT):
-            gtrack_convert_to_indexed(track, remove_old=False)
         _pymisha.pm_dbreload()
     except Exception as exc:
         warnings.warn(
