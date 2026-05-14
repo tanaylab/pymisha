@@ -40,7 +40,8 @@ def _open_url(url: str, *, timeout: float = 60.0, retries: int = 3) -> bytes:
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
-                return resp.read()
+                body: bytes = resp.read()
+                return body
         except (urllib.error.URLError, OSError) as exc:
             last_exc = exc
             if attempt == retries - 1:

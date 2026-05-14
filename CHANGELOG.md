@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.47 (2026-05-14)
+
+### Fixes
+- **mypy compliance** for the `pymisha/genome/` modules added in v0.1.43-v0.1.46. Restores green CI on `main`. No behavior change.
+
 ## v0.1.46 (2026-05-14)
 
 ### Features

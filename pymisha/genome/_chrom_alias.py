@@ -114,7 +114,7 @@ def _length_column(alias_df: pd.DataFrame) -> str | None:
     """
     for col in alias_df.columns:
         if str(col).lower() == "length":
-            return col
+            return str(col)
     return None
 
 
@@ -436,7 +436,12 @@ def _resolve_chrom_alias(
         raise ValueError(
             "target_lengths requires target_chroms (match_by_length=True)"
         )
-    if target_chroms and len(target_chroms) != len(target_lengths):
+    # Once we get here, target_chroms and target_lengths are either both None /
+    # empty or both populated. Materialize concrete lists for the populated case
+    # so mypy can stop treating them as Optional.
+    _t_chroms: list[str] = list(target_chroms) if target_chroms else []
+    _t_lengths: list[int] = list(target_lengths) if target_lengths else []
+    if _t_chroms and len(_t_chroms) != len(_t_lengths):
         raise ValueError(
             "target_chroms and target_lengths must have the same length"
         )
@@ -444,9 +449,9 @@ def _resolve_chrom_alias(
     # Empty alias_df: either synthesize from target_chroms or fall back to
     # identity.
     if alias_df is None or alias_df.empty:
-        if target_chroms:
+        if _t_chroms:
             synth = pd.DataFrame(
-                {"_target": list(target_chroms), "length": list(target_lengths)}
+                {"_target": _t_chroms, "length": _t_lengths}
             )
             final_coverage = _canonical_coverage(
                 synth["_target"], groot_chroms, groot_lengths
@@ -466,9 +471,9 @@ def _resolve_chrom_alias(
     if not candidate_cols:
         # alias_df has nothing but a length column. Treat as empty for the
         # purposes of detection.
-        if target_chroms:
+        if _t_chroms:
             synth = pd.DataFrame(
-                {"_target": list(target_chroms), "length": list(target_lengths)}
+                {"_target": _t_chroms, "length": _t_lengths}
             )
             final_coverage = _canonical_coverage(
                 synth["_target"], groot_chroms, groot_lengths
@@ -501,12 +506,12 @@ def _resolve_chrom_alias(
     rescued_df = alias_df.copy()
     rescued_df[canonical_col] = canonical
 
-    if target_chroms:
+    if _t_chroms:
         rescued_df = _synthesize_target_chroms(
             rescued_df,
             canonical_col,
-            list(target_chroms),
-            list(target_lengths),
+            _t_chroms,
+            _t_lengths,
             groot_chroms,
             groot_lengths,
         )

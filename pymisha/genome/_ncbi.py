@@ -71,7 +71,8 @@ def _ncbi_dataset_report(accession: str) -> dict:
     Returns the parsed top-level dict. Raises on network / parse errors.
     """
     body = _open_url(_datasets_report_url(accession))
-    return json.loads(body.decode("utf-8"))
+    parsed: dict = json.loads(body.decode("utf-8"))
+    return parsed
 
 
 def _ncbi_extract_sequence_report(zip_bytes: bytes) -> list[dict]:
