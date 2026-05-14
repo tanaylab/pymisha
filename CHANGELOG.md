@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.46 (2026-05-14)
+
+### Features
+- **`gdb_build_genome(..., source={"source": "ncbi", "accession": "GCF_..."})`.** NCBI Datasets API v2 backend with FTP fallback. Install path fetches `SEQUENCE_REPORT` + (optional) `GENOME_GFF` only (full `GENOME_FASTA` skipped, ~900 MB saved per call on a human accession). FTP fallback at `https://ftp.ncbi.nlm.nih.gov/genomes/all/<GCx>/<NNN>/<NNN>/<NNN>/<acc>_<asm>/` covers empty-zip GFF and rmsk (`<acc>_<asm>_genomic.gff.gz`, `<acc>_<asm>_rm.out.gz`). cgi/cytoband are not provided by NCBI; requesting them warns and skips. (R misha 5.6.30 `409c235e` `d6cd6047`.)
+- **`gdb_install_intervals(..., force=True)`** parity confirmed across all three install-capable backends (ucsc/ucsc-hub/ncbi). With `force=False` (default), requesting a set the backend does not provide raises `ValueError`. With `force=True`, the orchestrator emits a `UserWarning` and installs only the available subset. (R misha 5.6.29 `968bf782`.)
+
+## v0.1.45 (2026-05-14)
+
+### Features
+- **`gdb_build_genome(..., source={"source": "ucsc-hub", "accession": "GCA_..."})`.** UCSC mammal-hub backend. Probes known hub filename conventions (no HTML scraping); 404 on a per-asset URL is treated as "not available". Hub directories provide chromAlias + chrom.sizes + FASTA + RepeatMasker + cpgIslandExt + GTFs under `genes/`. Cytoband is never available from hubs. (R misha 5.6.16.)
+- **Multi-pass chromAlias rescue (`match_by_length=True`, default).** Four-pass algorithm fills missing canonical entries via unique-length matches, overrides misnamed rows when a length pair resolves them, breaks cross-row name collisions by length, and synthesizes `target_chroms` rows when the upstream sources don't carry them. Post-rescue `min_coverage` gate (R 5.6.30 `537bfe29`). Single-pass mode (`match_by_length=False`) retained for callers that want the strict pre-rescue behavior.
+
+## v0.1.44 (2026-05-14)
+
+### Features
+- **`gdb_install_intervals(groot, source, sets=...)`.** Install UCSC intervals sets (`genes`, `rmsk`, `cgi`, `cytoband`) into an existing groot. Parses gzipped GTF + RepeatMasker .out + UCSC database TSVs; bp-weighted chromAlias detection picks the canonical chrom column. Writes per-rmsk-class subsets for the major classes (SINE/LINE/LTR/DNA/Simple_repeat/Low_complexity). Provenance written to `<groot>/tracks/.misha_install.json`. (R misha 5.6.16 48c8a700 partial port; ucsc-hub and ncbi backends land in v0.1.45-v0.1.46.)
+- **`gdb_build_genome(..., sets=...)` re-enabled.** When `sets` is non-empty, `gdb_build_genome` now invokes `gdb_install_intervals` after the sequence build. Same set of backends (`ucsc` only in v0.1.44).
+
+## v0.1.43 (2026-05-14)
+
+### Features
+- **`gdb_build_genome(name, ...)` skeleton** for the `manual`, `local`, and `s3` backends. New entry point with a bundled registry of 11 genomes (hg19, hg38, mm9, mm10, mm39, rn6, rn7, dm6, ce11, sacCer3, danRer11). Resolution chain: explicit `registry=` arg, then `$PYMISHA_GENOME_REGISTRY`, then `./misha.yaml`, then the bundled `recipes.yaml`. The `ucsc`, `ucsc-hub`, `ncbi` backends and `gdb_install_intervals` land in later releases. (R misha 5.6.16 partial port.)
+
 ## v0.1.42 (2026-05-14)
 
 ### Robustness

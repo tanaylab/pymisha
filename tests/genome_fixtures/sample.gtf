@@ -1,0 +1,20 @@
+# sample.gtf - small synthetic GTF for pymisha genome tests
+# Two transcripts: T1 on chrom 1 (+ strand), T2 on chrom 2 (- strand)
+# Coordinates are 1-based inclusive (standard GTF)
+1	test	transcript	100	2000	.	+	.	gene_id "G1"; transcript_id "T1";
+1	test	five_prime_utr	100	199	.	+	.	gene_id "G1"; transcript_id "T1";
+1	test	exon	100	500	.	+	.	gene_id "G1"; transcript_id "T1"; exon_number "1";
+1	test	exon	800	1200	.	+	.	gene_id "G1"; transcript_id "T1"; exon_number "2";
+1	test	exon	1500	2000	.	+	.	gene_id "G1"; transcript_id "T1"; exon_number "3";
+1	test	three_prime_utr	1900	2000	.	+	.	gene_id "G1"; transcript_id "T1";
+# blank line below
+
+2	test	transcript	5000	10000	.	-	.	gene_id "G2"; transcript_id "T2";
+2	test	five_prime_utr	9800	10000	.	-	.	gene_id "G2"; transcript_id "T2";
+2	test	exon	5000	6000	.	-	.	gene_id "G2"; transcript_id "T2"; exon_number "1";
+2	test	exon	7000	8000	.	-	.	gene_id "G2"; transcript_id "T2"; exon_number "2";
+2	test	exon	9000	10000	.	-	.	gene_id "G2"; transcript_id "T2"; exon_number "3";
+2	test	three_prime_utr	5000	5100	.	-	.	gene_id "G2"; transcript_id "T2";
+# extra non-filtered features to verify filtering
+1	test	CDS	200	500	.	+	0	gene_id "G1"; transcript_id "T1";
+1	test	gene	100	2000	.	+	.	gene_id "G1";

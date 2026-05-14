@@ -40,4 +40,4 @@ site/
 .nfs*
 
 .a5c/
-.worktrees/
+.worktrees/.claude/

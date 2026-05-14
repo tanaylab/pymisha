@@ -1,0 +1,38 @@
+# Built-in pymisha genome registry.
+#
+# Used as the lowest-priority fallback by gdb_build_genome() and friends.
+# Resolution order is documented in the gdb_build_genome docstring.
+#
+# Schema:
+#   version: 1
+#   genome:
+#     <name>:
+#       source: ucsc | ncbi | s3 | manual | local
+#       <source-specific fields>
+#
+# Per-source required fields:
+#   ucsc:    assembly
+#   ncbi:    accession (must match ^GC[FA]_[0-9]+\.[0-9]+$)
+#            optional chrom_naming: sequence_name (default) | ucsc | accession
+#   s3:      name (mapped to gdb_create_genome())
+#   local:   path (existing groot)
+#   manual:  content (fasta string or list); optional genes/genes_format/
+#            annots_file/annots_names/rmsk/cpgIsland/cytoband
+#
+# A bare string value is shorthand for "source: local, path: <string>"
+# (compatible with tgdb/misha.yaml).
+
+version: 1
+
+genome:
+  hg19:     {source: ucsc, assembly: hg19}
+  hg38:     {source: ucsc, assembly: hg38}
+  mm9:      {source: ucsc, assembly: mm9}
+  mm10:     {source: ucsc, assembly: mm10}
+  mm39:     {source: ucsc, assembly: mm39}
+  rn6:      {source: ucsc, assembly: rn6}
+  rn7:      {source: ucsc, assembly: rn7}
+  dm6:      {source: ucsc, assembly: dm6}
+  ce11:     {source: ucsc, assembly: ce11}
+  sacCer3:  {source: ucsc, assembly: sacCer3}
+  danRer11: {source: ucsc, assembly: danRer11}

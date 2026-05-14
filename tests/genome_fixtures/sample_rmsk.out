@@ -1,0 +1,11 @@
+   SW   perc perc perc  query     position in query           matching       repeat              position in repeat
+score   div. del. ins.  sequence  begin    end          (left)   repeat         class/family    begin  end    (left)  ID
+
+   100  10.0  0.0  0.0  1            1001     1200    (0)  +  AluSx        SINE/Alu             1    300    (0)    1
+   200  12.5  0.5  0.0  1            2001     2500    (0)  +  L1ME1        LINE/L1            500   1000    (0)    2
+   150  15.0  1.0  0.0  1            3001     3300    (0)  +  HERVH-int    LTR/ERV1             1    200    (0)    3
+
+   180  18.0  0.0  0.0  2            1001     1500    (0)  +  Charlie1     DNA/hAT-Charlie      1    400    (0)    4
+    50   5.0  0.0  0.0  2            2001     2050    (0)  +  (TG)n        Simple_repeat        1     50    (0)    5
+    40   3.0  0.0  0.0  2            3001     3030    (0)  +  AT_rich      Low_complexity       1     30    (0)    6
+   210  14.0  0.0  0.0  2            4001     4400    (0)  +  AluY         SINE/Alu             1    400    (0)    7

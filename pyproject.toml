@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymisha"
-version = "0.1.42"
+version = "0.1.46"
 description = "Python interface for misha genomic databases with C++ streaming backends"
 readme = "README.md"
 license = {text = "MIT"}
@@ -55,10 +55,11 @@ Repository = "https://github.com/tanaylab/pymisha.git"
 Issues = "https://github.com/tanaylab/pymisha/issues"
 
 [tool.setuptools]
-packages = ["pymisha"]
+packages = ["pymisha", "pymisha.genome"]
 
 [tool.setuptools.package-data]
 pymisha = ["py.typed", "examples/**/*", "examples/**/.*"]
+"pymisha.genome" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 120
@@ -90,6 +91,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
     "benchmark: mark test as a benchmark",
+    "network: mark test as requiring network access (skipped by default)",
 ]
 
 [tool.coverage.run]

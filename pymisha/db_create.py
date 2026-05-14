@@ -1074,15 +1074,61 @@ def gdb_create_genome(
             f"Available genomes are: {available}"
         )
 
-    base_dir = Path(path if path is not None else os.getcwd()).expanduser()
-    base_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = str(Path(path if path is not None else os.getcwd()).expanduser())
+    _gdb_create_genome_from_s3(
+        genome,
+        dest_dir,
+        verify_checksum=verify_checksum,
+        tmpdir=tmpdir,
+    )
+
+    from .db import gdb_init, gdb_reload
+    gdb_init(str(Path(dest_dir) / genome))
+    gdb_reload()
+    return
+
+
+def _gdb_create_genome_from_s3(
+    name: str,
+    dest_dir: str,
+    verbose: bool = False,
+    tmpdir: str | None = None,
+    verify_checksum: bool = True,
+) -> None:
+    """Download ``<name>.tar.gz`` from the misha-genome S3 bucket and extract.
+
+    Internal helper shared by :func:`gdb_create_genome` and the
+    ``s3`` backend used by ``gdb_build_genome``. Downloads
+    ``https://misha-genome.s3.eu-west-1.amazonaws.com/<name>.tar.gz`` to a
+    temp file, optionally verifies its SHA256, extracts safely into
+    ``dest_dir``, and confirms ``<dest_dir>/<name>`` exists. Does NOT
+    initialize misha against the extracted directory; callers are
+    responsible for that (or for moving the directory before init).
+
+    Parameters
+    ----------
+    name : str
+        Genome identifier and S3 object key (e.g. ``"hg38"``).
+    dest_dir : str
+        Directory to extract into. Must already exist or be creatable.
+    verbose : bool, default False
+        Reserved for future progress output. Currently unused.
+    tmpdir : str, optional
+        Directory for the temporary archive. Defaults to
+        ``tempfile.gettempdir()``.
+    verify_checksum : bool, default True
+        If True, fetch and verify the archive SHA256 from
+        ``<archive_url>.sha256``.
+    """
+    dest_path = Path(dest_dir).expanduser()
+    dest_path.mkdir(parents=True, exist_ok=True)
     tmp_base = Path(tmpdir if tmpdir is not None else tempfile.gettempdir()).expanduser()
     tmp_base.mkdir(parents=True, exist_ok=True)
 
     fd, archive_name = tempfile.mkstemp(suffix=".tar.gz", dir=str(tmp_base))
     os.close(fd)
     archive_path = Path(archive_name)
-    archive_url = f"https://misha-genome.s3.eu-west-1.amazonaws.com/{genome}.tar.gz"
+    archive_url = f"https://misha-genome.s3.eu-west-1.amazonaws.com/{name}.tar.gz"
 
     try:
         _download_file(archive_url, archive_path)
@@ -1095,19 +1141,14 @@ def gdb_create_genome(
                     f"Checksum mismatch for {archive_url}: "
                     f"expected {expected_sha256}, got {actual_sha256}"
                 )
-        _safe_extract_tar(archive_path, base_dir)
+        _safe_extract_tar(archive_path, dest_path)
     finally:
         with suppress(OSError):
             archive_path.unlink(missing_ok=True)
 
-    extracted_root = base_dir / genome
+    extracted_root = dest_path / name
     if not extracted_root.exists():
         raise FileNotFoundError(
             f"Downloaded archive did not contain expected directory: {extracted_root}"
         )
-
-    from .db import gdb_init, gdb_reload
-    gdb_init(str(extracted_root))
-    gdb_reload()
-
     return
