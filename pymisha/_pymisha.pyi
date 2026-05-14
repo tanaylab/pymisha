@@ -522,6 +522,27 @@ def pm_intervals_canonic(
     C++ signature: ``PyArg_ParseTuple(args, "O|p", ...)``
     """
 
+def pm_intervals_random(
+    size: int,
+    n: int,
+    dist_from_edge: float,
+    chrom_intervals: Any,
+    filter_intervals: Any | None,
+    seed: int,
+    /,
+) -> dict[str, np.ndarray]:
+    """Generate random non-overlapping genomic intervals (C++ fast path).
+
+    Returns dict with 'chrom' (object array of strings), 'start' (int64
+    array), and 'end' (int64 array).
+
+    RNG is ``std::mt19937_64`` seeded with *seed*. Output is NOT
+    bit-identical to the pure-Python implementation (which uses
+    ``numpy.random``).
+
+    C++ signature: ``PyArg_ParseTuple(args, "LLdOOL", ...)``
+    """
+
 def pm_intervals_covered_bp(intervals: Any, /) -> int:
     """Count total covered basepairs.
 

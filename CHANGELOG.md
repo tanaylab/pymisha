@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.51 (2026-05-14)
+
+### Performance
+- **`gintervals_random` auto-routes to a C++ implementation for large genomes.** Genomes with > 1000 contigs OR > 10M total bp get the new `pm_intervals_random` C++ path; smaller genomes keep the pure-Python implementation. 5000-contig synthetic benchmark: 6.3x speedup (~9 ms -> ~1.4 ms). C++ path uses `std::mt19937_64`; output is statistically equivalent to the Python path but NOT bit-identical (different RNG family). Edge case from R `1b41bceb` (contig length exactly `size + 2*dist_from_edge`) handled.
+
 ## v0.1.50 (2026-05-14)
 
 ### Performance

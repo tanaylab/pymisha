@@ -4587,12 +4587,130 @@ def gintervals_normalize(
     return result
 
 
+# Routing threshold for gintervals_random: dispatch to the C++ fast path when
+# the genome has many contigs OR is large. Below this, the Python path is
+# competitive and lets users keep numpy-seeded reproducibility.
+_GINTERVALS_RANDOM_CPP_MIN_CHROMS = 1000
+_GINTERVALS_RANDOM_CPP_MIN_BP = 10_000_000
+
+
+def _gintervals_random_python(
+    size: int,
+    n: int,
+    dist_from_edge: float,
+    all_genome: pd.DataFrame,
+    mask: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Reference Python implementation (uses numpy's global RNG).
+
+    Kept as the small-genome path. Output is deterministic against
+    ``numpy.random.seed`` set by the caller.
+    """
+    segments = []  # list of (chrom_name, seg_start, seg_end) where seg_end is exclusive
+
+    for row in all_genome.itertuples(index=False):
+        chrom = row.chrom
+        chrom_size = int(row.end)
+        lo = int(dist_from_edge)
+        hi = chrom_size - int(dist_from_edge) - size
+
+        if hi < lo:
+            continue  # chromosome too short
+
+        if mask is None:
+            segments.append((chrom, lo, hi + 1))
+        else:
+            chrom_filter = mask[mask["chrom"] == chrom]
+            if len(chrom_filter) == 0:
+                segments.append((chrom, lo, hi + 1))
+                continue
+
+            cur_lo = lo
+            for frow in chrom_filter.itertuples(index=False):
+                fs = int(frow.start)
+                fe = int(frow.end)
+                excl_lo = max(cur_lo, fs - size + 1)
+                excl_hi = min(hi, fe - 1)
+                if excl_lo > cur_lo:
+                    seg_end = min(excl_lo, hi + 1)
+                    if seg_end > cur_lo:
+                        segments.append((chrom, cur_lo, seg_end))
+                if excl_hi >= cur_lo:
+                    cur_lo = excl_hi + 1
+            if cur_lo <= hi:
+                segments.append((chrom, cur_lo, hi + 1))
+
+    if not segments:
+        raise ValueError(
+            f"No valid genomic positions for intervals of size {size} "
+            f"with dist_from_edge {dist_from_edge}"
+        )
+
+    seg_chroms = [s[0] for s in segments]
+    seg_starts = _numpy.array([s[1] for s in segments], dtype=_numpy.int64)
+    seg_lengths = _numpy.array([s[2] - s[1] for s in segments], dtype=_numpy.int64)
+
+    total_length = seg_lengths.sum()
+    if total_length == 0:
+        raise ValueError("No valid genomic positions for random intervals")
+
+    cum_lengths = _numpy.cumsum(seg_lengths)
+    rand_positions = _numpy.random.randint(0, total_length, size=n)
+
+    seg_indices = _numpy.searchsorted(cum_lengths, rand_positions, side="right")
+    offsets = rand_positions - _numpy.concatenate([[0], cum_lengths[:-1]])[seg_indices]
+
+    result_chroms = [seg_chroms[i] for i in seg_indices]
+    result_starts = seg_starts[seg_indices] + offsets
+    result_ends = result_starts + size
+
+    return _pandas.DataFrame({
+        "chrom": result_chroms,
+        "start": result_starts,
+        "end": result_ends,
+    })
+
+
+def _gintervals_random_cpp(
+    size: int,
+    n: int,
+    dist_from_edge: float,
+    all_genome: pd.DataFrame,
+    mask: pd.DataFrame | None,
+    seed: int,
+) -> pd.DataFrame:
+    """C++ fast path. RNG is std::mt19937_64 seeded with ``seed``.
+
+    The output is NOT bit-identical to the Python path (different RNG).
+    For statistical purposes (mean position, per-chrom counts) the two
+    paths are equivalent.
+    """
+    chrom_pm = _df2pymisha(all_genome[["chrom", "start", "end"]])
+    filter_pm = (
+        _df2pymisha(mask[["chrom", "start", "end"]])
+        if mask is not None and len(mask) > 0
+        else None
+    )
+    result = _pymisha.pm_intervals_random(
+        int(size),
+        int(n),
+        float(dist_from_edge),
+        chrom_pm,
+        filter_pm,
+        int(seed),
+    )
+    if result is None:
+        raise ValueError("pm_intervals_random returned no result")
+    return _pandas.DataFrame(result)
+
+
 def gintervals_random(
     size: int,
     n: int,
     dist_from_edge: float = 3_000_000,
     chromosomes: list[str] | None = None,
     mask: pd.DataFrame | None = None,
+    seed: int | None = None,
     **kwargs: Any,
 ) -> pd.DataFrame:
     """
@@ -4601,6 +4719,18 @@ def gintervals_random(
     Intervals are sampled uniformly from the genome (after excluding
     chromosome edges and optional filter regions).  Each interval is
     exactly *size* basepairs.
+
+    Routing
+    -------
+    For million-contig genomes the implementation dispatches to a C++
+    fast path that avoids per-chrom Python overhead. The heuristic is
+    "> 1000 contigs OR > 10M bp total". The C++ path uses
+    ``std::mt19937_64`` seeded with *seed* (default 60427) and is NOT
+    bit-identical to the Python path, which uses numpy's global RNG.
+    Set *seed* explicitly to make C++ runs reproducible. To force the
+    Python path (e.g. for numpy-seed reproducibility on a large genome),
+    leave *seed* as ``None`` and the function falls back to the Python
+    implementation only when the genome is small.
 
     Parameters
     ----------
@@ -4614,7 +4744,12 @@ def gintervals_random(
         Restrict sampling to these chromosomes.
     mask : DataFrame, optional
         Intervals to exclude from sampling (columns ``chrom``, ``start``,
-        ``end``).
+        ``end``). Sampled intervals are guaranteed not to overlap any
+        masked region.
+    seed : int, optional
+        Seed for the C++ RNG. Defaults to 60427 (project convention).
+        Ignored when the Python fallback path is taken; set
+        ``numpy.random.seed`` for that path.
     filter : DataFrame, optional
         Backward-compatible alias for ``mask``.
 
@@ -4647,7 +4782,6 @@ def gintervals_random(
         bad = ", ".join(sorted(kwargs))
         raise TypeError(f"Unexpected keyword argument(s): {bad}")
 
-    # Validate inputs
     if not isinstance(size, (int, _numpy.integer)) or size <= 0:
         raise ValueError("size must be a positive integer")
     if not isinstance(n, (int, _numpy.integer)) or n <= 0:
@@ -4659,10 +4793,8 @@ def gintervals_random(
     n = int(n)
     dist_from_edge = float(dist_from_edge)
 
-    # Get genome intervals
     all_genome = gintervals_all()
 
-    # Filter by chromosomes
     if chromosomes is not None:
         if not isinstance(chromosomes, (list, tuple)):
             raise ValueError("chromosomes must be a list of strings")
@@ -4673,7 +4805,6 @@ def gintervals_random(
                 f"No chromosomes named {', '.join(chromosomes)} found in the genome"
             )
 
-    # Validate and canonicalize filter intervals
     if mask is not None:
         if not isinstance(mask, _pandas.DataFrame):
             raise ValueError("mask must be a DataFrame")
@@ -4684,90 +4815,24 @@ def gintervals_random(
             mask["chrom"] = _normalize_chroms(mask["chrom"].astype(str).tolist())
             if chromosomes is not None:
                 mask = mask[mask["chrom"].isin(chromosomes)]
-            # Canonicalize to merge overlaps
             mask = gintervals_canonic(mask)
         if mask is None or len(mask) == 0:
             mask = None
 
-    # Build valid segments per chromosome
-    # Each segment is a (chrom, seg_start, seg_end) where intervals can be placed
-    # An interval of 'size' starting at position p must satisfy:
-    #   p >= dist_from_edge  AND  p + size <= chrom_size - dist_from_edge
-    #   AND  [p, p+size) does not overlap any filter region
-    segments = []  # list of (chrom_name, seg_start, seg_end) where seg_end is exclusive
+    # Heuristic: dispatch to C++ for million-contig or very large genomes.
+    total_chroms = len(all_genome)
+    total_bp = int(all_genome["end"].sum()) if total_chroms > 0 else 0
+    use_cpp = (
+        total_chroms > _GINTERVALS_RANDOM_CPP_MIN_CHROMS
+        or total_bp > _GINTERVALS_RANDOM_CPP_MIN_BP
+    )
 
-    for row in all_genome.itertuples(index=False):
-        chrom = row.chrom
-        chrom_size = int(row.end)
-        lo = int(dist_from_edge)
-        hi = chrom_size - int(dist_from_edge) - size
-
-        if hi < lo:
-            continue  # chromosome too short
-
-        if mask is None:
-            segments.append((chrom, lo, hi + 1))  # +1 because hi is inclusive start position
-        else:
-            # Subtract filter regions from [lo, hi]
-            chrom_filter = mask[mask["chrom"] == chrom]
-            if len(chrom_filter) == 0:
-                segments.append((chrom, lo, hi + 1))
-                continue
-
-            # For each filter region [fs, fe), an interval starting at p
-            # with size 'size' overlaps if p < fe and p + size > fs,
-            # i.e. p in [fs - size + 1, fe - 1], so we exclude
-            # start positions in [max(lo, fs - size + 1), min(hi, fe - 1)]
-            cur_lo = lo
-            for frow in chrom_filter.itertuples(index=False):
-                fs = int(frow.start)
-                fe = int(frow.end)
-                # Excluded start positions: [fs - size + 1, fe - 1]
-                excl_lo = max(cur_lo, fs - size + 1)
-                excl_hi = min(hi, fe - 1)
-                if excl_lo > cur_lo:
-                    # Valid segment before this exclusion
-                    seg_end = min(excl_lo, hi + 1)
-                    if seg_end > cur_lo:
-                        segments.append((chrom, cur_lo, seg_end))
-                if excl_hi >= cur_lo:
-                    cur_lo = excl_hi + 1
-            if cur_lo <= hi:
-                segments.append((chrom, cur_lo, hi + 1))
-
-    if not segments:
-        raise ValueError(
-            f"No valid genomic positions for intervals of size {size} "
-            f"with dist_from_edge {dist_from_edge}"
+    if use_cpp:
+        return _gintervals_random_cpp(
+            size, n, dist_from_edge, all_genome, mask,
+            seed if seed is not None else 60427,
         )
-
-    # Compute segment lengths and cumulative weights
-    seg_chroms = [s[0] for s in segments]
-    seg_starts = _numpy.array([s[1] for s in segments], dtype=_numpy.int64)
-    seg_lengths = _numpy.array([s[2] - s[1] for s in segments], dtype=_numpy.int64)
-
-    total_length = seg_lengths.sum()
-    if total_length == 0:
-        raise ValueError("No valid genomic positions for random intervals")
-
-    cum_lengths = _numpy.cumsum(seg_lengths)
-
-    # Sample n random positions
-    rand_positions = _numpy.random.randint(0, total_length, size=n)
-
-    # Map random positions to segments
-    seg_indices = _numpy.searchsorted(cum_lengths, rand_positions, side="right")
-    offsets = rand_positions - _numpy.concatenate([[0], cum_lengths[:-1]])[seg_indices]
-
-    result_chroms = [seg_chroms[i] for i in seg_indices]
-    result_starts = seg_starts[seg_indices] + offsets
-    result_ends = result_starts + size
-
-    return _pandas.DataFrame({
-        "chrom": result_chroms,
-        "start": result_starts,
-        "end": result_ends,
-    })
+    return _gintervals_random_python(size, n, dist_from_edge, all_genome, mask)
 
 
 def gintervals_rm(intervals_set: str, force: bool = False) -> None:

@@ -174,6 +174,62 @@ def test_find_existing_1d_filename_short_circuits_for_indexed(tmp_path):
 
 
 @pytest.mark.benchmark
+def test_gintervals_random_cpp_beats_python_on_large_genome(tmp_path):
+    """C++ path should outperform Python on a many-contig genome.
+
+    Builds a 5000-contig groot, then times the C++ and Python branches of
+    ``gintervals_random`` directly. Asserts that C++ is at least 5x faster
+    than Python at the same sample count. The asserted ratio is loose to
+    avoid CI flake; in practice the speedup is much larger.
+    """
+    try:
+        import numpy as np
+
+        from pymisha.intervals import (
+            _gintervals_random_cpp,
+            _gintervals_random_python,
+        )
+
+        groot = tmp_path / "g"
+        _build_groot(groot, num_chroms=5000, seq_len=400)
+        pm.gdb_init(str(groot))
+
+        genome = pm.gintervals_all()
+        size = 50
+        n = 1000
+
+        # Warm-up.
+        _ = _gintervals_random_cpp(size, n, 0.0, genome, None, 60427)
+        np.random.seed(60427)
+        _ = _gintervals_random_python(size, n, 0.0, genome, None)
+
+        cpp_times = []
+        for _ in range(5):
+            t = time.perf_counter()
+            _gintervals_random_cpp(size, n, 0.0, genome, None, 60427)
+            cpp_times.append(time.perf_counter() - t)
+        cpp_t = min(cpp_times)
+
+        py_times = []
+        for _ in range(5):
+            np.random.seed(60427)
+            t = time.perf_counter()
+            _gintervals_random_python(size, n, 0.0, genome, None)
+            py_times.append(time.perf_counter() - t)
+        py_t = min(py_times)
+
+        ratio = py_t / cpp_t if cpp_t > 0 else float("inf")
+        print(f"\ngintervals_random (5000 contigs, n={n}): "
+              f"cpp={cpp_t*1000:.2f}ms, py={py_t*1000:.2f}ms, speedup={ratio:.1f}x")
+        assert ratio >= 5.0, (
+            f"C++ path only {ratio:.1f}x faster than Python "
+            f"(cpp={cpp_t*1000:.2f}ms, py={py_t*1000:.2f}ms); expected >= 5x"
+        )
+    finally:
+        _restore_test_db()
+
+
+@pytest.mark.benchmark
 def test_init_read_no_redundant_stat(tmp_path):
     """E.1.4: stat(track.idx) call inside init_read is removed.
 
