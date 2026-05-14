@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.49 (2026-05-14)
+
+### Fixes
+- **`gdb_reload` now clears the Python-side dataset scan cache.** Track and interval-set names created externally between two `gdb_reload` calls become immediately visible. The C++ side was already rescanning correctly; this closes the Python-cache gap. (R misha 5.6.30 `c82b01f0`.)
+
+### Notes
+- **R 5.6.30 `6dc476a8` (meta short-circuit per-chrom probe) is N/A in pymisha:** `pm_track_info` already takes the indexed fast path (two `stat()` calls on `track.idx` + `track.dat`) when an index is present and only falls back to per-chromosome stats for per-chrom-format tracks - matching R's post-`6dc476a8` behavior.
+
 ## v0.1.48 (2026-05-14)
 
 ### Performance

@@ -832,3 +832,22 @@ def test_dataset_load_verbose(tmp_path, capsys):
         assert "Loaded" in captured.out or "dataset" in captured.out.lower()
     finally:
         pm.gdataset_unload(ds_path, validate=False)
+
+
+def test_gdb_reload_invalidates_dataset_scan_cache():
+    """gdb_reload must clear the Python-side dataset scan cache so external
+    track creation becomes visible. (R 5.6.30 c82b01f0.)"""
+    from pymisha.dataset import _DATASET_SCAN_CACHE
+
+    pm.gdb_init(str(TEST_DB))
+    try:
+        # Seed the cache directly; in real usage gdataset_load populates it.
+        _DATASET_SCAN_CACHE["/fake/groot"] = ({"trk1"}, {"ivl1"})
+        assert _DATASET_SCAN_CACHE
+
+        pm.gdb_reload()
+        assert not _DATASET_SCAN_CACHE, (
+            f"expected scan cache cleared after gdb_reload, got {set(_DATASET_SCAN_CACHE)}"
+        )
+    finally:
+        pm.gdb_init(str(TEST_DB))

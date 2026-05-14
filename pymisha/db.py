@@ -113,6 +113,11 @@ def gdb_reload():
     """
     _checkroot()
     _pymisha.pm_dbreload()
+    # Python-side dataset scan cache must be cleared on reload; the C++
+    # side rescans tracks via pm_dbreload but the Python cache of track/
+    # interval-set names per groot becomes stale. (R 5.6.30 c82b01f0.)
+    from .dataset import _clear_dataset_scan_cache
+    _clear_dataset_scan_cache()
 
 
 def gdb_mark_cache_dirty():
