@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 #include <string>
 
@@ -610,6 +611,15 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
             verror("breaks must have at least 2 elements");
         }
 
+        // 0D models have a single bin spanning the whole genome. The Python
+        // side then passes iter_size = INT64_MAX as a "no constraint"
+        // sentinel; the per-position bin-bounds check below would overflow
+        // (bins[c].first + INT64_MAX wraps to a negative number) and
+        // misroute unaligned-interval samples through the uniform-random
+        // fallback. Treat num_bins == 1 as a fast path that skips the
+        // bounds check entirely (R 5.6.x parity follow-up, roadmap #1).
+        const bool one_bin = (num_bins == 1);
+
         // --- Build CDF data from Python list ---
         // Use flat vector layout: cdf_data[bin][kmer_idx * NUM_BASES + base_idx]
         std::vector<std::vector<float>> cdf_data(num_bins);
@@ -832,14 +842,26 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                         // attributes each (k+1)-mer event to bin_at(pos - k).
                         int64_t bin_query_pos = pos - k;
                         int bin_idx = -1;
-                        if (!bins.empty()) {
+                        if (one_bin) {
+                            // 0D model: single bin spans everything. Skip
+                            // the bounds check that would overflow when
+                            // iter_size == INT64_MAX.
+                            if (!bins.empty()) bin_idx = bins[0].second;
+                        } else if (!bins.empty()) {
                             while (bin_cursor + 1 < bins.size() &&
                                    bin_query_pos >= bins[bin_cursor + 1].first) {
                                 ++bin_cursor;
                             }
-                            if (bin_query_pos >= bins[bin_cursor].first &&
-                                bin_query_pos <
-                                    bins[bin_cursor].first + iter_size) {
+                            int64_t bin_first = bins[bin_cursor].first;
+                            // Saturate: bin_first + iter_size can overflow
+                            // when callers pass the INT64_MAX no-constraint
+                            // sentinel on a > 0 bin start.
+                            int64_t bin_end_excl =
+                                (iter_size > std::numeric_limits<int64_t>::max() - bin_first)
+                                    ? std::numeric_limits<int64_t>::max()
+                                    : bin_first + iter_size;
+                            if (bin_query_pos >= bin_first &&
+                                bin_query_pos < bin_end_excl) {
                                 bin_idx = bins[bin_cursor].second;
                             }
                         }

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.54 (2026-05-14)
+
+### Fixes
+- **`gsynth_sample` on 0D models with unaligned intervals no longer falls back to uniform-random output.** A signed-int64 overflow when adding `iter_size = INT64_MAX` (the no-constraint sentinel for 0D models) to a positive bin start position made the bin-bounds check fail, returning `bin_idx = -1` and falling through to uniform-random base selection. `gsynth_forbid_kmer` on a 0D model now correctly produces samples that respect the forbidden pattern regardless of interval alignment. Aligned-interval samples are byte-identical to v0.1.53. (Roadmap follow-up #1.)
+
 ## v0.1.53 (2026-05-14)
 
 ### Features
