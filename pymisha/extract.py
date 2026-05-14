@@ -1131,6 +1131,141 @@ def _worker_extract_chunk(args: tuple[Any, ...]) -> pd.DataFrame | None:
     return _pymisha2df(result)
 
 
+_VALID_STRATEGIES = ("auto", "tracks", "tiles")
+# Track count at or above which "auto" picks track-parallel.
+# Matches R misha 5.6.18 threshold (>= 8 tracks + non-streaming iterator).
+_AUTO_TRACKS_MIN_EXPRS = 8
+
+
+def _validate_strategy(strategy: str) -> str:
+    """Raise ValueError on unknown strategy; return lowercased value."""
+    s = str(strategy).lower()
+    if s not in _VALID_STRATEGIES:
+        raise ValueError(
+            f"multitasking_strategy must be one of {_VALID_STRATEGIES}; got {strategy!r}"
+        )
+    return s
+
+
+def _resolve_parallel_strategy(strategy: str, n_exprs: int, iterator: Any) -> str:
+    """Decide between 'tracks' and 'tiles' given the configured strategy.
+
+    'auto' picks 'tracks' when there are enough expressions to amortize fork
+    overhead AND the iterator is non-streaming (fixed bin size or a concrete
+    interval set - i.e., output size is predictable per worker). Otherwise
+    'tiles' (the legacy chrom-parallel path).
+    """
+    s = _validate_strategy(strategy)
+    if s != "auto":
+        return s
+    if n_exprs < _AUTO_TRACKS_MIN_EXPRS:
+        return "tiles"
+    # Heuristic for "non-streaming" iterator: an int (fixed binsize) or a
+    # concrete DataFrame is predictable; named-track/string iterators may
+    # produce variable output and are kept on the tiles path.
+    if isinstance(iterator, (int, _pandas.DataFrame)):
+        return "tracks"
+    return "tiles"
+
+
+def _worker_extract_tracks(args: tuple[Any, ...]) -> pd.DataFrame | None:
+    """Worker for track-parallel gextract: process a subset of expressions
+    over the full interval set."""
+    (intervals_dict, expr_subset, iterator_val, config_dict, vtracks_dict) = args
+    intervals_df = _pandas.DataFrame(intervals_dict)
+    result = _pymisha.pm_extract(
+        expr_subset,
+        _df2pymisha(intervals_df),
+        iterator_val,
+        config_dict,
+        vtracks_dict,
+    )
+    return _pymisha2df(result)
+
+
+def _split_exprs(exprs: list[str], n: int) -> list[list[str]]:
+    """Split *exprs* into at most *n* contiguous, non-empty chunks."""
+    n = max(1, min(n, len(exprs)))
+    base = len(exprs) // n
+    rem = len(exprs) % n
+    out = []
+    i = 0
+    for k in range(n):
+        size = base + (1 if k < rem else 0)
+        out.append(exprs[i:i + size])
+        i += size
+    return out
+
+
+def _parallel_extract_tracks(
+    exprs: list[str],
+    intervals: pd.DataFrame,
+    iterator: Iterator | str,
+    config: dict[str, Any],
+    vtracks_dict: dict[str, dict[str, Any]] | None = None,
+) -> pd.DataFrame | None:
+    """Run gextract with each worker handling a subset of expressions across
+    the full interval set, then column-bind the expression results.
+
+    Returns the merged DataFrame, or ``None`` to fall back to the legacy path
+    when the inputs aren't amenable to track-parallel.
+    """
+    import multiprocessing
+
+    max_procs = int(config.get("max_processes", 1))
+    if max_procs < 2 or len(exprs) < 2:
+        return None
+
+    n_workers = min(max_procs, len(exprs))
+    expr_chunks = _split_exprs(exprs, n_workers)
+
+    worker_config = dict(config)
+    worker_config["progress"] = False
+
+    intervals_dict = intervals.to_dict(orient="list")
+    worker_args = [
+        (intervals_dict, chunk, iterator, worker_config, vtracks_dict)
+        for chunk in expr_chunks
+    ]
+
+    ctx = multiprocessing.get_context("fork")
+    with ctx.Pool(processes=n_workers) as pool:
+        results = pool.map(_worker_extract_tracks, worker_args)
+
+    non_empty = [(chunk, df) for chunk, df in zip(expr_chunks, results, strict=True)
+                 if df is not None and len(df) > 0]
+    if not non_empty:
+        return _pandas.DataFrame()
+
+    # Workers ran on identical (intervals, iterator) so the coordinate /
+    # intervalID rows match. Sort each by intervalID to be defensive, then
+    # take coords from the first chunk, column-bind expression values from
+    # all chunks, and append intervalID last to match serial output column
+    # order (coords -> exprs -> intervalID).
+    sort_key = "intervalID"
+    first_chunk_exprs, first_df = non_empty[0]
+    if sort_key in first_df.columns:
+        first_df = first_df.sort_values(sort_key).reset_index(drop=True)
+
+    coord_cols = [c for c in ("chrom", "start", "end", "chrom1", "start1", "end1",
+                               "chrom2", "start2", "end2")
+                  if c in first_df.columns]
+    meta_cols = coord_cols + ([sort_key] if sort_key in first_df.columns else [])
+
+    def _value_columns(df: pd.DataFrame) -> pd.DataFrame:
+        return df[[c for c in df.columns if c not in meta_cols]]
+
+    parts = [first_df[coord_cols].copy(), _value_columns(first_df)]
+    for _chunk, df in non_empty[1:]:
+        if sort_key in df.columns:
+            df = df.sort_values(sort_key).reset_index(drop=True)
+        parts.append(_value_columns(df))
+    if sort_key in first_df.columns:
+        parts.append(first_df[[sort_key]].copy())
+
+    return _pandas.concat(parts, axis=1)
+
+
 def _parallel_extract(
     exprs: list[str],
     intervals: pd.DataFrame,
@@ -1372,7 +1507,17 @@ def gextract(
                 and file is None
             )
             if use_parallel:
-                df = _parallel_extract(exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict)
+                strategy = _resolve_parallel_strategy(
+                    _cfg.get("multitasking_strategy", "auto"),
+                    n_exprs=len(exprs),
+                    iterator=iterator,
+                )
+                if strategy == "tracks":
+                    df = _parallel_extract_tracks(
+                        exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict,
+                    )
+                if df is None:
+                    df = _parallel_extract(exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict)
 
             if df is None:
                 with _progress_context(progress, desc=progress_desc):

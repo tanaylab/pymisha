@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.52 (2026-05-14)
+
+### Fixes
+- **`gdb_install_intervals` now produces the full TSS/UTR sets on NCBI and UCSC backends.** `_install_genes` previously filtered only Ensembl/GENCODE feature names (`transcript`, `five_prime_utr`, `three_prime_utr`); production NCBI GFF3 uses `mRNA` + `five_prime_UTR` + `three_prime_UTR`, and UCSC's `ncbiRefSeq.gtf.gz` uses `5UTR` + `3UTR`. The NCBI path was producing empty TSS+UTR sets; UCSC was producing empty UTR sets. The synthetic test fixture used GENCODE naming and hid the bug.
+- **`pwm.edit_distance` family: `direction="below"` + `bidirect=True` now takes MAX across strands (was MIN).** A genomic substitution affects both strands, so disrupting a motif site needs both strands below threshold — the harder strand bounds the answer. (R misha 5.6.10 `19c51158`.)
+- **`pwm.edit_distance` family: removed hidden `score_min = score_thresh` default for `direction="below"`.** The hidden default was a footgun: users pre-filtering for strong matches and then calling edit distance got unexpected NAs. `score_min` now defaults to no filter for both directions; pass it explicitly when needed. (R misha 5.6.10 `88e49b62`.)
+
+### Performance
+- **`gextract` gained a `multitasking_strategy` config knob (`"auto"` | `"tracks"` | `"tiles"`).** `auto` (default) picks track-parallel for >= 8 expressions with a non-streaming iterator and tile-parallel (legacy chrom-parallel) otherwise. Track-parallel runs each worker over a subset of expressions across the full interval set, which substantially outperforms the legacy chrom-parallel path on many-track / few-interval workloads (e.g., scoring thousands of motif vtracks across a peak set). (R misha 5.6.18 `gmultitasking.strategy`.)
+
+### Breaking
+- `direction="below"` PWM edit distance results change for `bidirect=True` callers (now MAX across strands) and for any caller relying on the implicit `score_min = score_thresh` default. Set `score_min` explicitly to recover the prior filter, or `score_min=-inf` to keep no filter.
+
 ## v0.1.51 (2026-05-14)
 
 ### Performance

@@ -3840,10 +3840,15 @@ class TestGseqPwmEditsDirectionBelow:
 
 
 class TestGseqPwmEditsDirectionBelowBidirect:
-    """Bidirectional scanning with direction='below'."""
+    """Bidirectional scanning with direction='below'.
 
-    def test_bidirect_picks_fewer_edits_strand(self):
-        """Bidirectional should pick the strand requiring fewer edits."""
+    R 5.6.10 (commit 19c51158): a genomic substitution changes both strands
+    simultaneously, so disrupting a motif site requires bringing *both* strands
+    below the threshold - the harder strand (max edits) determines the answer.
+    """
+
+    def test_bidirect_below_takes_max_across_strands_easy_fwd(self):
+        """Forward already below, reverse needs N>0: take N (the harder strand)."""
         pssm = np.array([
             [0.97, 0.01, 0.01, 0.01],
             [0.01, 0.97, 0.01, 0.01],
@@ -3855,24 +3860,71 @@ class TestGseqPwmEditsDirectionBelowBidirect:
             score_min=float('-inf'),
         )
         assert len(result) > 0
-        # Forward strand is already below threshold → 0 edits
-        assert result["n_edits"].iloc[0] == 0
-        assert result["strand"].iloc[0] == 1
+        # Reverse strand (the harder one) sets the bound - max across strands.
+        assert result["n_edits"].iloc[0] > 0
+        assert result["strand"].iloc[0] == -1
 
-    def test_bidirect_when_both_above(self):
-        """When both strands are above threshold, pick the one needing fewer edits."""
+    def test_bidirect_below_takes_max_across_strands_easy_rev(self):
+        """Reverse already below, forward needs N>0: take N (the harder strand)."""
         pssm = np.array([
             [0.97, 0.01, 0.01, 0.01],
             [0.01, 0.97, 0.01, 0.01],
         ])
-        # "AC" forward is high, revcomp "GT" is low (already below -0.01)
+        # "AC" forward matches motif (-0.06, above thresh -1.0; needs 1 edit to go below);
+        # reverse "GT" is far below (-9.21).
         result = pm.gseq_pwm_edits(
-            "AC", pssm, score_thresh=-0.01,
+            "AC", pssm, score_thresh=-1.0,
             prior=0, bidirect=True, direction="below",
             score_min=float('-inf'),
         )
         assert len(result) > 0
-        # Reverse strand "GT" is already below -0.01 → 0 edits
+        # Forward strand (the harder one) sets the bound.
+        assert result["n_edits"].iloc[0] > 0
+        assert result["strand"].iloc[0] == 1
+
+    def test_bidirect_below_max_equals_per_strand_when_one_dominates(self):
+        """Confirm the combined value equals the per-strand harder edit count."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        # Forward-only single-strand probe: how many edits to disrupt forward "AC"?
+        r_fwd = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=-1.0, strand=1,
+            prior=0, bidirect=False, direction="below",
+            score_min=float('-inf'),
+        )
+        # Bidirect should match the forward count (reverse "GT" is already below).
+        r_bi = pm.gseq_pwm_edits(
+            "AC", pssm, score_thresh=-1.0,
+            prior=0, bidirect=True, direction="below",
+            score_min=float('-inf'),
+        )
+        assert r_fwd["n_edits"].iloc[0] == r_bi["n_edits"].iloc[0]
+
+
+class TestGseqPwmEditsDirectionBelowScoreMinDefault:
+    """R 5.6.10 (commit 88e49b62): score_min no longer silently defaults to
+    score_thresh for direction='below'. Hidden default was a footgun - users
+    who didn't realize were getting NA for windows already below threshold.
+    """
+
+    def test_no_hidden_score_min_default(self):
+        """Without explicit score_min, windows already below threshold should
+        report 0 edits, not be filtered out."""
+        pssm = np.array([
+            [0.97, 0.01, 0.01, 0.01],
+            [0.01, 0.97, 0.01, 0.01],
+        ])
+        # "GT" forward scores well below 0; with the hidden default,
+        # score_min=score_thresh=-1.0 would filter it. Without it, the
+        # window scores below threshold → 0 edits to satisfy "below".
+        result = pm.gseq_pwm_edits(
+            "GT", pssm, score_thresh=-1.0,
+            prior=0, bidirect=False, direction="below",
+            # NOTE: deliberately not passing score_min - testing the default.
+        )
+        assert len(result) > 0
         assert result["n_edits"].iloc[0] == 0
 
 
@@ -4229,7 +4281,13 @@ class TestVtrackDirectionBelowBidirectional:
     def teardown_method(self):
         _remove_all_vtracks()
 
-    def test_bidirectional_min_of_strands(self):
+    def test_bidirectional_max_of_strands(self):
+        """direction='below' + bidirect=True: take MAX across strands.
+
+        R 5.6.10 (19c51158): disrupting a motif site needs both strands to
+        fall below, so the harder strand bounds the answer. (For 'above',
+        MIN remains correct - tested separately.)
+        """
         pssm = _create_test_pssm()
         test_interval = pm.gintervals(["1"], [200], [240])
         threshold = -5.0
@@ -4264,9 +4322,9 @@ class TestVtrackDirectionBelowBidirectional:
         rev = result["ed_b_rev"].iloc[0]
         bidi = result["ed_b_bidi"].iloc[0]
 
-        # Bidirectional should be minimum of strands
+        # Bidirectional with direction='below' should take MAX across strands.
         if not np.isnan(fwd) and not np.isnan(rev):
-            npt.assert_allclose(bidi, min(fwd, rev), atol=1e-6)
+            npt.assert_allclose(bidi, max(fwd, rev), atol=1e-6)
         elif not np.isnan(fwd):
             npt.assert_allclose(bidi, fwd, atol=1e-6)
         elif not np.isnan(rev):

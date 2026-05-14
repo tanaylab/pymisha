@@ -25,6 +25,25 @@ _DEFAULT_GENE_SETS: dict[str, str] = {
     "utr5": "utr5",
 }
 
+# Map source-specific feature names to the four canonical roles we install.
+# Different backends emit different feature column conventions:
+#   - Ensembl/GENCODE GTF: transcript / exon / five_prime_utr / three_prime_utr
+#   - UCSC ncbiRefSeq.gtf.gz: transcript / exon / 5UTR / 3UTR
+#   - NCBI RefSeq GFF3: mRNA / exon / five_prime_UTR / three_prime_UTR
+# Canonical role names (`transcript`, `exon`, `five_prime_utr`, `three_prime_utr`)
+# are what _install_genes splits on internally.
+_FEATURE_CANONICAL: dict[str, str] = {
+    "transcript": "transcript",
+    "mRNA": "transcript",
+    "exon": "exon",
+    "five_prime_utr": "five_prime_utr",
+    "five_prime_UTR": "five_prime_utr",
+    "5UTR": "five_prime_utr",
+    "three_prime_utr": "three_prime_utr",
+    "three_prime_UTR": "three_prime_utr",
+    "3UTR": "three_prime_utr",
+}
+
 
 def _install_genes(
     gtf_bytes: bytes,
@@ -45,8 +64,13 @@ def _install_genes(
 
     df = _gtf_to_dataframe(
         gtf_bytes,
-        feature_filter=("exon", "transcript", "five_prime_utr", "three_prime_utr"),
+        feature_filter=tuple(_FEATURE_CANONICAL.keys()),
     )
+
+    # Canonicalize feature names so downstream splits work regardless of
+    # whether the source was Ensembl/GENCODE GTF, UCSC GTF, or NCBI GFF3.
+    df["feature"] = df["feature"].map(_FEATURE_CANONICAL)
+    df = df[df["feature"].notna()].reset_index(drop=True)
 
     # Translate chroms; drop rows we can't map.
     df["chrom"] = df["chrom"].map(translator)

@@ -1675,10 +1675,6 @@ def gseq_pwm_edits(
     if direction not in ("above", "below"):
         raise ValueError("direction must be 'above' or 'below'")
 
-    # For direction="below", default score_min to score_thresh (see vtracks.py).
-    if direction == "below" and score_min is None:
-        score_min = float(score_thresh)
-
     # Resolve strand mode
     strand_mode = 0 if bidirect else int(strand)
 

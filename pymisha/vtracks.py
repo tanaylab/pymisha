@@ -1521,12 +1521,6 @@ def gvtrack_create(
                 raise ValueError("direction must be 'above' or 'below'")
             config["direction"] = direction
 
-        # For direction="below", default score_min to score_thresh: windows
-        # already scoring below the threshold trivially need 0 edits and would
-        # dominate the minimum, making the result always 0.
-        if direction == "below" and config.get("score_min") is None:
-            config["score_min"] = config.get("score_thresh")
-
     # For PWM virtual tracks, if pssm is a DataFrame, ensure column order A, C, G, T
     if str(config.get('func', '')).startswith('pwm'):
         pssm = config.get('pssm')

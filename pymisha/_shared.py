@@ -31,6 +31,7 @@ except ImportError as e:
 CONFIG = {
     'multitasking': True,           # Allow parallel processing
     'multitasking_stdout': False,   # Debug output from children
+    'multitasking_strategy': 'auto',  # 'auto' | 'tracks' | 'tiles' (R 5.6.18 parity)
     'min_processes': 4,             # Min workers for multitasking
     'max_processes': 20,            # Max workers for multitasking
     'max_data_size': 10000000,      # Max rows in memory

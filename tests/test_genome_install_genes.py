@@ -110,3 +110,68 @@ def test_install_genes_empty_after_filter(monkeypatch):
     installed = _install_genes(gtf, _identity)
     assert calls == []
     assert installed == {}
+
+
+# ---------------------------------------------------------------------------
+# Real-shape backend inputs: NCBI GFF3 + UCSC GTF use feature names that
+# differ from the Ensembl/GENCODE conventions of the sample.gtf fixture.
+# Pre-fix, both backends silently dropped TSS and/or UTR sets.
+# ---------------------------------------------------------------------------
+
+# RefSeq GFF3 shape: mRNA, five_prime_UTR, three_prime_UTR; key=value attrs.
+NCBI_GFF3 = b"""##gff-version 3
+##sequence-region NC_000001.11 1 248956422
+NC_000001.11\tBestRefSeq\tgene\t1000\t5000\t.\t+\t.\tID=gene-A;Name=A
+NC_000001.11\tBestRefSeq\tmRNA\t1000\t5000\t.\t+\t.\tID=rna-A;Parent=gene-A
+NC_000001.11\tBestRefSeq\texon\t1000\t1500\t.\t+\t.\tID=exon-A-1;Parent=rna-A
+NC_000001.11\tBestRefSeq\texon\t3000\t5000\t.\t+\t.\tID=exon-A-2;Parent=rna-A
+NC_000001.11\tBestRefSeq\tfive_prime_UTR\t1000\t1200\t.\t+\t.\tID=utr5-A;Parent=rna-A
+NC_000001.11\tBestRefSeq\tthree_prime_UTR\t4800\t5000\t.\t+\t.\tID=utr3-A;Parent=rna-A
+NC_000001.11\tBestRefSeq\tCDS\t1201\t4799\t.\t+\t0\tID=cds-A;Parent=rna-A
+"""
+
+# UCSC ncbiRefSeq.gtf.gz shape: transcript + exon + 5UTR/3UTR; key "value" attrs.
+UCSC_GTF = (
+    b'chrM\tncbiRefSeq\ttranscript\t100\t500\t.\t+\t.\tgene_id "G1"; transcript_id "rna-G1";\n'
+    b'chrM\tncbiRefSeq\texon\t100\t250\t.\t+\t.\tgene_id "G1"; transcript_id "rna-G1"; exon_number "1";\n'
+    b'chrM\tncbiRefSeq\texon\t350\t500\t.\t+\t.\tgene_id "G1"; transcript_id "rna-G1"; exon_number "2";\n'
+    b'chrM\tncbiRefSeq\t5UTR\t100\t150\t.\t+\t.\tgene_id "G1"; transcript_id "rna-G1";\n'
+    b'chrM\tncbiRefSeq\t3UTR\t450\t500\t.\t+\t.\tgene_id "G1"; transcript_id "rna-G1";\n'
+    b'chrM\tncbiRefSeq\tCDS\t151\t449\t.\t+\t0\tgene_id "G1"; transcript_id "rna-G1";\n'
+)
+
+
+def test_install_genes_recognizes_ncbi_gff3_feature_names(monkeypatch):
+    """NCBI RefSeq GFF3 uses mRNA + five_prime_UTR + three_prime_UTR (capital).
+
+    Pre-fix: TSS, utr5, utr3 sets came out empty.
+    """
+    calls = _capture(monkeypatch)
+    installed = _install_genes(NCBI_GFF3, lambda c: "1" if c == "NC_000001.11" else None)
+    by_name = {name: df for df, name in calls}
+    assert set(by_name) == {"tss", "exons", "utr3", "utr5"}
+    assert len(by_name["tss"]) == 1
+    assert ((by_name["tss"]["end"] - by_name["tss"]["start"]) == 1).all()
+    assert len(by_name["exons"]) == 2
+    assert len(by_name["utr5"]) == 1
+    assert len(by_name["utr3"]) == 1
+    assert installed["tss"] == 1
+    assert installed["utr5"] == 1
+    assert installed["utr3"] == 1
+
+
+def test_install_genes_recognizes_ucsc_gtf_5utr_3utr(monkeypatch):
+    """UCSC ncbiRefSeq.gtf.gz uses 5UTR / 3UTR (no underscore, no five_prime_*).
+
+    Pre-fix: utr3 and utr5 sets came out empty.
+    """
+    calls = _capture(monkeypatch)
+    installed = _install_genes(UCSC_GTF, lambda c: "M" if c == "chrM" else None)
+    by_name = {name: df for df, name in calls}
+    assert set(by_name) == {"tss", "exons", "utr3", "utr5"}
+    assert len(by_name["tss"]) == 1
+    assert len(by_name["exons"]) == 2
+    assert len(by_name["utr5"]) == 1
+    assert len(by_name["utr3"]) == 1
+    assert installed["utr5"] == 1
+    assert installed["utr3"] == 1

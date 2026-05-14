@@ -863,61 +863,88 @@ WindowResult find_best_window_edits(
     const bool has_score_filter = has_score_min || has_score_max;
     const int seqlen = static_cast<int>(seq.length());
 
+    // direction=below + bidirectional: a genomic substitution affects both
+    // strands, so the answer is bounded by the *harder* strand at each
+    // position. Take MAX across strands per window, then MIN across windows.
+    // Matches R misha 5.6.10 (19c51158).
+    const bool below_bidirect = below && scan_forward && scan_reverse;
+
     WindowResult best;
     best.n_edits = -1;
     best.strand = 0;
     best.window_start = 0;
 
-    for (int s0 = roi_start_0; s0 <= roi_end_0; ++s0) {
+    auto evaluate_window = [&](int s0, bool reverse) -> WindowResult {
+        WindowResult wr;
+        wr.n_edits = -1;
         const char* window_start = seq.data() + s0;
-
-        auto try_window = [&](bool reverse, int direction) {
-            int seq_avail = seqlen - s0;
-            // Score filter: compute L-length window score for filtering
-            // Only apply if we have at least L bases available
-            if (has_score_filter && seq_avail >= L) {
-                float logp = 0.0f;
-                for (int i = 0; i < L; i++) {
-                    int si = reverse ? (L - 1 - i) : i;
-                    char base = window_start[si];
-                    if (reverse) base = complement_base(base);
-                    int bidx = base_to_index(base);
-                    if (bidx == 4) {
-                        float sum = 0.0f;
-                        for (int b = 0; b < 4; b++) sum += pssm[i].get_log_prob_from_code(b);
-                        logp += sum / 4.0f;
-                    } else {
-                        logp += pssm[i].get_log_prob_from_code(bidx);
-                    }
+        int seq_avail = seqlen - s0;
+        if (has_score_filter && seq_avail >= L) {
+            float logp = 0.0f;
+            for (int i = 0; i < L; i++) {
+                int si = reverse ? (L - 1 - i) : i;
+                char base = window_start[si];
+                if (reverse) base = complement_base(base);
+                int bidx = base_to_index(base);
+                if (bidx == 4) {
+                    float sum = 0.0f;
+                    for (int b = 0; b < 4; b++) sum += pssm[i].get_log_prob_from_code(b);
+                    logp += sum / 4.0f;
+                } else {
+                    logp += pssm[i].get_log_prob_from_code(bidx);
                 }
-                if (has_score_min && logp < score_min) return;
-                if (has_score_max && logp > score_max) return;
             }
+            if (has_score_min && logp < score_min) return wr;
+            if (has_score_max && logp > score_max) return wr;
+        }
+        if (max_indels > 0) {
+            wr = compute_window_edits_detailed_with_indels(
+                window_start, seq_avail, L, pssm, col_max_scores, col_min_scores,
+                S_max, S_min, threshold, max_edits, max_indels, reverse, below);
+        } else {
+            wr = compute_window_edits_detailed(
+                window_start, L, pssm, col_max_scores, col_min_scores,
+                S_max, S_min, threshold, max_edits, reverse, below,
+                gain_values, bin_index);
+        }
+        return wr;
+    };
 
-            WindowResult wr;
-            if (max_indels > 0) {
-                wr = compute_window_edits_detailed_with_indels(
-                    window_start, seq_avail, L, pssm, col_max_scores, col_min_scores,
-                    S_max, S_min, threshold, max_edits, max_indels, reverse, below);
-            } else {
-                wr = compute_window_edits_detailed(
-                    window_start, L, pssm, col_max_scores, col_min_scores,
-                    S_max, S_min, threshold, max_edits, reverse, below,
-                    gain_values, bin_index);
+    auto consider_candidate = [&](const WindowResult& wr, int direction, int s0) {
+        if (wr.n_edits < 0) return;
+        if (best.n_edits < 0 || wr.n_edits < best.n_edits ||
+            (wr.n_edits == best.n_edits && wr.score_before > best.score_before)) {
+            best = wr;
+            best.strand = direction;
+            best.window_start = s0 + 1;
+        }
+    };
+
+    for (int s0 = roi_start_0; s0 <= roi_end_0; ++s0) {
+        if (below_bidirect) {
+            WindowResult fwd = evaluate_window(s0, /*reverse=*/false);
+            WindowResult rev = evaluate_window(s0, /*reverse=*/true);
+            bool have_fwd = fwd.n_edits >= 0;
+            bool have_rev = rev.n_edits >= 0;
+            if (have_fwd && have_rev) {
+                if (fwd.n_edits >= rev.n_edits) {
+                    consider_candidate(fwd, +1, s0);
+                } else {
+                    consider_candidate(rev, -1, s0);
+                }
+            } else if (have_fwd) {
+                consider_candidate(fwd, +1, s0);
+            } else if (have_rev) {
+                consider_candidate(rev, -1, s0);
             }
-
-            if (wr.n_edits < 0) return;
-
-            if (best.n_edits < 0 || wr.n_edits < best.n_edits ||
-                (wr.n_edits == best.n_edits && wr.score_before > best.score_before)) {
-                best = wr;
-                best.strand = direction;
-                best.window_start = s0 + 1;
+        } else {
+            if (scan_forward) {
+                consider_candidate(evaluate_window(s0, /*reverse=*/false), +1, s0);
             }
-        };
-
-        if (scan_forward) try_window(false, +1);
-        if (scan_reverse) try_window(true, -1);
+            if (scan_reverse) {
+                consider_candidate(evaluate_window(s0, /*reverse=*/true), -1, s0);
+            }
+        }
     }
 
     return best;
