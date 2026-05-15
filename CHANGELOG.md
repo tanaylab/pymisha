@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.59 (2026-05-15)
+
+### Features
+- **`gtrack_array_create(track, description, intervals, values, colnames)`** writes a new array track from a DataFrame + 2-D matrix in memory. NaN cells are stored sparsely, matching R's array-track invariant. The on-disk format is byte-compatible with R misha - `.colnames` written by PyMisha is readable via `unserialize()` in R. Complements `gtrack_array_extract` / `gtrack_array_get_colnames` shipped in v0.1.57.
+
 ## v0.1.58 (2026-05-15)
 
 ### Fixes

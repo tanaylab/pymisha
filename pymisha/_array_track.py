@@ -178,6 +178,75 @@ def _read_one_interval_values(
     return out
 
 
+def write_chrom_file(
+    filepath: Path,
+    starts: _numpy.ndarray,
+    ends: _numpy.ndarray,
+    value_blocks: list[_numpy.ndarray],
+) -> None:
+    """Write a single chromosome's array-track binary file.
+
+    *value_blocks* is a list (one per interval) of ndarrays with dtype
+    ``[("val", "<f4"), ("idx", "<u4")]``. NaN values must already be
+    filtered out by the caller. Intervals must be sorted by start and
+    must not overlap (parallels R's `GenomeTrackArrays::write_next_interval`).
+    """
+    n = len(starts)
+    if n != len(ends) or n != len(value_blocks):
+        raise ValueError(
+            "starts, ends, and value_blocks must have equal lengths"
+        )
+    starts = _numpy.asarray(starts, dtype=_numpy.int64)
+    ends = _numpy.asarray(ends, dtype=_numpy.int64)
+    if n > 0 and ((ends <= starts).any() or (starts[1:] < ends[:-1]).any()):
+        raise ValueError(
+            "array-track intervals must be sorted, non-overlapping, and "
+            "have end > start"
+        )
+
+    with open(filepath, "wb") as fh:
+        fh.write(struct.pack("<i", _ARRAYS_SIGNATURE))
+        intervals_pos_offset = fh.tell()
+        fh.write(struct.pack("<q", 0))  # placeholder, rewritten at end
+        vals_positions: list[int] = []
+        for block in value_blocks:
+            vals_positions.append(fh.tell())
+            if block is None or len(block) == 0:
+                fh.write(struct.pack("<I", 0))
+                continue
+            fh.write(struct.pack("<I", len(block)))
+            fh.write(block.tobytes())
+        intervals_pos = fh.tell()
+        fh.write(struct.pack("<Q", n))
+        for s, e, vp in zip(starts.tolist(), ends.tolist(),
+                            vals_positions, strict=True):
+            fh.write(struct.pack("<qqq", int(s), int(e), int(vp)))
+        fh.seek(intervals_pos_offset)
+        fh.write(struct.pack("<q", intervals_pos))
+
+
+def build_value_blocks(
+    values: _numpy.ndarray,
+) -> list[_numpy.ndarray]:
+    """Convert a 2D (n_intervals, n_cols) float matrix into per-interval
+    sparse blocks. NaN entries are dropped (matching the R format
+    invariant that NaN positions are absent from the value list).
+    """
+    if values.ndim != 2:
+        raise ValueError("values must be a 2-D matrix")
+    n_intervals, n_cols = values.shape
+    block_dtype = _numpy.dtype([("val", "<f4"), ("idx", "<u4")])
+    out: list[_numpy.ndarray] = []
+    for i in range(n_intervals):
+        row = values[i].astype(_numpy.float32, copy=False)
+        idx = _numpy.where(~_numpy.isnan(row))[0].astype(_numpy.uint32)
+        block = _numpy.zeros(idx.size, dtype=block_dtype)
+        block["idx"] = idx
+        block["val"] = row[idx]
+        out.append(block)
+    return out
+
+
 def extract_array(
     track_dir: Path,
     intervals: _pd.DataFrame,

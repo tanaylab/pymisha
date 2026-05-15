@@ -144,6 +144,82 @@ class TestArrayTrackHelperExports:
         assert "gtrack_array_extract" in pm.__all__
 
 
+class TestGtrackArrayCreate:
+    """Write-then-read round trips. The on-disk format matches R misha
+    (binary + R-serialized .colnames)."""
+
+    def test_simple_roundtrip(self):
+        import pandas as pd
+        ivs = pd.DataFrame({
+            "chrom": ["1", "1", "2"],
+            "start": [0, 200, 0],
+            "end":   [100, 300, 50],
+        })
+        values = np.array([
+            [1.0, 2.0, np.nan, 4.0],
+            [np.nan, 6.0, 7.0, 8.0],
+            [9.0, np.nan, 11.0, np.nan],
+        ])
+        try:
+            pm.gtrack_array_create(
+                "test_arr_rt", "roundtrip", ivs, values,
+                colnames=["a", "b", "c", "d"],
+            )
+            assert pm.gtrack_exists("test_arr_rt")
+            assert pm.gtrack_info("test_arr_rt")["type"] == "array"
+            assert pm.gtrack_array_get_colnames("test_arr_rt") == [
+                "a", "b", "c", "d"
+            ]
+            out = pm.gtrack_array_extract("test_arr_rt")
+            assert len(out) == 3
+            # Verify a known cell
+            row1 = out[out["start"] == 0].iloc[0]
+            assert row1["a"] == 1.0
+            assert np.isnan(row1["c"])
+        finally:
+            pm.gtrack_rm("test_arr_rt", force=True)
+
+    def test_rejects_mismatched_value_columns(self):
+        import pandas as pd
+        ivs = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [100]})
+        with pytest.raises(ValueError, match="match len.colnames"):
+            pm.gtrack_array_create(
+                "test_arr_x", "x", ivs, np.array([[1.0, 2.0]]),
+                colnames=["a", "b", "c"],
+            )
+
+    def test_rejects_unsorted_intervals(self):
+        import pandas as pd
+        ivs = pd.DataFrame({
+            "chrom": ["1", "1"],
+            "start": [200, 0],
+            "end":   [300, 100],
+        })
+        # gtrack_array_create sorts internally, so this should succeed
+        try:
+            pm.gtrack_array_create(
+                "test_arr_s", "s", ivs, np.array([[1.0], [2.0]]),
+                colnames=["a"],
+            )
+            out = pm.gtrack_array_extract("test_arr_s")
+            assert list(out["start"]) == [0, 200]
+        finally:
+            pm.gtrack_rm("test_arr_s", force=True)
+
+    def test_rejects_overlapping_intervals(self):
+        import pandas as pd
+        ivs = pd.DataFrame({
+            "chrom": ["1", "1"],
+            "start": [0, 50],
+            "end":   [100, 150],
+        })
+        with pytest.raises(ValueError, match="non-overlapping"):
+            pm.gtrack_array_create(
+                "test_arr_o", "o", ivs, np.array([[1.0], [2.0]]),
+                colnames=["a"],
+            )
+
+
 class TestColnamesRSerializeRoundTrip:
     """The .colnames file we write must be readable by R's
     `unserialize()` - the wire format mirrors R's

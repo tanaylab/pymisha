@@ -4273,6 +4273,112 @@ def gtrack_2d_import_contacts(
 # Array tracks (R parity for gtrack.array.*)
 # ---------------------------------------------------------------------------
 
+def gtrack_array_create(
+    track: str,
+    description: str,
+    intervals: pd.DataFrame,
+    values: Any,
+    colnames: list[str],
+) -> None:
+    """Create an ``array`` track from intervals + a per-position matrix.
+
+    Lower-level analogue of R's ``gtrack.array.import`` for the
+    in-memory case (R's import shells out to a C parser for files; here
+    you supply intervals + values directly).
+
+    Parameters
+    ----------
+    track : str
+        Name for the new track.
+    description : str
+        Human-readable description (stored as a track attribute).
+    intervals : pandas.DataFrame
+        ``chrom, start, end`` rows. Must be sorted within each chromosome
+        and non-overlapping (R's array-track invariant).
+    values : array_like of shape (n_intervals, n_cols)
+        Float values. ``NaN`` is treated as "missing" and stored sparsely
+        (matching the R format - NaN cells are not written).
+    colnames : list of str
+        Column names; ``len(colnames) == values.shape[1]``.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> import numpy as np, pandas as pd
+    >>> _ = pm.gdb_init_examples()
+    >>> ivs = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [100]})
+    >>> pm.gtrack_array_create("my_arr", "demo", ivs, np.array([[1.0, 2.0]]),
+    ...                        ["a", "b"])  # doctest: +SKIP
+    """
+    from ._array_track import build_value_blocks, write_chrom_file, write_colnames
+
+    _checkroot()
+    _validate_track_name(track)
+    _ensure_track_absent(track)
+
+    if not isinstance(intervals, pd.DataFrame):
+        raise ValueError("intervals must be a pandas DataFrame")
+    for col in ("chrom", "start", "end"):
+        if col not in intervals.columns:
+            raise ValueError(f"intervals must have a '{col}' column")
+
+    values_arr = np.asarray(values, dtype=np.float64)
+    if values_arr.ndim != 2:
+        raise ValueError("values must be a 2-D array (n_intervals x n_cols)")
+    if values_arr.shape[0] != len(intervals):
+        raise ValueError(
+            "values.shape[0] must match len(intervals); got "
+            f"{values_arr.shape[0]} vs {len(intervals)}"
+        )
+    if values_arr.shape[1] != len(colnames):
+        raise ValueError(
+            "values.shape[1] must match len(colnames); got "
+            f"{values_arr.shape[1]} vs {len(colnames)}"
+        )
+    if len(set(colnames)) != len(colnames):
+        raise ValueError("colnames must be unique")
+
+    ivs = _normalize_intervals_df(intervals).copy().reset_index(drop=True)
+    ivs = _canonicalize_known_chroms(ivs)
+    if len(ivs) == 0:
+        raise ValueError("No intervals map to known chromosomes")
+    if len(ivs) != len(intervals):
+        raise ValueError(
+            "intervals contains rows mapping to unknown chromosomes"
+        )
+
+    # Sort within chromosome.
+    ivs["_row"] = np.arange(len(ivs))
+    ivs_sorted = ivs.sort_values(["chrom", "start"], kind="mergesort").reset_index(drop=True)
+    row_order = ivs_sorted["_row"].to_numpy()
+    values_sorted = values_arr[row_order]
+
+    with _atomic_track_create(track) as track_dir:
+        track_dir.mkdir(parents=True, exist_ok=True)
+        # vars subdir is part of the standard track layout
+        (track_dir / "vars").mkdir(exist_ok=True)
+        write_colnames(track_dir, list(colnames))
+        for chrom, group in ivs_sorted.groupby("chrom", sort=False):
+            chrom_path = track_dir / str(chrom)
+            starts = group["start"].to_numpy(dtype=np.int64)
+            ends = group["end"].to_numpy(dtype=np.int64)
+            block_rows = values_sorted[group.index.to_numpy()]
+            blocks = build_value_blocks(block_rows)
+            write_chrom_file(chrom_path, starts, ends, blocks)
+
+    # Reload the database so the new track is visible, then set attrs.
+    _pymisha.pm_dbreload()
+    _set_created_attrs(
+        track,
+        description,
+        (
+            f'gtrack_array_create("{track}", description, intervals, '
+            f"values, colnames=[{', '.join(repr(n) for n in colnames)}])"
+        ),
+    )
+    _pymisha.pm_dbreload()
+
+
 def gtrack_array_get_colnames(track: str) -> list[str]:
     """Return the column names of an ``array`` track.
 
