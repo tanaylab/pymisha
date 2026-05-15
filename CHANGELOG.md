@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.65 (2026-05-15)
+
+### Performance
+- **`gintervals_intersect` / `union` / `diff` / `canonic` 1.4-1.9x faster on million-row inputs.** Hg38, 1M-row 1D ops: intersect 522 -> 331 ms, union 391 -> 212 ms, diff 447 -> 260 ms, canonic 241 -> 145 ms.
+- **`gtrack_create_sparse` ~1.5x faster on million-row inputs.** Hg38 (non-indexed, 455 chroms): 1.88 s -> 1.24 s. Indexed DBs (Phylo447, 194 chroms): 599 -> 511 ms.
+- **`gtrack_create_dense` -215 ms per call** on databases with thousands of tracks.
+- **`gextract` with `iter=intvar` ~1.4x faster on dense tracks.** Hg38, 5 Mb / 200-bp bins: 30.3 -> 21.5 ms.
+
 ## v0.1.64 (2026-05-15)
 
 ### Fixes

@@ -19,6 +19,10 @@ int BufferedFile::open(const char *path, const char *mode, bool lock)
 	m_filename = path;
 	m_fp = fopen(path, mode);
 	if (m_fp) {
+        // Bump stdio buffer to 1 MiB on write modes so streaming writes
+        // coalesce into few syscalls (matters on networked filesystems).
+        if (mode && (*mode == 'w' || *mode == 'a' || strchr(mode, '+')))
+            setvbuf(m_fp, nullptr, _IOFBF, 1 << 20);
         if (lock) {
             struct flock fl;
 
