@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.61 (2026-05-15)
+
+### Fixes
+- **Docs build:** removed a `../../dev/notes/` link from `docs/guides/parity.md` that broke `mkdocs --strict` on main (dev/ is excluded from the shipped tree).
+
 ## v0.1.60 (2026-05-15)
 
 ### Fixes

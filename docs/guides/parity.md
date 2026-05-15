@@ -1,8 +1,9 @@
 # Parity Notes
 
 PyMisha targets full functional parity with R misha. The remaining gaps are
-documented here. See [`dev/notes/2026-05-15-functional-parity-audit.md`](../../dev/notes/2026-05-15-functional-parity-audit.md)
-in the repo for the per-feature roadmap.
+documented here. The per-feature roadmap lives in
+`dev/notes/2026-05-15-functional-parity-audit.md` on the development
+branch of the source repo (not bundled with the published site).
 
 ## Newly covered (v0.1.55 - v0.1.59)
 

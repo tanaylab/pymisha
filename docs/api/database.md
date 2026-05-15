@@ -57,6 +57,16 @@ Functions for initializing, configuring, and managing genomic databases, includi
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gdb_list_genomes
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gdb_genome_info
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gdb_get_readonly_attrs
     options:
       show_root_heading: true

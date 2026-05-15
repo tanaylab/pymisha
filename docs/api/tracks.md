@@ -112,6 +112,34 @@ Functions for creating, importing, modifying, and managing genomic tracks, inclu
       show_root_heading: true
       heading_level: 3
 
+## Array Tracks
+
+Multi-column per-position tracks. The PyMisha implementation reads and writes
+the on-disk format byte-compatibly with R misha. Note that `gextract` does
+not yet dispatch through the C++ scanner for ARRAYS tracks - use
+`gtrack_array_extract` to read array data; the scanner integration is
+tracked under Group K of the 2026-05-15 parity roadmap.
+
+::: pymisha.gtrack_array_create
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gtrack_array_extract
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gtrack_array_get_colnames
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gtrack_array_set_colnames
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gtrack_attr_get
     options:
       show_root_heading: true
