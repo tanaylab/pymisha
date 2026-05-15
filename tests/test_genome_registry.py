@@ -210,3 +210,31 @@ def test_bundled_yaml_has_version_1():
     for name, entry in data["genome"].items():
         assert entry["source"] == "ucsc", f"{name} has non-ucsc source"
         assert "assembly" in entry, f"{name} missing assembly"
+
+
+def test_gdb_list_genomes_returns_dataframe():
+    """R parity: gdb_list_genomes returns a DataFrame with name/source/detail/layer."""
+    import pymisha as pm
+
+    df = pm.gdb_list_genomes()
+    assert {"name", "source", "detail", "layer"} <= set(df.columns)
+    assert (df["name"] == "hg38").any()
+    hg38 = df[df["name"] == "hg38"].iloc[0]
+    assert hg38["source"] == "ucsc"
+    assert hg38["detail"] == "hg38"
+
+
+def test_gdb_genome_info_returns_recipe():
+    """R parity: gdb_genome_info returns the resolved recipe dict."""
+    import pymisha as pm
+
+    recipe = pm.gdb_genome_info("hg38")
+    assert recipe["source"] == "ucsc"
+    assert recipe["assembly"] == "hg38"
+
+
+def test_gdb_genome_info_unknown_raises():
+    import pymisha as pm
+
+    with pytest.raises(KeyError):
+        pm.gdb_genome_info("not_a_real_genome_xyz")

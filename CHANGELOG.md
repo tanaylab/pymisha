@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.55 (2026-05-15)
+
+### Features
+- **`gdb_list_genomes()` and `gdb_genome_info(name)`** are now public APIs (R parity for `gdb.list_genomes` / `gdb.genome_info`). They walk the registry chain (explicit arg -> `PYMISHA_GENOME_REGISTRY` -> `./misha.yaml` -> bundled `recipes.yaml`) and return a DataFrame / recipe dict.
+- **`gintervals_neighbors(intervals_set_out=, warn_ignored_strand=, mindist1/maxdist1/mindist2/maxdist2=)`** now accept the same parameter surface as R `gintervals.neighbors`. The 2D-distance params are accepted as no-ops for 1D inputs (matching R); 2D inputs raise `NotImplementedError` (deferred to the 2D C++ scanner work).
+- **`gintervals_mapply(enable_gapply_intervals=, band=)`** R parity. `enable_gapply_intervals=True` passes the current iterator interval as a `gapply_intervals` kwarg to `func` (PyMisha analogue of R's `GAPPLY.INTERVALS`).
+- **`gcis_decay`** now accepts compound 2D expressions that reference exactly one 2D track (e.g., `"track + 0"`). Distance is computed from coordinates so the expression value is unused.
+
+### Fixes
+- **`gsynth_sample` / `gsynth_random` / `gsynth_replace_kmer` default `output_format` is now `"misha"`** to match R. `"seq"` remains accepted as a legacy alias. Unknown values now raise `ValueError` instead of silently falling back to `"fasta"`.
+- **`gsynth_random` accepts an `iterator=1` parameter** for R API parity (no-op in PyMisha because sampling is per-position).
+- **`gintervals_neighbors` no longer ignores `strand` columns silently** - emits a warning by default when `intervals1` has a `strand` column and `use_intervals1_strand=False`. The directional helpers (`_upstream`, `_downstream`) suppress the warning.
+
 ## v0.1.54 (2026-05-14)
 
 ### Fixes

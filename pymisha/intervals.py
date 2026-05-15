@@ -2061,8 +2061,14 @@ def gintervals_neighbors(
     maxneighbors: int = 1,
     mindist: float = -1e9,
     maxdist: float = 1e9,
+    mindist1: float = -1e9,
+    maxdist1: float = 1e9,
+    mindist2: float = -1e9,
+    maxdist2: float = 1e9,
     na_if_notfound: bool = False,
     use_intervals1_strand: bool = False,
+    warn_ignored_strand: bool = True,
+    intervals_set_out: str | None = None,
 ) -> pd.DataFrame | None:
     """
     Find nearest neighbors between two sets of intervals.
@@ -2080,9 +2086,13 @@ def gintervals_neighbors(
     maxneighbors : int, default 1
         Maximum number of neighbors to return per query interval.
     mindist : float, default -1e9
-        Minimum distance (negative means target is upstream/left of query).
+        Minimum 1D distance (negative means target is upstream/left of query).
     maxdist : float, default 1e9
-        Maximum distance (positive means target is downstream/right of query).
+        Maximum 1D distance (positive means target is downstream/right of query).
+    mindist1, maxdist1, mindist2, maxdist2 : float, optional
+        Per-dimension distance ranges for **2D** intervals. Accepted for
+        R-misha API parity. PyMisha currently does not implement 2D neighbor
+        search, so any 2D input raises ``NotImplementedError``.
     na_if_notfound : bool, default False
         If True, include queries with no neighbors (with NA values).
     use_intervals1_strand : bool, default False
@@ -2092,11 +2102,21 @@ def gintervals_neighbors(
         When True:
         - + strand queries: negative distance = upstream, positive = downstream
         - - strand queries: negative distance = downstream, positive = upstream
+    warn_ignored_strand : bool, default True
+        Emit a warning when ``intervals1`` carries a ``strand`` column and
+        ``use_intervals1_strand=False`` (the strand would be silently
+        ignored otherwise).
+    intervals_set_out : str, optional
+        Name of an interval set to write the result into. When supplied,
+        the result is saved with ``gintervals_save(...)`` and the function
+        returns ``None``.
 
     Returns
     -------
     DataFrame or None
         DataFrame with query and neighbor coordinates plus distance column.
+        ``None`` if no neighbors are found, or if *intervals_set_out* was
+        provided.
 
     Examples
     --------
@@ -2122,15 +2142,43 @@ def gintervals_neighbors(
     if intervals2 is None:
         raise ValueError("intervals2 cannot be None")
 
+    if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
+        raise NotImplementedError(
+            "2D gintervals_neighbors is not yet implemented in PyMisha "
+            "(tracked under Group K of the 2026-05-15 parity roadmap)."
+        )
+
+    if mindist1 != -1e9 or maxdist1 != 1e9 or mindist2 != -1e9 or maxdist2 != 1e9:
+        # R behaviour: for 1D input these are accepted but unused; we mirror
+        # that rather than erroring so R-script ports work.
+        pass
+
     if maxneighbors < 1:
         raise ValueError("maxneighbors must be >= 1")
 
     if mindist > maxdist:
         raise ValueError("mindist must be <= maxdist")
 
+    if (
+        warn_ignored_strand
+        and not use_intervals1_strand
+        and "strand" in intervals1.columns
+    ):
+        import warnings as _warnings
+        _warnings.warn(
+            "intervals1 contains a 'strand' column that will be ignored for "
+            "distance calculation. Set use_intervals1_strand=True to use it, "
+            "or warn_ignored_strand=False to suppress this warning.",
+            stacklevel=2,
+        )
+
     if len(intervals1) == 0:
+        if intervals_set_out is not None:
+            return None
         return None
     if len(intervals2) == 0 and not na_if_notfound:
+        if intervals_set_out is not None:
+            return None
         return None
 
     result = _pymisha.pm_find_neighbors(
@@ -2143,7 +2191,21 @@ def gintervals_neighbors(
         int(use_intervals1_strand)
     )
 
-    return _pymisha2df(result)
+    df = _pymisha2df(result)
+    if intervals_set_out is not None:
+        if df is not None and len(df) > 0:
+            gintervals_save(df, intervals_set_out)
+        return None
+    return df
+
+
+def _is_2d_intervals_df(intervals: Any) -> bool:
+    """True if *intervals* is a 2D-shaped DataFrame (has ``chrom1``)."""
+    return (
+        isinstance(intervals, _pandas.DataFrame)
+        and "chrom1" in intervals.columns
+        and "chrom2" in intervals.columns
+    )
 
 
 def gintervals_neighbors_upstream(
@@ -2203,7 +2265,8 @@ def gintervals_neighbors_upstream(
         maxneighbors=maxneighbors,
         mindist=-maxdist, maxdist=0,
         na_if_notfound=na_if_notfound,
-        use_intervals1_strand=True
+        use_intervals1_strand=True,
+        warn_ignored_strand=False,
     )
 
 
@@ -2264,7 +2327,8 @@ def gintervals_neighbors_downstream(
         maxneighbors=maxneighbors,
         mindist=0, maxdist=maxdist,
         na_if_notfound=na_if_notfound,
-        use_intervals1_strand=True
+        use_intervals1_strand=True,
+        warn_ignored_strand=False,
     )
 
 
@@ -3264,6 +3328,8 @@ def gintervals_mapply(
     iterator: Any = None,
     intervals_set_out: str | None = None,
     colnames: str = "value",
+    enable_gapply_intervals: bool = False,
+    band: tuple[int, int] | tuple[float, float] | None = None,
 ) -> pd.DataFrame | None:
     """
     Apply a function to track expression values for each interval.
@@ -3276,6 +3342,10 @@ def gintervals_mapply(
     ----------
     func : callable
         Function to apply. Receives one numpy array per track expression.
+        If *enable_gapply_intervals* is True, also receives a keyword
+        argument ``gapply_intervals`` containing the current iterator
+        interval (as a dict with chrom/start/end keys, plus the 2D
+        analogues when applicable).
     *exprs : str
         Track expressions to evaluate.
     intervals : DataFrame
@@ -3286,6 +3356,14 @@ def gintervals_mapply(
         If given, save result as an intervals set and return None.
     colnames : str, default "value"
         Name of the result column.
+    enable_gapply_intervals : bool, default False
+        R parity. When True, ``func`` is called with an additional
+        ``gapply_intervals`` keyword argument carrying the current
+        iterator interval. ``func`` must accept ``**kwargs`` or an
+        explicit ``gapply_intervals=None`` parameter.
+    band : (int, int), optional
+        2D-band filter for 2D track expressions. Forwarded to
+        :func:`gextract`.
 
     Returns
     -------
@@ -3347,7 +3425,7 @@ def gintervals_mapply(
     # Extract each expression once for all intervals
     extracted = []
     for expr in expr_list:
-        ext = gextract(expr, intervals=query_intervals)
+        ext = gextract(expr, intervals=query_intervals, band=band)
         extracted.append(ext)
 
     n_intervals = len(query_intervals)
@@ -3375,6 +3453,11 @@ def gintervals_mapply(
 
     # Apply func per interval
     results = []
+    iv_rows = (
+        query_intervals.to_dict("records")
+        if enable_gapply_intervals
+        else None
+    )
     for i in range(n_intervals):
         reverse = reverse_flags[i] if reverse_flags is not None else False
         interval_id = i + 1  # gextract uses 1-based intervalIDs
@@ -3390,7 +3473,11 @@ def gintervals_mapply(
                 arr = arr[::-1].copy()
             arrays.append(arr)
 
-        val = func(*arrays)
+        if enable_gapply_intervals:
+            assert iv_rows is not None
+            val = func(*arrays, gapply_intervals=iv_rows[i])
+        else:
+            val = func(*arrays)
         results.append(val)
 
     # Build result DataFrame

@@ -49,7 +49,7 @@ def _sample_seq(model, start: int, end: int) -> str:
         intervals=pm.gintervals("1", start, end),
         iterator=200,
         seed=60427,
-        output_format="string",
+        output_format="vector",
     )
     return out[0]
 

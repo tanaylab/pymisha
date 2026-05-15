@@ -561,6 +561,66 @@ class TestGsynthReplaceKmer:
             pm.gsynth_replace_kmer("", "", intervals=ivs)
 
 
+class TestGsynthOutputFormatAliases:
+    """R parity: "misha" is the default output_format; "seq" is a legacy alias.
+
+    R signature is ``output_format = c("misha", "fasta", "vector")`` (first
+    element is the default). Before this fix PyMisha defaulted to "fasta",
+    which silently produced different output than the R API for identical
+    invocations.
+    """
+
+    def test_misha_alias_writes_binary(self, tmp_path):
+        ivs = pm.gintervals(["1"], [0], [200])
+        model = pm.gsynth_train(intervals=ivs, k=2, iterator=200)
+        out = tmp_path / "x.seq"
+        pm.gsynth_sample(model, str(out), output_format="misha",
+                         intervals=ivs, iterator=200, seed=60427)
+        assert out.exists()
+        # Binary format starts with raw bytes, not '>'
+        with open(out, "rb") as fh:
+            assert fh.read(1) != b">"
+
+    def test_seq_alias_still_works(self, tmp_path):
+        ivs = pm.gintervals(["1"], [0], [200])
+        model = pm.gsynth_train(intervals=ivs, k=2, iterator=200)
+        out = tmp_path / "x.seq"
+        pm.gsynth_sample(model, str(out), output_format="seq",
+                         intervals=ivs, iterator=200, seed=60427)
+        assert out.exists()
+
+    def test_default_is_misha_not_fasta(self, tmp_path):
+        ivs = pm.gintervals(["1"], [0], [200])
+        model = pm.gsynth_train(intervals=ivs, k=2, iterator=200)
+        out = tmp_path / "x.bin"
+        pm.gsynth_sample(model, str(out), intervals=ivs, iterator=200,
+                         seed=60427)
+        with open(out, "rb") as fh:
+            assert fh.read(1) != b">", "default must be misha binary, not fasta"
+
+    def test_invalid_format_raises(self):
+        ivs = pm.gintervals(["1"], [0], [200])
+        model = pm.gsynth_train(intervals=ivs, k=2, iterator=200)
+        with pytest.raises(ValueError, match="Invalid output_format"):
+            pm.gsynth_sample(model, output_format="bogus",
+                             intervals=ivs, iterator=200)
+
+    def test_random_accepts_iterator_param(self):
+        ivs = pm.gintervals(["1"], [0], [500])
+        # R: gsynth.random(..., iterator = 1). Must not raise.
+        out = pm.gsynth_random(intervals=ivs, output_format="vector",
+                               iterator=1, seed=60427)
+        assert len(out) == 1
+        assert len(out[0]) == 500
+
+    def test_replace_kmer_default_is_misha(self, tmp_path):
+        ivs = pm.gintervals(["1"], [0], [200])
+        out = tmp_path / "x.bin"
+        pm.gsynth_replace_kmer("CG", "GC", intervals=ivs, output=str(out))
+        with open(out, "rb") as fh:
+            assert fh.read(1) != b">"
+
+
 # ============================================================================
 # Multi-dimensional stratification stress tests
 # ============================================================================

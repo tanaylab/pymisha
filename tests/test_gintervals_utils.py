@@ -580,3 +580,27 @@ class TestGintervalsRandom:
         assert len(result) == 3
         assert (result["start"] == 0).all()
         assert (result["end"] == 500_000).all()
+
+    def test_r_style_filter_alias(self):
+        """R misha uses `filter=`; pymisha accepts it as an alias for `mask=`
+        so R-script ports keep working without silent uniform sampling."""
+        mask = pm.gintervals("1", 0, 100_000)
+        result = pm.gintervals_random(
+            100, 20, dist_from_edge=0, filter=mask, seed=60427
+        )
+        assert len(result) == 20
+        overlapping = (
+            (result["chrom"] == "1")
+            & (result["start"] < 100_000)
+            & (result["end"] > 0)
+        ).sum()
+        assert overlapping == 0, (
+            "filter= alias must exclude masked regions, not silently ignore"
+        )
+
+    def test_mask_and_filter_both_supplied_errors(self):
+        mask = pm.gintervals("1", 0, 100_000)
+        with pytest.raises(ValueError, match="only one of 'mask' or 'filter'"):
+            pm.gintervals_random(
+                100, 5, dist_from_edge=0, mask=mask, filter=mask
+            )

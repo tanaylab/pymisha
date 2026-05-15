@@ -385,6 +385,61 @@ def _val2bin_vec(values: _numpy.ndarray, breaks_arr: _numpy.ndarray, include_low
     return _bin_values(values, breaks_arr, include_lowest).astype(_numpy.int64)
 
 
+def _resolve_cis_decay_track(expr: str) -> str:
+    """Resolve the 2D track used for coordinate iteration in `gcis_decay`.
+
+    Accepts a plain 2D track name or any expression that references
+    exactly one existing 2D track. The expression's *value* is not used by
+    the cis-decay algorithm; only the iteration coordinates matter, so
+    routing to the referenced track's native contact objects is
+    sufficient for the common compound cases (e.g., ``"track + 0"``,
+    ``"track * scaling"``).
+    """
+    from . import _shared
+    from .expr import _parse_expr_vars
+    from .tracks import gtrack_info
+
+    expr_str = str(expr).strip()
+    if not expr_str:
+        raise ValueError("expr must be a non-empty 2D track expression")
+
+    # Fast path: bare track name.
+    track_names = set(_pymisha.pm_track_names())
+    if expr_str in track_names:
+        info = gtrack_info(expr_str)
+        if info.get("dimensions") != 2:
+            raise ValueError(f"Track '{expr_str}' is not a 2D track")
+        return expr_str
+
+    # Compound expression: extract referenced track names and require
+    # exactly one 2D track.
+    vtrack_names = set(_shared._VTRACKS.keys())
+    new_expr, used_tracks, used_vtracks, _ = _parse_expr_vars(
+        expr_str, track_names, vtrack_names
+    )
+    if used_vtracks:
+        raise NotImplementedError(
+            "gcis_decay does not yet support vtrack-referencing expressions "
+            "(tracked under Group K of the 2026-05-15 parity roadmap)."
+        )
+
+    two_d_tracks = [
+        t for t in used_tracks if gtrack_info(t).get("dimensions") == 2
+    ]
+    if len(two_d_tracks) == 1:
+        return two_d_tracks[0]
+    if len(two_d_tracks) == 0:
+        raise ValueError(
+            f"gcis_decay: expression '{expr_str}' references no 2D track"
+        )
+    raise NotImplementedError(
+        "gcis_decay with compound 2D expressions referencing more than one "
+        f"2D track ({sorted(two_d_tracks)}) is not yet implemented. The R "
+        "version uses the C++ scanner for this; the PyMisha equivalent is "
+        "tracked under Group K of the 2026-05-15 parity roadmap."
+    )
+
+
 def gcis_decay(
     expr: str,
     breaks: list[float],
@@ -411,7 +466,10 @@ def gcis_decay(
     Parameters
     ----------
     expr : str
-        A 2D track expression (must be a simple 2D track name).
+        A 2D track expression. Plain track names are fastest; compound
+        expressions that reference exactly one 2D track (e.g.,
+        ``"track + 0"``) are also accepted - their value is ignored and
+        the referenced track's contact coordinates are used.
     breaks : array_like
         Sorted break points defining distance bins.
         Example: ``breaks=[x1, x2, x3]`` creates bins ``(x1, x2]`` and
@@ -475,7 +533,6 @@ def gcis_decay(
     )
     from .extract import _find_2d_track_file, _validate_band
     from .intervals import _normalize_chroms, gintervals_all
-    from .tracks import gtrack_info
 
     breaks = [float(b) for b in breaks]
     if len(breaks) < 2:
@@ -501,11 +558,12 @@ def gcis_decay(
     # Validate band
     band = _validate_band(band)
 
-    # Get track info
-    info = gtrack_info(expr)
-    if info.get("dimensions") != 2:
-        raise ValueError(f"Track '{expr}' is not a 2D track")
-    track_path = _pymisha.pm_track_path(expr)
+    # Resolve the 2D track to iterate over. R accepts arbitrary 2D
+    # expressions (e.g., "trackA - trackB"); PyMisha currently supports
+    # any expression that references exactly one 2D track (the value of
+    # the expression is unused - only the contact coordinates matter).
+    track_for_iter = _resolve_cis_decay_track(expr)
+    track_path = _pymisha.pm_track_path(track_for_iter)
 
     # Determine which chromosomes to iterate over
     if intervals is None:

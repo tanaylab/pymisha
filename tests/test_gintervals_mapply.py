@@ -140,3 +140,23 @@ class TestGintervalsMapply:
             lambda x: 42.0, "dense_track", intervals=intervals
         )
         assert result["value"].iloc[0] == 42.0
+
+    def test_enable_gapply_intervals_passes_row(self):
+        """R parity: enable_gapply_intervals=True passes the iterator
+        interval as a `gapply_intervals` kwarg (PyMisha analogue of R's
+        GAPPLY.INTERVALS)."""
+        intervals = pymisha.gintervals(["1", "2"], [0, 0], [10000, 10000])
+
+        seen: list[dict] = []
+
+        def fn(arr, gapply_intervals=None):
+            seen.append(dict(gapply_intervals))
+            return float(np.nanmax(arr)) if len(arr) else float("nan")
+
+        pymisha.gintervals_mapply(
+            fn, "dense_track", intervals=intervals,
+            enable_gapply_intervals=True,
+        )
+        assert len(seen) == 2
+        assert set(seen[0]) >= {"chrom", "start", "end"}
+        assert seen[0]["chrom"] in ("1", "2")

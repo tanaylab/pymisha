@@ -479,3 +479,73 @@ class TestGintervalsNeighborsColnames:
         cols = list(result.columns)
         value_cols = [c for c in cols if 'value' in c]
         assert len(value_cols) == 2
+
+
+class TestGintervalsNeighborsRParity:
+    """R parity: mindist1/maxdist1/mindist2/maxdist2 (2D-only, accepted for 1D
+    inputs as no-ops), warn_ignored_strand, intervals_set_out."""
+
+    def test_extra_2d_distance_params_accepted_for_1d(self):
+        intervs1 = make_intervals([('1', 100, 200)])
+        intervs2 = make_intervals([('1', 300, 400)])
+        result = pm.gintervals_neighbors(
+            intervs1, intervs2,
+            mindist1=-100, maxdist1=100,
+            mindist2=-100, maxdist2=100,
+        )
+        assert result is not None and len(result) == 1
+
+    def test_2d_input_raises_not_implemented(self):
+        ivs2d = pm.gintervals_2d('1', 0, 100, '1', 200, 300)
+        with pytest.raises(NotImplementedError, match="2D"):
+            pm.gintervals_neighbors(ivs2d, ivs2d)
+
+    def test_warn_ignored_strand_default_true(self, recwarn):
+        intervs1 = make_intervals(
+            [('1', 100, 200)], extra_cols={'strand': [1]}
+        )
+        intervs2 = make_intervals([('1', 300, 400)])
+        pm.gintervals_neighbors(intervs1, intervs2)
+        assert any(
+            "strand" in str(w.message).lower() for w in recwarn.list
+        ), "expected an 'ignored strand' warning"
+
+    def test_warn_ignored_strand_suppressed(self, recwarn):
+        intervs1 = make_intervals(
+            [('1', 100, 200)], extra_cols={'strand': [1]}
+        )
+        intervs2 = make_intervals([('1', 300, 400)])
+        pm.gintervals_neighbors(
+            intervs1, intervs2, warn_ignored_strand=False
+        )
+        strand_warnings = [
+            w for w in recwarn.list if "strand" in str(w.message).lower()
+        ]
+        assert not strand_warnings
+
+    def test_warn_skipped_when_use_intervals1_strand_true(self, recwarn):
+        intervs1 = make_intervals(
+            [('1', 100, 200)], extra_cols={'strand': [1]}
+        )
+        intervs2 = make_intervals([('1', 300, 400)])
+        pm.gintervals_neighbors(
+            intervs1, intervs2, use_intervals1_strand=True
+        )
+        strand_warnings = [
+            w for w in recwarn.list if "strand" in str(w.message).lower()
+        ]
+        assert not strand_warnings
+
+    def test_intervals_set_out_saves_and_returns_none(self):
+        intervs1 = make_intervals([('1', 100, 200)])
+        intervs2 = make_intervals([('1', 300, 400)])
+        try:
+            result = pm.gintervals_neighbors(
+                intervs1, intervs2, intervals_set_out="tmp_neighbors_out"
+            )
+            assert result is None
+            assert pm.gintervals_exists("tmp_neighbors_out")
+            loaded = pm.gintervals_load("tmp_neighbors_out")
+            assert len(loaded) == 1
+        finally:
+            pm.gintervals_rm("tmp_neighbors_out", force=True)

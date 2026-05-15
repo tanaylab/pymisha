@@ -99,3 +99,65 @@ def _validate_recipe(recipe: dict) -> None:
     missing = required - set(recipe)
     if missing:
         raise ValueError(f"recipe for source={src!r} missing fields: {sorted(missing)}")
+
+
+def gdb_list_genomes(registry: str | None = None):
+    """List genome recipes visible across the registry chain.
+
+    R parity for ``gdb.list_genomes``. Returns a DataFrame with one row
+    per genome, recording the source (ucsc, ncbi, manual, local, ...),
+    a per-source detail string, and the registry layer the entry was
+    resolved from. Higher-priority layers shadow lower-priority ones,
+    so each name appears at most once.
+
+    Parameters
+    ----------
+    registry : str, optional
+        Path to an explicit YAML registry file. Prepended to the lookup
+        chain (highest priority).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: ``name``, ``source``, ``detail``, ``layer``.
+    """
+    import pandas as _pd
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for layer in _registry_chain(registry):
+        entries = _load_yaml(layer)
+        for nm, raw in entries.items():
+            if nm in seen:
+                continue
+            seen.add(nm)
+            try:
+                recipe = _normalize_recipe(raw, layer)
+            except (ValueError, KeyError):
+                continue
+            detail = (
+                recipe.get("assembly")
+                or recipe.get("accession")
+                or recipe.get("path")
+                or (
+                    recipe.get("fasta")[0]
+                    if isinstance(recipe.get("fasta"), list) and recipe.get("fasta")
+                    else None
+                )
+            )
+            rows.append({
+                "name": nm,
+                "source": recipe["source"],
+                "detail": detail,
+                "layer": str(layer),
+            })
+    return _pd.DataFrame(rows, columns=["name", "source", "detail", "layer"])
+
+
+def gdb_genome_info(name: str, registry: str | None = None) -> dict:
+    """Return the normalized recipe dict for a registered genome.
+
+    R parity for ``gdb.genome_info``. Walks the registry chain and
+    returns the first matching recipe.
+    """
+    return _resolve_genome(name, registry=registry)

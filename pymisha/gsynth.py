@@ -29,6 +29,27 @@ _logger = _logging.getLogger(__name__)
 # Default chunk size threshold for parallel processing (1 billion bases)
 GSYNTH_MAX_CHUNK_SIZE = int(1e9)
 
+# Canonical names: "misha" (binary), "fasta", "vector". "seq" is the
+# legacy PyMisha alias for "misha".
+_OUTPUT_FORMAT_ALIASES = {"misha": "misha", "seq": "misha",
+                          "fasta": "fasta", "vector": "vector"}
+_OUTPUT_FORMAT_CODES = {"misha": 0, "fasta": 1, "vector": 2}
+
+
+def _normalize_output_format(fmt: str) -> str:
+    """Map a user-supplied output_format to its canonical name.
+
+    Accepts R-style ``"misha"``, legacy PyMisha ``"seq"``, ``"fasta"`` and
+    ``"vector"``. Raises ``ValueError`` for anything else.
+    """
+    try:
+        return _OUTPUT_FORMAT_ALIASES[fmt]
+    except KeyError as exc:
+        valid = ", ".join(sorted(set(_OUTPUT_FORMAT_ALIASES)))
+        raise ValueError(
+            f"Invalid output_format {fmt!r}; expected one of: {valid}"
+        ) from exc
+
 # ---------------------------------------------------------------------------
 # Model dataclass
 # ---------------------------------------------------------------------------
@@ -1424,7 +1445,7 @@ def gsynth_sample(
     model: GsynthModel,
     output: str | None = None,
     *,
-    output_format: str = "fasta",
+    output_format: str = "misha",
     intervals: _pd.DataFrame | None = None,
     iterator: int | None = None,
     mask_copy: _pd.DataFrame | None = None,
@@ -1462,11 +1483,12 @@ def gsynth_sample(
     output : str, optional
         Output file path.  If ``None``, sequences are returned in memory
         (equivalent to ``output_format="vector"``).
-    output_format : {"fasta", "seq", "vector"}, default "fasta"
+    output_format : {"misha", "fasta", "vector"}, default "misha"
         Output format:
 
+        - ``"misha"`` -- misha binary ``.seq`` format. ``"seq"`` is
+          accepted as a legacy alias.
         - ``"fasta"`` -- FASTA text format.
-        - ``"seq"`` -- misha binary ``.seq`` format.
         - ``"vector"`` -- return sequences as a Python list of strings
           (does not write to file).
     intervals : DataFrame, optional
@@ -1561,6 +1583,8 @@ def gsynth_sample(
     if not isinstance(model, GsynthModel):
         raise TypeError("model must be a GsynthModel")
 
+    output_format = _normalize_output_format(output_format)
+
     if bin_merge is not None and (
         not isinstance(bin_merge, list) or len(bin_merge) != model.n_dims
     ):
@@ -1653,12 +1677,11 @@ def gsynth_sample(
         do_parallel = False
 
     # Determine output format code
-    fmt_map = {"seq": 0, "fasta": 1, "vector": 2}
     if output is None:
-        fmt_code = 2  # vector mode
+        fmt_code = _OUTPUT_FORMAT_CODES["vector"]
         output_path = ""
     else:
-        fmt_code = fmt_map.get(output_format, 1)
+        fmt_code = _OUTPUT_FORMAT_CODES[output_format]
         output_path = str(output)
         # Ensure parent directory exists
         parent = _os.path.dirname(output_path)
@@ -2234,11 +2257,12 @@ def gsynth_random(
     intervals: _pd.DataFrame | None = None,
     nuc_probs: dict[str, float] | None = None,
     output: str | None = None,
-    output_format: str = "fasta",
+    output_format: str = "misha",
     mask_copy: _pd.DataFrame | None = None,
     preserve_n: bool = True,
     n_samples: int = 1,
     seed: int | None = None,
+    iterator: int = 1,
 ) -> list[str] | None:
     """Generate random genome sequences without a trained model.
 
@@ -2258,11 +2282,12 @@ def gsynth_random(
         Default is uniform (0.25 each).
     output : str, optional
         Output file path.  If ``None``, sequences are returned in memory.
-    output_format : {"fasta", "seq", "vector"}, default "fasta"
+    output_format : {"misha", "fasta", "vector"}, default "misha"
         Output format:
 
+        - ``"misha"`` -- misha binary ``.seq`` format. ``"seq"`` is
+          accepted as a legacy alias.
         - ``"fasta"`` -- FASTA text format.
-        - ``"seq"`` -- misha binary ``.seq`` format.
         - ``"vector"`` -- return sequences as a Python list of strings.
     mask_copy : DataFrame, optional
         Intervals where the original reference sequence is preserved
@@ -2278,6 +2303,10 @@ def gsynth_random(
     seed : int, optional
         Random seed for reproducibility.  If ``None``, uses the current
         random state.
+    iterator : int, default 1
+        Accepted for R-misha API parity. PyMisha samples every position
+        independently regardless of this value, so the parameter has no
+        effect on output. Provided so R-script ports keep working.
 
     Returns
     -------
@@ -2306,6 +2335,9 @@ def gsynth_random(
     1000
     """
     _checkroot()
+
+    output_format = _normalize_output_format(output_format)
+    del iterator  # accepted for R parity; sampling is per-position regardless
 
     if intervals is None:
         intervals = gintervals_all()
@@ -2354,12 +2386,11 @@ def gsynth_random(
     flat_breaks = [0.0, 1.0]  # Single bin
 
     # Output setup
-    fmt_map = {"seq": 0, "fasta": 1, "vector": 2}
     if output is None:
-        fmt_code = 2
+        fmt_code = _OUTPUT_FORMAT_CODES["vector"]
         output_path = ""
     else:
-        fmt_code = fmt_map.get(output_format, 1)
+        fmt_code = _OUTPUT_FORMAT_CODES[output_format]
         output_path = str(output)
         parent = _os.path.dirname(output_path)
         if parent:
@@ -2400,7 +2431,7 @@ def gsynth_replace_kmer(
     *,
     intervals: _pd.DataFrame | None = None,
     output: str | None = None,
-    output_format: str = "fasta",
+    output_format: str = "misha",
     check_composition: bool = True,
 ) -> list[str] | None:
     """Iteratively replace a k-mer in genome sequences.
@@ -2427,11 +2458,12 @@ def gsynth_replace_kmer(
         Genomic intervals to process.  If ``None``, uses all chromosomes.
     output : str, optional
         Output file path.  If ``None``, sequences are returned in memory.
-    output_format : {"fasta", "seq", "vector"}, default "fasta"
+    output_format : {"misha", "fasta", "vector"}, default "misha"
         Output format:
 
+        - ``"misha"`` -- misha binary ``.seq`` format. ``"seq"`` is
+          accepted as a legacy alias.
         - ``"fasta"`` -- FASTA text format.
-        - ``"seq"`` -- misha binary ``.seq`` format.
         - ``"vector"`` -- return sequences as a Python list of strings.
     check_composition : bool, default True
         If ``True``, verify that *target* and *replacement* contain the
@@ -2473,6 +2505,8 @@ def gsynth_replace_kmer(
     """
     _checkroot()
 
+    output_format = _normalize_output_format(output_format)
+
     if not target or not replacement:
         raise ValueError("target and replacement cannot be empty")
     if len(target) != len(replacement):
@@ -2493,12 +2527,11 @@ def gsynth_replace_kmer(
     intervals = _maybe_load_intervals_set(intervals)
 
     # Output setup
-    fmt_map = {"seq": 0, "fasta": 1, "vector": 2}
     if output is None:
-        fmt_code = 2
+        fmt_code = _OUTPUT_FORMAT_CODES["vector"]
         output_path = ""
     else:
-        fmt_code = fmt_map.get(output_format, 1)
+        fmt_code = _OUTPUT_FORMAT_CODES[output_format]
         output_path = str(output)
         parent = _os.path.dirname(output_path)
         if parent:

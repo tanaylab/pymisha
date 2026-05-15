@@ -573,3 +573,45 @@ class TestContainingInterval:
     def test_empty_intervals(self):
         from pymisha.analysis import _containing_interval
         assert _containing_interval([], 0, 100) == -1
+
+
+class TestGcisDecayCompoundExpression:
+    """R parity: gcis_decay accepts compound 2D expressions referencing
+    exactly one 2D track. Distance is computed from contact coordinates,
+    so the expression value is unused (matches R's scanner semantics)."""
+
+    def test_compound_single_track_matches_bare(self):
+        src = pd.DataFrame(
+            {"chrom": ["1"], "start": [0], "end": [500_000]}
+        )
+        domain = pd.DataFrame(
+            {"chrom": ["1"], "start": [0], "end": [500_000]}
+        )
+        breaks = [0, 1000, 10000, 100000, 500000]
+        bare = pm.gcis_decay("rects_track", breaks, src, domain)
+        compound = pm.gcis_decay("rects_track + 0", breaks, src, domain)
+        assert (bare == compound).all()
+
+    def test_vtrack_in_expression_raises_not_implemented(self):
+        """Compound 2D expressions involving virtual tracks need the C++
+        scanner (Group K). Until then, raise a clear error."""
+        src = pd.DataFrame(
+            {"chrom": ["1"], "start": [0], "end": [500_000]}
+        )
+        domain = src.copy()
+        breaks = [0, 1000, 100000, 500000]
+        pm.gvtrack_create("vt_rects", "rects_track", "avg")
+        try:
+            with pytest.raises(NotImplementedError, match="vtrack"):
+                pm.gcis_decay("vt_rects + 0", breaks, src, domain)
+        finally:
+            pm.gvtrack_rm("vt_rects")
+
+    def test_no_2d_track_in_expr_raises(self):
+        src = pd.DataFrame(
+            {"chrom": ["1"], "start": [0], "end": [500_000]}
+        )
+        domain = src.copy()
+        breaks = [0, 1000, 100000, 500000]
+        with pytest.raises(ValueError, match="references no 2D track"):
+            pm.gcis_decay("dense_track * 2", breaks, src, domain)

@@ -61,6 +61,7 @@ from .gdir import (
     gtrack_create_dirs,
 )
 from .genome import gdb_build_genome, gdb_install_intervals
+from .genome.registry import gdb_genome_info, gdb_list_genomes
 from .genome_edit import (
     ggenome_implant,
     ggenome_transplant,
@@ -240,7 +241,9 @@ __all__ = [
     'gdb_create_genome',
     'gdb_create_linked',
     'gdb_build_genome',
+    'gdb_genome_info',
     'gdb_install_intervals',
+    'gdb_list_genomes',
     'gdb_convert_to_indexed',
     'gdb_get_readonly_attrs',
     'gdb_set_readonly_attrs',
