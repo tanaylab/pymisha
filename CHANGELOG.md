@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.58 (2026-05-15)
+
+### Fixes
+- **CI mypy errors from v0.1.55-v0.1.57 are resolved.** mypy is clean across `pymisha/_r_serialize.py`, `pymisha/genome/registry.py`, `pymisha/intervals.py`, and `pymisha/tracks.py`. No runtime behaviour change.
+
+### Improvements
+- **Obsolete 2D track formats now produce an actionable error message** instead of "requires conversion". Lists the obsolete format name, points to R misha's `gtrack.convert` as the upgrade path, and notes that a PyMisha in-process converter is tracked under Group J of the 2026-05-15 parity audit. The legacy formats (`OLD_RECTS1`, `OLD_RECTS2`, `OLD_COMPUTED1`, `OLD_COMPUTED2`, `OLD_COMPUTED3`) have not been written by misha for years; the converter port is deferred.
+
 ## v0.1.57 (2026-05-15)
 
 ### Features

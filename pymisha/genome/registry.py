@@ -135,15 +135,12 @@ def gdb_list_genomes(registry: str | None = None):
                 recipe = _normalize_recipe(raw, layer)
             except (ValueError, KeyError):
                 continue
+            fasta = recipe.get("fasta")
             detail = (
                 recipe.get("assembly")
                 or recipe.get("accession")
                 or recipe.get("path")
-                or (
-                    recipe.get("fasta")[0]
-                    if isinstance(recipe.get("fasta"), list) and recipe.get("fasta")
-                    else None
-                )
+                or (fasta[0] if isinstance(fasta, list) and fasta else None)
             )
             rows.append({
                 "name": nm,

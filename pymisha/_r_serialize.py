@@ -64,11 +64,11 @@ def _read_int(fh: BinaryIO) -> int:
     buf = fh.read(4)
     if len(buf) != 4:
         raise EOFError("unexpected end of R-serialize stream")
-    return struct.unpack(">i", buf)[0]
+    return int(struct.unpack(">i", buf)[0])
 
 
 def _read_double(fh: BinaryIO) -> float:
-    return struct.unpack(">d", fh.read(8))[0]
+    return float(struct.unpack(">d", fh.read(8))[0])
 
 
 def _read_bytes(fh: BinaryIO, n: int) -> bytes:
@@ -137,21 +137,27 @@ def _read_item(fh: BinaryIO, ref_table: list[Any]) -> Any:
     if type_code in (_LGLSXP, _INTSXP):
         length = _read_int(fh)
         raw = _read_bytes(fh, 4 * length)
-        arr = _numpy.frombuffer(raw, dtype=">i4").astype(_numpy.int32, copy=True)
+        int_arr: _numpy.ndarray = _numpy.frombuffer(raw, dtype=">i4").astype(
+            _numpy.int32, copy=True
+        )
         # LGLSXP: 0 = FALSE, 1 = TRUE, NA = -INT_MAX (treated as masked False).
-        out = arr.astype(bool, copy=True) if type_code == _LGLSXP else arr
-        return _wrap_with_attrs(fh, ref_table, out, has_attr, has_tag)
+        int_out: _numpy.ndarray = (
+            int_arr.astype(bool, copy=True) if type_code == _LGLSXP else int_arr
+        )
+        return _wrap_with_attrs(fh, ref_table, int_out, has_attr, has_tag)
 
     if type_code == _REALSXP:
         length = _read_int(fh)
         raw = _read_bytes(fh, 8 * length)
-        arr = _numpy.frombuffer(raw, dtype=">f8").astype(_numpy.float64, copy=True)
-        return _wrap_with_attrs(fh, ref_table, arr, has_attr, has_tag)
+        real_arr: _numpy.ndarray = _numpy.frombuffer(raw, dtype=">f8").astype(
+            _numpy.float64, copy=True
+        )
+        return _wrap_with_attrs(fh, ref_table, real_arr, has_attr, has_tag)
 
     if type_code == _STRSXP:
         length = _read_int(fh)
-        out = [_read_item(fh, ref_table) for _ in range(length)]
-        return _wrap_with_attrs(fh, ref_table, out, has_attr, has_tag)
+        str_items: list[Any] = [_read_item(fh, ref_table) for _ in range(length)]
+        return _wrap_with_attrs(fh, ref_table, str_items, has_attr, has_tag)
 
     if type_code == _VECSXP:
         length = _read_int(fh)
@@ -230,10 +236,15 @@ def _decode_altrep_state(cls_name: str, state: Any) -> Any:
         # state is c(length, start, step)
         if isinstance(state, _numpy.ndarray) and state.size == 3:
             length = int(state[0])
-            start = state[1]
-            step = state[2]
-            dtype = _numpy.int32 if cls_name == "compact_intseq" else _numpy.float64
-            return _numpy.arange(length, dtype=dtype) * dtype(step) + dtype(start)
+            if cls_name == "compact_intseq":
+                start_i = int(state[1])
+                step_i = int(state[2])
+                return _numpy.arange(length, dtype=_numpy.int32) * step_i + start_i
+            start_f = float(state[1])
+            step_f = float(state[2])
+            return (
+                _numpy.arange(length, dtype=_numpy.float64) * step_f + start_f
+            )
         raise NotImplementedError(
             f"{cls_name} state was {type(state).__name__}: {state!r}"
         )

@@ -4366,18 +4366,21 @@ def gtrack_array_extract(
         if all(isinstance(s, str) for s in slice_list):
             cn_idx = {name: i for i, name in enumerate(colnames)}
             try:
-                slice_idx = [cn_idx[s] for s in slice_list]
+                slice_idx = [cn_idx[str(s)] for s in slice_list]
             except KeyError as exc:
                 raise ValueError(
                     f"{exc.args[0]!r} is not a column of track '{track}'"
                 ) from exc
         elif all(isinstance(s, (int, np.integer)) for s in slice_list):
+            int_slice: list[int] = []
             for s in slice_list:
-                if s < 0 or s >= len(colnames):
+                s_int = int(s)  # type: ignore[call-overload]
+                if s_int < 0 or s_int >= len(colnames):
                     raise ValueError(
-                        f"slice index {s} out of range [0, {len(colnames)})"
+                        f"slice index {s_int} out of range [0, {len(colnames)})"
                     )
-            slice_idx = [int(s) for s in slice_list]
+                int_slice.append(s_int)
+            slice_idx = int_slice
         else:
             raise ValueError("slice must be a list of strings or ints")
 

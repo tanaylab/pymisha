@@ -160,7 +160,14 @@ GenomeTrack::Type GenomeTrack::get_type(const char *track_dir, const GenomeChrom
             if (type == OLD_RECTS1 || type == OLD_RECTS2 || type == OLD_COMPUTED1 || type == OLD_COMPUTED2 || type == OLD_COMPUTED3) {
                 if (return_obsolete_types)
                     return type;
-                TGLError<GenomeTrack>(OBSOLETE_FORMAT, "Track file at %s is in obsolete format and requires conversion", track_dir);
+                TGLError<GenomeTrack>(
+                    OBSOLETE_FORMAT,
+                    "Track file at %s is in an obsolete 2D format (%s, written by R misha versions older than ~2018). "
+                    "Use R misha's gtrack.convert(\"<track>\") to upgrade it to the modern RECTS/COMPUTED format, "
+                    "then it will be readable by pymisha. PyMisha does not currently include an in-process converter "
+                    "(tracked under Group J of the 2026-05-15 parity roadmap; the conversion path needs the "
+                    "StatQuadTree unserialize legacy templates). File an issue with a sample if you need it.",
+                    track_dir, TYPE_NAMES[type]);
             }
 
             if (type != RECTS && type != POINTS && type != COMPUTED)

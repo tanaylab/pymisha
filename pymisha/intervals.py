@@ -2157,6 +2157,7 @@ def gintervals_neighbors(
     if (
         warn_ignored_strand
         and not use_intervals1_strand
+        and isinstance(intervals1, _pandas.DataFrame)
         and "strand" in intervals1.columns
     ):
         import warnings as _warnings
