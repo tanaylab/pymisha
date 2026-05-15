@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.60 (2026-05-15)
+
+### Fixes
+- **`_read_r_readonly_format`** now uses the native R-serialize reader (`pymisha._r_serialize`) instead of `pyreadr`. The runtime no longer needs `pyreadr` to load a database with R-written read-only-attribute files. `pyreadr` remains a soft dependency only for `gintervals_save` (RDS writer).
+
+### Docs
+- Refreshed `docs/guides/parity.md` to reflect Groups G/H/I/J shipped in v0.1.55-v0.1.59.
+
 ## v0.1.59 (2026-05-15)
 
 ### Features

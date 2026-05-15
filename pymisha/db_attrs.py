@@ -122,26 +122,24 @@ def _coerce_readonly_obj(obj: Any, filename: str) -> list[str]:
 
 
 def _read_r_readonly_format(path: Path) -> list[str]:
+    """Read a R-written readonly-attrs file (XDR or gzip RDS character vector).
+
+    Uses the native pymisha R-serialize reader (no Rscript or pyreadr
+    dependency at runtime).
+    """
+    from ._r_serialize import read as _r_read
+
     filename = str(path)
     try:
-        import pyreadr
+        obj = _r_read(filename)
     except Exception as exc:
         raise ValueError(
             f"Invalid format of read-only attributes file {filename}"
         ) from exc
 
-    try:
-        parsed = pyreadr.read_r(filename)
-    except Exception as exc:
-        raise ValueError(
-            f"Invalid format of read-only attributes file {filename}"
-        ) from exc
-
-    if not parsed:
+    if obj is None:
         return []
-
-    first = next(iter(parsed.values()))
-    return _coerce_readonly_obj(first, filename)
+    return _coerce_readonly_obj(obj, filename)
 
 
 def gdb_get_readonly_attrs() -> list[str] | None:
