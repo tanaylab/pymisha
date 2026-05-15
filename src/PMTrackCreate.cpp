@@ -44,6 +44,13 @@ using namespace std;
 // (R 5.6.30 81635130) and enables atomic gtrack.create via tmp dir + rename.
 namespace pymisha_track_create {
     thread_local std::string g_create_dir_override;
+
+    // Worker count for pm_track_create_sparse's empty-chrom signature-file
+    // dispatch. Set by Python wrapper from pm.CONFIG (multitasking +
+    // max_processes); 0 means "use default" (4); 1 forces sequential.
+    // Capped to a sane upper bound in the C++ side so misconfiguration
+    // can't spawn hundreds of threads per call.
+    thread_local int g_create_empty_writers = 0;
 }
 
 namespace {
@@ -124,6 +131,10 @@ static void write_empty_sparse_file_syscall(const string &path, int32_t sig)
 // data) this drops ~1.0 s of wall time to ~0.5 s. Mirrors the sequential
 // loop semantics: each chrom that was not touched by the main write loop
 // gets a 4-byte signature file at its canonical 1d filename.
+//
+// Worker count is controlled by pymisha_track_create::g_create_empty_writers
+// (set by the Python wrapper from pm.CONFIG -- multitasking off => 1,
+// otherwise min(max_processes, hard cap)). Value 0 means "use default".
 static void create_empty_sparse_files_parallel(const string &track_dir,
                                                const GenomeChromKey &chromkey,
                                                uint32_t num_chroms,
@@ -140,9 +151,15 @@ static void create_empty_sparse_files_parallel(const string &track_dir,
     }
     if (paths.empty()) return;
 
-    // 4 workers saturates NFSv3 CREATE pipelining empirically; more threads
-    // don't help and just add startup overhead.
-    unsigned nworkers = std::min<unsigned>(4u, (unsigned)paths.size());
+    // Default: 4 workers (empirically saturates NFSv3 CREATE pipelining
+    // for the hg38-on-NFS case); user can override via pm.CONFIG. Hard cap
+    // at 16 so a misconfigured max_processes can't spawn hundreds of
+    // threads here -- empty-file creates don't benefit from more.
+    int requested = pymisha_track_create::g_create_empty_writers;
+    if (requested <= 0) requested = 4;
+    if (requested > 16) requested = 16;
+    unsigned nworkers = std::min<unsigned>((unsigned)requested,
+                                           (unsigned)paths.size());
     if (nworkers <= 1) {
         for (const string &p : paths)
             write_empty_sparse_file_syscall(p, sig);
@@ -1238,5 +1255,20 @@ PyObject *pm_clear_create_dir_override(PyObject *self, PyObject *args)
     (void)self;
     (void)args;
     pymisha_track_create::g_create_dir_override.clear();
+    Py_RETURN_NONE;
+}
+
+// Worker count for the empty-chrom signature-file dispatch inside
+// pm_track_create_sparse. 0 means "default" (4 workers); 1 forces
+// sequential. Thread-local so concurrent callers don't fight over
+// a global. Python wrapper sets it from pm.CONFIG (multitasking +
+// max_processes) before each pm_track_create_sparse call.
+PyObject *pm_set_create_parallel_writers(PyObject *self, PyObject *args)
+{
+    (void)self;
+    int n = 0;
+    if (!PyArg_ParseTuple(args, "i", &n))
+        return nullptr;
+    pymisha_track_create::g_create_empty_writers = n;
     Py_RETURN_NONE;
 }

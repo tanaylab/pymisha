@@ -992,6 +992,7 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
         raise ValueError("Sparse intervals must be sorted and non-overlapping per chromosome")
 
     with _atomic_track_create(track):
+        _apply_create_parallel_writers_from_config()
         _pymisha.pm_track_create_sparse(track, _df2pymisha(data))
 
     # On indexed DBs the C++ writer (pm_track_create_sparse) already
@@ -1017,6 +1018,33 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
             stacklevel=2,
         )
         raise
+
+
+_DEFAULT_TRACK_CREATE_PARALLEL_WRITERS = 4  # empirical NFSv3 CREATE saturation
+
+
+def _apply_create_parallel_writers_from_config() -> None:
+    """Push the configured worker count for empty-chrom file dispatch
+    into C++ before a track-create call.
+
+    Resolution order:
+    1. `pm.CONFIG["track_create_parallel_writers"]` if explicitly set.
+    2. `pm.CONFIG["multitasking"] == False` -> 1 worker (sequential).
+    3. Default (4): empirically saturates NFSv3 CREATE pipelining; more
+       workers don't help and add thread-startup overhead.
+    """
+    from . import _shared
+    config = _shared.CONFIG
+    override = config.get("track_create_parallel_writers")
+    if override is not None:
+        n = int(override)
+    elif not bool(config.get("multitasking", True)):
+        n = 1
+    else:
+        n = _DEFAULT_TRACK_CREATE_PARALLEL_WRITERS
+    if n < 1:
+        n = 1
+    _pymisha.pm_set_create_parallel_writers(n)
 
 
 _CREATE_DENSE_FUNCS = (

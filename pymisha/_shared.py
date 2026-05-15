@@ -38,7 +38,13 @@ CONFIG = {
     'eval_buf_size': 1000,          # Batch size for expression eval
     'debug': False,                 # Debug prints
     'progress': True,              # False, True, 'tqdm', 'rich', 'text', or callable
-    'progress_style': 'rich'        # Default when progress=True
+    'progress_style': 'rich',       # Default when progress=True
+    # Parallel writers for the empty-chrom signature-file dispatch inside
+    # gtrack_create_sparse on non-indexed DBs. None = follow multitasking
+    # + max_processes (capped at 8). Set explicitly (1..16) to tune for
+    # your storage; 1 forces sequential. Only relevant on NFS-like
+    # filesystems with many alt contigs.
+    'track_create_parallel_writers': None,
 }
 
 # Global state

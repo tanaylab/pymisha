@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.66 (2026-05-15)
+
+### Configuration
+- **`pm.CONFIG["track_create_parallel_writers"]`** controls how many threads `gtrack_create_sparse` uses for empty per-chrom signature file dispatch on non-indexed DBs. Default 4. Set to 1 to force sequential, higher to push parallelism. `multitasking=False` also forces 1 worker. Was hardcoded to 4 in v0.1.65.
+
 ## v0.1.65 (2026-05-15)
 
 ### Performance
