@@ -173,6 +173,11 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
         SegmentFinder<GInterval>::NNIterator nn_iter(&segment_finder);
 
         int cur_chromid = -1;
+        // Single-pass index over the sorted intervals2 vector. Each chrom
+        // transition just advances this pointer forward to the next
+        // matching chromid run, so total insertion work is O(|intervals2|)
+        // instead of O(|intervals1_chrom_changes| * |intervals2|).
+        size_t intervals2_pos = 0;
 
         // Process each query interval
         for (size_t i = 0; i < intervals1.size(); ++i) {
@@ -186,11 +191,17 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
                 uint64_t chrom_size = chromkey.get_chrom_size(cur_chromid);
                 segment_finder.reset(0, chrom_size);
 
-                // Insert all intervals2 on this chromosome
-                for (size_t j = 0; j < intervals2.size(); ++j) {
-                    if (intervals2[j].chromid == cur_chromid) {
-                        segment_finder.insert(intervals2[j]);
-                    }
+                // Both intervals1 and intervals2 are sorted by chromid, so
+                // we only need to skip past earlier chroms in intervals2
+                // and then insert the contiguous run for cur_chromid.
+                while (intervals2_pos < intervals2.size() &&
+                       intervals2[intervals2_pos].chromid < cur_chromid) {
+                    ++intervals2_pos;
+                }
+                while (intervals2_pos < intervals2.size() &&
+                       intervals2[intervals2_pos].chromid == cur_chromid) {
+                    segment_finder.insert(intervals2[intervals2_pos]);
+                    ++intervals2_pos;
                 }
             }
 

@@ -637,7 +637,13 @@ static void extract_sub_intervals(
 }
 
 // Forward declaration (defined later)
-static int choose_num_kids(uint64_t num_intervals);
+static int choose_num_kids(uint64_t num_intervals, int64_t total_scope_bp = -1);
+
+static int64_t total_intervals_scope(const std::vector<GInterval> &intervals) {
+    int64_t total = 0;
+    for (const auto &iv : intervals) total += iv.end - iv.start;
+    return total;
+}
 
 static int choose_num_kids_for_range(size_t num_intervals, int64_t total_range, int64_t bin_size)
 {
@@ -649,18 +655,28 @@ static int choose_num_kids_for_range(size_t num_intervals, int64_t total_range, 
     int min_p = g_pymisha->min_processes();
     int target = std::clamp(hw ? hw : max_p, min_p, max_p);
 
-    // Range-based: at least 50000 bins per worker
+    // Range-based: at least 50000 bins per worker.
     int64_t total_bins = (total_range + bin_size - 1) / bin_size;
     int64_t min_bins_per_kid = 50000;
     int desired = std::min((int64_t)target, (total_bins + min_bins_per_kid - 1) / min_bins_per_kid);
     if (desired < 1) desired = 1;
 
-    // Also consider count-based (existing logic)
-    int count_based = choose_num_kids(num_intervals);
+    int count_based = choose_num_kids(num_intervals, total_range);
 
     int result = std::max(count_based, (int)desired);
     if (result < 2)
         return 0;
+
+    // Scope floor: also require each kid sees min_scope4process bp on the
+    // range-based path. Without this, dense scans on small scopes pay
+    // fork+IPC cost that exceeds the parallel compute win.
+    uint64_t min_scope = g_pymisha->min_scope4process();
+    if (min_scope > 0 && total_range > 0) {
+        uint64_t scope_per_kid = (uint64_t)total_range / (uint64_t)result;
+        if (scope_per_kid < min_scope)
+            return 0;
+    }
+
     return std::min(result, target);
 }
 
@@ -1185,7 +1201,7 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -1303,7 +1319,7 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
 
             sort_accumulator(acc);
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             // Single-process path: scan directly into NumPy arrays
@@ -1451,7 +1467,7 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -1539,7 +1555,7 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
 
             merge_adjacent(out_intervals);
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             out_intervals = compute_screen(expr, intervals, iterator_policy, progress_cb, py_vtracks);
@@ -1711,7 +1727,7 @@ static void compute_interval_summaries(const std::string &expr,
     }
 }
 
-static int choose_num_kids(uint64_t num_intervals)
+static int choose_num_kids(uint64_t num_intervals, int64_t total_scope_bp)
 {
     if (!g_pymisha->multitasking_avail())
         return 0;
@@ -1723,6 +1739,23 @@ static int choose_num_kids(uint64_t num_intervals)
 
     if (target < 2 || num_intervals < static_cast<uint64_t>(target))
         return 0;
+
+    // Workload floors: fork-based multitasking pays an upfront cost
+    // (fork + sem/mmap setup) plus per-row FIFO marshalling. Below these
+    // thresholds, parallel is measured to lose by 20-200x vs serial on
+    // hg38/Phylo447 sparse-track gextract/gquantiles/gsummary/gscreen.
+    uint64_t min_intervs = g_pymisha->min_intervs4process();
+    if (min_intervs > 0 && num_intervals < min_intervs)
+        return 0;
+
+    if (total_scope_bp >= 0) {
+        uint64_t min_scope = g_pymisha->min_scope4process();
+        if (min_scope > 0) {
+            uint64_t scope_per_kid = (uint64_t)total_scope_bp / (uint64_t)target;
+            if (scope_per_kid < min_scope)
+                return 0;
+        }
+    }
 
     return target;
 }
@@ -1770,7 +1803,7 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -1803,7 +1836,7 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
                 summary.merge(kid_summary);
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             summary = compute_summary(expr, intervals, iterator_policy, progress_cb);
@@ -2073,7 +2106,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -2186,7 +2219,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
                              1);
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             if (!intervals.empty()) {
@@ -2251,7 +2284,7 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
         g_pymisha->verify_max_data_size(intervals.size(), "Result");
 
         std::vector<double> values;
-        int num_kids = choose_num_kids(intervals.size());
+        int num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -2313,7 +2346,7 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
                 }
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             std::vector<SummaryStats> summaries;
@@ -2426,7 +2459,7 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
         std::vector<double> quantiles;
         bool estimated_any = false;
 
-        int num_kids = choose_num_kids(intervals.size());
+        int num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
 
         PyObject *progress_cb = get_progress_cb(py_config);
         if (num_kids > 0) {
@@ -2492,7 +2525,7 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
                 }
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             estimated_any = compute_interval_quantiles(expr, intervals, iterator_policy,
@@ -3089,9 +3122,10 @@ PyObject *pm_seq_extract(PyObject *self, PyObject *args)
         for (size_t i = 0; i < intervals.size(); ++i) {
             seqfetch.read_interval(intervals[i], chromkey, seq_buf);
 
-            // Convert to Python string
-            std::string seq_str(seq_buf.begin(), seq_buf.end());
-            PyObject *py_seq = PyUnicode_FromStringAndSize(seq_str.c_str(), seq_str.size());
+            // PyUnicode_FromStringAndSize copies the bytes once; the
+            // intermediate std::string was a redundant copy of seq_buf.
+            PyObject *py_seq = PyUnicode_FromStringAndSize(seq_buf.data(),
+                                                          seq_buf.size());
             if (!py_seq) {
                 verror("Failed to create sequence string");
             }
@@ -3302,7 +3336,7 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -3356,7 +3390,7 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
                 }
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             result = compute_partition(expr, intervals, bin_finder, iterator_policy, progress_cb);
@@ -3387,17 +3421,24 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
         int64_t *start_data = (int64_t *)PyArray_DATA((PyArrayObject *)(PyObject *)py_start);
         int64_t *end_data = (int64_t *)PyArray_DATA((PyArrayObject *)(PyObject *)py_end);
         int64_t *bin_data = (int64_t *)PyArray_DATA((PyArrayObject *)(PyObject *)py_bin);
+        PyObject **chrom_data = (PyObject **)PyArray_DATA((PyArrayObject *)(PyObject *)py_chrom);
 
+        // Hot loop: reuse PyUnicode chrom string across same-chromid runs
+        // (partition output is sorted by chrom). Matches intervals_to_py.
+        int last_chromid = -1;
+        PyObject *last_str = nullptr;
         for (size_t i = 0; i < n; ++i) {
             const PartitionInterval &pi = result[i];
 
-            // Set chrom (as string)
-            PyObject *chrom_str = PyUnicode_FromString(chromkey.id2chrom(pi.chromid).c_str());
-            if (!chrom_str) verror("Failed to create chrom string");
-            PyArrayObject *chrom_arr = (PyArrayObject *)(PyObject *)py_chrom;
-            char *ptr = (char *)PyArray_GETPTR1(chrom_arr, i);
-            PyArray_SETITEM(chrom_arr, ptr, chrom_str);
-            Py_DECREF(chrom_str);
+            if (pi.chromid != last_chromid || !last_str) {
+                last_str = PyUnicode_FromString(chromkey.id2chrom(pi.chromid).c_str());
+                if (!last_str) verror("Failed to create chrom string");
+                last_chromid = pi.chromid;
+                chrom_data[i] = last_str;
+            } else {
+                Py_INCREF(last_str);
+                chrom_data[i] = last_str;
+            }
 
             start_data[i] = pi.start;
             end_data[i] = pi.end;
@@ -4135,7 +4176,7 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -4177,7 +4218,7 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
                 }
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             distribution = compute_dist(exprs, intervals, bins_manager, iterator_policy, progress_cb);
@@ -4491,7 +4532,7 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
                 num_kids = (int)range_kids.size();
             }
         } else {
-            num_kids = choose_num_kids(intervals.size());
+            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
         }
 
         PyObject *progress_cb = get_progress_cb(py_config);
@@ -4597,7 +4638,7 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
 
             sort_lookup_result(result);
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
         } else {
             result = compute_lookup(exprs, intervals, bins_manager, lookup_table,
@@ -5278,7 +5319,7 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
                     num_kids = (int)range_kids.size();
                 }
             } else {
-                num_kids = choose_num_kids(intervals.size());
+                num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
             }
         } else {
             num_kids = 0;
@@ -5368,7 +5409,7 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
                 }
             }
 
-            while (PyMisha::wait_for_kids(100))
+            while (PyMisha::wait_for_kids(1))
                 ;
 
             if (method == CorMethod::SPEARMAN_EXACT) {

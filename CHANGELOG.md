@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.69 (2026-05-15)
+
+### Performance
+- **`gquantiles` / `gsummary` / `gscreen` / `gpartition` 20-30x faster on 100k-1M interval inputs.** Multitasking no longer fires for sparse-track workloads where fork + IPC overhead exceeds the serial scan. Phylo447 / 100k 500-bp intervals: gquantiles 190 -> 7 ms, gsummary 188 -> 7 ms, gscreen 188 -> 8 ms, gpartition 186 -> 6 ms.
+- **`gextract` 20-90x faster on small-to-medium workloads.** Phylo447 / 100k 500-bp intervals: 491 -> 7 ms (single track), 634 -> 7 ms (3 tracks).
+- **Child-process wakeup polling reduced from 100 ms to 1 ms** in all multitask call sites.
+- **`gintervals_neighbors`** does a single pass over the sorted target set per chrom run instead of rescanning it on every query-chrom transition.
+- **`gseq_extract`** drops a redundant per-interval `std::string` copy.
+- **`gpartition`** reuses the chrom `PyUnicode` across same-chrom output runs (matches the v0.1.64 `intervals_to_py` pattern).
+
+### Configuration
+- **`pm.CONFIG["min_scope4process"]`** (default `1_000_000_000` bp): minimum scope per worker required to enable multitasking. Set to `0` to fork unconditionally.
+- **`pm.CONFIG["min_intervs4process"]`** (default `250_000`): minimum total intervals required before any fork.
+
 ## v0.1.68 (2026-05-15)
 
 ### Performance

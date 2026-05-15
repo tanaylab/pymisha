@@ -1197,6 +1197,30 @@ _VALID_STRATEGIES = ("auto", "tracks", "tiles")
 _AUTO_TRACKS_MIN_EXPRS = 8
 
 
+def _workload_too_small_for_fork(
+    intervals: pd.DataFrame, max_procs: int, config: dict
+) -> bool:
+    """Return True if the workload is below the multitask thresholds.
+
+    Mirrors the C++ ``choose_num_kids`` gating (min_intervs4process,
+    min_scope4process) so the Python-level worker-pool fork is also
+    skipped when serial is expected to win.
+    """
+    if max_procs < 2:
+        return True
+    n = len(intervals)
+    min_intervs = int(config.get("min_intervs4process", 250_000))
+    if min_intervs > 0 and n < min_intervs:
+        return True
+    min_scope = int(config.get("min_scope4process", 1_000_000_000))
+    if min_scope > 0 and "start" in intervals.columns and "end" in intervals.columns:
+        # Sum can overflow Python int? No - Python ints are arbitrary precision.
+        scope = int((intervals["end"].to_numpy() - intervals["start"].to_numpy()).sum())
+        if scope // max_procs < min_scope:
+            return True
+    return False
+
+
 def _validate_strategy(strategy: str) -> str:
     """Raise ValueError on unknown strategy; return lowercased value."""
     s = str(strategy).lower()
@@ -1560,11 +1584,13 @@ def gextract(
         # with forked workers) or when file output is requested.
         with _config_no_mt(_itr_id_map) as _cfg:
             df = None
+            _max_procs = int(_cfg.get("max_processes", 1))
             use_parallel = (
                 _cfg.get("multitasking")
-                and int(_cfg.get("max_processes", 1)) > 1
+                and _max_procs > 1
                 and not callable(progress)
                 and file is None
+                and not _workload_too_small_for_fork(intervals, _max_procs, _cfg)
             )
             if use_parallel:
                 strategy = _resolve_parallel_strategy(

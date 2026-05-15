@@ -150,6 +150,11 @@ public:
     // Returns the upper limit for data size
     uint64_t max_data_size() const { return m_max_data_size; }
 
+    // Multitask gating thresholds. Forking is skipped when the workload is
+    // too small to amortize fork+IPC overhead. Both must be exceeded.
+    uint64_t min_scope4process() const { return m_min_scope4process; }
+    uint64_t min_intervs4process() const { return m_min_intervs4process; }
+
     // Returns buffer size of the numpy arrays used within PyEval_EvalCode
     int eval_buf_size() const { return m_eval_buf_size; }
 
@@ -237,6 +242,11 @@ protected:
     int                         m_min_processes{4};
     int                         m_max_processes{20};
     uint64_t                    m_max_data_size{10000000};
+    // Min total interval scope (bp) and count to enable C++ fork-based
+    // multitasking. Below these floors the fork+FIFO overhead dominates.
+    // Defaults chosen from hg38/Phylo447 bench: 1 Gbp / 250k intervals.
+    uint64_t                    m_min_scope4process{1000000000};
+    uint64_t                    m_min_intervs4process{250000};
     int                         m_eval_buf_size{1000};
     static bool                 s_multitasking_stdout;
 

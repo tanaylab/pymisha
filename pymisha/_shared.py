@@ -35,6 +35,11 @@ CONFIG = {
     'min_processes': 4,             # Min workers for multitasking
     'max_processes': 20,            # Max workers for multitasking
     'max_data_size': 10000000,      # Max rows in memory
+    # Workload floors for fork-based multitasking. Fork+IPC costs ~150ms on
+    # this stack; below these floors serial is faster (measured 20-200x on
+    # hg38/Phylo447 sparse-track ops). Set to 0 to fork unconditionally.
+    'min_scope4process': 1_000_000_000,   # min total scope (bp) per worker
+    'min_intervs4process': 250_000,       # min total intervals before any fork
     'eval_buf_size': 1000,          # Batch size for expression eval
     'debug': False,                 # Debug prints
     'progress': True,              # False, True, 'tqdm', 'rich', 'text', or callable

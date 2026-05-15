@@ -51,7 +51,7 @@ def test_track_parallel_matches_serial():
         serial = pm.gextract(exprs, intervals, iterator=100)
 
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "tracks",
         })
@@ -75,7 +75,7 @@ def test_track_parallel_matches_tile_parallel():
 
     try:
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "tiles",
         })
@@ -104,7 +104,7 @@ def test_strategy_auto_default_uses_tiles_for_few_exprs():
         serial = pm.gextract(["dense_track"], intervals, iterator=100)
 
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "auto",
         })
@@ -131,7 +131,7 @@ def test_strategy_auto_uses_tracks_for_many_exprs():
         serial = pm.gextract(exprs, intervals, iterator=100)
 
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "auto",
         })
@@ -154,7 +154,7 @@ def test_invalid_strategy_rejected():
 
     try:
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "max_processes": 2,
             "multitasking_strategy": "bogus",
         })
@@ -187,7 +187,7 @@ def test_strategy_tracks_routes_through_track_parallel(monkeypatch):
     saved = config.copy()
     try:
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "tracks",
         })
@@ -217,7 +217,7 @@ def test_strategy_auto_with_many_exprs_routes_through_track_parallel(monkeypatch
     saved = config.copy()
     try:
         config.update({
-            "multitasking": True,
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
             "min_processes": 3, "max_processes": 3,
             "multitasking_strategy": "auto",
         })

@@ -552,6 +552,12 @@ void PyMisha::load_options()
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_data_size"), true)), false) && PyLong_Check(opt))
         m_max_data_size = max(PyLong_AsUnsignedLong(opt), 1UL);
 
+    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_scope4process"), true)), false) && PyLong_Check(opt))
+        m_min_scope4process = (uint64_t)max(PyLong_AsLong(opt), 0L);
+
+    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_intervs4process"), true)), false) && PyLong_Check(opt))
+        m_min_intervs4process = (uint64_t)max(PyLong_AsLong(opt), 0L);
+
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("eval_buf_size"), true)), false) && PyLong_Check(opt))
         m_eval_buf_size = max(PyLong_AsUnsignedLong(opt), 1UL);
 }
