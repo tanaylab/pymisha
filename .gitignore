@@ -40,5 +40,5 @@ site/
 .nfs*
 
 .a5c/
-.worktrees/.claude/
+.worktrees/
 .claude/

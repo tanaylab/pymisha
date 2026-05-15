@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.64 (2026-05-15)
+
+### Fixes
+- **mypy CI:** expression helpers (`_parse_expr_vars`, `_validate_expr_security`, and friends) now accept `collections.abc.Set[str]` for `track_names` / `vtrack_names`, so the cached `frozenset` returned by the v0.1.63 `pm_track_names` cache type-checks at every call site. No behavior change.
+
 ## v0.1.63 (2026-05-15)
 
 ### Performance

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from collections.abc import Set as AbstractSet
 from types import FrameType
 from typing import Any
 
@@ -35,8 +36,8 @@ def _expr_safe_name(name: str) -> str:
 
 def _register_expr_name(
     name: str,
-    track_names: set[str],
-    vtrack_names: set[str],
+    track_names: AbstractSet[str],
+    vtrack_names: AbstractSet[str],
     used_tracks: set[str],
     used_vtracks: set[str],
     var_map: dict[str, str],
@@ -52,8 +53,8 @@ def _register_expr_name(
 
 def _replace_identifier_token(
     token: str,
-    track_names: set[str],
-    vtrack_names: set[str],
+    track_names: AbstractSet[str],
+    vtrack_names: AbstractSet[str],
     used_tracks: set[str],
     used_vtracks: set[str],
     var_map: dict[str, str],
@@ -102,8 +103,8 @@ def _find_vtracks_in_expr(expr: str) -> list[str]:
 
 def _parse_expr_vars(
     expr: str,
-    track_names: set[str],
-    vtrack_names: set[str],
+    track_names: AbstractSet[str],
+    vtrack_names: AbstractSet[str],
 ) -> tuple[str, set[str], set[str], dict[str, str]]:
     """
     Parse an expression and replace track/vtrack names with safe Python identifiers.

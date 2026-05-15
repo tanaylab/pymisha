@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Set as AbstractSet
 from typing import Any
 
 import numpy as np
@@ -40,8 +41,8 @@ def _interval_coord_cols(intervals: pd.DataFrame) -> list[str]:
 
 def _validate_expr_security(
     expr: str,
-    track_names: set[str] | None = None,
-    vtrack_names: set[str] | None = None,
+    track_names: AbstractSet[str] | None = None,
+    vtrack_names: AbstractSet[str] | None = None,
     user_vars: dict[str, Any] | None = None,
 ) -> None:
     if track_names is None:
