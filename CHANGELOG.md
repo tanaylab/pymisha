@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.68 (2026-05-15)
+
+### Performance
+- **`gextract` on raw 2D RECTS/POINTS tracks is ~2x faster.** Replaces the per-interval Python loop in `_gextract_2d_single` with a native C++ object-enumeration path (`pm_extract_2d`). Synthetic 3M-rect track, 100k queries, 2.4M output rows: 6.18 s -> 2.61 s (2.37x). Vtrack-aggregated paths (`avg` / `area` / `weighted.sum` / `min` / `max`) and object-level vtracks are unchanged in this release.
+
 ## v0.1.67 (2026-05-15)
 
 ### Fixes

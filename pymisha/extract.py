@@ -228,10 +228,13 @@ def _obj_in_band(obj: tuple[int, ...], is_points: bool, band: tuple[int, int]) -
     return (ox2 - oy1 > d1) and (ox1 - oy2 + 1 < d2)
 
 
-def _gextract_2d_single(
+def _gextract_2d_single_python(
     track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None
 ) -> pd.DataFrame | None:
-    """Extract a single 2D track over 2D intervals."""
+    """Pure-Python reference implementation of 2D bare-track extract.
+
+    Kept for parity tests against the C++ fast path. Not used in production.
+    """
     from ._quadtree import open_2d_pair, query_2d_track_opened
     from .tracks import gtrack_info
 
@@ -292,6 +295,62 @@ def _gextract_2d_single(
         ],
     )
     return result.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
+
+
+def _gextract_2d_single(
+    track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None
+) -> pd.DataFrame | None:
+    """Extract objects from a 2D track via the native C++ binding.
+
+    Returns a DataFrame with chrom1/start1/end1/chrom2/start2/end2/<col_name>/
+    intervalID columns, sorted by (chrom1, start1, chrom2, start2, intervalID).
+    Returns None if no objects intersect any interval.
+    """
+    from .intervals import _chrom_id_map
+
+    n = len(intervals)
+    if n == 0:
+        return None
+
+    cmap = _chrom_id_map()
+    chrom1_ids = _numpy.empty(n, dtype=_numpy.int32)
+    chrom2_ids = _numpy.empty(n, dtype=_numpy.int32)
+    for i, name in enumerate(intervals["chrom1"].astype(str).values):
+        chrom1_ids[i] = cmap.get(name, -1)
+    for i, name in enumerate(intervals["chrom2"].astype(str).values):
+        chrom2_ids[i] = cmap.get(name, -1)
+
+    intervals_dict = {
+        "chrom1": chrom1_ids,
+        "start1": intervals["start1"].to_numpy(dtype=_numpy.int64),
+        "end1":   intervals["end1"].to_numpy(dtype=_numpy.int64),
+        "chrom2": chrom2_ids,
+        "start2": intervals["start2"].to_numpy(dtype=_numpy.int64),
+        "end2":   intervals["end2"].to_numpy(dtype=_numpy.int64),
+    }
+
+    result = _pymisha.pm_extract_2d(track, intervals_dict, band)
+    if result is None:
+        return None
+
+    # Reverse chromid -> name lookup for output columns.
+    id2name = {v: k for k, v in cmap.items()}
+    chrom1_names = [id2name.get(int(c), str(int(c))) for c in result["chrom1"]]
+    chrom2_names = [id2name.get(int(c), str(int(c))) for c in result["chrom2"]]
+
+    out = _pandas.DataFrame({
+        "chrom1": chrom1_names,
+        "start1": result["start1"],
+        "end1":   result["end1"],
+        "chrom2": chrom2_names,
+        "start2": result["start2"],
+        "end2":   result["end2"],
+        col_name: result["value"],
+        "intervalID": result["intervalID"],
+    })
+    return out.sort_values(
+        ["chrom1", "start1", "chrom2", "start2", "intervalID"]
+    ).reset_index(drop=True)
 
 
 _2D_VTRACK_FUNCS = {

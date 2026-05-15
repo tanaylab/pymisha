@@ -99,6 +99,9 @@ PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args);
 PyObject *pm_ggenome_implant(PyObject *self, PyObject *args);
 PyObject *pm_intervals_random(PyObject *self, PyObject *args);
 PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args);
+PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
+PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args);
+PyObject *pm_extract_2d(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -169,6 +172,9 @@ static PyMethodDef module_methods[] = {
     {"pm_ggenome_implant", pm_ggenome_implant, METH_VARARGS, "Implant donor sequences into reference FASTA (C++ fast path)"},
     {"pm_intervals_random", pm_intervals_random, METH_VARARGS, "Generate random non-overlapping genomic intervals (C++ fast path)"},
     {"pm_parse_wig_or_bedgraph", pm_parse_wig_or_bedgraph, METH_VARARGS, "Parse a WIG/BedGraph file into chrom/start/end/value arrays (C++ fast path)"},
+    {"pm_test_2d_iterator", pm_test_2d_iterator, METH_VARARGS, "Test-only: drive PMTrackExpressionIntervals2DIterator and return emissions"},
+    {"pm_test_2d_scanner", pm_test_2d_scanner, METH_VARARGS, "Test-only: drive PMTrackExpr2DScanner over a 2D track + intervals"},
+    {"pm_extract_2d", pm_extract_2d, METH_VARARGS, "Extract objects from a 2D RECTS/POINTS track for 2D intervals"},
     {NULL, NULL, 0, NULL}
 };
 

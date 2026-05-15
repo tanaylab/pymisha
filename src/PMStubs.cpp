@@ -15,6 +15,11 @@
 #include "BinFinder.h"
 #include "BinsManager.h"
 #include "QuadTreeReader.h"
+#include "GInterval2D.h"
+#include "PMTrackExpression2DIterator.h"
+#include "PMGenomeTrack2D.h"
+#include "PMTrackExpression2DScanner.h"
+#include "PMTrackExpression2DVars.h"
 #include "pmutils.h"
 #include <new>
 #include <vector>
@@ -26,6 +31,7 @@
 #include <cstring>
 #include <cstdio>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -5696,5 +5702,453 @@ PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args)
 
 batch_cleanup:
     PyBuffer_Release(&pybuf);
+    return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_test_2d_iterator
+//
+// Test-only binding that constructs a PMTrackExpressionIntervals2DIterator
+// over the supplied dict-of-arrays input and emits the intervals back as a
+// dict of arrays. Used by tests/test_2d_scanner_iterator.py.
+//---------------------------------------------------------------------------
+
+static int _pm_test_2d_get_array(PyObject *dict, const char *key, PyArrayObject **out)
+{
+    PyObject *item = PyDict_GetItemString(dict, key);
+    if (!item) {
+        PyErr_Format(PyExc_KeyError, "missing key '%s' in intervals dict", key);
+        return -1;
+    }
+    if (!PyArray_Check(item)) {
+        PyErr_Format(PyExc_ValueError, "'%s' must be a numpy array", key);
+        return -1;
+    }
+    *out = (PyArrayObject *)item;
+    return 0;
+}
+
+PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *intervals_dict = NULL;
+    if (!PyArg_ParseTuple(args, "O!", &PyDict_Type, &intervals_dict)) {
+        return NULL;
+    }
+
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    // Materialize input as a std::vector<GInterval2D>.
+    std::vector<GInterval2D> input;
+    input.reserve(n);
+    for (npy_intp i = 0; i < n; ++i) {
+        int c1 = (int) (*(int32_t *)PyArray_GETPTR1(arr_c1, i));
+        int c2 = (int) (*(int32_t *)PyArray_GETPTR1(arr_c2, i));
+        int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, i);
+        int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, i);
+        int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, i);
+        int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, i);
+        input.emplace_back(c1, s1, e1, c2, s2, e2);
+    }
+
+    PMTrackExpressionIntervals2DIterator it(input);
+    it.begin();
+
+    std::vector<int>     out_c1, out_c2;
+    std::vector<int64_t> out_s1, out_e1, out_s2, out_e2;
+    std::vector<int64_t> out_id;
+    out_c1.reserve(n); out_c2.reserve(n);
+    out_s1.reserve(n); out_e1.reserve(n);
+    out_s2.reserve(n); out_e2.reserve(n);
+    out_id.reserve(n);
+
+    while (!it.isend()) {
+        const GInterval2D &iv = it.last_interval();
+        out_c1.push_back(iv.chromid1);
+        out_c2.push_back(iv.chromid2);
+        out_s1.push_back(iv.start1);
+        out_e1.push_back(iv.end1);
+        out_s2.push_back(iv.start2);
+        out_e2.push_back(iv.end2);
+        out_id.push_back(static_cast<int64_t>(it.original_interval_idx()));
+        it.next();
+    }
+
+    npy_intp m = static_cast<npy_intp>(out_c1.size());
+    npy_intp dims[1] = {m};
+
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+
+    #define SET_INT32(name, vec)                                          \
+        do {                                                              \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT32);           \
+            if (m > 0) {                                                  \
+                int32_t *ptr = (int32_t *)PyArray_DATA((PyArrayObject *)a);\
+                for (npy_intp i = 0; i < m; ++i) ptr[i] = (vec)[i];        \
+            }                                                             \
+            PyDict_SetItemString(result, name, a);                        \
+            Py_DECREF(a);                                                 \
+        } while (0)
+
+    #define SET_INT64(name, vec)                                          \
+        do {                                                              \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);           \
+            if (m > 0) memcpy(PyArray_DATA((PyArrayObject *)a),            \
+                              (vec).data(), m * sizeof(int64_t));         \
+            PyDict_SetItemString(result, name, a);                        \
+            Py_DECREF(a);                                                 \
+        } while (0)
+
+    SET_INT32("chrom1", out_c1);
+    SET_INT64("start1", out_s1);
+    SET_INT64("end1",   out_e1);
+    SET_INT32("chrom2", out_c2);
+    SET_INT64("start2", out_s2);
+    SET_INT64("end2",   out_e2);
+    SET_INT64("interval_id", out_id);
+
+    #undef SET_INT32
+    #undef SET_INT64
+
+    return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_test_2d_scanner
+//
+// Test-only binding that drives PMTrackExpr2DScanner over a single track
+// and a 2D intervals input, returning a numpy double array of per-row
+// aggregated values. Used by tests/test_2d_scanner_vars.py to verify
+// byte-for-byte parity with the pure-Python _gextract_2d_vtrack_agg.
+//
+// Args:
+//   track_name : str
+//   intervals  : dict of 6 numpy arrays (same shape as pm_test_2d_iterator)
+//   func       : str   ("area" / "weighted.sum" / "min" / "max" / "avg")
+//   band       : (int, int) | None
+//
+// Returns:
+//   numpy double array of length n.
+//---------------------------------------------------------------------------
+
+PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *track_name = NULL;
+    PyObject   *intervals_dict = NULL;
+    const char *func_name = NULL;
+    PyObject   *band_obj = Py_None;
+
+    if (!PyArg_ParseTuple(args, "sO!sO",
+                          &track_name,
+                          &PyDict_Type, &intervals_dict,
+                          &func_name,
+                          &band_obj)) {
+        return NULL;
+    }
+
+    // Parse band - must be either None or a length-2 tuple/list of ints.
+    bool has_band = false;
+    long long band_d1 = 0, band_d2 = 0;
+    if (band_obj && band_obj != Py_None) {
+        PyObject *seq = PySequence_Fast(band_obj, "band must be a 2-tuple or None");
+        if (!seq) return NULL;
+        if (PySequence_Fast_GET_SIZE(seq) != 2) {
+            Py_DECREF(seq);
+            PyErr_SetString(PyExc_ValueError, "band must have length 2");
+            return NULL;
+        }
+        band_d1 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 0));
+        band_d2 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 1));
+        Py_DECREF(seq);
+        if (PyErr_Occurred()) return NULL;
+        if (band_d1 >= band_d2) {
+            PyErr_SetString(PyExc_ValueError, "band d1 must be < d2");
+            return NULL;
+        }
+        has_band = true;
+    }
+
+    // Pull the six arrays out of the intervals dict.
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    // Materialise the intervals vector.
+    std::vector<GInterval2D> input;
+    input.reserve(static_cast<size_t>(n));
+    for (npy_intp i = 0; i < n; ++i) {
+        int c1 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c1, i));
+        int c2 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c2, i));
+        int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, i);
+        int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, i);
+        int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, i);
+        int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, i);
+        input.emplace_back(c1, s1, e1, c2, s2, e2);
+    }
+
+    try {
+        PMTrackExpr2DScanner scanner;
+        quadtree::DiagonalBand band_obj_real;
+        const quadtree::DiagonalBand *band_ptr = nullptr;
+        if (has_band) {
+            band_obj_real = quadtree::DiagonalBand(band_d1, band_d2);
+            band_ptr = &band_obj_real;
+        }
+        scanner.run_single_var(track_name, func_name, input, band_ptr);
+
+        npy_intp dims[1] = {n};
+        PyObject *out = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        if (!out) return NULL;
+        if (n > 0 && scanner.values()) {
+            std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject *>(out)),
+                        scanner.values(),
+                        static_cast<size_t>(n) * sizeof(double));
+        }
+        return out;
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return NULL;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+}
+
+//---------------------------------------------------------------------------
+// pm_extract_2d
+//
+// Native object-enumeration path for `gextract(track, intervals)` on a 2D
+// RECTS / POINTS track. Replaces the per-interval Python loop in
+// pymisha.extract._gextract_2d_single.
+//
+// Args:
+//   track_name : str           - physical 2D track name
+//   intervals  : dict          - chrom1 / start1 / end1 / chrom2 / start2 / end2
+//                                arrays (chromids as int32, coords as int64)
+//   band       : tuple|None    - (d1, d2) diagonal-band filter, or None
+//
+// Returns:
+//   dict-of-arrays with keys "chrom1" (int32), "start1" (int64), "end1" (int64),
+//   "chrom2" (int32), "start2" (int64), "end2" (int64), "value" (float64),
+//   "intervalID" (int64). Or Py_None if no rows.
+//
+// Python caller maps chromids back to names and assembles the DataFrame.
+//---------------------------------------------------------------------------
+
+PyObject *pm_extract_2d(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *track_name = NULL;
+    PyObject   *intervals_dict = NULL;
+    PyObject   *band_obj = Py_None;
+
+    if (!PyArg_ParseTuple(args, "sO!O",
+                          &track_name,
+                          &PyDict_Type, &intervals_dict,
+                          &band_obj)) {
+        return NULL;
+    }
+
+    // Parse band.
+    bool has_band = false;
+    long long band_d1 = 0, band_d2 = 0;
+    if (band_obj && band_obj != Py_None) {
+        PyObject *seq = PySequence_Fast(band_obj, "band must be a 2-tuple or None");
+        if (!seq) return NULL;
+        if (PySequence_Fast_GET_SIZE(seq) != 2) {
+            Py_DECREF(seq);
+            PyErr_SetString(PyExc_ValueError, "band must have length 2");
+            return NULL;
+        }
+        band_d1 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 0));
+        band_d2 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 1));
+        Py_DECREF(seq);
+        if (PyErr_Occurred()) return NULL;
+        if (band_d1 >= band_d2) {
+            PyErr_SetString(PyExc_ValueError, "band d1 must be < d2");
+            return NULL;
+        }
+        has_band = true;
+    }
+
+    // Pull intervals arrays.
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError, "intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    // Group intervals by (chromid1, chromid2). For each group store the
+    // original buffer index so we can stamp intervalID correctly later.
+    struct PairKey {
+        int c1, c2;
+        bool operator==(const PairKey &o) const { return c1 == o.c1 && c2 == o.c2; }
+    };
+    struct PairKeyHash {
+        size_t operator()(const PairKey &k) const noexcept {
+            return (static_cast<size_t>(static_cast<uint32_t>(k.c1)) << 32) |
+                   static_cast<uint32_t>(k.c2);
+        }
+    };
+
+    std::unordered_map<PairKey, std::vector<int64_t>, PairKeyHash> by_pair;
+    by_pair.reserve(32);
+    for (npy_intp i = 0; i < n; ++i) {
+        PairKey key{
+            static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c1, i)),
+            static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c2, i)),
+        };
+        by_pair[key].push_back(static_cast<int64_t>(i));
+    }
+
+    // Output accumulators.
+    std::vector<int32_t> out_c1, out_c2;
+    std::vector<int64_t> out_s1, out_e1, out_s2, out_e2;
+    std::vector<double>  out_val;
+    std::vector<int64_t> out_id;
+
+    quadtree::DiagonalBand band_real;
+    const quadtree::DiagonalBand *band_ptr = nullptr;
+    if (has_band) {
+        band_real = quadtree::DiagonalBand(band_d1, band_d2);
+        band_ptr = &band_real;
+    }
+
+    try {
+        PMGenomeTrack2D track;
+        track.init(track_name);  // throws on bad / non-2D / non-RECTS-POINTS
+
+        for (auto &kv : by_pair) {
+            const PairKey &key = kv.first;
+            const std::vector<int64_t> &idxs = kv.second;
+
+            bool have_data = false;
+            try {
+                have_data = track.set_chrom_pair(key.c1, key.c2);
+            } catch (const TGLException &) {
+                // Hard failure on this pair: bubble up.
+                throw;
+            }
+            if (!have_data) continue;
+
+            const bool is_points = track.is_points();
+
+            for (int64_t orig_idx : idxs) {
+                int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, orig_idx);
+                int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, orig_idx);
+                int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, orig_idx);
+                int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, orig_idx);
+
+                quadtree::QueryObjects qresult =
+                    track.query_objects(s1, s2, e1, e2, band_ptr);
+
+                size_t m = qresult.ids.size();
+                for (size_t j = 0; j < m; ++j) {
+                    out_c1.push_back(static_cast<int32_t>(key.c1));
+                    out_c2.push_back(static_cast<int32_t>(key.c2));
+                    if (is_points) {
+                        // POINTS: x1==x2-1==x, y1==y2-1==y (the Python path
+                        // returns end = x+1 and end = y+1).
+                        out_s1.push_back(qresult.x1s[j]);
+                        out_e1.push_back(qresult.x1s[j] + 1);
+                        out_s2.push_back(qresult.y1s[j]);
+                        out_e2.push_back(qresult.y1s[j] + 1);
+                    } else {
+                        out_s1.push_back(qresult.x1s[j]);
+                        out_e1.push_back(qresult.x2s[j]);
+                        out_s2.push_back(qresult.y1s[j]);
+                        out_e2.push_back(qresult.y2s[j]);
+                    }
+                    out_val.push_back(static_cast<double>(qresult.vals[j]));
+                    out_id.push_back(orig_idx);
+                }
+            }
+        }
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return NULL;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+
+    if (out_c1.empty()) {
+        Py_RETURN_NONE;
+    }
+
+    npy_intp out_n = static_cast<npy_intp>(out_c1.size());
+    npy_intp dims[1] = {out_n};
+
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+
+    auto set_int32 = [&](const char *name, const std::vector<int32_t> &v) {
+        PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT32);
+        std::memcpy(PyArray_DATA((PyArrayObject *)a), v.data(), out_n * sizeof(int32_t));
+        PyDict_SetItemString(result, name, a);
+        Py_DECREF(a);
+    };
+    auto set_int64 = [&](const char *name, const std::vector<int64_t> &v) {
+        PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);
+        std::memcpy(PyArray_DATA((PyArrayObject *)a), v.data(), out_n * sizeof(int64_t));
+        PyDict_SetItemString(result, name, a);
+        Py_DECREF(a);
+    };
+    auto set_f64 = [&](const char *name, const std::vector<double> &v) {
+        PyObject *a = PyArray_SimpleNew(1, dims, NPY_FLOAT64);
+        std::memcpy(PyArray_DATA((PyArrayObject *)a), v.data(), out_n * sizeof(double));
+        PyDict_SetItemString(result, name, a);
+        Py_DECREF(a);
+    };
+
+    set_int32("chrom1", out_c1);
+    set_int64("start1", out_s1);
+    set_int64("end1",   out_e1);
+    set_int32("chrom2", out_c2);
+    set_int64("start2", out_s2);
+    set_int64("end2",   out_e2);
+    set_f64  ("value",  out_val);
+    set_int64("intervalID", out_id);
+
     return result;
 }
