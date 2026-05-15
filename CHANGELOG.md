@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.62 (2026-05-15)
+
+### Performance
+- **WIG/BedGraph import is ~7x faster.** `gtrack_import` from plain (non-gzipped) WIG and BedGraph files now streams through a C++ parser (`pm_parse_wig_or_bedgraph`) instead of building Python lists line-by-line. Bench: 50 MB / 3M-row WIG variableStep parses in 0.7s vs 5.6s; 91 MB / 3M-row BedGraph in 0.9s vs 5.9s. Gzipped inputs still use the pure-Python streamer. Closes part of Group M.2 of the 2026-05-15 parity audit.
+
 ## v0.1.61 (2026-05-15)
 
 ### Fixes

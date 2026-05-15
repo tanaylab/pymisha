@@ -653,6 +653,17 @@ def _parse_bed(path: str) -> pd.DataFrame:
 
 
 def _parse_wig_or_bedgraph(path: str) -> pd.DataFrame:
+    # Fast path: plain (non-gzipped) WIG/BedGraph streams through C++.
+    # Gzipped inputs still go through the pure-Python streamer below.
+    if not str(path).lower().endswith(".gz") and hasattr(_pymisha, "pm_parse_wig_or_bedgraph"):
+        cols = _pymisha.pm_parse_wig_or_bedgraph(str(path))
+        return pd.DataFrame({
+            "chrom": cols["chrom"],
+            "start": cols["start"],
+            "end": cols["end"],
+            "value": cols["value"],
+        })
+
     chrom: list[str] = []
     start: list[int] = []
     end: list[int] = []
