@@ -4267,3 +4267,118 @@ def gtrack_2d_import_contacts(
             stacklevel=2,
         )
         raise
+
+
+# ---------------------------------------------------------------------------
+# Array tracks (R parity for gtrack.array.*)
+# ---------------------------------------------------------------------------
+
+def gtrack_array_get_colnames(track: str) -> list[str]:
+    """Return the column names of an ``array`` track.
+
+    R parity for ``gtrack.array.get_colnames``. The names live in
+    ``<track_dir>/.colnames`` as an R-serialized named integer vector.
+    """
+    _checkroot()
+    if not _track_exists(track):
+        raise ValueError(f"Track '{track}' does not exist")
+    info = gtrack_info(track)
+    if info.get("type") != "array":
+        raise ValueError(
+            f"gtrack_array_get_colnames: '{track}' is not an array track "
+            f"(type={info.get('type')!r})"
+        )
+    from ._array_track import read_colnames
+    track_path = Path(_pymisha.pm_track_path(track))
+    return read_colnames(track_path)
+
+
+def gtrack_array_set_colnames(track: str, colnames: list[str]) -> None:
+    """Set the column names of an ``array`` track.
+
+    R parity for ``gtrack.array.set_colnames``. Writes
+    ``<track_dir>/.colnames`` in a format both R misha and pymisha read.
+    """
+    _checkroot()
+    if not _track_exists(track):
+        raise ValueError(f"Track '{track}' does not exist")
+    info = gtrack_info(track)
+    if info.get("type") != "array":
+        raise ValueError(
+            f"gtrack_array_set_colnames: '{track}' is not an array track "
+            f"(type={info.get('type')!r})"
+        )
+    from ._array_track import write_colnames
+    track_path = Path(_pymisha.pm_track_path(track))
+    write_colnames(track_path, list(colnames))
+
+
+def gtrack_array_extract(
+    track: str,
+    slice: list[str] | list[int] | None = None,
+    intervals: pd.DataFrame | str | None = None,
+) -> pd.DataFrame:
+    """Extract per-position array values from an ``array`` track.
+
+    R parity for ``gtrack.array.extract``. Returns a DataFrame with
+    ``chrom, start, end, <selected colnames>, intervalID``. One output
+    row per overlapping track interval (clipped to the query); columns
+    where the track has no value are ``NaN``.
+
+    Parameters
+    ----------
+    track : str
+        Array track name.
+    slice : list of str or int, optional
+        Column subset to return. Strings are matched against the track
+        colnames; integers are 0-based column indices. ``None`` returns
+        all columns.
+    intervals : DataFrame, optional
+        Query intervals (``chrom, start, end``). Defaults to all genome.
+    """
+    _checkroot()
+    if not _track_exists(track):
+        raise ValueError(f"Track '{track}' does not exist")
+    info = gtrack_info(track)
+    if info.get("type") != "array":
+        raise ValueError(
+            f"gtrack_array_extract: '{track}' is not an array track "
+            f"(type={info.get('type')!r})"
+        )
+
+    from ._array_track import extract_array, read_colnames
+    from .extract import _maybe_load_intervals_set
+
+    track_path = Path(_pymisha.pm_track_path(track))
+    colnames = read_colnames(track_path)
+
+    if intervals is None:
+        from .intervals import gintervals_all
+        intervals = gintervals_all()
+    intervals = _maybe_load_intervals_set(intervals)
+    if not isinstance(intervals, pd.DataFrame):
+        raise ValueError("intervals must be a DataFrame or interval-set name")
+
+    if slice is None:
+        slice_idx: list[int] | None = None
+    else:
+        slice_list = list(slice)
+        if all(isinstance(s, str) for s in slice_list):
+            cn_idx = {name: i for i, name in enumerate(colnames)}
+            try:
+                slice_idx = [cn_idx[s] for s in slice_list]
+            except KeyError as exc:
+                raise ValueError(
+                    f"{exc.args[0]!r} is not a column of track '{track}'"
+                ) from exc
+        elif all(isinstance(s, (int, np.integer)) for s in slice_list):
+            for s in slice_list:
+                if s < 0 or s >= len(colnames):
+                    raise ValueError(
+                        f"slice index {s} out of range [0, {len(colnames)})"
+                    )
+            slice_idx = [int(s) for s in slice_list]
+        else:
+            raise ValueError("slice must be a list of strings or ints")
+
+    return extract_array(track_path, intervals, slice_idx, colnames)

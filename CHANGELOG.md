@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.57 (2026-05-15)
+
+### Features
+- **Array track read support.** Closes B1 of the 2026-05-15 parity audit. Three new public functions mirror R's `gtrack.array.*`:
+  - `gtrack_array_get_colnames(track)` reads the column names from `<track>/.colnames` via the new R-serialize reader.
+  - `gtrack_array_set_colnames(track, names)` writes the file in a format both R misha and pymisha can read.
+  - `gtrack_array_extract(track, slice=, intervals=)` returns a DataFrame with one row per overlapping track interval and one column per requested array column (NaN where the track has no value at that index). `slice` accepts either column names or 0-based indices.
+- **Improved `gextract` error message on array tracks.** Previously raised `Track type 'array' not yet supported`; now points the user at `gtrack_array_extract`. Full C++ scanner integration for array tracks is deferred to Group K.
+
 ## v0.1.56 (2026-05-15)
 
 ### Features

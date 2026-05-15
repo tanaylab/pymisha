@@ -224,6 +224,12 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
         }
     } else if (track_type == GenomeTrack::SPARSE) {
         var.track = std::make_unique<GenomeTrackSparse>();
+    } else if (track_type == GenomeTrack::ARRAYS) {
+        TGLError("gextract / scanner does not support array tracks yet. "
+                 "Use gtrack_array_extract('%s', ...) to read the per-column "
+                 "values, or gtrack_array_get_colnames() to inspect the "
+                 "column names.",
+                 track_name.c_str());
     } else {
         TGLError("Track type '%s' not yet supported for track: %s",
                  GenomeTrack::TYPE_NAMES[track_type], track_name.c_str());
