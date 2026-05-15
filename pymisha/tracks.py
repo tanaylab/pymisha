@@ -1037,7 +1037,7 @@ def _apply_create_parallel_writers_from_config() -> None:
     config = _shared.CONFIG
     override = config.get("track_create_parallel_writers")
     if override is not None:
-        n = int(override)
+        n = int(override)  # type: ignore[call-overload]
     elif not bool(config.get("multitasking", True)):
         n = 1
     else:

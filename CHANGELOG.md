@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.67 (2026-05-15)
+
+### Fixes
+- **mypy CI:** annotate the `pm.CONFIG["track_create_parallel_writers"]` cast in `_apply_create_parallel_writers_from_config` (CONFIG values are typed as `object`). No behavior change.
+
 ## v0.1.66 (2026-05-15)
 
 ### Configuration
