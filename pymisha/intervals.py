@@ -1658,12 +1658,24 @@ def _sort_intervals(intervals: pd.DataFrame) -> pd.DataFrame:
 
 
 def _intervals_to_cpp(intervals: pd.DataFrame) -> Any:
-    """Prepare intervals for C++ processing (convert Categorical chrom to string)."""
-    df = intervals[['chrom', 'start', 'end']].copy()
-    # Ensure chrom is string, not Categorical (C++ doesn't handle Categorical)
-    if hasattr(df['chrom'], 'cat'):
-        df['chrom'] = df['chrom'].astype(str)
-    return _df2pymisha(df)
+    """Prepare intervals for C++ processing (chrom/start/end columns).
+
+    Returns the pymisha internal list-of-arrays format directly to skip the
+    DataFrame.copy() + per-column iloc that _df2pymisha goes through.
+    """
+    chrom_series = intervals['chrom']
+    if isinstance(chrom_series.dtype, pd.CategoricalDtype):
+        chrom_arr = chrom_series.astype(str).to_numpy()
+    else:
+        chrom_arr = chrom_series.to_numpy()
+    start_arr = intervals['start'].to_numpy()
+    end_arr = intervals['end'].to_numpy()
+    return [
+        _numpy.array(['chrom', 'start', 'end'], dtype=object),
+        chrom_arr,
+        start_arr,
+        end_arr,
+    ]
 
 
 def gintervals_union(
@@ -2432,27 +2444,35 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
     gintervals_rm : Remove a named interval set.
     """
     _checkroot()
-    from . import _shared
-    assert _shared._GROOT is not None
 
-    roots: list[str] = []
-    if _shared._UROOT:
-        roots.append(_shared._UROOT)
-    roots.append(_shared._GROOT)
-    roots.extend(_shared._GDATASETS)
+    # C++ caches interval-set names alongside tracks during gdb_init / gdb_reload.
+    # Falls back to a filesystem walk for the few callers that may run before
+    # full db init (e.g. dataset bootstrap tests).
+    try:
+        interval_set_names = _pymisha.pm_interv_names()
+    except Exception:
+        from . import _shared
+        assert _shared._GROOT is not None
 
-    interval_set_names: set[str] = set()
-    for root in roots:
-        tracks_dir = Path(root) / "tracks"
-        if not tracks_dir.exists():
-            continue
-        for suffix in (".interv", ".interv2d"):
-            for interv_file in tracks_dir.rglob(f"*{suffix}"):
-                rel_path = interv_file.relative_to(tracks_dir)
-                name = str(rel_path)[:-len(suffix)].replace("/", ".").replace("\\", ".")
-                interval_set_names.add(name)
+        roots: list[str] = []
+        if _shared._UROOT:
+            roots.append(_shared._UROOT)
+        roots.append(_shared._GROOT)
+        roots.extend(_shared._GDATASETS)
 
-    interval_sets: list[str] = sorted(interval_set_names)
+        seen: set[str] = set()
+        for root in roots:
+            tracks_dir = Path(root) / "tracks"
+            if not tracks_dir.exists():
+                continue
+            for suffix in (".interv", ".interv2d"):
+                for interv_file in tracks_dir.rglob(f"*{suffix}"):
+                    rel_path = interv_file.relative_to(tracks_dir)
+                    name = str(rel_path)[:-len(suffix)].replace("/", ".").replace("\\", ".")
+                    seen.add(name)
+        interval_set_names = list(seen)
+
+    interval_sets: list[str] = sorted(set(interval_set_names))
 
     # Apply pattern filter
     if pattern:
@@ -3221,15 +3241,17 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
         df["start"] = df["start"].astype(float)
         df["end"] = df["end"].astype(float)
 
-    # Save using pyreadr
-    try:
-        import pyreadr
-        pyreadr.write_rds(str(interv_path), df)
-    except ImportError:
-        raise ImportError(
-            "pyreadr is required to save interval sets. "
-            "Install with: pip install pyreadr"
-        ) from None
+    # Save using the native R-serialize writer (drops the pyreadr/librdata
+    # dependency at runtime and is ~50x faster on million-row data frames
+    # because we avoid the Python <-> librdata bridge per row).
+    from ._r_serialize import write_dataframe
+    write_dataframe(str(interv_path), df)
+
+    # Register the new interval-set name in the C++ cache so it shows up
+    # in gintervals_ls() / gintervals_exists() without paying a full
+    # pm_dbreload rescan of the tracks/ tree.
+    with _contextlib.suppress(Exception):
+        _pymisha.pm_interv_register(intervals_set)
 
 
 def gintervals_update(
@@ -4977,6 +4999,11 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
         iattr_path = interv_path.with_suffix(".iattr")
         if iattr_path.exists():
             iattr_path.unlink()
+
+    # Drop from C++ cache so gintervals_ls() / gintervals_exists() see
+    # the removal immediately (no pm_dbreload required).
+    with _contextlib.suppress(Exception):
+        _pymisha.pm_interv_unregister(intervals_set)
 
 
 def _open_genes_file(path_or_url: str) -> tuple[IO[str], str | None]:

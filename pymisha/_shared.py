@@ -163,6 +163,57 @@ def _checkroot():
         raise RuntimeError('Database not set. Call gdb_init() first.')
 
 
+# Python-side cache for `_pymisha.pm_track_names()`.  The C++ side already
+# keeps a `m_track_cache` of track names; converting that vector to a
+# Python list of 15k PyUnicode objects (and then `set(...)`-ing it) still
+# costs ~3 ms on hg38, and several hot-path Python helpers call it on
+# every gextract / gsummary / gscreen invocation.
+#
+# Both the list and the set are cached.  Invalidation is wired to
+# gdb_init / gdb_reload / gdb_unload via :func:`_clear_track_names_cache`.
+_TRACK_NAMES_LIST: list[str] | None = None
+_TRACK_NAMES_SET: frozenset[str] | None = None
+
+
+def _clear_track_names_cache() -> None:
+    """Drop the cached pm_track_names result.  Called on db transitions."""
+    global _TRACK_NAMES_LIST, _TRACK_NAMES_SET
+    _TRACK_NAMES_LIST = None
+    _TRACK_NAMES_SET = None
+
+
+def _track_names_list() -> list[str]:
+    """Return the cached pm_track_names() list (no copy)."""
+    global _TRACK_NAMES_LIST
+    if _TRACK_NAMES_LIST is None:
+        _TRACK_NAMES_LIST = _pymisha.pm_track_names()
+    return _TRACK_NAMES_LIST
+
+
+def _track_names_set() -> frozenset[str]:
+    """Return the cached pm_track_names() result as a frozenset."""
+    global _TRACK_NAMES_SET
+    if _TRACK_NAMES_SET is None:
+        _TRACK_NAMES_SET = frozenset(_track_names_list())
+    return _TRACK_NAMES_SET
+
+
+def _pm_dbreload() -> None:
+    """Reload the C++ track scan + clear all Python-side caches.
+
+    Every internal track-mutation site (gtrack_rm, gtrack_create_*,
+    gintervals_save, gdir / gdataset changes...) used to call
+    ``_pymisha.pm_dbreload()`` directly, which bypasses the Python
+    caches (track names, computed-track types, expression-validation
+    set).  Routing all those callers through this helper keeps the
+    cached views in sync with the C++ side.
+    """
+    _pymisha.pm_dbreload()
+    _clear_track_names_cache()
+    from .tracks import _clear_computed_track_cache
+    _clear_computed_track_cache()
+
+
 def _df2pymisha(arg):
     """Convert DataFrame to internal format (following pynaryn pattern)."""
     if isinstance(arg, _pandas.DataFrame):
@@ -234,8 +285,8 @@ def _intersect_scope_with_iterator(scope, iterator_intervals):
 
     Both inputs are DataFrames with chrom/start/end columns.  The iterator
     intervals are first sorted and unified (overlapping intervals merged).
-    Then a two-pointer sweep computes all pairwise intersections between
-    scope and unified-iterator intervals on the same chromosome.
+    A vectorized per-chromosome sweep then computes all pairwise
+    intersections between scope and unified-iterator intervals.
 
     Returns
     -------
@@ -250,96 +301,140 @@ def _intersect_scope_with_iterator(scope, iterator_intervals):
                                     "end": _pandas.Series([], dtype=int)})
         return empty, _numpy.array([], dtype=int)
 
-    # --- unify iterator intervals (sort + merge overlapping) ---
+    # --- iterator: sort by (chrom, start), merge overlapping within chrom ---
     itr_chroms = iterator_intervals["chrom"].to_numpy()
-    itr_starts = iterator_intervals["start"].to_numpy(dtype=int, copy=False)
-    itr_ends = iterator_intervals["end"].to_numpy(dtype=int, copy=False)
-
+    itr_starts = iterator_intervals["start"].to_numpy(dtype=_numpy.int64, copy=False)
+    itr_ends = iterator_intervals["end"].to_numpy(dtype=_numpy.int64, copy=False)
     itr_order = _numpy.lexsort((itr_starts, itr_chroms))
-    u_chroms = []
-    u_starts = []
-    u_ends = []
-    prev_c = None
-    prev_s = -1
-    prev_e = -1
-    for idx in itr_order:
-        c = itr_chroms[idx]
-        s = int(itr_starts[idx])
-        e = int(itr_ends[idx])
-        if c == prev_c and s < prev_e:
-            prev_e = max(prev_e, e)
-        else:
-            if prev_c is not None:
-                u_chroms.append(prev_c)
-                u_starts.append(prev_s)
-                u_ends.append(prev_e)
-            prev_c, prev_s, prev_e = c, s, e
-    if prev_c is not None:
-        u_chroms.append(prev_c)
-        u_starts.append(prev_s)
-        u_ends.append(prev_e)
+    itr_chroms = itr_chroms[itr_order]
+    itr_starts = itr_starts[itr_order]
+    itr_ends = itr_ends[itr_order]
 
-    u_chroms_arr = _numpy.array(u_chroms, dtype=object)
-    u_starts_arr = _numpy.array(u_starts, dtype=int)
-    u_ends_arr = _numpy.array(u_ends, dtype=int)
+    n_iter = len(itr_chroms)
+    # Per-chrom running max of end (reset on chrom boundary) - vectorized
+    # per slice via np.maximum.accumulate.
+    chrom_boundary = _numpy.empty(n_iter, dtype=bool)
+    chrom_boundary[0] = True
+    if n_iter > 1:
+        chrom_boundary[1:] = itr_chroms[1:] != itr_chroms[:-1]
+    chrom_start_idx = _numpy.flatnonzero(chrom_boundary)
+    chrom_end_idx = _numpy.r_[chrom_start_idx[1:], n_iter]
 
-    # --- sort scope, preserving original 0-based index ---
+    running_max_end = _numpy.empty(n_iter, dtype=_numpy.int64)
+    for s, e in zip(chrom_start_idx, chrom_end_idx, strict=False):
+        running_max_end[s:e] = _numpy.maximum.accumulate(itr_ends[s:e])
+
+    new_group = _numpy.empty(n_iter, dtype=bool)
+    new_group[0] = True
+    if n_iter > 1:
+        new_group[1:] = chrom_boundary[1:] | (itr_starts[1:] >= running_max_end[:-1])
+
+    group_id = _numpy.cumsum(new_group) - 1
+    n_groups = int(group_id[-1] + 1)
+    merged_chroms = itr_chroms[new_group]
+    merged_starts = itr_starts[new_group]
+    merged_ends = _numpy.zeros(n_groups, dtype=_numpy.int64)
+    _numpy.maximum.at(merged_ends, group_id, itr_ends)
+
+    # --- scope: sort by (chrom, start), keep original 1-based ids ---
     sc_chroms = scope["chrom"].to_numpy()
-    sc_starts = scope["start"].to_numpy(dtype=int, copy=False)
-    sc_ends = scope["end"].to_numpy(dtype=int, copy=False)
+    sc_starts = scope["start"].to_numpy(dtype=_numpy.int64, copy=False)
+    sc_ends = scope["end"].to_numpy(dtype=_numpy.int64, copy=False)
     sc_order = _numpy.lexsort((sc_starts, sc_chroms))
+    sc_chroms_sorted = sc_chroms[sc_order]
+    sc_starts_sorted = sc_starts[sc_order]
+    sc_ends_sorted = sc_ends[sc_order]
+    sc_orig_ids = sc_order.astype(_numpy.int64, copy=False) + 1
 
-    # --- two-pointer sweep per chromosome ---
-    out_chroms = []
-    out_starts = []
-    out_ends = []
-    out_ids = []
+    # Per-chrom processing - all ops inside each chrom are vectorized.
+    n_merged = len(merged_chroms)
+    if n_merged == 0:
+        empty = _pandas.DataFrame({"chrom": _pandas.Series([], dtype=str),
+                                    "start": _pandas.Series([], dtype=int),
+                                    "end": _pandas.Series([], dtype=int)})
+        return empty, _numpy.array([], dtype=int)
+    merged_chrom_boundary = _numpy.empty(n_merged, dtype=bool)
+    merged_chrom_boundary[0] = True
+    if n_merged > 1:
+        merged_chrom_boundary[1:] = merged_chroms[1:] != merged_chroms[:-1]
+    merged_chrom_starts = _numpy.flatnonzero(merged_chrom_boundary)
+    merged_chrom_ends = _numpy.r_[merged_chrom_starts[1:], n_merged]
+    iter_chrom_map = {
+        merged_chroms[s]: (int(s), int(e))
+        for s, e in zip(merged_chrom_starts, merged_chrom_ends, strict=False)
+    }
 
-    # Build chrom -> range index for unified iterator
-    itr_chrom_ranges = {}
-    if len(u_chroms_arr) > 0:
-        cur_c = u_chroms_arr[0]
-        cur_start_idx = 0
-        for i in range(1, len(u_chroms_arr)):
-            if u_chroms_arr[i] != cur_c:
-                itr_chrom_ranges[cur_c] = (cur_start_idx, i)
-                cur_c = u_chroms_arr[i]
-                cur_start_idx = i
-        itr_chrom_ranges[cur_c] = (cur_start_idx, len(u_chroms_arr))
+    sc_chrom_boundary = _numpy.empty(len(sc_chroms_sorted), dtype=bool)
+    sc_chrom_boundary[0] = True
+    if len(sc_chroms_sorted) > 1:
+        sc_chrom_boundary[1:] = sc_chroms_sorted[1:] != sc_chroms_sorted[:-1]
+    sc_chrom_starts = _numpy.flatnonzero(sc_chrom_boundary)
+    sc_chrom_ends = _numpy.r_[sc_chrom_starts[1:], len(sc_chroms_sorted)]
 
-    for sc_idx in sc_order:
-        sc_c = sc_chroms[sc_idx]
-        sc_s = int(sc_starts[sc_idx])
-        sc_e = int(sc_ends[sc_idx])
-        orig_id = int(sc_idx) + 1  # 1-based
+    out_chroms_parts = []
+    out_starts_parts = []
+    out_ends_parts = []
+    out_ids_parts = []
 
-        rng = itr_chrom_ranges.get(sc_c)
+    for sc_s, sc_e in zip(sc_chrom_starts, sc_chrom_ends, strict=False):
+        chrom = sc_chroms_sorted[sc_s]
+        rng = iter_chrom_map.get(chrom)
         if rng is None:
             continue
-        itr_lo, itr_hi = rng
+        it_lo, it_hi = rng
+        it_s = merged_starts[it_lo:it_hi]
+        it_e = merged_ends[it_lo:it_hi]
+        sc_s_arr = sc_starts_sorted[sc_s:sc_e]
+        sc_e_arr = sc_ends_sorted[sc_s:sc_e]
+        sc_ids_arr = sc_orig_ids[sc_s:sc_e]
 
-        for j in range(itr_lo, itr_hi):
-            u_s = u_starts_arr[j]
-            u_e = u_ends_arr[j]
-            if u_s >= sc_e:
-                break
-            if u_e <= sc_s:
-                continue
-            ov_s = max(sc_s, u_s)
-            ov_e = min(sc_e, u_e)
-            if ov_s < ov_e:
-                out_chroms.append(sc_c)
-                out_starts.append(ov_s)
-                out_ends.append(ov_e)
-                out_ids.append(orig_id)
+        # For each scope[i], iter range [lo[i], hi[i]) of merged iter that overlap.
+        # lo[i] = first j with it_e[j] > sc_s_arr[i]
+        # hi[i] = first j with it_s[j] >= sc_e_arr[i]
+        lo = _numpy.searchsorted(it_e, sc_s_arr, side='right')
+        hi = _numpy.searchsorted(it_s, sc_e_arr, side='left')
+        sizes = _numpy.maximum(hi - lo, 0)
+        total = int(sizes.sum())
+        if total == 0:
+            continue
+
+        sc_rep_idx = _numpy.repeat(_numpy.arange(len(sc_s_arr)), sizes)
+        offsets = _numpy.repeat(lo, sizes)
+        cum_sizes = _numpy.r_[0, _numpy.cumsum(sizes[:-1])]
+        within_group = _numpy.arange(total) - _numpy.repeat(cum_sizes, sizes)
+        iter_idx = offsets + within_group
+
+        sc_s_rep = sc_s_arr[sc_rep_idx]
+        sc_e_rep = sc_e_arr[sc_rep_idx]
+        ov_s = _numpy.maximum(sc_s_rep, it_s[iter_idx])
+        ov_e = _numpy.minimum(sc_e_rep, it_e[iter_idx])
+        valid = ov_s < ov_e
+        if not valid.any():
+            continue
+
+        n_valid = int(valid.sum())
+        out_chroms_parts.append(_numpy.full(n_valid, chrom, dtype=object))
+        out_starts_parts.append(ov_s[valid])
+        out_ends_parts.append(ov_e[valid])
+        out_ids_parts.append(sc_ids_arr[sc_rep_idx][valid])
+
+    if not out_chroms_parts:
+        empty = _pandas.DataFrame({"chrom": _pandas.Series([], dtype=str),
+                                    "start": _pandas.Series([], dtype=int),
+                                    "end": _pandas.Series([], dtype=int)})
+        return empty, _numpy.array([], dtype=int)
+
+    out_chroms = _numpy.concatenate(out_chroms_parts)
+    out_starts = _numpy.concatenate(out_starts_parts)
+    out_ends = _numpy.concatenate(out_ends_parts)
+    out_ids = _numpy.concatenate(out_ids_parts)
 
     result_df = _pandas.DataFrame({
         "chrom": out_chroms,
         "start": out_starts,
         "end": out_ends,
     })
-    id_map = _numpy.array(out_ids, dtype=int)
-    return result_df, id_map
+    return result_df, out_ids
 
 
 def _preprocess_intervals_iterator(intervals, iterator):

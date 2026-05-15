@@ -15,6 +15,7 @@ from ._shared import (
     _df2pymisha,
     _pymisha,
     _pymisha2df,
+    _track_names_set,
 )
 from .extract import _maybe_load_intervals_set
 
@@ -404,7 +405,7 @@ def _resolve_cis_decay_track(expr: str) -> str:
         raise ValueError("expr must be a non-empty 2D track expression")
 
     # Fast path: bare track name.
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     if expr_str in track_names:
         info = gtrack_info(expr_str)
         if info.get("dimensions") != 2:

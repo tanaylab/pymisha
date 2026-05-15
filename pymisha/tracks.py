@@ -38,8 +38,10 @@ from ._shared import (
     _checkroot,
     _config_no_mt,
     _df2pymisha,
+    _pm_dbreload,
     _preprocess_intervals_iterator,
     _pymisha,
+    _track_names_set,
 )
 from ._types import Intervals, NumpyArray
 
@@ -82,6 +84,25 @@ def _load_track_attributes(track_name: str) -> dict[str, str]:
     return attrs
 
 
+# Per-track "is computed?" cache, populated lazily by _check_computed_tracks.
+# Maps track-name -> bool.  Invalidated by gdb_init / gdb_reload via
+# _clear_computed_track_cache(); cheap enough to live as a module-global
+# dict.  Even one cached lookup beats pm_track_info (~18 ms on hg38).
+_COMPUTED_TRACK_CACHE: dict[str, bool] = {}
+
+# Cache of "this expr tuple has already been validated as clean" — keyed by
+# (frozenset(exprs), frozenset(vtrack_names)).  Avoids re-parsing the
+# expression and re-touching the track_names set on every gextract/gscreen
+# call inside a loop.
+_CHECK_EXPRS_CACHE: set[tuple] = set()
+
+
+def _clear_computed_track_cache() -> None:
+    """Drop the _check_computed_tracks caches.  Called on db reload/unload."""
+    _COMPUTED_TRACK_CACHE.clear()
+    _CHECK_EXPRS_CACHE.clear()
+
+
 def _check_computed_tracks(exprs: str | list[str]) -> None:
     """Check whether any track referenced in *exprs* is a COMPUTED track.
 
@@ -90,6 +111,16 @@ def _check_computed_tracks(exprs: str | list[str]) -> None:
     function parses one or more track expressions, resolves the physical
     track names they contain, and raises ``NotImplementedError`` if any of
     them has type ``"computed"``.
+
+    Two caches keep tight loops cheap:
+      1. :data:`_CHECK_EXPRS_CACHE`: once a particular (exprs, vtracks)
+         pair has been validated clean, subsequent calls return immediately
+         without touching pm_track_names or pm_track_info.
+      2. :data:`_COMPUTED_TRACK_CACHE`: per-track is-computed result, so
+         distinct expressions that mention the same track reuse the result.
+
+    Both caches are cleared on ``gdb_init`` / ``gdb_reload`` /
+    ``gdb_unload`` so they stay correct across db transitions.
 
     Parameters
     ----------
@@ -104,27 +135,39 @@ def _check_computed_tracks(exprs: str | list[str]) -> None:
     if isinstance(exprs, str):
         exprs = [exprs]
 
+    vtrack_names = frozenset(_shared._VTRACKS.keys())
+    cache_key = (tuple(exprs), vtrack_names)
+    if cache_key in _CHECK_EXPRS_CACHE:
+        return
+
     from .expr import _parse_expr_vars
 
-    track_names = set(_pymisha.pm_track_names())
-    vtrack_names = set(_shared._VTRACKS.keys())
+    track_names = _track_names_set()
 
-    all_tracks = set()
+    all_tracks: set[str] = set()
     for expr in exprs:
         _, expr_tracks, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
         all_tracks.update(expr_tracks)
 
     for tname in sorted(all_tracks):
-        try:
-            info = _pymisha.pm_track_info(tname)
-        except Exception:
-            continue
-        if info.get("type") == "computed":
+        cached = _COMPUTED_TRACK_CACHE.get(tname)
+        if cached is None:
+            try:
+                info = _pymisha.pm_track_info(tname)
+            except Exception:
+                _COMPUTED_TRACK_CACHE[tname] = False
+                continue
+            cached = info.get("type") == "computed"
+            _COMPUTED_TRACK_CACHE[tname] = cached
+        if cached:
             raise NotImplementedError(
                 f"COMPUTED tracks (Hi-C normalization) are not yet supported "
                 f"in pymisha. Track '{tname}' is a COMPUTED track. "
                 f"Consider using R misha for this workflow."
             )
+
+    # All tracks clean — remember this expression set so the next call short-circuits.
+    _CHECK_EXPRS_CACHE.add(cache_key)
 
 
 def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) -> list[str] | None:
@@ -913,9 +956,9 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     # produced track.dat + track.idx directly, so we skip the post-create
     # convert step. Byte-identical to the per-chrom + convert pipeline.
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(track, description, f'gtrack.create_sparse("{track}", description, intervals, values)')
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1066,7 +1109,7 @@ def gtrack_create_dense(
             f'{binsize}, {defval:g}, func="{func}")'
         )
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(
             track,
             description,
@@ -1074,7 +1117,7 @@ def gtrack_create_dense(
         )
         gtrack_attr_set(track, "type", "dense")
         gtrack_attr_set(track, "binsize", str(binsize))
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1256,10 +1299,10 @@ def gtrack_create_dense_direct(
 
     if reload:
         try:
-            _pymisha.pm_dbreload()
+            _pm_dbreload()
             if _db_is_indexed(_shared._GROOT):
                 gtrack_convert_to_indexed(track, remove_old=False)
-                _pymisha.pm_dbreload()
+                _pm_dbreload()
         except Exception as exc:
             warnings.warn(
                 f"post-create steps failed for track '{track}': {exc}; "
@@ -1445,7 +1488,7 @@ def gtrack_smooth(
         )
 
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         created_by = (
             f'gtrack.smooth({track}, description, {str(expr)}, {winsize}, '
             f'{weight_thr}, {smooth_nans}, {alg})'
@@ -1458,7 +1501,7 @@ def gtrack_smooth(
                 gtrack_attr_set(track, "binsize", str(int(new_info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1567,7 +1610,7 @@ def gtrack_create(
         _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _cfg)
 
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(
             track,
             description,
@@ -1580,7 +1623,7 @@ def gtrack_create(
                 gtrack_attr_set(track, "binsize", str(int(info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2114,7 +2157,7 @@ def gtrack_mv(src: str, dest: str) -> None:
         shutil.move(str(src_dir), str(dest_dir))
 
     _cleanup_empty_track_parents(src_dir, src_db)
-    _pymisha.pm_dbreload()
+    _pm_dbreload()
 
 
 _TRACK_INTERNAL_FILES = frozenset(
@@ -2359,7 +2402,7 @@ def _gtrack_copy_one(
         raise
 
     if dest_db_loaded:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
 
     return destname
 
@@ -2544,7 +2587,7 @@ def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:
             f"failed to remove track directory: {track_dir}"
         )
     _cleanup_empty_track_parents(track_dir, db_root)
-    _pymisha.pm_dbreload()
+    _pm_dbreload()
 
 
 def gtrack_import_mappedseq(
@@ -3846,7 +3889,7 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
             write_2d_track_file(filename, objs, arena, is_points=is_points)
 
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(
             track,
             description,
@@ -4259,7 +4302,7 @@ def gtrack_2d_import_contacts(
                 )
 
     try:
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
 
         contacts_str = '", "'.join(contacts)
         fends_str = f'"{fends}"' if fends else "NULL"

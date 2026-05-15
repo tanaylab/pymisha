@@ -218,6 +218,25 @@ from .vtracks import (
     gvtrack_rm,
 )
 
+# Monkey-patch _pymisha.pm_dbreload so ANY caller (including tests that
+# import the C extension directly) triggers Python-side cache
+# invalidation.  The C++ side never mutates the track scan without
+# pm_dbreload (or pm_dbinit / pm_dbunload) being called, so wrapping
+# this entry point keeps the Python caches (track_names, computed-track
+# types, expr-validation set) consistent with the C++ track_cache.
+_original_pm_dbreload = _pymisha.pm_dbreload
+
+
+def _pm_dbreload_with_invalidation(*args: Any, **kwargs: Any) -> Any:
+    result = _original_pm_dbreload(*args, **kwargs)
+    _shared._clear_track_names_cache()
+    from .tracks import _clear_computed_track_cache
+    _clear_computed_track_cache()
+    return result
+
+
+_pymisha.pm_dbreload = _pm_dbreload_with_invalidation
+
 
 def __getattr__(name: str) -> Any:
     # Expose live DB state variables instead of stale import-time snapshots.

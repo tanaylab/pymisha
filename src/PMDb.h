@@ -54,6 +54,17 @@ public:
     bool track_exists(const std::string &track_name) const;
     std::string track_dataset(const std::string &track_name) const;
 
+    // Interval-set listing (cached alongside the track scan so listing
+    // interval sets is O(1) instead of a Python rglob over tracks/).
+    std::vector<std::string> interv_names() const;
+
+    // Incrementally register / unregister an interval-set name without
+    // rebuilding the whole cache.  Used by gintervals_save / _rm so a
+    // freshly created (or removed) set becomes visible immediately
+    // without paying the O(N tracks) pm_dbreload rescan.
+    void register_interv(const std::string &name) const;
+    void unregister_interv(const std::string &name) const;
+
     // Dataset management
     void set_datasets(const std::vector<std::string> &datasets);
 
@@ -69,6 +80,10 @@ private:
     GenomeChromKey m_chromkey;
     mutable std::set<std::string> m_track_cache;  // Cached track names
     mutable std::unordered_map<std::string, std::string> m_track_db; // Track -> db root
+
+    // Interval-set names found alongside tracks (suffixes .interv / .interv2d).
+    // Same cache lifetime as m_track_cache: refreshed by rebuild_track_cache().
+    mutable std::set<std::string> m_interv_cache;
 
     // pm_intervals_all cache.
     //

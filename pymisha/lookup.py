@@ -13,10 +13,12 @@ from ._shared import (
     _config_no_mt,
     _df2pymisha,
     _numpy,
+    _pm_dbreload,
     _preprocess_intervals_iterator,
     _pymisha,
     _pymisha2df,
     _remap_interval_ids,
+    _track_names_set,
 )
 from ._types import Iterator
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
@@ -346,7 +348,7 @@ def _glookup_python(
 
 def _resolve_lookup_dimensions(exprs: list[str], iterator: Iterator | str) -> set[int]:
     """Infer whether lookup output should be 1D or 2D from used physical tracks."""
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     if not track_names:
         return set()
 
@@ -562,5 +564,5 @@ def gtrack_lookup(
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)
-            _pymisha.pm_dbreload()
+            _pm_dbreload()
         raise

@@ -2489,6 +2489,73 @@ PyObject *pm_track_names(PyObject *self, PyObject *args)
     }
 }
 
+// Get interval-set names (cached alongside the track scan).
+PyObject *pm_interv_names(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+
+        std::vector<std::string> names = g_pmdb->interv_names();
+
+        PMPY result(PyList_New(names.size()), true);
+        for (size_t i = 0; i < names.size(); ++i) {
+            PyList_SET_ITEM((PyObject *)result, i, PyUnicode_FromString(names[i].c_str()));
+        }
+
+        result.to_be_stolen();
+        return (PyObject *)result;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+}
+
+// Incrementally register an interval-set name in the PMDb cache.
+PyObject *pm_interv_register(PyObject *self, PyObject *args)
+{
+    try {
+        const char *name = nullptr;
+        if (!PyArg_ParseTuple(args, "s", &name)) {
+            verror("Invalid arguments to pm_interv_register");
+        }
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        g_pmdb->register_interv(name);
+        Py_RETURN_NONE;
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    }
+}
+
+// Incrementally remove an interval-set name from the PMDb cache.
+PyObject *pm_interv_unregister(PyObject *self, PyObject *args)
+{
+    try {
+        const char *name = nullptr;
+        if (!PyArg_ParseTuple(args, "s", &name)) {
+            verror("Invalid arguments to pm_interv_unregister");
+        }
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        g_pmdb->unregister_interv(name);
+        Py_RETURN_NONE;
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    }
+}
+
 // Get track information
 PyObject *pm_track_info(PyObject *self, PyObject *args)
 {

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.63 (2026-05-15)
+
+### Performance
+- **`gintervals_ls()` is now O(1) on warm databases (was O(N_files)).** PMDb caches interval-set names alongside tracks during the existing `gdb_init` scan; the old Python `Path.rglob("*.interv*")` walked every per-chrom file under `tracks/`. On hg38 (15k tracks, 20 interval sets): ~38 s -> ~0.04 ms. `gintervals_save` / `gintervals_rm` incrementally register / unregister names without paying a full `pm_dbreload` rescan.
+- **`gextract` / `gsummary` / `gscreen` / `gdist` / `glookup` with `iterator=intervals` is 100-1000x faster on million-row inputs.** Vectorized the per-chromosome two-pointer sweep that intersects a scope DataFrame with an iterator DataFrame; the old O(K*J) Python loop ate ~95% of total time on real workloads (hg38 phyloP447, 10k 500-bp intervals: 9.4 s -> 77 ms).
+- **`gintervals_save` is ~50x faster on million-row data frames.** Replaced `pyreadr.write_rds()` with a native R-serialize XDR writer (`pymisha._r_serialize.write_dataframe`); the writer streams numeric/string columns to disk in bulk `numpy.tobytes()` ops instead of round-tripping through the librdata C++ binding row by row (1M rows, 24 unique chroms: 16.8 s -> 0.34 s).
+- **`gintervals_load` is ~2x faster on million-row interval sets.** The R-serialize reader's STRSXP path now inlines CHARSXP parsing instead of recursing through `_read_item` for every string (1M rows: 1.0 s -> 0.55 s).
+- **`gextract` / `gsummary` / `gscreen` tight loops are 5-8x faster.** Cached `_check_computed_tracks` (per-(exprs, vtracks) and per-track results) plus a Python-side cache for `pm_track_names()` shave ~12 ms of fixed Python overhead off every call. Caches are cleared on `gdb_init` / `gdb_reload` / `gdb_unload`; a `_pymisha.pm_dbreload` monkey-patch keeps the cache in sync even for callers that hit the C extension directly. Hg38, 1000 intervals, tight `iter=intervals` loop: ~77 ms -> ~10 ms per call.
+
+### Internal
+- `_intervals_to_cpp` now constructs the pymisha-internal list-of-arrays format directly, skipping a `DataFrame.copy()` + per-column `iloc` round-trip.
+- New C++ API: `pm_interv_names`, `pm_interv_register`, `pm_interv_unregister`. New PMDb members: `m_interv_cache`, `interv_names()`, `register_interv()`, `unregister_interv()`.
+
 ## v0.1.62 (2026-05-15)
 
 ### Performance

@@ -72,6 +72,12 @@ def gdb_init(path: str, userpath: str | None = None):
     # Clear interval scan cache from previous session
     from .dataset import _clear_dataset_scan_cache
     _clear_dataset_scan_cache()
+    # Track-type cache must also be reset when switching dbs.
+    from .tracks import _clear_computed_track_cache
+    _clear_computed_track_cache()
+    # Track-names cache (Python list/set view over C++ track_cache).
+    from ._shared import _clear_track_names_cache
+    _clear_track_names_cache()
 
     _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _pymisha.pm_dbsetdatasets([])
@@ -118,6 +124,13 @@ def gdb_reload():
     # interval-set names per groot becomes stale. (R 5.6.30 c82b01f0.)
     from .dataset import _clear_dataset_scan_cache
     _clear_dataset_scan_cache()
+    # Track-type cache for _check_computed_tracks: track types are read
+    # from pm_track_info, which now picks up tracks added/removed by the
+    # rescan, but the cache may hold stale entries for removed tracks.
+    from .tracks import _clear_computed_track_cache
+    _clear_computed_track_cache()
+    from ._shared import _clear_track_names_cache
+    _clear_track_names_cache()
 
 
 def gdb_mark_cache_dirty():
@@ -190,6 +203,10 @@ def gdb_unload():
 
     from .dataset import _clear_dataset_scan_cache
     _clear_dataset_scan_cache()
+    from .tracks import _clear_computed_track_cache
+    _clear_computed_track_cache()
+    from ._shared import _clear_track_names_cache
+    _clear_track_names_cache()
 
 
 def gdb_examples_path():

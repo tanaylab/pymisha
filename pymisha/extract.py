@@ -25,6 +25,7 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
     _remap_interval_ids,
+    _track_names_set,
 )
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
@@ -687,7 +688,7 @@ def _gextract_2d(
     from .tracks import gtrack_info
 
     band = _validate_band(band)
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     parsed = []
@@ -1458,7 +1459,7 @@ def gextract(
     if colnames is not None and len(colnames) != len(exprs):
         raise ValueError(f"colnames length ({len(colnames)}) must match number of expressions ({len(exprs)})")
 
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     parsed = []
@@ -1762,7 +1763,7 @@ def gscreen(
     # Handle DataFrame-as-iterator for 1D gscreen
     intervals, iterator, _scr_id_map = _preprocess_intervals_iterator(intervals, iterator)
 
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
     expr_eval, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
 

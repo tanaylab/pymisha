@@ -43,6 +43,9 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args);
 PyObject *pm_intervals_summary(PyObject *self, PyObject *args);
 PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args);
 PyObject *pm_track_names(PyObject *self, PyObject *args);
+PyObject *pm_interv_names(PyObject *self, PyObject *args);
+PyObject *pm_interv_register(PyObject *self, PyObject *args);
+PyObject *pm_interv_unregister(PyObject *self, PyObject *args);
 PyObject *pm_track_info(PyObject *self, PyObject *args);
 PyObject *pm_track_path(PyObject *self, PyObject *args);
 PyObject *pm_track_dataset(PyObject *self, PyObject *args);
@@ -109,6 +112,9 @@ static PyMethodDef module_methods[] = {
     {"pm_intervals_summary", pm_intervals_summary, METH_VARARGS, "Summarize expression values per interval"},
     {"pm_intervals_quantiles", pm_intervals_quantiles, METH_VARARGS, "Compute expression quantiles per interval"},
     {"pm_track_names", pm_track_names, METH_VARARGS, "Get track names"},
+    {"pm_interv_names", pm_interv_names, METH_VARARGS, "Get interval-set names"},
+    {"pm_interv_register", pm_interv_register, METH_VARARGS, "Register an interval-set name in the cache"},
+    {"pm_interv_unregister", pm_interv_unregister, METH_VARARGS, "Remove an interval-set name from the cache"},
     {"pm_track_info", pm_track_info, METH_VARARGS, "Get track information"},
     {"pm_track_path", pm_track_path, METH_VARARGS, "Get track path on disk"},
     {"pm_track_dataset", pm_track_dataset, METH_VARARGS, "Get track dataset root"},

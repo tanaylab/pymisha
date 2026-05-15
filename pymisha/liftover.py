@@ -33,7 +33,7 @@ from ._crc64 import (
 from ._crc64 import (
     crc64_init as _crc64_init,
 )
-from ._shared import _checkroot, _pymisha
+from ._shared import _checkroot, _pm_dbreload, _pymisha
 from .intervals import gintervals_all
 
 # ---------------------------------------------------------------------------
@@ -2329,7 +2329,7 @@ def gtrack_liftover(
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
         # Write .attributes file
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(track, description,
                            f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
         return
@@ -2354,7 +2354,7 @@ def gtrack_liftover(
         # No intervals mapped — create empty track
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(track, description,
                            f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
         return
@@ -2366,7 +2366,7 @@ def gtrack_liftover(
     if len(target_data) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pymisha.pm_dbreload()
+        _pm_dbreload()
         _set_created_attrs(track, description,
                            f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
         return

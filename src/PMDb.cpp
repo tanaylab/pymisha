@@ -68,6 +68,7 @@ void PMDb::unload() {
     m_datasets.clear();
     m_track_cache.clear();
     m_track_db.clear();
+    m_interv_cache.clear();
     m_chromkey = GenomeChromKey();  // Reset
     m_initialized = false;
 }
@@ -208,6 +209,22 @@ std::vector<std::string> PMDb::track_names() const {
     return std::vector<std::string>(m_track_cache.begin(), m_track_cache.end());
 }
 
+std::vector<std::string> PMDb::interv_names() const {
+    if (!m_initialized) {
+        TGLError("Database not initialized. Call gdb_init() first.");
+    }
+
+    return std::vector<std::string>(m_interv_cache.begin(), m_interv_cache.end());
+}
+
+void PMDb::register_interv(const std::string &name) const {
+    m_interv_cache.insert(name);
+}
+
+void PMDb::unregister_interv(const std::string &name) const {
+    m_interv_cache.erase(name);
+}
+
 std::string PMDb::track_path(const std::string &track_name) const {
     if (!m_initialized) {
         TGLError("Database not initialized. Call gdb_init() first.");
@@ -269,12 +286,38 @@ void PMDb::scan_tracks_impl(const std::string &base_dir,
         std::string full_path = base_dir + "/" + name;
 
         struct stat st;
-        if (stat(full_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-            continue;  // Not a directory
+        if (stat(full_path.c_str(), &st) != 0) {
+            continue;
+        }
+
+        std::string name_str(name);
+
+        // Detect interval-set names (.interv2d / .interv).  These can be a
+        // single binary file *or* a per-chromosome directory (legacy
+        // layout, e.g. .../rmsk.interv/chr1, chr2, ...).
+        // Check .interv2d before .interv since .interv is a prefix of it.
+        const std::string suffix2d = ".interv2d";
+        const std::string suffix1d = ".interv";
+        std::string interv_base;
+        if (name_str.size() > suffix2d.size() &&
+            name_str.compare(name_str.size() - suffix2d.size(), suffix2d.size(), suffix2d) == 0) {
+            interv_base = name_str.substr(0, name_str.size() - suffix2d.size());
+        } else if (name_str.size() > suffix1d.size() &&
+                   name_str.compare(name_str.size() - suffix1d.size(), suffix1d.size(), suffix1d) == 0) {
+            interv_base = name_str.substr(0, name_str.size() - suffix1d.size());
+        }
+        if (!interv_base.empty() && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+            std::string interv_name = prefix.empty() ? interv_base : (prefix + "." + interv_base);
+            m_interv_cache.insert(interv_name);
+            // Don't recurse into per-chrom interv dirs.
+            continue;
+        }
+
+        if (!S_ISDIR(st.st_mode)) {
+            continue;
         }
 
         // Check if this is a .track directory
-        std::string name_str(name);
         if (name_str.size() > 6 && name_str.substr(name_str.size() - 6) == ".track") {
             // It's a track - extract name
             std::string track_name = name_str.substr(0, name_str.size() - 6);
@@ -336,6 +379,7 @@ void PMDb::rebuild_track_cache()
 {
     m_track_cache.clear();
     m_track_db.clear();
+    m_interv_cache.clear();
 
     // Datasets (load order); later datasets override earlier ones
     for (const auto &ds : m_datasets) {

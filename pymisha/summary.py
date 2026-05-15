@@ -22,6 +22,7 @@ from ._shared import (
     _progress_context,
     _pymisha,
     _pymisha2df,
+    _track_names_set,
 )
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _find_vtracks_in_expr, _parse_expr_vars, _resolve_user_vars
@@ -44,7 +45,7 @@ def _validate_expr_security(
     user_vars: dict[str, Any] | None = None,
 ) -> None:
     if track_names is None:
-        track_names = set(_pymisha.pm_track_names())
+        track_names = _track_names_set()
     if vtrack_names is None:
         vtrack_names = set(_shared._VTRACKS.keys())
 
@@ -180,7 +181,7 @@ def gdist(
 
     _check_computed_tracks(exprs)
 
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     # Resolve user variables across all expressions
@@ -355,7 +356,7 @@ def _gdist_vtrack_streaming(
         user_vars = {}
 
     # Parse all expressions to find physical tracks and vtracks
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     parsed = []
@@ -525,7 +526,7 @@ def _gsummary_vtrack_streaming(
     if user_vars is None:
         user_vars = {}
 
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
@@ -730,7 +731,7 @@ def _gquantiles_vtrack_streaming(
     if user_vars is None:
         user_vars = {}
 
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
     new_expr, expr_tracks, expr_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
@@ -980,7 +981,7 @@ def gsummary(
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
 
     # Resolve user variables
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
     expr_eval, _, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
     user_vars = _resolve_user_vars(expr_eval, caller_ns)
@@ -1105,7 +1106,7 @@ def gquantiles(
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
 
     # Resolve user variables
-    track_names = set(_pymisha.pm_track_names())
+    track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
     expr_eval, _, _, _ = _parse_expr_vars(expr, track_names, vtrack_names)
     user_vars = _resolve_user_vars(expr_eval, caller_ns)
