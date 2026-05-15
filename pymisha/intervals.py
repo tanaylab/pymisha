@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import tempfile
 import urllib.request
 from collections.abc import Callable
@@ -97,52 +96,48 @@ def _intervset_path(intervals_set: str) -> Path:
 
 
 def _decode_r_obj_to_bytes(obj_path: str | Path) -> pd.DataFrame:
-    try:
-        import pyreadr
-    except ImportError as exc:
-        raise ImportError(
-            "pyreadr is required to load interval sets. "
-            "Install with: pip install pyreadr"
-        ) from exc
+    """Decode a single R-serialized object on disk into a DataFrame.
 
-    result = pyreadr.read_r(str(obj_path))
-    if not result:
-        raise ValueError(f"Could not read serialized object from {obj_path}")
-    # pyreadr returns an OrderedDict; take the first value
-    return list(result.values())[0]
+    Used to read legacy bigset chromosome shards. Native reader (no R
+    or pyreadr at runtime).
+    """
+    from ._r_serialize import read as _r_read
+
+    obj = _r_read(obj_path)
+    if isinstance(obj, pd.DataFrame):
+        return obj
+    if isinstance(obj, dict):
+        # Some shards are wrapped in a single-element dict
+        first = next(iter(obj.values()))
+        if isinstance(first, pd.DataFrame):
+            return first
+    raise ValueError(
+        f"expected a data.frame in {obj_path}, got {type(obj).__name__}"
+    )
 
 
 def _decode_intervals_meta(meta_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # .meta is a serialized list(stats=..., zeroline=...)
-    # pyreadr cannot decode non-dataframe objects, so use Rscript.
-    with tempfile.TemporaryDirectory(prefix="pymisha-meta-") as tmpdir:
-        stats_path = Path(tmpdir) / "stats.rds"
-        zero_path = Path(tmpdir) / "zeroline.rds"
-        r_cmd = (
-            "f<-commandArgs(TRUE)[1]; out_stats<-commandArgs(TRUE)[2]; out_zero<-commandArgs(TRUE)[3]; "
-            "con<-file(f,'rb'); obj<-unserialize(con); close(con); "
-            "saveRDS(obj$stats, out_stats); saveRDS(obj$zeroline, out_zero)"
+    """Decode a legacy bigset ``.meta`` file (an R-serialized
+    ``list(stats=..., zeroline=...)``) into two DataFrames.
+
+    Uses :mod:`pymisha._r_serialize` so no Rscript dependency is needed
+    at runtime.
+    """
+    from ._r_serialize import read as _r_read
+
+    obj = _r_read(meta_path)
+    if not isinstance(obj, dict) or "stats" not in obj or "zeroline" not in obj:
+        raise ValueError(
+            f"{meta_path}: expected an R-serialized list with 'stats' and "
+            f"'zeroline' entries, got {type(obj).__name__}"
         )
-        rscript = shutil.which("Rscript")
-        if not rscript:
-            raise RuntimeError(
-                "Rscript is required to load legacy intervals metadata (.meta). "
-                "Install Rscript or convert the intervals set to indexed format."
-            )
-        try:
-            subprocess.run(
-                [rscript, "-e", r_cmd, str(meta_path), str(stats_path), str(zero_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            raise RuntimeError(
-                f"Failed to decode intervals metadata via Rscript: {stderr or exc}"
-            ) from exc
-        stats = _decode_r_obj_to_bytes(stats_path)
-        zeroline = _decode_r_obj_to_bytes(zero_path)
+    stats = obj["stats"]
+    zeroline = obj["zeroline"]
+    if not isinstance(stats, pd.DataFrame) or not isinstance(zeroline, pd.DataFrame):
+        raise ValueError(
+            f"{meta_path}: 'stats' and 'zeroline' must be data.frames; got "
+            f"{type(stats).__name__} / {type(zeroline).__name__}"
+        )
     return stats, zeroline
 
 

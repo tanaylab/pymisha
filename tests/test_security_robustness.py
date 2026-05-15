@@ -144,7 +144,11 @@ def test_parse_chain_file_requires_regular_file(tmp_path):
         liftover_mod._parse_chain_file(tmp_path, db_chrom_sizes={})
 
 
-def test_decode_intervals_meta_reports_missing_rscript(monkeypatch, tmp_path):
-    monkeypatch.setattr(intervals_mod.shutil, "which", lambda _: None)
-    with pytest.raises(RuntimeError, match="Rscript is required"):
-        intervals_mod._decode_intervals_meta(tmp_path / ".meta")
+def test_decode_intervals_meta_native_reader_no_rscript(tmp_path):
+    """v0.1.56: _decode_intervals_meta no longer shells out to Rscript.
+
+    It uses the native pymisha R-serialize reader. A missing file raises
+    a FileNotFoundError, not the old "Rscript is required" RuntimeError.
+    """
+    with pytest.raises(FileNotFoundError):
+        intervals_mod._decode_intervals_meta(tmp_path / "nonexistent.meta")

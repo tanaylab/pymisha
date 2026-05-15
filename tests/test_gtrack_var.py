@@ -1,6 +1,8 @@
 """Tests for gtrack.var.* functions (track variable management)."""
 
 import os
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -227,74 +229,88 @@ class TestGtrackVarRSerializationDetection:
         with open(filepath, "wb") as f:
             f.write(data)
 
-    def test_r_serialize_v2_ascii_detected(self):
-        """R serialize v2 ASCII format (starts with b'A\\n') raises clear error."""
+    def test_r_serialize_v2_ascii_rejected(self):
+        """R serialize ASCII format (starts with b'A\\n') is not supported
+        - it's rare in practice (R writes XDR by default) and we point
+        the user at how to re-serialize."""
         track = "test_rvar_ascii"
         try:
             pm.gtrack_create_sparse(
                 track, "test", pm.gintervals(1, 0, 1000), [1.0]
             )
             self._write_fake_var(track, "rvar", b"A\n2\n12345\n")
-            with pytest.raises(ValueError, match="written by R misha"):
+            with pytest.raises(ValueError, match="ASCII serialize"):
                 pm.gtrack_var_get(track, "rvar")
         finally:
             pm.gtrack_rm(track, force=True)
             pm.gdb_reload()
 
-    def test_r_serialize_v2_xdr_detected(self):
-        """R serialize v2 XDR binary format (starts with b'X\\n') raises clear error."""
-        track = "test_rvar_xdr"
-        try:
-            pm.gtrack_create_sparse(
-                track, "test", pm.gintervals(1, 0, 1000), [1.0]
-            )
-            self._write_fake_var(track, "rvar", b"X\n\x00\x00\x00\x02")
-            with pytest.raises(ValueError, match="written by R misha"):
-                pm.gtrack_var_get(track, "rvar")
-        finally:
-            pm.gtrack_rm(track, force=True)
-            pm.gdb_reload()
-
-    def test_r_serialize_v3_detected(self):
-        """R serialize v3 format (starts with b'B\\n') raises clear error."""
+    def test_r_serialize_v3_ascii_rejected(self):
+        """R serialize v3 ASCII format (starts with b'B\\n') is also
+        rejected with the same message."""
         track = "test_rvar_v3"
         try:
             pm.gtrack_create_sparse(
                 track, "test", pm.gintervals(1, 0, 1000), [1.0]
             )
             self._write_fake_var(track, "rvar", b"B\n\x00\x00\x00\x03")
-            with pytest.raises(ValueError, match="written by R misha"):
+            with pytest.raises(ValueError, match="ASCII serialize"):
                 pm.gtrack_var_get(track, "rvar")
         finally:
             pm.gtrack_rm(track, force=True)
             pm.gdb_reload()
 
-    def test_gzip_rds_detected(self):
-        """Gzip-compressed RDS file (starts with b'\\x1f\\x8b') raises clear error."""
-        track = "test_rvar_gzip"
+    @pytest.mark.skipif(
+        shutil.which("Rscript") is None, reason="Rscript not available"
+    )
+    def test_r_xdr_var_now_readable(self):
+        """A track variable written in XDR-binary format by R can now be
+        read by PyMisha (closes B3 of the 2026-05-15 parity audit)."""
+        track = "test_rvar_xdr_real"
         try:
             pm.gtrack_create_sparse(
                 track, "test", pm.gintervals(1, 0, 1000), [1.0]
             )
-            self._write_fake_var(track, "rvar", b"\x1f\x8b\x08\x00\x00")
-            with pytest.raises(ValueError, match="written by R misha"):
-                pm.gtrack_var_get(track, "rvar")
+            track_path = pm.gtrack_path(track)
+            var_dir = os.path.join(track_path, "vars")
+            os.makedirs(var_dir, exist_ok=True)
+            filepath = os.path.join(var_dir, "rvar")
+            script = (
+                f"con<-file('{filepath}','wb'); "
+                f"serialize(c('a','b','c'), con, ascii=FALSE, xdr=TRUE); "
+                f"close(con)"
+            )
+            subprocess.run(
+                ["Rscript", "-e", script],
+                check=True, capture_output=True, text=True,
+            )
+            assert pm.gtrack_var_get(track, "rvar") == ["a", "b", "c"]
         finally:
             pm.gtrack_rm(track, force=True)
             pm.gdb_reload()
 
-    def test_error_message_includes_track_and_var_names(self):
-        """Error message includes the track and variable names."""
-        track = "test_rvar_msg"
+    @pytest.mark.skipif(
+        shutil.which("Rscript") is None, reason="Rscript not available"
+    )
+    def test_r_rds_var_now_readable(self):
+        """saveRDS (gzip-compressed XDR) variables are also readable."""
+        track = "test_rvar_rds_real"
         try:
             pm.gtrack_create_sparse(
                 track, "test", pm.gintervals(1, 0, 1000), [1.0]
             )
-            self._write_fake_var(track, "my_rvar", b"X\n\x00\x00\x00\x02")
-            with pytest.raises(
-                ValueError, match=r"'my_rvar'.*'test_rvar_msg'"
-            ):
-                pm.gtrack_var_get(track, "my_rvar")
+            track_path = pm.gtrack_path(track)
+            var_dir = os.path.join(track_path, "vars")
+            os.makedirs(var_dir, exist_ok=True)
+            filepath = os.path.join(var_dir, "rvar")
+            script = f"saveRDS(list(a=1, b=42L), '{filepath}')"
+            subprocess.run(
+                ["Rscript", "-e", script],
+                check=True, capture_output=True, text=True,
+            )
+            obj = pm.gtrack_var_get(track, "rvar")
+            assert set(obj.keys()) == {"a", "b"}
+            assert int(obj["b"][0]) == 42
         finally:
             pm.gtrack_rm(track, force=True)
             pm.gdb_reload()

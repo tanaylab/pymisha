@@ -3522,15 +3522,28 @@ def gtrack_var_get(track: str, var: str) -> Any:
         header = f.read(2)
         f.seek(0)
 
-        # Detect R serialization formats before attempting pickle.
-        # R serialize v2 ASCII starts with b'A\n', XDR binary with b'X\n',
-        # R serialize v3 with b'B\n', and gzip-compressed RDS with the
-        # gzip magic number b'\x1f\x8b'.
-        if header in (b"A\n", b"X\n", b"B\n", b"\x1f\x8b"):
+        # Detect R serialization formats. R serialize v2 ASCII starts
+        # with b'A\n', XDR binary with b'X\n', v3 with b'B\n', and
+        # gzip-compressed RDS with the gzip magic number b'\x1f\x8b'.
+        # PyMisha reads XDR-binary and gzipped XDR natively; the ASCII
+        # variants are uncommon and not supported.
+        if header in (b"X\n", b"\x1f\x8b"):
+            from ._r_serialize import read as _r_read
+            try:
+                return _r_read(filepath)
+            except NotImplementedError as exc:
+                raise ValueError(
+                    f"Track variable '{var}' on track '{track}' was written "
+                    f"by R misha but contains an R-serialize feature pymisha "
+                    f"does not decode yet: {exc}. Open an issue with a sample."
+                ) from exc
+
+        if header in (b"A\n", b"B\n"):
             raise ValueError(
-                f"Track variable '{var}' on track '{track}' was written by "
-                f"R misha and cannot be read by PyMisha. Use R misha to read "
-                f"this variable, or re-create it in Python."
+                f"Track variable '{var}' on track '{track}' is in R's ASCII "
+                f"serialize format, which pymisha does not read. Re-serialize "
+                f"in R with `serialize(value, con, ascii=FALSE)` (or use "
+                f"`saveRDS`) and try again."
             )
 
         try:

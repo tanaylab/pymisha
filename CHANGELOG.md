@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.56 (2026-05-15)
+
+### Features
+- **Native R-serialize reader (drops the Rscript hard dependency).** `pymisha._r_serialize.read()` decodes R's XDR (binary) format plus gzip-compressed RDS, with support for character / integer / numeric / logical vectors, NULL, raw bytes, named lists, data frames, and the common ALTREP encodings (`compact_intseq`, `compact_realseq`, `wrap_*`, `deferred_string`). Used by:
+  - **`gintervals_load(legacy_bigset)`**: legacy `.meta` files no longer need `Rscript` at runtime - the previous `"Rscript is required to load legacy intervals metadata"` error is gone.
+  - **`gtrack_var_get`**: variables written by R misha (XDR or gzipped XDR) are now readable from Python. The ASCII variants (`A\n`, `B\n`) are still rejected with a clear message pointing to `serialize(..., ascii=FALSE)` as the workaround.
+
 ## v0.1.55 (2026-05-15)
 
 ### Features
