@@ -313,12 +313,20 @@ def _gextract_2d_single(
         return None
 
     cmap = _chrom_id_map()
-    chrom1_ids = _numpy.empty(n, dtype=_numpy.int32)
-    chrom2_ids = _numpy.empty(n, dtype=_numpy.int32)
-    for i, name in enumerate(intervals["chrom1"].astype(str).values):
-        chrom1_ids[i] = cmap.get(name, -1)
-    for i, name in enumerate(intervals["chrom2"].astype(str).values):
-        chrom2_ids[i] = cmap.get(name, -1)
+    chrom1_ids = (
+        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
+    chrom2_ids = (
+        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
 
     intervals_dict = {
         "chrom1": chrom1_ids,
@@ -333,10 +341,12 @@ def _gextract_2d_single(
     if result is None:
         return None
 
-    # Reverse chromid -> name lookup for output columns.
+    # Vectorized reverse chromid -> name lookup for output columns.
     id2name = {v: k for k, v in cmap.items()}
-    chrom1_names = [id2name.get(int(c), str(int(c))) for c in result["chrom1"]]
-    chrom2_names = [id2name.get(int(c), str(int(c))) for c in result["chrom2"]]
+    c1_series = _pandas.Series(result["chrom1"]).astype("int64")
+    c2_series = _pandas.Series(result["chrom2"]).astype("int64")
+    chrom1_names = c1_series.map(id2name).fillna(c1_series.astype(str)).to_numpy()
+    chrom2_names = c2_series.map(id2name).fillna(c2_series.astype(str)).to_numpy()
 
     out = _pandas.DataFrame({
         "chrom1": chrom1_names,
@@ -568,32 +578,12 @@ def _gextract_2d_vtrack_agg(
     )
 
 
-def _gextract_2d_vtrack_objects(
+def _gextract_2d_vtrack_objects_python(
     track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None, func: str
 ) -> pd.DataFrame:
-    """Extract object-level stats from a 2D track for 2D intervals.
+    """Pure-Python reference implementation of 2D object-level reduction.
 
-    Returns one row per query interval with the computed value.
-
-    Parameters
-    ----------
-    track : str
-        Physical 2D track name.
-    col_name : str
-        Column name for the value in the output DataFrame.
-    intervals : DataFrame
-        2D intervals with chrom1/start1/end1/chrom2/start2/end2 columns.
-    band : tuple of (int, int) or None
-        Diagonal band filter ``(d1, d2)``.
-    func : str
-        Object function: ``"exists"``, ``"size"``, ``"first"``,
-        ``"last"``, or ``"sample"``.
-
-    Returns
-    -------
-    DataFrame
-        One row per query interval with columns: chrom1, start1, end1,
-        chrom2, start2, end2, <col_name>, intervalID.
+    Kept for parity tests against the C++ fast path. Not used in production.
     """
     import random
 
@@ -664,6 +654,79 @@ def _gextract_2d_vtrack_objects(
             "start2": intervals["start2"].values,
             "end2": intervals["end2"].values,
             col_name: values,
+            "intervalID": _numpy.arange(n, dtype=int),
+        }
+    )
+
+
+def _gextract_2d_vtrack_objects(
+    track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None, func: str
+) -> pd.DataFrame:
+    """Reduce a 2D track to a per-interval scalar via object-level funcs.
+
+    Calls the native C++ binding ``pm_extract_2d_objects``. Returns one row
+    per input interval with the computed value. Defaults: exists/size -> 0.0,
+    first/last/sample -> NaN.
+    """
+    from .intervals import _chrom_id_map
+
+    if func not in _2D_OBJECT_FUNCS:
+        raise ValueError(
+            f"_gextract_2d_vtrack_objects: unknown func '{func}' "
+            f"(expected one of {sorted(_2D_OBJECT_FUNCS)})"
+        )
+
+    n = len(intervals)
+    if n == 0:
+        return _pandas.DataFrame(
+            {
+                "chrom1": intervals["chrom1"].to_numpy(),
+                "start1": intervals["start1"].values,
+                "end1": intervals["end1"].values,
+                "chrom2": intervals["chrom2"].to_numpy(),
+                "start2": intervals["start2"].values,
+                "end2": intervals["end2"].values,
+                col_name: _numpy.empty(0, dtype=float),
+                "intervalID": _numpy.empty(0, dtype=int),
+            }
+        )
+
+    cmap = _chrom_id_map()
+    chrom1_ids = (
+        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
+    chrom2_ids = (
+        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
+
+    intervals_dict = {
+        "chrom1": chrom1_ids,
+        "start1": intervals["start1"].to_numpy(dtype=_numpy.int64),
+        "end1": intervals["end1"].to_numpy(dtype=_numpy.int64),
+        "chrom2": chrom2_ids,
+        "start2": intervals["start2"].to_numpy(dtype=_numpy.int64),
+        "end2": intervals["end2"].to_numpy(dtype=_numpy.int64),
+    }
+
+    result = _pymisha.pm_extract_2d_objects(track, intervals_dict, band, func, 60427)
+
+    return _pandas.DataFrame(
+        {
+            "chrom1": intervals["chrom1"].to_numpy(),
+            "start1": intervals["start1"].values,
+            "end1": intervals["end1"].values,
+            "chrom2": intervals["chrom2"].to_numpy(),
+            "start2": intervals["start2"].values,
+            "end2": intervals["end2"].values,
+            col_name: result["value"],
             "intervalID": _numpy.arange(n, dtype=int),
         }
     )

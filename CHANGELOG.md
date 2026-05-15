@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.70 (2026-05-15)
+
+### Performance
+- **2D object-level vtrack functions are ~5x faster.** The `exists`, `size`, `first`, `last`, and `sample` reductions over a 2D RECTS/POINTS track route through the new `pm_extract_2d_objects` C++ binding instead of the per-interval Python loop. Synthetic 10M-rect track, 100k queries, warm cache: 6.8 s -> 1.26 s.
+- Vectorized chromid name lookups in `_gextract_2d_single` (matters at multi-million-row outputs).
+
 ## v0.1.69 (2026-05-15)
 
 ### Performance

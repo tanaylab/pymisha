@@ -102,6 +102,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d(PyObject *self, PyObject *args);
+PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -175,6 +176,7 @@ static PyMethodDef module_methods[] = {
     {"pm_test_2d_iterator", pm_test_2d_iterator, METH_VARARGS, "Test-only: drive PMTrackExpressionIntervals2DIterator and return emissions"},
     {"pm_test_2d_scanner", pm_test_2d_scanner, METH_VARARGS, "Test-only: drive PMTrackExpr2DScanner over a 2D track + intervals"},
     {"pm_extract_2d", pm_extract_2d, METH_VARARGS, "Extract objects from a 2D RECTS/POINTS track for 2D intervals"},
+    {"pm_extract_2d_objects", pm_extract_2d_objects, METH_VARARGS, "Reduce a 2D RECTS/POINTS track to a per-interval scalar via exists/size/first/last/sample"},
     {NULL, NULL, 0, NULL}
 };
 

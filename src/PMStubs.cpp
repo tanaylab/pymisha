@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
@@ -6103,13 +6104,7 @@ PyObject *pm_extract_2d(PyObject *self, PyObject *args)
             const PairKey &key = kv.first;
             const std::vector<int64_t> &idxs = kv.second;
 
-            bool have_data = false;
-            try {
-                have_data = track.set_chrom_pair(key.c1, key.c2);
-            } catch (const TGLException &) {
-                // Hard failure on this pair: bubble up.
-                throw;
-            }
+            bool have_data = track.set_chrom_pair(key.c1, key.c2);
             if (!have_data) continue;
 
             const bool is_points = track.is_points();
@@ -6191,5 +6186,221 @@ PyObject *pm_extract_2d(PyObject *self, PyObject *args)
     set_f64  ("value",  out_val);
     set_int64("intervalID", out_id);
 
+    return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_extract_2d_objects
+//
+// Native object-level reduction path for the 2D vtrack object funcs
+// (exists / size / first / last / sample). One row per input interval.
+// Replaces the per-interval Python loop in
+// pymisha.extract._gextract_2d_vtrack_objects.
+//
+// Args:
+//   track_name : str           - physical 2D track name (RECTS / POINTS)
+//   intervals  : dict          - chrom1 / start1 / end1 / chrom2 / start2 / end2
+//                                arrays (chromids as int32, coords as int64)
+//   band       : tuple|None    - (d1, d2) diagonal-band filter, or None
+//   func       : str           - "exists" | "size" | "first" | "last" | "sample"
+//   seed       : int           - RNG seed for "sample" (ignored otherwise)
+//
+// Returns:
+//   dict {"value": np.ndarray[n] of float64}
+//
+// Defaults when no object intersects an interval:
+//   exists / size : 0.0
+//   first / last / sample : NaN
+//---------------------------------------------------------------------------
+
+PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *track_name = NULL;
+    PyObject   *intervals_dict = NULL;
+    PyObject   *band_obj = Py_None;
+    const char *func_str = NULL;
+    long long   seed = 60427;
+
+    if (!PyArg_ParseTuple(args, "sO!OsL",
+                          &track_name,
+                          &PyDict_Type, &intervals_dict,
+                          &band_obj,
+                          &func_str,
+                          &seed)) {
+        return NULL;
+    }
+
+    // Parse func.
+    enum ObjFunc { F_EXISTS, F_SIZE, F_FIRST, F_LAST, F_SAMPLE };
+    ObjFunc func;
+    if      (strcmp(func_str, "exists") == 0) func = F_EXISTS;
+    else if (strcmp(func_str, "size")   == 0) func = F_SIZE;
+    else if (strcmp(func_str, "first")  == 0) func = F_FIRST;
+    else if (strcmp(func_str, "last")   == 0) func = F_LAST;
+    else if (strcmp(func_str, "sample") == 0) func = F_SAMPLE;
+    else {
+        PyErr_Format(PyExc_ValueError,
+                     "pm_extract_2d_objects: unknown func '%s' (expected one of "
+                     "exists/size/first/last/sample)", func_str);
+        return NULL;
+    }
+
+    // Parse band.
+    bool has_band = false;
+    long long band_d1 = 0, band_d2 = 0;
+    if (band_obj && band_obj != Py_None) {
+        PyObject *seq = PySequence_Fast(band_obj, "band must be a 2-tuple or None");
+        if (!seq) return NULL;
+        if (PySequence_Fast_GET_SIZE(seq) != 2) {
+            Py_DECREF(seq);
+            PyErr_SetString(PyExc_ValueError, "band must have length 2");
+            return NULL;
+        }
+        band_d1 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 0));
+        band_d2 = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, 1));
+        Py_DECREF(seq);
+        if (PyErr_Occurred()) return NULL;
+        if (band_d1 >= band_d2) {
+            PyErr_SetString(PyExc_ValueError, "band d1 must be < d2");
+            return NULL;
+        }
+        has_band = true;
+    }
+
+    // Pull intervals arrays.
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "pm_extract_2d_objects: intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    // Default values per func (exists/size -> 0, first/last/sample -> NaN).
+    double default_val = (func == F_EXISTS || func == F_SIZE)
+        ? 0.0
+        : std::numeric_limits<double>::quiet_NaN();
+
+    // Output values, length n, initialized to default.
+    npy_intp dims[1] = {n};
+    PyObject *out_arr = PyArray_SimpleNew(1, dims, NPY_FLOAT64);
+    if (!out_arr) return NULL;
+    double *out = (double *)PyArray_DATA((PyArrayObject *)out_arr);
+    for (npy_intp i = 0; i < n; ++i) out[i] = default_val;
+
+    // Empty input -> return empty result.
+    if (n == 0) {
+        PyObject *result = PyDict_New();
+        if (!result) { Py_DECREF(out_arr); return NULL; }
+        PyDict_SetItemString(result, "value", out_arr);
+        Py_DECREF(out_arr);
+        return result;
+    }
+
+    // Group intervals by (chromid1, chromid2).
+    struct PairKey2 {
+        int c1, c2;
+        bool operator==(const PairKey2 &o) const { return c1 == o.c1 && c2 == o.c2; }
+    };
+    struct PairKey2Hash {
+        size_t operator()(const PairKey2 &k) const noexcept {
+            return (static_cast<size_t>(static_cast<uint32_t>(k.c1)) << 32) |
+                   static_cast<uint32_t>(k.c2);
+        }
+    };
+
+    std::unordered_map<PairKey2, std::vector<int64_t>, PairKey2Hash> by_pair;
+    by_pair.reserve(32);
+    for (npy_intp i = 0; i < n; ++i) {
+        PairKey2 key{
+            static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c1, i)),
+            static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c2, i)),
+        };
+        by_pair[key].push_back(static_cast<int64_t>(i));
+    }
+
+    quadtree::DiagonalBand band_real;
+    const quadtree::DiagonalBand *band_ptr = nullptr;
+    if (has_band) {
+        band_real = quadtree::DiagonalBand(band_d1, band_d2);
+        band_ptr = &band_real;
+    }
+
+    // Seeded RNG for sample.
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    try {
+        PMGenomeTrack2D track;
+        track.init(track_name);
+
+        for (auto &kv : by_pair) {
+            const PairKey2 &key = kv.first;
+            const std::vector<int64_t> &idxs = kv.second;
+
+            bool have_data = track.set_chrom_pair(key.c1, key.c2);
+            if (!have_data) continue;
+
+            for (int64_t orig_idx : idxs) {
+                int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, orig_idx);
+                int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, orig_idx);
+                int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, orig_idx);
+                int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, orig_idx);
+
+                quadtree::QueryObjects qresult =
+                    track.query_objects(s1, s2, e1, e2, band_ptr);
+
+                size_t m = qresult.ids.size();
+
+                switch (func) {
+                case F_EXISTS:
+                    out[orig_idx] = m > 0 ? 1.0 : 0.0;
+                    break;
+                case F_SIZE:
+                    out[orig_idx] = static_cast<double>(m);
+                    break;
+                case F_FIRST:
+                    if (m > 0) {
+                        out[orig_idx] = static_cast<double>(qresult.vals[0]);
+                    }
+                    break;
+                case F_LAST:
+                    if (m > 0) {
+                        out[orig_idx] = static_cast<double>(qresult.vals[m - 1]);
+                    }
+                    break;
+                case F_SAMPLE:
+                    if (m > 0) {
+                        std::uniform_int_distribution<size_t> dist(0, m - 1);
+                        size_t pick = dist(rng);
+                        out[orig_idx] = static_cast<double>(qresult.vals[pick]);
+                    }
+                    break;
+                }
+            }
+        }
+    } catch (const TGLException &e) {
+        Py_DECREF(out_arr);
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return NULL;
+    } catch (const std::exception &e) {
+        Py_DECREF(out_arr);
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+
+    PyObject *result = PyDict_New();
+    if (!result) { Py_DECREF(out_arr); return NULL; }
+    PyDict_SetItemString(result, "value", out_arr);
+    Py_DECREF(out_arr);
     return result;
 }
