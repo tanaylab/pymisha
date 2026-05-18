@@ -16,10 +16,12 @@ from pymisha.genome._ncbi import (
     NCBI_INCLUDE_VALUES,
     _datasets_report_url,
     _datasets_zip_url,
+    _ncbi_assembly_name_from_ftp_listing,
     _ncbi_assembly_name_from_report,
     _ncbi_dataset_report,
     _ncbi_extract_sequence_report,
     _ncbi_ftp_assembly_dir,
+    _ncbi_ftp_parent_dir,
     _ncbi_has_annotation,
     _ncbi_post_download,
     _ncbi_sequence_report,
@@ -217,6 +219,38 @@ def test_ncbi_ftp_assembly_dir_format():
 def test_ncbi_ftp_assembly_dir_rejects_empty_asm():
     with pytest.raises(ValueError, match="assembly_name must be non-empty"):
         _ncbi_ftp_assembly_dir("GCF_000001635.27", "")
+
+
+def test_ncbi_ftp_parent_dir_format():
+    assert _ncbi_ftp_parent_dir("GCF_000001635.26") == (
+        "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/635/"
+    )
+    assert _ncbi_ftp_parent_dir("GCA_009914755.4") == (
+        "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/009/914/755/"
+    )
+
+
+def test_ncbi_assembly_name_from_ftp_listing_finds_accession():
+    listing = (
+        b"GCF_000001635.26_GRCm38.p6/\n"
+        b"GCF_000001635.27_GRCm39/\n"
+    )
+    assert _ncbi_assembly_name_from_ftp_listing("GCF_000001635.26", listing) == "GRCm38.p6"
+    assert _ncbi_assembly_name_from_ftp_listing("GCF_000001635.27", listing) == "GRCm39"
+
+
+def test_ncbi_assembly_name_from_ftp_listing_returns_empty_when_not_found():
+    listing = b"GCF_000001635.27_GRCm39/\n"
+    assert _ncbi_assembly_name_from_ftp_listing("GCF_000001635.26", listing) == ""
+
+
+def test_ncbi_assembly_name_from_ftp_listing_handles_trailing_slash():
+    # FTP listings may or may not have trailing slashes; both should work.
+    listing_no_slash = b"GCF_000001635.26_GRCm38.p6\n"
+    assert (
+        _ncbi_assembly_name_from_ftp_listing("GCF_000001635.26", listing_no_slash)
+        == "GRCm38.p6"
+    )
 
 
 # ---------------------------------------------------------------------------

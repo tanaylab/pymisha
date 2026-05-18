@@ -165,6 +165,38 @@ def _ncbi_assembly_name_from_report(report: dict) -> str:
     return reports[0].get("assembly_info", {}).get("assembly_name", "") or ""
 
 
+def _ncbi_ftp_parent_dir(accession: str) -> str:
+    """Return the parent FTP directory URL that contains all assembly subdirs.
+
+    Pattern:
+      https://ftp.ncbi.nlm.nih.gov/genomes/all/{GCF|GCA}/<NNN>/<NNN>/<NNN>/
+    """
+    _validate_accession(accession)
+    prefix = accession[:3]
+    digits = accession.split("_", 1)[1].split(".", 1)[0]
+    a, b, c = digits[0:3], digits[3:6], digits[6:9]
+    return f"https://ftp.ncbi.nlm.nih.gov/genomes/all/{prefix}/{a}/{b}/{c}/"
+
+
+def _ncbi_assembly_name_from_ftp_listing(accession: str, listing_body: bytes) -> str:
+    """Extract assembly_name from an FTP parent-directory listing.
+
+    The listing contains lines like:
+      GCF_000001635.26_GRCm38.p6/
+      GCF_000001635.27_GRCm39/
+
+    Returns the assembly_name suffix for the exact accession version, or ``""``
+    when not found.
+    """
+    prefix = accession + "_"
+    for line in listing_body.decode("utf-8", errors="replace").splitlines():
+        line = line.strip().rstrip("/")
+        if line.startswith(prefix):
+            # Strip the accession_ prefix to get just the assembly name.
+            return line[len(prefix):]
+    return ""
+
+
 def _ncbi_has_annotation(report: dict) -> bool:
     """True iff the Datasets `dataset_report` says the assembly is annotated."""
     reports = report.get("reports", [])
@@ -246,7 +278,11 @@ def _ncbi_fetch_assets(
         "cytoband": None,
     }
 
-    # Pull dataset_report once if we need assembly_name (for FTP fallback).
+    # Resolve assembly_name once; used by both the genes-FTP fallback and rmsk.
+    # Primary source: /dataset_report (fast, a few KB).
+    # Fallback: FTP parent-directory listing when the report is suppressed /
+    # empty (e.g. GCF_000001635.26 GRCm38.p6 whose Datasets record is replaced
+    # by GRCm39 in the active index). Ports R d6cd6047.
     needs_asm = ("genes" in sets) or ("rmsk" in sets)
     asm_name = ""
     if needs_asm:
@@ -254,8 +290,18 @@ def _ncbi_fetch_assets(
             report = _ncbi_dataset_report(accession)
             asm_name = _ncbi_assembly_name_from_report(report)
         except Exception:
-            # Tolerated; FTP fetches will warn-and-skip when asm_name unknown.
             asm_name = ""
+        if not asm_name:
+            # /dataset_report was empty or suppressed; fall back to the FTP
+            # parent-directory listing to extract the assembly_name from the
+            # subdirectory name (e.g. GCF_000001635.26_GRCm38.p6/).
+            try:
+                parent_url = _ncbi_ftp_parent_dir(accession)
+                listing = _open_url(parent_url)
+                asm_name = _ncbi_assembly_name_from_ftp_listing(accession, listing)
+            except Exception:
+                # Best-effort; FTP fetches will warn-and-skip when still empty.
+                asm_name = ""
 
     # Build the Datasets include list. Always SEQUENCE_REPORT (chromAlias),
     # plus GENOME_GFF when genes is requested. Never GENOME_FASTA here.

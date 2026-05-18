@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.73 (2026-05-18)
+
+### Fixes
+- **`gdb_install_intervals` resolves assembly_name from the FTP listing when the NCBI Datasets `/dataset_report` is empty or suppressed.** Previously, accessions whose Datasets API record was suppressed (e.g. `GCF_000001635.26` GRCm38.p6, replaced by GRCm39 in the active index) left `assembly_name` empty and the GFF was silently skipped even though the FTP directory still hosted `<acc>_<asm>_genomic.gff.gz`. Now falls back to parsing the parent FTP listing for the assembly subdirectory. Ports R commit `d6cd6047`.
+
+### Internal
+- Regression tests added for: cache invalidation on `gtrack_rm` + `gtrack_create_*` and `gintervals_rm` + `gintervals_save` on indexed DBs (R commit `4c3803b0`); `min_coverage` gate position in chrom-alias resolution (R commit `537bfe29`). Both pass on current pymisha; tests guard against drift.
+
 ## v0.1.72 (2026-05-18)
 
 ### Features
