@@ -136,6 +136,7 @@ from .intervals_attr import (
     gintervals_attr_import,
     gintervals_attr_set,
 )
+from .intervals_mat import gintervals_from_mat, gintervals_to_mat
 from .liftover import (
     gintervals_as_chain,
     gintervals_liftover,
@@ -388,6 +389,8 @@ __all__ = [
     'gintervals_annotate',
     'gintervals_normalize',
     'gintervals_random',
+    'gintervals_to_mat',
+    'gintervals_from_mat',
 
     # Virtual track functions
     'gvtrack_create',

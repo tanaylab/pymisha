@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.72 (2026-05-18)
+
+### Features
+- **`gintervals_to_mat` / `gintervals_from_mat`.** Pivot an intervals + values DataFrame into a matrix-shaped DataFrame indexed by intervals (3-level MultiIndex of `chrom/start/end`, or 4-level when `id_col` is given). Inverse via `gintervals_from_mat`. Pandas-native `iloc` slicing and `pd.concat` preserve the intervals correspondence. Ports R PR #120.
+
+### Fixes
+- **mypy CI:** narrow the type of `df` after `_apply_intervals_join` in `_apply_extract_output` so the post-processing block type-checks cleanly. No behavior change.
+
 ## v0.1.71 (2026-05-18)
 
 ### Features

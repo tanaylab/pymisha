@@ -1308,6 +1308,7 @@ def _apply_extract_output(
     # Apply intervals_join FIRST, before file/intervals_set_out which read
     # from the post-processed result.
     df = _apply_intervals_join(df, input_intervals, intervals_join, is_2d=is_2d)
+    assert df is not None  # _apply_intervals_join preserves non-None input
 
     # -- intervals_set_out: save coordinate columns as a named interval set --
     if intervals_set_out is not None:
