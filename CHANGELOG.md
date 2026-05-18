@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.71 (2026-05-18)
+
+### Features
+- **`gextract` gains `intervals_join` argument.** Replaces the `misha.ext::gextract.left_join` workflow with a single built-in call. Modes: `"id"` (default; appends `intervalID`), `"intervals"` (drops `intervalID`, attaches every column of the input intervals DataFrame to each output row, suffixing conflicting names with `"1"`), `"none"` (drops `intervalID`, attaches nothing). Supported attach dtypes: numeric, bool, string, category. `file=` and `intervals_set_out=` are rejected with `intervals_join="intervals"`. Ports R PR #124.
+
 ## v0.1.70 (2026-05-15)
 
 ### Performance

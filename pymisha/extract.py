@@ -1191,10 +1191,90 @@ def giterator_intervals_2d(
             yield chunk
 
 
-def _apply_extract_output(
-    df: pd.DataFrame | None, file: str | None, intervals_set_out: str | None, *, is_2d: bool = False
+def _is_attachable_dtype(s: pd.Series) -> tuple[bool, str]:
+    """Return (ok, reason) for whether a column is supported by intervals_join='intervals'.
+
+    Supported: int, float, bool, string/object (assumed str), category, pandas StringDtype.
+    Rejected: datetime, timedelta, period, complex, lists/dicts in object columns.
+    """
+    # Categorical is allowed.
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        return True, ""
+    # pandas StringDtype is allowed.
+    if pd.api.types.is_string_dtype(s) and not pd.api.types.is_object_dtype(s):
+        return True, ""
+    # Numeric + bool via kind char.
+    if s.dtype.kind in {"i", "u", "f", "b"}:
+        return True, ""
+    # Object dtype: only allow if every non-null entry is a str.
+    if s.dtype == object:
+        non_null = s.dropna()
+        if len(non_null) == 0 or non_null.map(lambda v: isinstance(v, str)).all():
+            return True, ""
+        return False, "object column contains non-string values"
+    return False, f"unsupported dtype {s.dtype}"
+
+
+def _apply_intervals_join(
+    df: pd.DataFrame | None,
+    input_intervals: pd.DataFrame | None,
+    intervals_join: str,
+    is_2d: bool = False,
 ) -> pd.DataFrame | None:
-    """Apply file-writing and intervals_set_out post-processing to an extraction result.
+    """Post-process gextract result according to intervals_join mode.
+
+    - 'id': no change (intervalID kept).
+    - 'none': drop intervalID.
+    - 'intervals': drop intervalID, attach all columns of input_intervals
+      (mapped via 1-indexed intervalID), suffix conflicts with '1'.
+    """
+    if df is None or intervals_join == "id":
+        return df
+    if "intervalID" not in df.columns:
+        return df  # Already processed or no intervalID emitted.
+    if intervals_join == "none":
+        return df.drop(columns=["intervalID"])
+    if intervals_join != "intervals":
+        raise ValueError(f"intervals_join must be one of 'id', 'intervals', 'none'; got {intervals_join!r}")
+
+    if input_intervals is None or not isinstance(input_intervals, pd.DataFrame):
+        # No DataFrame to attach (e.g. ALLGENOME default). Treat as 'none'.
+        return df.drop(columns=["intervalID"])
+
+    # Validate attach-supported dtypes BEFORE doing the join.
+    for col in input_intervals.columns:
+        ok, reason = _is_attachable_dtype(input_intervals[col])
+        if not ok:
+            raise TypeError(
+                f"intervals_join='intervals': column {col!r} has unsupported type "
+                f"for attach ({reason})"
+            )
+
+    # Conflict resolution: output columns that collide with input get suffix '1'.
+    output_cols = set(df.columns) - {"intervalID"}
+    rename_map = {c: c + "1" for c in input_intervals.columns if c in output_cols}
+    attach_src = input_intervals.rename(columns=rename_map).reset_index(drop=True)
+
+    # 1-indexed intervalID -> 0-indexed positional lookup.
+    ids = df["intervalID"].to_numpy(dtype=int) - 1
+    attached = attach_src.iloc[ids].reset_index(drop=True)
+
+    return pd.concat(
+        [df.drop(columns=["intervalID"]).reset_index(drop=True), attached],
+        axis=1,
+    )
+
+
+def _apply_extract_output(
+    df: pd.DataFrame | None,
+    file: str | None,
+    intervals_set_out: str | None,
+    *,
+    is_2d: bool = False,
+    intervals_join: str = "id",
+    input_intervals: pd.DataFrame | None = None,
+) -> pd.DataFrame | None:
+    """Apply file-writing, intervals_set_out, and intervals_join post-processing to an extraction result.
 
     Parameters
     ----------
@@ -1209,6 +1289,11 @@ def _apply_extract_output(
     is_2d : bool
         Whether the extraction was 2D (affects which coordinate columns are
         used for ``intervals_set_out``).
+    intervals_join : {"id", "intervals", "none"}, default "id"
+        Post-processing mode for the intervalID column.
+    input_intervals : DataFrame or None
+        Resolved input intervals used for the ``intervals_join="intervals"``
+        attach (not used here for ``"id"``/``"none"``).
 
     Returns
     -------
@@ -1219,6 +1304,10 @@ def _apply_extract_output(
         if file is not None:
             return None
         return None
+
+    # Apply intervals_join FIRST, before file/intervals_set_out which read
+    # from the post-processed result.
+    df = _apply_intervals_join(df, input_intervals, intervals_join, is_2d=is_2d)
 
     # -- intervals_set_out: save coordinate columns as a named interval set --
     if intervals_set_out is not None:
@@ -1484,6 +1573,7 @@ def gextract(
     colnames: list[str] | None = None,
     band: tuple[int, int] | tuple[float, float] | None = None,
     vars: dict[str, Any] | None = None,
+    intervals_join: str = "id",
     **kwargs: Any,
 ) -> pd.DataFrame | None:
     """Return evaluated track expression values for each iterator interval.
@@ -1517,6 +1607,17 @@ def gextract(
     vars : dict, optional
         Explicit variable bindings for the expression.  When provided,
         these are used instead of auto-capturing the caller's namespace.
+    intervals_join : {"id", "intervals", "none"}, default "id"
+        How to relate output rows back to the input *intervals*.
+
+        - ``"id"`` (default): append an ``intervalID`` column (1-indexed)
+          to each output row, mapping it to the input intervals row.
+        - ``"intervals"``: drop ``intervalID`` and attach every column
+          of the input *intervals* DataFrame to each output row.
+          Conflicting names get a ``"1"`` suffix (``chrom`` -> ``chrom1``).
+          Not supported with ``file=`` or ``intervals_set_out=``.
+          Supported attach dtypes: numeric, bool, string, category.
+        - ``"none"``: drop ``intervalID``, attach nothing.
     **kwargs
         Additional keyword arguments:
 
@@ -1564,6 +1665,23 @@ def gextract(
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
 
+    if intervals_join not in ("id", "intervals", "none"):
+        raise ValueError(
+            f"intervals_join must be one of 'id', 'intervals', 'none'; got {intervals_join!r}"
+        )
+
+    if intervals_join == "intervals":
+        if kwargs.get("file") is not None:
+            raise ValueError(
+                "intervals_join='intervals' is not supported with file= output "
+                "(TSV writer cannot safely round-trip arbitrary column types)"
+            )
+        if kwargs.get("intervals_set_out") is not None:
+            raise ValueError(
+                "intervals_join='intervals' is not supported with intervals_set_out= "
+                "(intervals sets only carry numeric coordinate columns)"
+            )
+
     from .tracks import _check_computed_tracks
 
     _check_computed_tracks(exprs)
@@ -1578,6 +1696,11 @@ def gextract(
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
+
+    # Capture for intervals_join post-processing. _preprocess_intervals_iterator
+    # may mutate intervals, but the row order / column set we want for attach
+    # is the post-loader, pre-iterator-preprocess state.
+    input_intervals_for_join = intervals.copy() if isinstance(intervals, pd.DataFrame) else None
 
     # Handle DataFrame-as-iterator: intersect scope with iterator intervals
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
@@ -1594,7 +1717,11 @@ def gextract(
             band=band,
             caller_ns=caller_ns,
         )
-        return _apply_extract_output(df, file, intervals_set_out, is_2d=True)
+        return _apply_extract_output(
+            df, file, intervals_set_out, is_2d=True,
+            intervals_join=intervals_join,
+            input_intervals=input_intervals_for_join,
+        )
 
     if band is not None:
         raise ValueError("band parameter is only supported with 2D intervals")
@@ -1686,7 +1813,11 @@ def gextract(
             if len(non_meta) == len(colnames):
                 rename_map = dict(zip(non_meta, colnames, strict=False))
                 df = df.rename(columns=rename_map)
-        return _apply_extract_output(df, file, intervals_set_out, is_2d=False)
+        return _apply_extract_output(
+            df, file, intervals_set_out, is_2d=False,
+            intervals_join=intervals_join,
+            input_intervals=input_intervals_for_join,
+        )
 
     track_arrays = {}
     base_df = None
@@ -1720,7 +1851,11 @@ def gextract(
         iter_df = _iterated_intervals(intervals, iterator)
 
     if iter_df is None or len(iter_df) == 0:
-        return _apply_extract_output(None, file, intervals_set_out, is_2d=False)
+        return _apply_extract_output(
+            None, file, intervals_set_out, is_2d=False,
+            intervals_join=intervals_join,
+            input_intervals=input_intervals_for_join,
+        )
 
     n_rows = len(iter_df)
     chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
@@ -1803,7 +1938,11 @@ def gextract(
     for col in result_cols:
         result_df[col] = result_arrays[col]
     result_df["intervalID"] = iter_df["intervalID"].to_numpy(dtype=int, copy=False)
-    return _apply_extract_output(result_df, file, intervals_set_out, is_2d=False)
+    return _apply_extract_output(
+        result_df, file, intervals_set_out, is_2d=False,
+        intervals_join=intervals_join,
+        input_intervals=input_intervals_for_join,
+    )
 
 
 def gscreen(
