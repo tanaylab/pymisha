@@ -18,7 +18,6 @@ import pytest
 
 from pymisha import _r_serialize
 
-
 _RSCRIPT = shutil.which("Rscript")
 
 
@@ -95,6 +94,131 @@ class TestRSerializeReader:
     def test_raw_bytes(self, tmp_path):
         _save_with_r('as.raw(c(1,2,3,255))', tmp_path / "x.rds")
         assert _r_serialize.read(tmp_path / "x.rds") == b"\x01\x02\x03\xff"
+
+    def test_factor_vector_decodes_to_categorical(self, tmp_path):
+        """R factors must come back as pandas.Categorical, not bare int codes.
+
+        Regression: legacy 1D `intervs.global.*` files store chrom as a
+        factor; if the reader hands back the INTSXP code array, downstream
+        `astype(str)` yields "1".."N" instead of "chr1".."chrN".
+        """
+        _save_with_r('factor(c("a","b","a","c","b"))', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, pd.Categorical)
+        assert list(val) == ["a", "b", "a", "c", "b"]
+        assert list(val.categories) == ["a", "b", "c"]
+
+    def test_factor_with_na(self, tmp_path):
+        _save_with_r('factor(c("a", NA, "b"))', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, pd.Categorical)
+        assert list(val.categories) == ["a", "b"]
+        assert int(val.codes[1]) == -1
+
+    def test_ordered_factor(self, tmp_path):
+        _save_with_r(
+            'factor(c("lo","hi","mid"), levels=c("lo","mid","hi"), ordered=TRUE)',
+            tmp_path / "x.rds",
+        )
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, pd.Categorical)
+        assert val.ordered is True
+        assert list(val.categories) == ["lo", "mid", "hi"]
+        assert list(val) == ["lo", "hi", "mid"]
+
+    def test_logical_with_na(self, tmp_path):
+        """LGLSXP NA must surface as pandas NA, not silently become True.
+
+        Regression: R's NA_LOGICAL is the int sentinel -INT_MAX; an
+        unconditional astype(bool) treated it as truthy.
+        """
+        _save_with_r('c(TRUE, NA, FALSE)', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        # Has NA -> nullable BooleanDtype, NA preserved.
+        assert isinstance(val, pd.arrays.BooleanArray)
+        assert bool(val[0]) is True
+        assert val[1] is pd.NA
+        assert bool(val[2]) is False
+
+    def test_logical_no_na_stays_bool_ndarray(self, tmp_path):
+        """No NAs: keep the existing bool ndarray contract."""
+        _save_with_r('c(TRUE, FALSE, TRUE)', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, np.ndarray) and val.dtype == bool
+        np.testing.assert_array_equal(val, [True, False, True])
+
+    def test_integer_with_na(self, tmp_path):
+        """INTSXP NA must surface as pandas NA, not the -INT_MAX sentinel."""
+        _save_with_r('c(1L, NA_integer_, 3L)', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, pd.arrays.IntegerArray)
+        assert int(val[0]) == 1
+        assert val[1] is pd.NA
+        assert int(val[2]) == 3
+        # The sentinel must not leak.
+        assert -2_147_483_648 not in val.to_numpy(dtype="float", na_value=np.nan).tolist()
+
+    def test_integer_no_na_stays_int32_ndarray(self, tmp_path):
+        """No NAs: keep the existing int32 ndarray contract."""
+        _save_with_r('c(1L, 2L, 3L)', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, np.ndarray) and val.dtype == np.int32
+        np.testing.assert_array_equal(val, [1, 2, 3])
+
+    def test_data_frame_with_integer_na_column(self, tmp_path):
+        """A data.frame integer column with NAs becomes a nullable Int32 column."""
+        _save_with_r(
+            'data.frame(x=c(1L, NA_integer_, 3L), y=c("a","b","c"), stringsAsFactors=FALSE)',
+            tmp_path / "x.rds",
+        )
+        df = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(df, pd.DataFrame)
+        assert str(df["x"].dtype) == "Int32"
+        assert int(df["x"].iloc[0]) == 1
+        assert df["x"].isna().tolist() == [False, True, False]
+        assert int(df["x"].iloc[2]) == 3
+
+    def test_named_integer_with_na(self, tmp_path):
+        """Named integer vector with NA: NA correctness wins.
+
+        Returns a pandas IntegerArray (NA preserved); the R-side names
+        attribute is dropped in this rare case because pandas extension
+        arrays cannot carry a custom .names attribute. Named atomic
+        vectors with NAs do not appear in any misha read path today.
+        """
+        _save_with_r('c(x=1L, y=NA_integer_, z=3L)', tmp_path / "x.rds")
+        val = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(val, pd.arrays.IntegerArray)
+        assert int(val[0]) == 1
+        assert val[1] is pd.NA
+        assert int(val[2]) == 3
+
+    def test_data_frame_with_logical_na_column(self, tmp_path):
+        _save_with_r(
+            'data.frame(flag=c(TRUE, NA, FALSE), x=1:3)',
+            tmp_path / "x.rds",
+        )
+        df = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(df, pd.DataFrame)
+        assert str(df["flag"].dtype) == "boolean"
+        assert df["flag"].isna().tolist() == [False, True, False]
+        assert bool(df["flag"].iloc[0]) is True
+        assert bool(df["flag"].iloc[2]) is False
+
+    def test_data_frame_with_factor_column(self, tmp_path):
+        """The actual failure mode: data.frame(chrom=factor(...), ...)
+        must decode chrom to a Categorical of labels, not integer codes.
+        """
+        _save_with_r(
+            'data.frame(chrom=factor(c("chr1","chr2","chr1","chr10")), x=1:4)',
+            tmp_path / "x.rds",
+        )
+        df = _r_serialize.read(tmp_path / "x.rds")
+        assert isinstance(df, pd.DataFrame)
+        assert list(df["chrom"].astype(str)) == ["chr1", "chr2", "chr1", "chr10"]
+        assert isinstance(df["chrom"].dtype, pd.CategoricalDtype)
+        # R factor() sorts levels lexicographically by default.
+        assert list(df["chrom"].cat.categories) == ["chr1", "chr10", "chr2"]
 
     def test_xdr_uncompressed(self, tmp_path):
         """The misha `.meta` and `.colnames` files are written via

@@ -206,11 +206,13 @@ def _read_item(fh: BinaryIO, ref_table: list[Any]) -> Any:
         int_arr: _numpy.ndarray = _numpy.frombuffer(raw, dtype=">i4").astype(
             _numpy.int32, copy=True
         )
-        # LGLSXP: 0 = FALSE, 1 = TRUE, NA = -INT_MAX (treated as masked False).
-        int_out: _numpy.ndarray = (
-            int_arr.astype(bool, copy=True) if type_code == _LGLSXP else int_arr
+        # Defer NA-aware coercion to _wrap_with_attrs so the factor-decode
+        # path in _apply_attributes still sees the raw 1-based codes
+        # (NA_INTEGER == NA_LOGICAL == -INT_MAX).
+        atomic_kind = "logical" if type_code == _LGLSXP else "integer"
+        return _wrap_with_attrs(
+            fh, ref_table, int_arr, has_attr, has_tag, _atomic_kind=atomic_kind
         )
-        return _wrap_with_attrs(fh, ref_table, int_out, has_attr, has_tag)
 
     if type_code == _REALSXP:
         length = _read_int(fh)
@@ -382,23 +384,128 @@ def _wrap_with_attrs(
     value: Any,
     has_attr: bool,
     _has_tag: bool,
+    *,
+    _atomic_kind: str | None = None,
 ) -> Any:
     if not has_attr:
-        return value
+        return _finalize_raw_atomic(value, _atomic_kind)
     attr_flags = _read_int(fh)
     attrs = _read_pairlist(fh, ref_table, attr_flags)
-    return _apply_attributes(value, attrs)
+    return _apply_attributes(value, attrs, _atomic_kind=_atomic_kind)
 
 
-def _apply_attributes(value: Any, attrs: dict[str, Any]) -> Any:
+def _finalize_raw_atomic(value: Any, kind: str | None) -> Any:
+    """Apply NA-aware coercion to a raw LGLSXP/INTSXP int32 ndarray.
+
+    R encodes NA in atomic LGLSXP / INTSXP vectors as the int sentinel
+    -INT_MAX. Without this step that sentinel leaks through:
+    - LGLSXP: ``astype(bool)`` turns the sentinel into ``True``.
+    - INTSXP: the sentinel surfaces as a very large negative integer.
+
+    When NAs are present we return a pandas nullable array (BooleanArray
+    or IntegerArray) so callers see actual NA, not silently-corrupted
+    values. With pandas unavailable we fall back to an object array
+    (logical) or float64-with-NaN (integer).
+    """
+    if (
+        kind is None
+        or not isinstance(value, _numpy.ndarray)
+        or value.dtype != _numpy.int32
+    ):
+        return value
+    if kind == "logical":
+        return _decode_logical(value)
+    if kind == "integer":
+        return _decode_integer(value)
+    return value
+
+
+def _decode_logical(int_arr: _numpy.ndarray) -> Any:
+    na_mask: _numpy.ndarray = (int_arr == _NA_LOGICAL)
+    if not na_mask.any():
+        return int_arr.astype(bool, copy=True)
+    try:
+        from pandas.arrays import BooleanArray as _BoolArr
+    except ImportError:
+        out: _numpy.ndarray = _numpy.empty(int_arr.shape, dtype=object)
+        for i, v in enumerate(int_arr.tolist()):
+            out[i] = None if v == _NA_LOGICAL else bool(v)
+        return out
+    values = int_arr.astype(bool, copy=True)
+    values[na_mask] = False  # mask takes precedence; concrete value irrelevant
+    return _BoolArr(values, na_mask.astype(_numpy.bool_, copy=False))
+
+
+def _decode_integer(int_arr: _numpy.ndarray) -> Any:
+    na_mask: _numpy.ndarray = (int_arr == _NA_INT)
+    if not na_mask.any():
+        return int_arr
+    try:
+        from pandas.arrays import IntegerArray as _IntArr
+    except ImportError:
+        out_f: _numpy.ndarray = int_arr.astype(_numpy.float64, copy=True)
+        out_f[na_mask] = _numpy.nan
+        return out_f
+    return _IntArr(int_arr, na_mask.astype(_numpy.bool_, copy=False))
+
+
+def _apply_attributes(
+    value: Any,
+    attrs: dict[str, Any],
+    *,
+    _atomic_kind: str | None = None,
+) -> Any:
     """Apply R attributes to a Python value.
 
+    - R factor (INTSXP + class="factor" + levels=STRSXP) -> ``pandas.Categorical``.
     - ``names`` on an atomic vector -> set ``.names`` (a Python list[str]).
     - ``names`` on a list -> dict (zip(names, list)).
     - ``class == "data.frame"`` on a list -> ``pandas.DataFrame``.
     """
     names = attrs.get("names")
     cls = attrs.get("class")
+
+    # R factor: INTSXP body + class containing "factor" + levels = STRSXP.
+    # Without this branch, the 1-based factor codes leak through as the
+    # column values (chrom "1".."N" instead of "chr1".."chrN"), breaking
+    # every legacy `.interv` data.frame that stores chrom as a factor.
+    if (
+        isinstance(value, _numpy.ndarray)
+        and value.dtype.kind in "iu"
+        and isinstance(cls, list)
+        and "factor" in cls
+    ):
+        levels = attrs.get("levels")
+        if isinstance(levels, list) and all(
+            isinstance(x, str) or x is None for x in levels
+        ):
+            try:
+                import pandas as _pd
+            except ImportError:
+                # Best-effort fallback: materialise labels as an object array.
+                out = _numpy.empty(value.shape, dtype=object)
+                for i, code in enumerate(value.tolist()):
+                    if code == _NA_INT or code <= 0 or code > len(levels):
+                        out[i] = None
+                    else:
+                        out[i] = levels[code - 1]
+                return out
+            codes = value.astype(_numpy.int64, copy=True) - 1
+            codes[value == _NA_INT] = -1
+            categories = [("" if x is None else x) for x in levels]
+            ordered = "ordered" in cls
+            return _pd.Categorical.from_codes(
+                codes, categories=categories, ordered=ordered
+            )
+
+    # Non-factor LGLSXP/INTSXP that still carries attrs (e.g. a named
+    # integer vector). NA-coerce now so downstream sees pandas NA, not
+    # the raw -INT_MAX sentinel. If NAs are present this returns a
+    # pandas extension array, which loses the `.names` attribute - NA
+    # correctness wins; named atomic vectors with NAs are exceedingly
+    # rare (the .colnames files we read never have NAs).
+    if _atomic_kind is not None:
+        value = _finalize_raw_atomic(value, _atomic_kind)
 
     if isinstance(value, list):
         # A VECSXP. If names are present, materialize a dict.
@@ -732,21 +839,6 @@ def _series_to_r_column(series: Any) -> tuple[str, Any]:
     # Strings: convert to a list[str], with None for NAs.
     raw = series.to_numpy(dtype=object)
     return ("character", [None if (v is None or (isinstance(v, float) and _numpy.isnan(v))) else str(v) for v in raw])
-
-
-def _write_factor_column(fh: BinaryIO, series: Any) -> None:
-    """Write a categorical Series as an R factor (INTSXP + levels + class)."""
-    cat = series.cat
-    codes = cat.codes.to_numpy()
-    # R factor codes are 1-based, NA = NA_INTEGER (-INT_MAX).
-    int_codes = (codes.astype(_numpy.int32, copy=False) + _numpy.int32(1))
-    int_codes[codes == -1] = _NA_INT
-    levels = [str(c) for c in cat.categories]
-    attrs = {
-        "levels": levels,
-        "class": ["factor"],
-    }
-    _write_intsxp(fh, int_codes, attrs=attrs)
 
 
 def write_dataframe(path: str | Path, df: Any) -> None:

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.74 (2026-05-19)
+
+### Fixes
+- **R factor decode in legacy `.interv` files.** A factor `chrom` column was decoded as bare 1-based integer codes (`"1"`..`"22"`) instead of the level labels (`"chr1"`..`"chrY"`), producing misleading `Chromosome "20" does not exist` errors on databases with fewer chromosomes than factor levels. Factors now decode to `pandas.Categorical`, including ordered factors and NA codes.
+- **R `NA_LOGICAL` and `NA_integer_` preserved.** Atomic logical NAs no longer silently become `True`; integer NAs no longer surface as the `-INT_MAX` sentinel. Vectors with NAs decode to `pandas.arrays.BooleanArray` / `IntegerArray`; NA-free vectors keep the existing `bool` / `int32` ndarray return type.
+
+### Internal
+- Remove unused `_write_factor_column`; the writer dispatch flattens Categorical to character on disk (unchanged).
+
 ## v0.1.73 (2026-05-18)
 
 ### Fixes
