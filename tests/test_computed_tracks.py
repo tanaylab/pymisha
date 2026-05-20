@@ -3,15 +3,15 @@
 import os
 import shutil
 import struct
+from pathlib import Path
 
 import pytest
 
 import pymisha as pm
 import _pymisha
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
+TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+TRACK_DIR = str(TEST_DB / "tracks")
 
 COMPUTED_TRACK_NAME = "test.computed_stub"
 COMPUTED_SIGNATURE = -11  # GenomeTrack::FORMAT_SIGNATURES[COMPUTED]
@@ -39,7 +39,7 @@ def _create_computed_track():
     filepath = os.path.join(tdir, "1-1")
     with open(filepath, "wb") as f:
         f.write(struct.pack("<i", COMPUTED_SIGNATURE))
-        # Pad with zeros — enough for get_type() to succeed without
+        # Pad with zeros - enough for get_type() to succeed without
         # reading further into the file.
         f.write(b"\x00" * 256)
 
@@ -56,7 +56,14 @@ def _cleanup_computed_track():
 
 @pytest.fixture(scope="module", autouse=True)
 def computed_track_fixture():
-    """Create the COMPUTED track before the module, remove after."""
+    """Create the COMPUTED track before the module, remove after.
+
+    Earlier tests in the session may have left the global db pointed at a
+    temp copy from ``gdb_init_examples()``.  Re-init the canonical test db
+    here so the on-disk track file written below is the one ``pm_dbreload``
+    actually sees.
+    """
+    pm.gdb_init(str(TEST_DB))
     _create_computed_track()
     yield
     _cleanup_computed_track()

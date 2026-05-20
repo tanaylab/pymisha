@@ -2111,23 +2111,25 @@ def gvtrack_array_slice(
 
         track_path = Path(_pymisha.pm_track_path(src))
         colnames = read_colnames(track_path)
-        slice_list = list(slice)
+        slice_list: list[Any] = list(slice)
         if all(isinstance(s, str) for s in slice_list):
+            str_list: list[str] = [str(s) for s in slice_list]
             cn_idx = {name: i for i, name in enumerate(colnames)}
-            bad = [s for s in slice_list if s not in cn_idx]
-            if bad:
+            bad_names = [s for s in str_list if s not in cn_idx]
+            if bad_names:
                 raise ValueError(
-                    f"gvtrack_array_slice: column(s) not found in '{src}': {bad!r}"
+                    f"gvtrack_array_slice: column(s) not found in '{src}': {bad_names!r}"
                 )
-            slice_cols: list[int] | None = [cn_idx[s] for s in slice_list]
+            slice_cols: list[int] | None = [cn_idx[s] for s in str_list]
         elif all(isinstance(s, (int, _numpy.integer)) for s in slice_list):
+            int_list: list[int] = [int(s) for s in slice_list]
             ncols = len(colnames)
-            bad_idx = [int(s) for s in slice_list if int(s) < 0 or int(s) >= ncols]
+            bad_idx = [s for s in int_list if s < 0 or s >= ncols]
             if bad_idx:
                 raise ValueError(
                     f"gvtrack_array_slice: column indices out of range [0, {ncols}): {bad_idx!r}"
                 )
-            slice_cols = [int(s) for s in slice_list]
+            slice_cols = int_list
         else:
             raise ValueError(
                 "gvtrack_array_slice: slice must be a list of strings (column names) "

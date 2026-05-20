@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import collections.abc
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from ._iterator_policy import FixedRectPolicy
@@ -68,6 +68,88 @@ def _resolve_exprs_for_scanner(exprs: list[str]) -> list[tuple[str, str, object,
                 return None  # compound expr, unsupported vtrack, etc.
             resolved.append(r)
     return resolved
+
+
+def _resolve_2d_compound_for_scanner(
+    exprs: list[str],
+) -> tuple[list[tuple[str, dict[str, str]]], list[tuple[str, tuple[str, str, object, int, int, int, int]]]] | None:
+    """Resolve compound 2D expressions referencing multiple 2D vtracks/tracks.
+
+    For each user expression, identify every referenced symbol (vtrack name
+    or bare 2D physical-track name), resolve each through
+    :func:`_resolve_2d_vtrack_var` (vtracks) or the bare-track defaulting
+    used by :func:`_resolve_exprs_for_scanner` (bare tracks). The resulting
+    set of unique symbols is what the C++ scanner will be asked to compute;
+    per-rectangle arithmetic is then evaluated in Python over the returned
+    per-symbol arrays.
+
+    Returns
+    -------
+    None
+        If any symbol is unresolvable, refers to a 1D track, an unsupported
+        vtrack, or if the expression contains no resolvable symbols at all.
+    (eval_specs, var_specs)
+        - ``eval_specs`` is a list (one entry per user expression) of
+          ``(expr_with_safe_names, safe_to_orig_map)`` tuples. The safe
+          expression uses ``__pmv_<hex>`` identifiers for symbols and is
+          ready for :func:`compile_safe_expression`.
+        - ``var_specs`` is a deduped list of
+          ``(safe_name, (track, func, params, ss1, es1, ss2, es2))`` tuples
+          driving one C++ scanner var per entry.
+    """
+    track_names_now = _track_names_set()
+    vtrack_names_now = set(_shared._VTRACKS.keys())
+
+    # safe_name -> (track, func, params, ss1, es1, ss2, es2)
+    seen_vars: dict[str, tuple[str, str, object, int, int, int, int]] = {}
+    eval_specs: list[tuple[str, dict[str, str]]] = []
+
+    for expr in exprs:
+        # Parse the expression into safe identifiers, collecting which tracks
+        # and vtracks were referenced.
+        new_expr, used_tracks, used_vtracks, var_map = _parse_expr_vars(
+            expr, track_names_now, vtrack_names_now
+        )
+        # var_map: __pmv_<hex> -> original-name
+        # used_tracks / used_vtracks: original names actually present
+
+        if not used_tracks and not used_vtracks:
+            # No resolvable symbols at all (e.g. "1 + 2"). Not for the scanner.
+            return None
+
+        for safe_name, orig_name in var_map.items():
+            if safe_name in seen_vars:
+                continue  # already resolved on a prior expression
+            if orig_name in vtrack_names_now:
+                r = _resolve_2d_vtrack_var(orig_name)
+                if r is None:
+                    return None  # 1D source, unsupported func, etc.
+                seen_vars[safe_name] = r
+            elif orig_name in track_names_now:
+                from .tracks import gtrack_info
+                try:
+                    info = gtrack_info(orig_name)
+                except Exception:
+                    return None
+                if int(info.get("dimensions", 1) or 1) != 2:
+                    return None  # 1D bare-track ref in a 2D expression
+                seen_vars[safe_name] = (orig_name, "avg", None, 0, 0, 0, 0)
+            else:
+                return None  # unknown identifier; fall through
+
+        # Validate that the rewritten expression has no stray identifiers
+        # beyond our safe names + the always-allowed numeric helpers. Any
+        # other identifier likely refers to a caller-namespace variable; in
+        # that case let the legacy path handle it.
+        try:
+            compile_safe_expression(new_expr, set(var_map.keys()))
+        except UnsafeExpressionError:
+            return None
+
+        eval_specs.append((new_expr, dict(var_map)))
+
+    var_specs = list(seen_vars.items())
+    return eval_specs, var_specs
 
 
 def _group_intervals_by_chrom_pair(
@@ -938,6 +1020,7 @@ def _gextract_2d_via_scanner(
         colnames_list = list(colnames)
 
     # Build the policy dict for the C++ binding.
+    policy_dict: dict[str, Any]
     if isinstance(policy, IntervalsPolicy):
         policy_dict = {"kind": "intervals"}
     elif isinstance(policy, TrackRectsPolicy):
@@ -954,7 +1037,7 @@ def _gextract_2d_via_scanner(
     elif isinstance(policy, CartesianGridSpec):
         cmap = _chrom_id_map()
 
-        def _df_to_intervals_dict(df):
+        def _df_to_intervals_dict(df: pd.DataFrame | None) -> dict[str, Any] | None:
             if df is None:
                 return None
             chrom_strs = df["chrom"].astype(str).tolist()
@@ -967,13 +1050,17 @@ def _gextract_2d_via_scanner(
                 "end":   df["end"].to_numpy(dtype=_numpy.int64),
             }
 
+        # `expansion2` is typed `object` on the dataclass; `__post_init__`
+        # always normalizes it to a tuple (mirroring `expansion1`), so it is
+        # safe to feed straight to numpy here.
+        expansion2_tuple = cast(tuple, policy.expansion2)
         policy_dict = {
             "kind":         "cartesian_grid",
-            "intervals1":   _df_to_intervals_dict(policy.intervals1),
+            "intervals1":   _df_to_intervals_dict(cast("pd.DataFrame | None", policy.intervals1)),
             "expansion1":   _numpy.array(list(policy.expansion1), dtype=_numpy.int64),
-            "intervals2":   _df_to_intervals_dict(policy.intervals2),
+            "intervals2":   _df_to_intervals_dict(cast("pd.DataFrame | None", policy.intervals2)),
             "expansion2":   (
-                _numpy.array(list(policy.expansion2), dtype=_numpy.int64)
+                _numpy.array(list(expansion2_tuple), dtype=_numpy.int64)
                 if policy.intervals2 is not None
                 else None
             ),
@@ -1038,6 +1125,72 @@ def _gextract_2d_via_scanner(
     return out.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
 
 
+def _gextract_2d_compound_via_scanner(
+    exprs: list[str],
+    intervals: pd.DataFrame,
+    policy: object,
+    *,
+    colnames: list[str] | None,
+    band: tuple[int, int] | None,
+    eval_specs: list[tuple[str, dict[str, str]]],
+    var_specs: list[tuple[str, tuple[str, str, object, int, int, int, int]]],
+) -> pd.DataFrame:
+    """Run compound 2D expressions through the C++ scanner.
+
+    Asks the scanner for one column per unique symbol (under safe internal
+    names), then evaluates each user expression over the resulting per-symbol
+    arrays. ``eval_specs`` carries the rewritten expressions and the safe-name
+    map produced by :func:`_resolve_2d_compound_for_scanner`; ``var_specs``
+    drives the scanner with the deduped var list.
+    """
+    safe_names = [safe for safe, _ in var_specs]
+    resolved_vars = [vt for _, vt in var_specs]
+
+    scanner_out = _gextract_2d_via_scanner(
+        # Use safe names so the binding does not collide with user-facing names.
+        safe_names, intervals, policy,
+        colnames=safe_names, band=band, resolved_vars=resolved_vars,
+    )
+
+    if colnames is None:
+        out_names = list(exprs)
+    elif isinstance(colnames, str):
+        out_names = [colnames]
+    else:
+        out_names = list(colnames)
+    if len(out_names) != len(exprs):
+        raise ValueError(
+            f"colnames length ({len(out_names)}) does not match exprs length ({len(exprs)})"
+        )
+
+    out = scanner_out[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+    for (safe_expr, var_map), out_name in zip(eval_specs, out_names, strict=True):
+        ns: dict[str, Any] = {
+            "np": _numpy, "numpy": _numpy,
+            "abs": abs, "min": min, "max": max,
+            "round": round, "float": float, "int": int, "bool": bool,
+        }
+        for safe in var_map:
+            ns[safe] = scanner_out[safe].to_numpy()
+        try:
+            code = compile_safe_expression(safe_expr, set(var_map.keys()))
+        except UnsafeExpressionError as exc:
+            raise ValueError(
+                f"2D compound expression {ns_orig(var_map, safe_expr)!r} is not safe to evaluate: {exc}"
+            ) from exc
+        out[out_name] = eval(code, ns)  # noqa: S307 - compiled+validated AST
+    out["intervalID"] = scanner_out["intervalID"].to_numpy()
+    return out
+
+
+def ns_orig(var_map: dict[str, str], safe_expr: str) -> str:
+    """Best-effort restoration of original symbol names in a safe expression for error messages."""
+    s = safe_expr
+    for safe, orig in var_map.items():
+        s = s.replace(safe, orig)
+    return s
+
+
 def _gextract_2d(
     exprs: list[str],
     intervals: pd.DataFrame,
@@ -1088,11 +1241,19 @@ def _gextract_2d(
                     exprs, intervals, policy, colnames=colnames, band=band,
                     resolved_vars=resolved,
                 )
+            compound = _resolve_2d_compound_for_scanner(exprs)
+            if compound is not None:
+                eval_specs, var_specs = compound
+                return _gextract_2d_compound_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    eval_specs=eval_specs, var_specs=var_specs,
+                )
             raise NotImplementedError(
                 "iterator=(N, M) FixedRect binning is not supported for "
                 "this expression. Supported: bare physical 2D track names, "
-                "or single-source reducing vtracks "
-                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})})."
+                "single-source reducing vtracks "
+                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})}), or "
+                "compound expressions over those (e.g. \"v_a + v_b\")."
             )
 
     # ── TrackRects via C++ scanner (new in v0.1.75) ───────────────────────
@@ -1150,7 +1311,17 @@ def _gextract_2d(
                     exprs, intervals, policy, colnames=colnames, band=band,
                     resolved_vars=resolved,
                 )
-            # Compound expressions or unsupported vtracks: fall through to
+            compound = _resolve_2d_compound_for_scanner(exprs)
+            if compound is not None:
+                from ._iterator_policy import TrackRectsPolicy
+
+                eval_specs, var_specs = compound
+                policy = TrackRectsPolicy(track_name=iterator)
+                return _gextract_2d_compound_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    eval_specs=eval_specs, var_specs=var_specs,
+                )
+            # Unsupported vtracks or non-routable compound: fall through to
             # the legacy path which resolves vtracks via the original flow.
 
     # ── CartesianGridSpec via C++ scanner (new in v0.1.76) ───────────────────
@@ -1166,11 +1337,19 @@ def _gextract_2d(
                     exprs, intervals, iterator, colnames=colnames, band=band,
                     resolved_vars=resolved,
                 )
+            compound = _resolve_2d_compound_for_scanner(exprs)
+            if compound is not None:
+                eval_specs, var_specs = compound
+                return _gextract_2d_compound_via_scanner(
+                    exprs, intervals, iterator, colnames=colnames, band=band,
+                    eval_specs=eval_specs, var_specs=var_specs,
+                )
             raise NotImplementedError(
                 "iterator=CartesianGridSpec(...) is not supported for this "
-                "expression. Supported: bare physical 2D track names, or "
+                "expression. Supported: bare physical 2D track names, "
                 "single-source reducing vtracks "
-                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})})."
+                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})}), or "
+                "compound expressions over those (e.g. \"v_a + v_b\")."
             )
 
     # ── Intervals iterator via C++ scanner (opt-in, release 4) ───────────────
@@ -1188,7 +1367,15 @@ def _gextract_2d(
                 colnames=colnames, band=band,
                 resolved_vars=resolved,
             )
-        # Unsupported vtracks or compound exprs: fall through to legacy.
+        compound = _resolve_2d_compound_for_scanner(exprs)
+        if compound is not None:
+            eval_specs, var_specs = compound
+            return _gextract_2d_compound_via_scanner(
+                exprs, intervals, IntervalsPolicy(),
+                colnames=colnames, band=band,
+                eval_specs=eval_specs, var_specs=var_specs,
+            )
+        # Unsupported vtracks or non-routable compound: fall through to legacy.
 
     track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
@@ -2229,6 +2416,10 @@ def gextract(
             )
             if all_array_slice:
                 # Use intervals as-is, assigning intervalID 1..N
+                # By this point intervals is guaranteed to be a DataFrame
+                # (preprocessing above resolves named sets); the cast is purely
+                # to narrow the static type away from the input str alternative.
+                assert isinstance(intervals, _pandas.DataFrame)
                 iter_df = intervals.copy()
                 iter_df["intervalID"] = _numpy.arange(1, len(iter_df) + 1, dtype=int)
             elif len(exprs) == 1:

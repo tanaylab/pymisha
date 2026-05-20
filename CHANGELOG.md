@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.86 (2026-05-20)
+
+### Fixes
+- **CI green.** Mypy now passes (`pymisha/extract.py` policy-dict and CartesianGrid resolver were inferred as `dict[str, str]` and `object`; both annotated explicitly. `pymisha/vtracks.py::gvtrack_array_slice` slice-list narrowing was tightened). The `test_computed_tracks` module fixture re-inits the canonical test db before writing the COMPUTED stub so the on-disk file matches the active db pointer regardless of which prior test last called `gdb_init_examples()`. No runtime behavior change.
+
+## v0.1.85 (2026-05-20)
+
+### Features
+- **Multi-track 2D compound expressions (R parity).** `gextract("v_a + v_b", ...)`, `gextract("track_a - track_b", ...)`, and any compound 2D expression mixing bare 2D tracks and reducing vtracks now route through the C++ scanner. Each symbol is computed once per rectangle, then the compound expression is evaluated over the per-symbol arrays. Works with `iterator=(N, M)`, `iterator="<2D track>"`, `iterator=CartesianGridSpec(...)`, and the opt-in `PYMISHA_USE_SCANNER_FOR_INTERVALS=1` intervals-iterator path. Previously raised `NotImplementedError` or silently fell through.
+
 ## v0.1.84 (2026-05-20)
 
 ### Fixes
