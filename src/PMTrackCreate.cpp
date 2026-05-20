@@ -918,9 +918,12 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
         PyObject *py_intervals = nullptr;
         PyObject *py_iterator = nullptr;
         PyObject *py_config = nullptr;
+        PyObject *py_vtracks = nullptr;
 
-        if (!PyArg_ParseTuple(args, "ssO|OO", &track, &expr, &py_intervals, &py_iterator, &py_config))
+        if (!PyArg_ParseTuple(args, "ssO|OOO", &track, &expr, &py_intervals, &py_iterator, &py_config, &py_vtracks))
             verror("Invalid arguments to pm_track_create_expr");
+        if (py_vtracks == Py_None)
+            py_vtracks = nullptr;
 
         string track_name(track);
         if (g_pmdb->track_exists(track_name))
@@ -946,7 +949,7 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
         }
 
         vector<string> exprs = {string(expr)};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
         const bool indexed_db = db_is_indexed();
@@ -1024,9 +1027,12 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
         const char *expr = nullptr;
         PyObject *py_intervals = nullptr;
         long iterator_policy = 0;
+        PyObject *py_vtracks = nullptr;
 
-        if (!PyArg_ParseTuple(args, "ssOl", &track, &expr, &py_intervals, &iterator_policy))
+        if (!PyArg_ParseTuple(args, "ssOl|O", &track, &expr, &py_intervals, &iterator_policy, &py_vtracks))
             verror("Invalid arguments to pm_modify");
+        if (py_vtracks == Py_None)
+            py_vtracks = nullptr;
 
         string track_name(track);
         if (!g_pmdb->track_exists(track_name))
@@ -1041,7 +1047,7 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
 
         PMTrackExprScanner scanner;
         vector<string> exprs = {string(expr)};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
         PMFixedBinIterator *fitr = dynamic_cast<PMFixedBinIterator *>(scanner.get_iterator());
         if (!fitr)
@@ -1090,9 +1096,12 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
         double weight_thr = 0;
         int smooth_nans = 0;
         const char *alg = nullptr;
+        PyObject *py_vtracks = nullptr;
 
-        if (!PyArg_ParseTuple(args, "ssOlddis", &track, &expr, &py_intervals, &iterator_policy, &winsize, &weight_thr, &smooth_nans, &alg))
+        if (!PyArg_ParseTuple(args, "ssOlddis|O", &track, &expr, &py_intervals, &iterator_policy, &winsize, &weight_thr, &smooth_nans, &alg, &py_vtracks))
             verror("Invalid arguments to pm_smooth");
+        if (py_vtracks == Py_None)
+            py_vtracks = nullptr;
 
         string track_name(track);
         if (g_pmdb->track_exists(track_name))
@@ -1119,7 +1128,7 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
 
         PMTrackExprScanner scanner;
         vector<string> exprs = {string(expr)};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
         PMFixedBinIterator *fitr = dynamic_cast<PMFixedBinIterator *>(scanner.get_iterator());
         if (!fitr)

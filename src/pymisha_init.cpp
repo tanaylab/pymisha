@@ -100,9 +100,15 @@ PyObject *pm_ggenome_implant(PyObject *self, PyObject *args);
 PyObject *pm_intervals_random(PyObject *self, PyObject *args);
 PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
+PyObject *pm_test_fixed_rect_iterator(PyObject *self, PyObject *args);
+PyObject *pm_test_fixed_rect_scanner(PyObject *self, PyObject *args);
+PyObject *pm_test_scanner_reuse(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args);
+PyObject *pm_test_track_rects_iterator(PyObject *self, PyObject *args);
+PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args);
+PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -174,9 +180,16 @@ static PyMethodDef module_methods[] = {
     {"pm_intervals_random", pm_intervals_random, METH_VARARGS, "Generate random non-overlapping genomic intervals (C++ fast path)"},
     {"pm_parse_wig_or_bedgraph", pm_parse_wig_or_bedgraph, METH_VARARGS, "Parse a WIG/BedGraph file into chrom/start/end/value arrays (C++ fast path)"},
     {"pm_test_2d_iterator", pm_test_2d_iterator, METH_VARARGS, "Test-only: drive PMTrackExpressionIntervals2DIterator and return emissions"},
+    {"pm_test_fixed_rect_iterator", pm_test_fixed_rect_iterator, METH_VARARGS, "Test-only: walk a FixedRect 2D iterator. Args: width, height, intervals_dict, band|None."},
+    {"pm_test_fixed_rect_scanner", pm_test_fixed_rect_scanner, METH_VARARGS, "Test-only: FixedRect iterator + 2D scanner end-to-end. Args: width, height, track, func, intervals_dict, band|None."},
+    {"pm_test_scanner_reuse", pm_test_scanner_reuse, METH_VARARGS, "Test-only: call run() twice on the same scanner to verify state reset. Args: width, height, track, func, intervals1_dict, intervals2_dict."},
     {"pm_test_2d_scanner", pm_test_2d_scanner, METH_VARARGS, "Test-only: drive PMTrackExpr2DScanner over a 2D track + intervals"},
+    {"pm_test_track_rects_iterator", pm_test_track_rects_iterator, METH_VARARGS, "Test-only: walk a TrackRects 2D iterator. Args: track_name, intervals_dict, band|None."},
+    {"pm_test_cartesian_grid_iterator", pm_test_cartesian_grid_iterator, METH_VARARGS, "Test-only: walk a CartesianGrid 2D iterator. Args: intervals1, expansion1, intervals2|None, expansion2|None, band_idx|None, scope, band|None."},
     {"pm_extract_2d", pm_extract_2d, METH_VARARGS, "Extract objects from a 2D RECTS/POINTS track for 2D intervals"},
     {"pm_extract_2d_objects", pm_extract_2d_objects, METH_VARARGS, "Reduce a 2D RECTS/POINTS track to a per-interval scalar via exists/size/first/last/sample"},
+    {"pm_extract_2d_scanner", pm_extract_2d_scanner, METH_VARARGS,
+     "Run the 2D scanner with an iterator policy. Args: policy_dict, intervals_dict, vars_list, colnames_list, band|None. Returns dict of per-colname value arrays plus _chrom1/_start1/_end1/_chrom2/_start2/_end2 coord arrays."},
     {NULL, NULL, 0, NULL}
 };
 

@@ -23,6 +23,7 @@ file in the track directory is an R-serialized named integer vector
 from __future__ import annotations
 
 import struct
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as _numpy
@@ -315,4 +316,64 @@ def extract_array(
     for i, name in enumerate(sel_names):
         out[name] = val_matrix[:, i]
     out["intervalID"] = iid_out
+    return out
+
+
+# Valid per-row reducer functions (matches R's SliceFunctions enum).
+ARRAY_REDUCE_FUNCS = {"avg", "min", "max", "sum", "stddev", "stdev"}
+
+
+def reduce_array_extract(
+    extracted: _pd.DataFrame,
+    val_cols: list[str],
+    func: str,
+    n_intervals: int,
+) -> _numpy.ndarray:
+    """Reduce *extracted* (output of ``extract_array``) to one scalar per interval.
+
+    Groups extracted rows by ``intervalID`` and applies *func* over all
+    non-NaN values in all selected columns (matching R's
+    ``GenomeTrackArrays::get_sliced_val`` cross-position / cross-column
+    aggregation semantics).  Rows for interval IDs absent from *extracted*
+    get NaN.
+    """
+    func = func.lower()
+    if func not in ARRAY_REDUCE_FUNCS:
+        raise ValueError(
+            f"Array track aggregation function must be one of "
+            f"{sorted(ARRAY_REDUCE_FUNCS)!r}, got {func!r}"
+        )
+
+    out = _numpy.full(n_intervals, _numpy.nan, dtype=_numpy.float64)
+
+    if extracted.empty or not val_cols:
+        return out
+
+    vals = extracted[val_cols].to_numpy(dtype=_numpy.float64)  # (nrows, ncols)
+    iids = extracted["intervalID"].to_numpy(dtype=_numpy.int64)  # 1-based
+
+    # Group rows by intervalID
+    groups: dict[int, list] = defaultdict(list)
+    for row_i, iid in enumerate(iids):
+        idx = int(iid) - 1  # 0-based
+        if 0 <= idx < n_intervals:
+            groups[idx].append(vals[row_i])
+
+    for idx, rows in groups.items():
+        # Concatenate all values across selected columns and all rows
+        all_vals = _numpy.concatenate(list(rows))
+        finite = all_vals[~_numpy.isnan(all_vals)]
+        if finite.size == 0:
+            continue
+        if func in ("avg", "mean"):
+            out[idx] = float(_numpy.mean(finite))
+        elif func == "min":
+            out[idx] = float(_numpy.min(finite))
+        elif func == "max":
+            out[idx] = float(_numpy.max(finite))
+        elif func == "sum":
+            out[idx] = float(_numpy.sum(finite))
+        elif func in ("stddev", "stdev"):
+            out[idx] = float(_numpy.std(finite, ddof=1)) if finite.size > 1 else _numpy.nan
+
     return out

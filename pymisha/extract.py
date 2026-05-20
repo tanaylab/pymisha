@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import collections.abc
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ._iterator_policy import FixedRectPolicy
 
 import pandas as pd
 
@@ -30,6 +33,41 @@ from ._shared import (
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
+
+
+def _scanner_for_intervals_enabled() -> bool:
+    """Return True when the env-var opt-in for the intervals scanner path is set."""
+    return os.environ.get("PYMISHA_USE_SCANNER_FOR_INTERVALS", "").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def _resolve_exprs_for_scanner(exprs: list[str]) -> list[tuple[str, str, object, int, int, int, int]] | None:
+    """Try to resolve every expression in ``exprs`` for the C++ 2D scanner.
+
+    Each expression must be either:
+    - A bare physical 2D track name (not a vtrack), OR
+    - A supported reducing 2D vtrack (see ``_resolve_2d_vtrack_var``).
+
+    Returns a list of ``(physical_track, func, params, ss1, es1, ss2, es2)``
+    tuples — one per expression — or ``None`` if any expression cannot be
+    routed through the scanner (compound expression, unsupported vtrack,
+    1D vtrack, etc.).
+    """
+    track_names_now = _track_names_set()
+    vtrack_names_now = set(_shared._VTRACKS.keys())
+
+    resolved: list[tuple[str, str, object, int, int, int, int]] = []
+    for expr in exprs:
+        if expr in track_names_now and expr not in vtrack_names_now:
+            # Bare physical track: default aggregation is "avg", no shifts.
+            resolved.append((expr, "avg", None, 0, 0, 0, 0))
+        else:
+            r = _resolve_2d_vtrack_var(expr)
+            if r is None:
+                return None  # compound expr, unsupported vtrack, etc.
+            resolved.append(r)
+    return resolved
 
 
 def _group_intervals_by_chrom_pair(
@@ -111,6 +149,9 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
+            return False
+        # Array-slice vtracks must go through Python
+        if cfg.get("kind") == "array_slice":
             return False
         # Filter vtracks must go through Python
         filt = cfg.get("filter")
@@ -380,6 +421,68 @@ _2D_VTRACK_FUNCS = {
 _2D_AGG_FUNCS = {"area", "weighted.sum", "min", "max", "avg"}
 _2D_OBJECT_FUNCS = {"exists", "size", "first", "last", "sample"}
 _2D_PERCENTILE_FUNCS = {"global.percentile"}
+
+# Funcs supported by PMTrackExpression2DVars::add_var (C++ scanner).
+# Verified by reading src/PMTrackExpression2DVars.cpp::parse_func.
+# "mean" is an alias for "avg" and is normalised below.
+# Object-level funcs (exists/size/first/last/sample) use query_objects per cell
+# inside set_vars_batch; global.percentile is deferred.
+_SCANNER_2D_FUNCS = {
+    "area", "weighted.sum", "min", "max", "avg", "mean",
+    "exists", "size", "first", "last", "sample",
+}
+
+
+def _resolve_2d_vtrack_var(expr: str) -> tuple[str, str, object, int, int, int, int] | None:
+    """Resolve a 2D vtrack expression to (physical_track, func, params, ss1, es1, ss2, es2).
+
+    Returns None when the expression is not a vtrack, or is a vtrack that
+    cannot be routed through the C++ scanner in this release (unsupported func,
+    compound source, non-string source, dim-projected 1D vtrack, or source
+    that is not a 2D track).
+
+    Supported: single-source 2D reducing vtracks with func in
+    ``_SCANNER_2D_FUNCS`` (area/weighted.sum/min/max/avg + exists/size/first/last/sample),
+    with optional per-var 2D shifts (sshift1/eshift1/sshift2/eshift2).
+    ``global.percentile`` is not scanner-supported and returns None.
+    """
+    cfg = _shared._VTRACKS.get(expr)
+    if cfg is None:
+        return None  # not a vtrack at all
+
+    # Dim-projected vtracks (dim=1 or dim=2) are 1D tracks viewed in 2D context.
+    # They are not backed by a 2D source track and cannot use the 2D scanner.
+    if cfg.get("dim") is not None:
+        return None
+
+    func = str(cfg.get("func", "avg")).lower()
+    # Normalise "mean" -> "avg" to match C++ scanner expectations.
+    if func == "mean":
+        func = "avg"
+
+    if func not in _SCANNER_2D_FUNCS:
+        return None  # global.percentile not scanner-supported (deferred)
+
+    src = cfg.get("src")
+    if not isinstance(src, str):
+        return None  # DataFrame source or compound — not a single named 2D track
+
+    # Verify the source is actually a 2D track (not 1D dense/fixedbin/etc.).
+    from .tracks import gtrack_info
+
+    try:
+        info = gtrack_info(src)
+    except Exception:
+        return None
+    if int(info.get("dimensions", 1) or 1) != 2:
+        return None  # 1D source track; can't use 2D scanner
+
+    params = cfg.get("params")
+    sshift1 = int(cfg.get("sshift1", 0) or 0)
+    eshift1 = int(cfg.get("eshift1", 0) or 0)
+    sshift2 = int(cfg.get("sshift2", 0) or 0)
+    eshift2 = int(cfg.get("eshift2", 0) or 0)
+    return (src, func, params, sshift1, eshift1, sshift2, eshift2)
 
 
 def _resolve_2d_vtrack_source(vtrack_name: str) -> tuple[str, dict[str, int], str]:
@@ -785,6 +888,156 @@ def _gextract_2d_vtrack_global_percentile(
     return agg_df
 
 
+def _gextract_2d_via_scanner(
+    exprs: list[str],
+    intervals: pd.DataFrame,
+    policy: FixedRectPolicy | Any,
+    *,
+    colnames: list[str] | None,
+    band: tuple[int, int] | None,
+    resolved_vars: list[tuple[str, str, object, int, int, int, int]] | None = None,
+) -> pd.DataFrame:
+    """Run a 2D extract through pm_extract_2d_scanner (FixedRect, TrackRects, or CartesianGrid).
+
+    Supports bare 2D track names as expressions and, when ``resolved_vars`` is
+    provided, reducing 2D vtracks.  Each bare track defaults to "avg".
+
+    Parameters
+    ----------
+    resolved_vars : list of (physical_track, func, params, ss1, es1, ss2, es2) or None
+        When provided, one entry per expression.  The physical_track, func, and
+        shifts are passed directly to the C++ scanner; params is currently unused.
+        When None, all ``exprs`` are treated as bare physical track names with
+        "avg" aggregation and zero shifts.
+
+    Returns a DataFrame with chrom1, start1, end1, chrom2, start2, end2,
+    <colname>, intervalID columns - matching the shape returned by the
+    regular _gextract_2d path.
+    """
+    from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
+    from .intervals import _chrom_id_map
+
+    exprs_list = list(exprs)
+
+    # Build (track, func, ss1, es1, ss2, es2) tuples for the C++ scanner.
+    if resolved_vars is not None:
+        # Caller supplied (physical_track, func, params, ss1, es1, ss2, es2).
+        vars_list = [
+            (track, func, ss1, es1, ss2, es2)
+            for (track, func, _params, ss1, es1, ss2, es2) in resolved_vars
+        ]
+    else:
+        # Bare physical track names: default aggregation is "avg", no shifts.
+        vars_list = [(expr, "avg", 0, 0, 0, 0) for expr in exprs_list]
+
+    if colnames is None:
+        colnames_list = list(exprs_list)
+    elif isinstance(colnames, str):
+        colnames_list = [colnames]
+    else:
+        colnames_list = list(colnames)
+
+    # Build the policy dict for the C++ binding.
+    if isinstance(policy, IntervalsPolicy):
+        policy_dict = {"kind": "intervals"}
+    elif isinstance(policy, TrackRectsPolicy):
+        policy_dict = {
+            "kind": "track_rects",
+            "track_name": policy.track_name,
+        }
+    elif isinstance(policy, FixedRectPolicy):
+        policy_dict = {
+            "kind": "fixed_rect",
+            "width": int(policy.width),
+            "height": int(policy.height),
+        }
+    elif isinstance(policy, CartesianGridSpec):
+        cmap = _chrom_id_map()
+
+        def _df_to_intervals_dict(df):
+            if df is None:
+                return None
+            chrom_strs = df["chrom"].astype(str).tolist()
+            chromids = _numpy.array(
+                [cmap.get(c, -1) for c in chrom_strs], dtype=_numpy.int32
+            )
+            return {
+                "chrom": chromids,
+                "start": df["start"].to_numpy(dtype=_numpy.int64),
+                "end":   df["end"].to_numpy(dtype=_numpy.int64),
+            }
+
+        policy_dict = {
+            "kind":         "cartesian_grid",
+            "intervals1":   _df_to_intervals_dict(policy.intervals1),
+            "expansion1":   _numpy.array(list(policy.expansion1), dtype=_numpy.int64),
+            "intervals2":   _df_to_intervals_dict(policy.intervals2),
+            "expansion2":   (
+                _numpy.array(list(policy.expansion2), dtype=_numpy.int64)
+                if policy.intervals2 is not None
+                else None
+            ),
+            "min_band_idx": policy.min_band_idx,
+            "max_band_idx": policy.max_band_idx,
+        }
+    else:
+        raise TypeError(f"Unsupported iterator policy: {type(policy)!r}")
+
+    # Convert chrom name strings to chromid integers for the scope dict.
+    cmap = _chrom_id_map()
+    chrom1_ids = (
+        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
+    chrom2_ids = (
+        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        .map(cmap)
+        .fillna(-1)
+        .astype(_numpy.int32)
+        .to_numpy()
+    )
+    scope_dict = {
+        "chrom1": chrom1_ids,
+        "start1": intervals["start1"].to_numpy(dtype=_numpy.int64),
+        "end1":   intervals["end1"].to_numpy(dtype=_numpy.int64),
+        "chrom2": chrom2_ids,
+        "start2": intervals["start2"].to_numpy(dtype=_numpy.int64),
+        "end2":   intervals["end2"].to_numpy(dtype=_numpy.int64),
+    }
+
+    band_arg = (int(band[0]), int(band[1])) if band is not None else None
+
+    result = _pymisha.pm_extract_2d_scanner(
+        policy_dict, scope_dict, vars_list, colnames_list, band_arg
+    )
+
+    # Convert chromid integers back to chrom name strings.
+    id2name = {v: k for k, v in cmap.items()}
+    c1_arr = _numpy.asarray(result["_chrom1"], dtype=_numpy.int64)
+    c2_arr = _numpy.asarray(result["_chrom2"], dtype=_numpy.int64)
+    c1_series = _pandas.Series(c1_arr).astype("int64")
+    chrom1_names = c1_series.map(id2name).fillna(c1_series.astype(str)).to_numpy()
+    c2_series = _pandas.Series(c2_arr).astype("int64")
+    chrom2_names = c2_series.map(id2name).fillna(c2_series.astype(str)).to_numpy()
+
+    n = len(chrom1_names)
+    out = _pandas.DataFrame({
+        "chrom1": chrom1_names,
+        "start1": result["_start1"],
+        "end1":   result["_end1"],
+        "chrom2": chrom2_names,
+        "start2": result["_start2"],
+        "end2":   result["_end2"],
+    })
+    for name in colnames_list:
+        out[name] = result[name]
+    out["intervalID"] = _numpy.arange(n, dtype=int)
+    return out.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
+
+
 def _gextract_2d(
     exprs: list[str],
     intervals: pd.DataFrame,
@@ -810,6 +1063,133 @@ def _gextract_2d(
     from .tracks import gtrack_info
 
     band = _validate_band(band)
+
+    # ── FixedRect via C++ scanner (new in v0.1.75) ────────────────────────
+    # A tuple/list of two positive integers means FixedRect binning.
+    # Route through pm_extract_2d_scanner when expressions are bare physical
+    # track names (no vtracks, no complex expressions).  If the check below
+    # finds vtracks, we fall through to the regular path which will raise a
+    # helpful error (vtracks not supported with iterator=(N,M) for now).
+    if (
+        iterator is not None
+        and not isinstance(iterator, str)
+        and isinstance(iterator, (tuple, list))
+        and len(iterator) == 2
+    ):
+        from ._iterator_policy import FixedRectPolicy, parse_iterator_policy
+
+        policy = parse_iterator_policy(iterator, intervals_is_2d=True)
+        if isinstance(policy, FixedRectPolicy):
+            # Route if all expressions are bare physical track names or
+            # supported reducing 2D vtracks (func in _SCANNER_2D_FUNCS).
+            resolved = _resolve_exprs_for_scanner(exprs)
+            if resolved is not None:
+                return _gextract_2d_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    resolved_vars=resolved,
+                )
+            raise NotImplementedError(
+                "iterator=(N, M) FixedRect binning is not supported for "
+                "this expression. Supported: bare physical 2D track names, "
+                "or single-source reducing vtracks "
+                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})})."
+            )
+
+    # ── TrackRects via C++ scanner (new in v0.1.75) ───────────────────────
+    # String iterator: validate then dispatch.
+    # - 2D rectangles/points track + all-bare exprs -> TrackRects C++ scanner
+    # - 2D rectangles/points track + vtracks -> fall through to legacy path
+    # - 1D track -> raise ValueError (R parity: R errors here)
+    # - saved interval set name -> fall through to legacy path (valid misha use)
+    # - unknown name (not a track, not an interval set) -> raise ValueError
+    if iterator is not None and isinstance(iterator, str):
+        from .tracks import gtrack_exists, gtrack_info
+
+        try:
+            _iter_exists = gtrack_exists(iterator)
+        except Exception:
+            _iter_exists = False
+
+        if not _iter_exists:
+            # Not a track: check if it's a saved interval set (valid legacy use).
+            from .intervals import gintervals_exists
+
+            try:
+                _is_iset = gintervals_exists(iterator)
+            except Exception:
+                _is_iset = False
+
+            if not _is_iset:
+                raise ValueError(
+                    f"Invalid iterator: {iterator!r} is not a known track name."
+                )
+            # It's a saved interval set: fall through to the legacy 2D dispatch.
+        else:
+            _iter_info = gtrack_info(iterator)
+            _iter_type = (
+                _iter_info.get("type") if isinstance(_iter_info, dict)
+                else getattr(_iter_info, "type", None)
+            )
+
+            if _iter_type not in ("rectangles", "points"):
+                raise ValueError(
+                    f"Invalid iterator: {iterator!r} is a 1D track (type={_iter_type!r}). "
+                    "A 2D rectangles or points track is required when using a track "
+                    "name as iterator for 2D extraction."
+                )
+
+            # 2D rects/points track confirmed.
+            # Route if all expressions are bare physical tracks or supported
+            # reducing 2D vtracks; otherwise fall through to the legacy path.
+            resolved = _resolve_exprs_for_scanner(exprs)
+            if resolved is not None:
+                from ._iterator_policy import TrackRectsPolicy
+
+                policy = TrackRectsPolicy(track_name=iterator)
+                return _gextract_2d_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    resolved_vars=resolved,
+                )
+            # Compound expressions or unsupported vtracks: fall through to
+            # the legacy path which resolves vtracks via the original flow.
+
+    # ── CartesianGridSpec via C++ scanner (new in v0.1.76) ───────────────────
+    # CartesianGridSpec passed as iterator= routes through the C++ scanner
+    # when all expressions are bare physical track names.
+    if iterator is not None:
+        from ._iterator_policy import CartesianGridSpec
+
+        if isinstance(iterator, CartesianGridSpec):
+            resolved = _resolve_exprs_for_scanner(exprs)
+            if resolved is not None:
+                return _gextract_2d_via_scanner(
+                    exprs, intervals, iterator, colnames=colnames, band=band,
+                    resolved_vars=resolved,
+                )
+            raise NotImplementedError(
+                "iterator=CartesianGridSpec(...) is not supported for this "
+                "expression. Supported: bare physical 2D track names, or "
+                "single-source reducing vtracks "
+                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})})."
+            )
+
+    # ── Intervals iterator via C++ scanner (opt-in, release 4) ───────────────
+    # When PYMISHA_USE_SCANNER_FOR_INTERVALS=1 and there is no explicit iterator
+    # (iterator is None), route all-bare-track extracts through the scanner
+    # instead of the legacy object-enumeration bypass.  vtracks and any case
+    # with a distinct iterator fall through to the legacy path unchanged.
+    if _scanner_for_intervals_enabled() and iterator is None:
+        from ._iterator_policy import IntervalsPolicy
+
+        resolved = _resolve_exprs_for_scanner(exprs)
+        if resolved is not None:
+            return _gextract_2d_via_scanner(
+                exprs, intervals, IntervalsPolicy(),
+                colnames=colnames, band=band,
+                resolved_vars=resolved,
+            )
+        # Unsupported vtracks or compound exprs: fall through to legacy.
+
     track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())
 
@@ -1841,15 +2221,27 @@ def gextract(
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         if iterator is None:
-            if len(exprs) == 1:
+            # Array-slice vtracks can determine their own iterator from the
+            # query intervals (one output row per input interval).
+            all_array_slice = used_vtracks and all(
+                _shared._VTRACKS.get(vt, {}).get("kind") == "array_slice"
+                for vt in used_vtracks
+            )
+            if all_array_slice:
+                # Use intervals as-is, assigning intervalID 1..N
+                iter_df = intervals.copy()
+                iter_df["intervalID"] = _numpy.arange(1, len(iter_df) + 1, dtype=int)
+            elif len(exprs) == 1:
                 raise ValueError(
                     f"Cannot implicitly determine iterator policy:\n"
                     f'track expression "{exprs[0]}" does not contain any tracks.'
                 )
-            raise ValueError(
-                "Cannot implicitly determine iterator policy: track expressions do not contain any tracks."
-            )
-        iter_df = _iterated_intervals(intervals, iterator)
+            else:
+                raise ValueError(
+                    "Cannot implicitly determine iterator policy: track expressions do not contain any tracks."
+                )
+        else:
+            iter_df = _iterated_intervals(intervals, iterator)
 
     if iter_df is None or len(iter_df) == 0:
         return _apply_extract_output(

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "PMTrackExpression2DIteratorPolicy.h"
 #include "pymisha.h"
 
 // g_pymisha (declared in pymisha.h) is a PyMisha * holding global config
@@ -28,6 +29,8 @@ void PMTrackExpr2DScanner::run_single_var(
     const std::vector<GInterval2D> &intervals,
     const quadtree::DiagonalBand *band)
 {
+    // Reset all state from any prior run.
+    m_vars.clear();
     m_num_intervals = intervals.size();
 
     // Register a single var. add_var throws on bad track / bad func.
@@ -76,4 +79,68 @@ const double *PMTrackExpr2DScanner::values() const
 {
     if (m_vars.num_vars() == 0) return nullptr;
     return m_vars.var(0).values;
+}
+
+void PMTrackExpr2DScanner::run(
+    const PMTrackExpression2DIteratorPolicy &policy,
+    const std::vector<VarSpec> &vars,
+    const std::vector<GInterval2D> &scope,
+    const quadtree::DiagonalBand *band)
+{
+    // Reset all state from any prior run.
+    m_vars.clear();
+    m_emitted_intervals.clear();
+    m_emitted = 0;
+    m_num_intervals = 0;
+
+    // Register all vars with their per-var shifts (throws on invalid track / func).
+    for (const auto &vs : vars) {
+        m_vars.add_var(vs.name, vs.func,
+                       vs.sshift1, vs.eshift1,
+                       vs.sshift2, vs.eshift2);
+    }
+
+    // Build the polymorphic iterator from the policy and walk it.
+    // Walk pattern: read last_interval() then call next().
+    // This is correct for both Intervals2D (begin() does not prime) and
+    // FixedRect (constructor calls begin()->next() so first cell is
+    // already live on construction; the outer while(!isend) guard is
+    // what allows us to read before advancing).
+    // run_single_var uses a different advance-first loop; both patterns
+    // are correct for their respective iterator contracts.
+    auto itr = policy.make_iterator(scope, band);
+    itr->begin();
+    while (!itr->isend()) {
+        // NOTE: the full emitted set is materialized up-front. For FixedRect at HiC
+        // scale (~10^8 cells) this is several GB (sizeof(GInterval2D) ~= 32 bytes).
+        // A streaming variant will be needed in a later release; for release-1
+        // workloads (test DB) this is acceptable.
+        m_emitted_intervals.push_back(itr->last_interval());
+        itr->next();
+    }
+
+    m_emitted = m_emitted_intervals.size();
+    m_num_intervals = m_emitted;
+
+    if (m_emitted == 0) return;
+
+    PMPY ldict;
+    m_vars.define_py_vars(static_cast<unsigned>(m_emitted), ldict, true);
+
+    int config_buf = g_pymisha ? g_pymisha->eval_buf_size() : 1000;
+    if (config_buf <= 0) config_buf = 1000;
+    unsigned batch = static_cast<unsigned>(
+        std::min<size_t>(static_cast<size_t>(config_buf), m_emitted));
+
+    for (unsigned cursor = 0; cursor < m_emitted; cursor += batch) {
+        unsigned count = std::min(batch,
+                                  static_cast<unsigned>(m_emitted - cursor));
+        m_vars.set_vars_batch(m_emitted_intervals, cursor, count, band);
+    }
+}
+
+const double *PMTrackExpr2DScanner::values_for_var(unsigned i) const
+{
+    if (i >= m_vars.num_vars()) return nullptr;
+    return m_vars.var(i).values;
 }

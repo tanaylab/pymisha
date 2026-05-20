@@ -16,6 +16,7 @@ except PackageNotFoundError:
 import numpy as np  # noqa: F401
 
 from . import _shared
+from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
 from ._shared import (  # noqa: F401 — imported for _PMLOCALS C++ bridge
     CONFIG,
     _bound_colname,
@@ -209,6 +210,7 @@ from .tracks import (
     gtrack_var_set,
 )
 from .vtracks import (
+    gvtrack_array_slice,
     gvtrack_clear,
     gvtrack_create,
     gvtrack_filter,
@@ -384,6 +386,10 @@ __all__ = [
     'giterator_cartesian_grid',
     'giterator_intervals',
     'giterator_intervals_2d',
+    'CartesianGridSpec',
+    'FixedRectPolicy',
+    'IntervalsPolicy',
+    'TrackRectsPolicy',
     'gintervals_rbind',
     'gintervals_mark_overlaps',
     'gintervals_annotate',
@@ -393,6 +399,7 @@ __all__ = [
     'gintervals_from_mat',
 
     # Virtual track functions
+    'gvtrack_array_slice',
     'gvtrack_create',
     'gvtrack_ls',
     'gvtrack_info',

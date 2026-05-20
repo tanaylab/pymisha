@@ -170,6 +170,58 @@ def _check_computed_tracks(exprs: str | list[str]) -> None:
     _CHECK_EXPRS_CACHE.add(cache_key)
 
 
+def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
+    """Build the vtracks spec dict that the C++ track-create scanner needs.
+
+    Track-creating C++ entry points (``pm_track_create_expr``, ``pm_modify``,
+    ``pm_smooth``) accept an optional ``vtracks`` argument that mirrors the
+    one ``pm_extract`` already uses.  This helper inspects *expr*, finds the
+    virtual tracks it references, verifies they are all C++-eligible, and
+    returns the spec dict to forward.  Returns ``None`` when the expression
+    does not reference any vtracks (fast path: no extra work in C++).
+
+    Parameters
+    ----------
+    expr : str
+        Track expression about to be handed to the C++ scanner.
+    caller : str
+        Calling function name (``"gtrack_create"`` etc.) used in the error
+        message so users can see which entry point complained.
+
+    Raises
+    ------
+    NotImplementedError
+        If *expr* references a vtrack that the C++ scanner cannot evaluate
+        (filter-bearing, array-slice, DataFrame-backed, or with a non-C++
+        function).  These vtracks still work through ``gextract``; users can
+        materialise the values and write them via ``gtrack_create_sparse``
+        / ``gtrack_create_dense``.
+    """
+    from .expr import _parse_expr_vars
+    from .extract import _build_vtracks_dict, _can_vtracks_use_cpp
+
+    vtrack_names = frozenset(_shared._VTRACKS.keys())
+    if not vtrack_names:
+        return None
+
+    track_names = _track_names_set()
+    _, _, used_vtracks, _ = _parse_expr_vars(expr, track_names, vtrack_names)
+    if not used_vtracks:
+        return None
+
+    if not _can_vtracks_use_cpp(used_vtracks):
+        bad = sorted(used_vtracks)
+        raise NotImplementedError(
+            f"{caller}: expression references virtual track(s) {bad} that "
+            "use features not yet supported in the track-creating C++ path "
+            "(filters, array slices, DataFrame sources, or non-aggregation "
+            "functions). Workaround: materialise the values with gextract "
+            "and write them via gtrack_create_sparse / gtrack_create_dense."
+        )
+
+    return _build_vtracks_dict(used_vtracks)
+
+
 def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) -> list[str] | None:
     """
     Return a list of track names in the Genomic Database.
@@ -1456,7 +1508,9 @@ def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> 
     from .extract import _maybe_load_intervals_set
     intervals = _maybe_load_intervals_set(intervals)
 
-    _pymisha.pm_modify(track, str(expr), _df2pymisha(intervals), binsize)
+    vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_modify")
+
+    _pymisha.pm_modify(track, str(expr), _df2pymisha(intervals), binsize, vtracks_dict)
 
     # Update created.by attribute (bypass readonly check for internal update)
     modify_str = f'gtrack.modify({track}, {str(expr)}, intervs)'
@@ -1561,11 +1615,13 @@ def gtrack_smooth(
     # Handle DataFrame-as-iterator
     all_intervs, iter_val, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iter_val)
 
+    vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_smooth")
+
     with _atomic_track_create(track):
         _pymisha.pm_smooth(
             track, str(expr), _df2pymisha(all_intervs),
             iter_val, float(winsize), float(weight_thr),
-            int(bool(smooth_nans)), alg,
+            int(bool(smooth_nans)), alg, vtracks_dict,
         )
 
     try:
@@ -1687,8 +1743,12 @@ def gtrack_create(
     # Handle DataFrame-as-iterator
     all_intervs, iterator, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iterator)
 
+    vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_create")
+
     with _config_no_mt(_itr_id_map) as _cfg, _atomic_track_create(track):
-        _pymisha.pm_track_create_expr(track, str(expr), _df2pymisha(all_intervs), iterator, _cfg)
+        _pymisha.pm_track_create_expr(
+            track, str(expr), _df2pymisha(all_intervs), iterator, _cfg, vtracks_dict
+        )
 
     try:
         _pm_dbreload()

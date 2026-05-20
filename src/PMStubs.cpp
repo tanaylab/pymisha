@@ -17,6 +17,10 @@
 #include "QuadTreeReader.h"
 #include "GInterval2D.h"
 #include "PMTrackExpression2DIterator.h"
+#include "PMTrackExpression2DIteratorPolicy.h"
+#include "PMTrackExpressionFixedRectIterator.h"
+#include "PMTrackExpressionTrackRectsIterator.h"
+#include "PMTrackExpressionCartesianGridIterator.h"
 #include "PMGenomeTrack2D.h"
 #include "PMTrackExpression2DScanner.h"
 #include "PMTrackExpression2DVars.h"
@@ -5872,6 +5876,356 @@ PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args)
 }
 
 //---------------------------------------------------------------------------
+// pm_test_fixed_rect_iterator
+//
+// Test-only binding that constructs a PMTrackExpressionFixedRectIterator and
+// emits all grid cells back as a dict of arrays.
+// Args: width (int), height (int), intervals_dict (dict of 6 numpy arrays),
+//       band (None or (d1, d2) tuple).
+// Returns: dict with keys chrom1/start1/end1/chrom2/start2/end2.
+//---------------------------------------------------------------------------
+
+PyObject *pm_test_fixed_rect_iterator(PyObject *self, PyObject *args)
+{
+    (void)self;
+    long long width_l, height_l;
+    PyObject *intervals_dict = NULL;
+    PyObject *band_obj = NULL;
+    if (!PyArg_ParseTuple(args, "LLOO",
+                          &width_l, &height_l, &intervals_dict, &band_obj))
+        return NULL;
+
+    // Parse intervals dict.
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    std::vector<GInterval2D> scope;
+    scope.reserve(n);
+    for (npy_intp i = 0; i < n; ++i) {
+        int     c1 = (int)(*(int32_t *)PyArray_GETPTR1(arr_c1, i));
+        int     c2 = (int)(*(int32_t *)PyArray_GETPTR1(arr_c2, i));
+        int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, i);
+        int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, i);
+        int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, i);
+        int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, i);
+        scope.emplace_back(c1, s1, e1, c2, s2, e2);
+    }
+
+    // Parse optional band.
+    std::unique_ptr<quadtree::DiagonalBand> band_ptr;
+    if (band_obj != Py_None) {
+        long long d1, d2;
+        if (!PyArg_ParseTuple(band_obj, "LL", &d1, &d2))
+            return NULL;
+        band_ptr = std::make_unique<quadtree::DiagonalBand>(
+            static_cast<int64_t>(d1), static_cast<int64_t>(d2));
+    }
+
+    // Construct and walk the iterator.
+    // begin() must be called explicitly after construction (Option A contract).
+    // Walk pattern: read last_interval(), push, call next().
+    std::vector<int>     out_c1, out_c2;
+    std::vector<int64_t> out_s1, out_e1, out_s2, out_e2;
+
+    try {
+        PMTrackExpressionFixedRectIterator it(
+            static_cast<int64_t>(width_l),
+            static_cast<int64_t>(height_l),
+            std::move(scope),
+            band_ptr.get());
+        it.begin();
+
+        while (!it.isend()) {
+            const GInterval2D &iv = it.last_interval();
+            out_c1.push_back(iv.chromid1);
+            out_c2.push_back(iv.chromid2);
+            out_s1.push_back(iv.start1);
+            out_e1.push_back(iv.end1);
+            out_s2.push_back(iv.start2);
+            out_e2.push_back(iv.end2);
+            it.next();
+        }
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+
+    npy_intp m = static_cast<npy_intp>(out_c1.size());
+    npy_intp dims[1] = {m};
+
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+
+    #define SET_INT32_FR(name, vec)                                           \
+        do {                                                                  \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT32);              \
+            if (m > 0) {                                                      \
+                int32_t *ptr = (int32_t *)PyArray_DATA((PyArrayObject *)a);   \
+                for (npy_intp i = 0; i < m; ++i) ptr[i] = (vec)[i];          \
+            }                                                                 \
+            PyDict_SetItemString(result, name, a);                            \
+            Py_DECREF(a);                                                     \
+        } while (0)
+
+    #define SET_INT64_FR(name, vec)                                           \
+        do {                                                                  \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);              \
+            if (m > 0) memcpy(PyArray_DATA((PyArrayObject *)a),               \
+                              (vec).data(), m * sizeof(int64_t));             \
+            PyDict_SetItemString(result, name, a);                            \
+            Py_DECREF(a);                                                     \
+        } while (0)
+
+    SET_INT32_FR("chrom1", out_c1);
+    SET_INT64_FR("start1", out_s1);
+    SET_INT64_FR("end1",   out_e1);
+    SET_INT32_FR("chrom2", out_c2);
+    SET_INT64_FR("start2", out_s2);
+    SET_INT64_FR("end2",   out_e2);
+
+    #undef SET_INT32_FR
+    #undef SET_INT64_FR
+
+    return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_test_fixed_rect_scanner
+//
+// Test-only binding that drives PMTrackExpr2DScanner::run() with a
+// FixedRect iterator policy over a single (track, func) var and a scope
+// dict, returning a numpy double array of per-cell aggregated values.
+//
+// Args:
+//   width        : int  - FixedRect cell width
+//   height       : int  - FixedRect cell height
+//   track_name   : str  - 2D track to aggregate
+//   func_name    : str  - agg func ("area" / "weighted.sum" / "min" / "max" / "avg")
+//   intervals    : dict of 6 numpy arrays (chrom1/start1/end1/chrom2/start2/end2)
+//   band         : (int, int) | None
+//
+// Returns:
+//   numpy double array of length num_emitted (grid cells).
+//---------------------------------------------------------------------------
+
+PyObject *pm_test_fixed_rect_scanner(PyObject *self, PyObject *args)
+{
+    (void)self;
+    long long   width_l, height_l;
+    const char *track_name, *func_name;
+    PyObject   *intervals_dict = NULL;
+    PyObject   *band_obj = Py_None;
+
+    if (!PyArg_ParseTuple(args, "LLssOO",
+                          &width_l, &height_l,
+                          &track_name, &func_name,
+                          &intervals_dict, &band_obj))
+        return NULL;
+
+    // Parse the intervals dict (same convention as pm_test_fixed_rect_iterator).
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom1", &arr_c1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start1", &arr_s1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end1",   &arr_e1) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "chrom2", &arr_c2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "start2", &arr_s2) < 0) return NULL;
+    if (_pm_test_2d_get_array(intervals_dict, "end2",   &arr_e2) < 0) return NULL;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "intervals arrays must all be the same length");
+        return NULL;
+    }
+
+    std::vector<GInterval2D> scope;
+    scope.reserve(static_cast<size_t>(n));
+    for (npy_intp i = 0; i < n; ++i) {
+        int     c1 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c1, i));
+        int     c2 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c2, i));
+        int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, i);
+        int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, i);
+        int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, i);
+        int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, i);
+        scope.emplace_back(c1, s1, e1, c2, s2, e2);
+    }
+
+    // Parse optional band.
+    std::unique_ptr<quadtree::DiagonalBand> band_ptr;
+    if (band_obj != Py_None) {
+        long long d1, d2;
+        if (!PyArg_ParseTuple(band_obj, "LL", &d1, &d2))
+            return NULL;
+        band_ptr = std::make_unique<quadtree::DiagonalBand>(
+            static_cast<int64_t>(d1), static_cast<int64_t>(d2));
+    }
+
+    try {
+        PMTrackExpression2DIteratorPolicy policy;
+        policy.kind   = PMTrackExpression2DIteratorPolicy::K_FIXED_RECT;
+        policy.width  = static_cast<int64_t>(width_l);
+        policy.height = static_cast<int64_t>(height_l);
+
+        PMTrackExpr2DScanner scanner;
+        std::vector<PMTrackExpr2DScanner::VarSpec> var_specs = {
+            {track_name, func_name},
+        };
+        scanner.run(policy, var_specs, scope, band_ptr.get());
+
+        size_t         emit = scanner.num_emitted();
+        const double  *vals = scanner.values_for_var(0);
+        npy_intp       dims[1] = {static_cast<npy_intp>(emit)};
+        PyObject      *arr = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        if (!arr) return NULL;
+        if (emit > 0 && vals) {
+            std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject *>(arr)),
+                        vals, emit * sizeof(double));
+        }
+        return arr;
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return NULL;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+}
+
+//---------------------------------------------------------------------------
+// pm_test_scanner_reuse
+//
+// Test-only binding that calls scanner.run() TWICE on the same
+// PMTrackExpr2DScanner instance to verify that state (m_vars, emitted
+// intervals, counts) is correctly reset between calls.
+//
+// Args:
+//   width        : int  - FixedRect cell width (same for both runs)
+//   height       : int  - FixedRect cell height (same for both runs)
+//   track_name   : str  - 2D track to aggregate
+//   func_name    : str  - agg func
+//   intervals1   : dict - scope for first run
+//   intervals2   : dict - scope for second run
+//
+// Returns:
+//   tuple (n1, n2, values2_list) where:
+//     n1          = num_emitted() after first run
+//     n2          = num_emitted() after second run
+//     values2_list = list of float64 values from second run's var(0)
+//
+// If m_vars accumulated across calls, values_for_var(0) after the second
+// run would point to the ghost first-run buffer with stale values; the
+// test detects this by comparing against a fresh scanner's result.
+//---------------------------------------------------------------------------
+
+static int _parse_scope_dict(PyObject *d,
+                             std::vector<GInterval2D> &out)
+{
+    PyArrayObject *arr_c1, *arr_s1, *arr_e1, *arr_c2, *arr_s2, *arr_e2;
+    if (_pm_test_2d_get_array(d, "chrom1", &arr_c1) < 0) return -1;
+    if (_pm_test_2d_get_array(d, "start1", &arr_s1) < 0) return -1;
+    if (_pm_test_2d_get_array(d, "end1",   &arr_e1) < 0) return -1;
+    if (_pm_test_2d_get_array(d, "chrom2", &arr_c2) < 0) return -1;
+    if (_pm_test_2d_get_array(d, "start2", &arr_s2) < 0) return -1;
+    if (_pm_test_2d_get_array(d, "end2",   &arr_e2) < 0) return -1;
+
+    npy_intp n = PyArray_DIM(arr_c1, 0);
+    if (PyArray_DIM(arr_s1, 0) != n || PyArray_DIM(arr_e1, 0) != n ||
+        PyArray_DIM(arr_c2, 0) != n || PyArray_DIM(arr_s2, 0) != n ||
+        PyArray_DIM(arr_e2, 0) != n) {
+        PyErr_SetString(PyExc_ValueError,
+                        "intervals arrays must all be the same length");
+        return -1;
+    }
+    out.reserve(static_cast<size_t>(n));
+    for (npy_intp i = 0; i < n; ++i) {
+        int     c1 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c1, i));
+        int     c2 = static_cast<int>(*(int32_t *)PyArray_GETPTR1(arr_c2, i));
+        int64_t s1 = *(int64_t *)PyArray_GETPTR1(arr_s1, i);
+        int64_t e1 = *(int64_t *)PyArray_GETPTR1(arr_e1, i);
+        int64_t s2 = *(int64_t *)PyArray_GETPTR1(arr_s2, i);
+        int64_t e2 = *(int64_t *)PyArray_GETPTR1(arr_e2, i);
+        out.emplace_back(c1, s1, e1, c2, s2, e2);
+    }
+    return 0;
+}
+
+PyObject *pm_test_scanner_reuse(PyObject *self, PyObject *args)
+{
+    (void)self;
+    long long   width_l, height_l;
+    const char *track_name, *func_name;
+    PyObject   *dict1 = NULL, *dict2 = NULL;
+
+    if (!PyArg_ParseTuple(args, "LLssOO",
+                          &width_l, &height_l,
+                          &track_name, &func_name,
+                          &dict1, &dict2))
+        return NULL;
+
+    std::vector<GInterval2D> scope1, scope2;
+    if (_parse_scope_dict(dict1, scope1) < 0) return NULL;
+    if (_parse_scope_dict(dict2, scope2) < 0) return NULL;
+
+    try {
+        PMTrackExpression2DIteratorPolicy policy;
+        policy.kind   = PMTrackExpression2DIteratorPolicy::K_FIXED_RECT;
+        policy.width  = static_cast<int64_t>(width_l);
+        policy.height = static_cast<int64_t>(height_l);
+
+        std::vector<PMTrackExpr2DScanner::VarSpec> var_specs = {
+            {track_name, func_name},
+        };
+
+        // Reuse the same scanner instance for both runs.
+        PMTrackExpr2DScanner scanner;
+        scanner.run(policy, var_specs, scope1, nullptr);
+        size_t n1 = scanner.num_emitted();
+
+        scanner.run(policy, var_specs, scope2, nullptr);
+        size_t n2 = scanner.num_emitted();
+
+        // Build the return value: (n1, n2, numpy_array_of_run2_values)
+        const double *vals2 = scanner.values_for_var(0);
+        npy_intp dims[1] = {static_cast<npy_intp>(n2)};
+        PyObject *arr = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        if (!arr) return NULL;
+        if (n2 > 0 && vals2) {
+            std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject *>(arr)),
+                        vals2, n2 * sizeof(double));
+        }
+
+        PyObject *result = PyTuple_New(3);
+        if (!result) { Py_DECREF(arr); return NULL; }
+        PyTuple_SET_ITEM(result, 0, PyLong_FromSize_t(n1));
+        PyTuple_SET_ITEM(result, 1, PyLong_FromSize_t(n2));
+        PyTuple_SET_ITEM(result, 2, arr);
+        return result;
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return NULL;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+}
+
+//---------------------------------------------------------------------------
 // pm_test_2d_scanner
 //
 // Test-only binding that drives PMTrackExpr2DScanner over a single track
@@ -5983,6 +6337,377 @@ PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args)
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
+    }
+}
+
+// Forward declaration: defined later in this file (pm_test_cartesian_grid_iterator section).
+static int _parse_1d_intervals_to_centers(
+    PyObject *d,
+    std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> &out);
+
+//---------------------------------------------------------------------------
+// pm_extract_2d_scanner
+//
+// Production binding: drives PMTrackExpr2DScanner with a polymorphic
+// iterator policy.
+//
+// Args:
+//   policy_dict    : dict  - {"kind": str, ...kind-specific params...}
+//                            kind "fixed_rect"  requires "width" (int) and "height" (int)
+//                            kind "track_rects" requires "track_name" (str)
+//                            kinds "intervals" and "cartesian_grid"
+//                            raise RuntimeError (planned for later releases)
+//   intervals_dict : dict  - 2D scope as 6 numpy arrays:
+//                            chrom1 (int32), start1 (int64), end1 (int64),
+//                            chrom2 (int32), start2 (int64), end2 (int64)
+//   vars_list      : list  - [(track_name: str, func_name: str), ...]
+//   colnames_list  : list  - [str, ...] one colname per var
+//   band           : tuple | None  - (d1: int, d2: int) diagonal-band filter
+//
+// Returns:
+//   dict with one entry per colname (float64 ndarray of length num_emitted),
+//   plus six coord arrays keyed _chrom1 (int32), _start1 (int64), _end1 (int64),
+//   _chrom2 (int32), _start2 (int64), _end2 (int64).
+//---------------------------------------------------------------------------
+
+PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *policy_dict   = nullptr;
+    PyObject *intervals_dict = nullptr;
+    PyObject *vars_list     = nullptr;
+    PyObject *colnames_list = nullptr;
+    PyObject *band_obj      = nullptr;
+
+    if (!PyArg_ParseTuple(args, "OOOOO",
+                          &policy_dict, &intervals_dict, &vars_list,
+                          &colnames_list, &band_obj))
+        return nullptr;
+
+    // Parse the iterator policy.
+    PyObject *kind_obj = PyDict_GetItemString(policy_dict, "kind");
+    if (!kind_obj) {
+        PyErr_SetString(PyExc_RuntimeError, "iterator policy: missing 'kind'");
+        return nullptr;
+    }
+    if (!PyUnicode_Check(kind_obj)) {
+        PyErr_SetString(PyExc_RuntimeError, "iterator policy: 'kind' must be a string");
+        return nullptr;
+    }
+    std::string kind = PyUnicode_AsUTF8(kind_obj);
+
+    PMTrackExpression2DIteratorPolicy policy{};
+    if (kind == "fixed_rect") {
+        PyObject *w = PyDict_GetItemString(policy_dict, "width");
+        PyObject *h = PyDict_GetItemString(policy_dict, "height");
+        if (!w || !h) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "FixedRect policy: missing width or height");
+            return nullptr;
+        }
+        policy.kind   = PMTrackExpression2DIteratorPolicy::K_FIXED_RECT;
+        policy.width  = PyLong_AsLongLong(w);
+        policy.height = PyLong_AsLongLong(h);
+        if (PyErr_Occurred()) return nullptr;
+    } else if (kind == "track_rects") {
+        PyObject *tn = PyDict_GetItemString(policy_dict, "track_name");
+        if (!tn) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "TrackRects policy: missing track_name");
+            return nullptr;
+        }
+        if (!PyUnicode_Check(tn)) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "TrackRects policy: track_name must be a string");
+            return nullptr;
+        }
+        if (!g_pmdb) {
+            PyErr_SetString(PyExc_RuntimeError, "Database not initialized");
+            return nullptr;
+        }
+        policy.kind       = PMTrackExpression2DIteratorPolicy::K_TRACK_RECTS;
+        policy.track_name = PyUnicode_AsUTF8(tn);
+        policy.chromkey   = &g_pmdb->chromkey();
+    } else if (kind == "cartesian_grid") {
+        if (!g_pmdb) {
+            PyErr_SetString(PyExc_RuntimeError, "Database not initialized");
+            return nullptr;
+        }
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+
+        // Parse intervals1 (required).
+        PyObject *ivd1 = PyDict_GetItemString(policy_dict, "intervals1");
+        if (!ivd1) {
+            PyErr_SetString(PyExc_RuntimeError, "CartesianGrid policy: missing 'intervals1'");
+            return nullptr;
+        }
+        std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> centers1;
+        if (_parse_1d_intervals_to_centers(ivd1, centers1) < 0)
+            return nullptr;
+
+        // Parse expansion1 (required).
+        PyObject *exp1_obj = PyDict_GetItemString(policy_dict, "expansion1");
+        if (!exp1_obj || !PyArray_Check(exp1_obj)) {
+            PyErr_SetString(PyExc_RuntimeError, "CartesianGrid policy: missing or invalid 'expansion1'");
+            return nullptr;
+        }
+        PyArrayObject *exp1_arr = (PyArrayObject *)exp1_obj;
+        npy_intp ne1 = PyArray_DIM(exp1_arr, 0);
+        std::vector<int64_t> expansion1;
+        expansion1.reserve(static_cast<size_t>(ne1));
+        for (npy_intp i = 0; i < ne1; ++i)
+            expansion1.push_back(*(int64_t *)PyArray_GETPTR1(exp1_arr, i));
+        std::sort(expansion1.begin(), expansion1.end());
+        expansion1.erase(std::unique(expansion1.begin(), expansion1.end()), expansion1.end());
+        if (expansion1.size() < 2) {
+            PyErr_SetString(PyExc_RuntimeError, "CartesianGrid policy: expansion1 must contain at least 2 unique values");
+            return nullptr;
+        }
+
+        // Parse intervals2 (None => reuse intervals1).
+        PyObject *ivd2 = PyDict_GetItemString(policy_dict, "intervals2");
+        std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> centers2;
+        if (ivd2 == nullptr || ivd2 == Py_None) {
+            centers2 = centers1;
+        } else {
+            if (_parse_1d_intervals_to_centers(ivd2, centers2) < 0)
+                return nullptr;
+        }
+
+        // Parse expansion2 (None => reuse expansion1).
+        PyObject *exp2_obj = PyDict_GetItemString(policy_dict, "expansion2");
+        std::vector<int64_t> expansion2;
+        if (exp2_obj == nullptr || exp2_obj == Py_None) {
+            expansion2 = expansion1;
+        } else {
+            if (!PyArray_Check(exp2_obj)) {
+                PyErr_SetString(PyExc_RuntimeError, "CartesianGrid policy: expansion2 must be a numpy array or None");
+                return nullptr;
+            }
+            PyArrayObject *exp2_arr = (PyArrayObject *)exp2_obj;
+            npy_intp ne2 = PyArray_DIM(exp2_arr, 0);
+            expansion2.reserve(static_cast<size_t>(ne2));
+            for (npy_intp i = 0; i < ne2; ++i)
+                expansion2.push_back(*(int64_t *)PyArray_GETPTR1(exp2_arr, i));
+            std::sort(expansion2.begin(), expansion2.end());
+            expansion2.erase(std::unique(expansion2.begin(), expansion2.end()), expansion2.end());
+            if (expansion2.size() < 2) {
+                PyErr_SetString(PyExc_RuntimeError, "CartesianGrid policy: expansion2 must contain at least 2 unique values");
+                return nullptr;
+            }
+        }
+
+        // Parse band_idx: min_band_idx and max_band_idx (both or neither).
+        PyObject *min_bi_obj = PyDict_GetItemString(policy_dict, "min_band_idx");
+        PyObject *max_bi_obj = PyDict_GetItemString(policy_dict, "max_band_idx");
+        bool use_band_idx = false;
+        int32_t min_band_idx = 0, max_band_idx = 0;
+        bool min_bi_set = (min_bi_obj != nullptr && min_bi_obj != Py_None);
+        bool max_bi_set = (max_bi_obj != nullptr && max_bi_obj != Py_None);
+        if (min_bi_set || max_bi_set) {
+            if (!min_bi_set || !max_bi_set) {
+                PyErr_SetString(PyExc_RuntimeError,
+                                "CartesianGrid policy: both min_band_idx and max_band_idx must be provided");
+                return nullptr;
+            }
+            // R semantics: band_idx only valid when intervals2 is None.
+            if (ivd2 != nullptr && ivd2 != Py_None) {
+                PyErr_SetString(PyExc_RuntimeError,
+                                "CartesianGrid policy: band_idx filter requires intervals2=None");
+                return nullptr;
+            }
+            use_band_idx = true;
+            min_band_idx = static_cast<int32_t>(PyLong_AsLong(min_bi_obj));
+            max_band_idx = static_cast<int32_t>(PyLong_AsLong(max_bi_obj));
+            if (PyErr_Occurred()) return nullptr;
+        }
+
+        // Build corrected grid points.
+        auto gp_axis0 = PMTrackExpressionCartesianGridIterator::build_grid_points(
+            centers1, expansion1, chromkey);
+        auto gp_axis1 = PMTrackExpressionCartesianGridIterator::build_grid_points(
+            centers2, expansion2, chromkey);
+
+        policy.kind             = PMTrackExpression2DIteratorPolicy::K_CARTESIAN_GRID;
+        policy.chromkey         = &chromkey;
+        policy.grid_points_axis0 = std::move(gp_axis0);
+        policy.grid_points_axis1 = std::move(gp_axis1);
+        policy.expansion0       = expansion1;
+        policy.expansion1       = expansion2;
+        policy.use_band_idx     = use_band_idx;
+        policy.min_band_idx     = min_band_idx;
+        policy.max_band_idx     = max_band_idx;
+    } else if (kind == "intervals") {
+        // No additional fields needed — the scope dict IS the iteration source.
+        policy.kind = PMTrackExpression2DIteratorPolicy::K_INTERVALS;
+    } else {
+        PyErr_SetString(PyExc_RuntimeError,
+                        ("Unknown iterator kind: " + kind).c_str());
+        return nullptr;
+    }
+
+    // Parse scope (uses the static helper added in T6).
+    std::vector<GInterval2D> scope;
+    if (_parse_scope_dict(intervals_dict, scope) < 0) return nullptr;
+
+    // Parse vars list.
+    // Accepted element formats:
+    //   (track: str, func: str)                                          -- no shifts
+    //   (track: str, func: str, ss1: int, es1: int, ss2: int, es2: int) -- with shifts
+    if (!PyList_Check(vars_list)) {
+        PyErr_SetString(PyExc_TypeError, "vars_list must be a list");
+        return nullptr;
+    }
+    std::vector<PMTrackExpr2DScanner::VarSpec> vars;
+    Py_ssize_t nv = PyList_Size(vars_list);
+    for (Py_ssize_t i = 0; i < nv; ++i) {
+        PyObject *t = PyList_GetItem(vars_list, i);
+        if (!t || !PyTuple_Check(t)) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "vars_list element must be a tuple");
+            return nullptr;
+        }
+        Py_ssize_t tsz = PyTuple_Size(t);
+        if (tsz != 2 && tsz != 6) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "vars_list element must be a 2-tuple (track, func) "
+                            "or 6-tuple (track, func, ss1, es1, ss2, es2)");
+            return nullptr;
+        }
+        PyObject *tn = PyTuple_GetItem(t, 0);
+        PyObject *fn = PyTuple_GetItem(t, 1);
+        if (!PyUnicode_Check(tn) || !PyUnicode_Check(fn)) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "vars_list (track, func) entries must be strings");
+            return nullptr;
+        }
+        PMTrackExpr2DScanner::VarSpec vs;
+        vs.name = PyUnicode_AsUTF8(tn);
+        vs.func = PyUnicode_AsUTF8(fn);
+        if (tsz == 6) {
+            vs.sshift1 = PyLong_AsLongLong(PyTuple_GetItem(t, 2));
+            vs.eshift1 = PyLong_AsLongLong(PyTuple_GetItem(t, 3));
+            vs.sshift2 = PyLong_AsLongLong(PyTuple_GetItem(t, 4));
+            vs.eshift2 = PyLong_AsLongLong(PyTuple_GetItem(t, 5));
+            if (PyErr_Occurred()) return nullptr;
+        }
+        vars.push_back(std::move(vs));
+    }
+
+    // Validate colnames length.
+    if (!PyList_Check(colnames_list)) {
+        PyErr_SetString(PyExc_TypeError, "colnames_list must be a list");
+        return nullptr;
+    }
+    Py_ssize_t nc = PyList_Size(colnames_list);
+    if (static_cast<size_t>(nc) != vars.size()) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "colnames length does not match vars length");
+        return nullptr;
+    }
+
+    // Guard against user colnames colliding with the internal coord keys:
+    static const char *RESERVED_COLNAMES[] = {
+        "_chrom1", "_start1", "_end1", "_chrom2", "_start2", "_end2"
+    };
+    for (Py_ssize_t i = 0; i < nc; ++i) {
+        PyObject *name = PyList_GetItem(colnames_list, i);
+        if (!PyUnicode_Check(name)) {
+            PyErr_SetString(PyExc_RuntimeError, "colnames entries must be strings");
+            return nullptr;
+        }
+        const char *name_cstr = PyUnicode_AsUTF8(name);
+        for (const char *reserved : RESERVED_COLNAMES) {
+            if (std::strcmp(name_cstr, reserved) == 0) {
+                PyErr_SetString(PyExc_RuntimeError,
+                                (std::string("colname '") + reserved +
+                                 "' collides with an internal coord key; choose a different name")
+                                    .c_str());
+                return nullptr;
+            }
+        }
+    }
+
+    // Parse band.
+    std::unique_ptr<quadtree::DiagonalBand> band;
+    if (band_obj != Py_None) {
+        long long d1, d2;
+        if (!PyArg_ParseTuple(band_obj, "LL", &d1, &d2))
+            return nullptr;
+        band = std::make_unique<quadtree::DiagonalBand>(
+            static_cast<int64_t>(d1), static_cast<int64_t>(d2));
+    }
+
+    try {
+        PMTrackExpr2DScanner scanner;
+        scanner.run(policy, vars, scope, band.get());
+
+        size_t   n      = scanner.num_emitted();
+        PyObject *result = PyDict_New();
+        if (!result) return nullptr;
+
+        // colname -> values arrays.
+        for (Py_ssize_t i = 0; i < nc; ++i) {
+            PyObject *name = PyList_GetItem(colnames_list, i);
+            npy_intp dims[1] = {static_cast<npy_intp>(n)};
+            PyObject *arr = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+            if (!arr) {
+                Py_DECREF(result);
+                return nullptr;
+            }
+            if (n > 0) {
+                const double *src =
+                    scanner.values_for_var(static_cast<unsigned>(i));
+                // values_for_var returns nullptr only when i >= num_vars(), which we've
+                // already validated cannot happen here. Guard is defense-in-depth.
+                if (src) {
+                    std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject *>(arr)),
+                                src, n * sizeof(double));
+                }
+            }
+            PyDict_SetItem(result, name, arr);
+            Py_DECREF(arr);
+        }
+
+        // Coord arrays: _chrom1/_start1/_end1/_chrom2/_start2/_end2.
+        const std::vector<GInterval2D> &emitted = scanner.emitted_intervals();
+        npy_intp ed[1] = {static_cast<npy_intp>(n)};
+        PyObject *c1 = PyArray_SimpleNew(1, ed, NPY_INT32);
+        PyObject *s1 = PyArray_SimpleNew(1, ed, NPY_INT64);
+        PyObject *e1 = PyArray_SimpleNew(1, ed, NPY_INT64);
+        PyObject *c2 = PyArray_SimpleNew(1, ed, NPY_INT32);
+        PyObject *s2 = PyArray_SimpleNew(1, ed, NPY_INT64);
+        PyObject *e2 = PyArray_SimpleNew(1, ed, NPY_INT64);
+        if (!c1 || !s1 || !e1 || !c2 || !s2 || !e2) {
+            Py_XDECREF(c1); Py_XDECREF(s1); Py_XDECREF(e1);
+            Py_XDECREF(c2); Py_XDECREF(s2); Py_XDECREF(e2);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        for (size_t k = 0; k < n; ++k) {
+            *((int32_t *)PyArray_GETPTR1((PyArrayObject *)c1, k)) =
+                static_cast<int32_t>(emitted[k].chromid1);
+            *((int64_t *)PyArray_GETPTR1((PyArrayObject *)s1, k)) = emitted[k].start1;
+            *((int64_t *)PyArray_GETPTR1((PyArrayObject *)e1, k)) = emitted[k].end1;
+            *((int32_t *)PyArray_GETPTR1((PyArrayObject *)c2, k)) =
+                static_cast<int32_t>(emitted[k].chromid2);
+            *((int64_t *)PyArray_GETPTR1((PyArrayObject *)s2, k)) = emitted[k].start2;
+            *((int64_t *)PyArray_GETPTR1((PyArrayObject *)e2, k)) = emitted[k].end2;
+        }
+        PyDict_SetItemString(result, "_chrom1", c1); Py_DECREF(c1);
+        PyDict_SetItemString(result, "_start1", s1); Py_DECREF(s1);
+        PyDict_SetItemString(result, "_end1",   e1); Py_DECREF(e1);
+        PyDict_SetItemString(result, "_chrom2", c2); Py_DECREF(c2);
+        PyDict_SetItemString(result, "_start2", s2); Py_DECREF(s2);
+        PyDict_SetItemString(result, "_end2",   e2); Py_DECREF(e2);
+
+        return result;
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return nullptr;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
     }
 }
 
@@ -6403,4 +7128,366 @@ PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
     PyDict_SetItemString(result, "value", out_arr);
     Py_DECREF(out_arr);
     return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_test_track_rects_iterator
+//
+// Test-only binding that constructs a PMTrackExpressionTrackRectsIterator
+// and collects all emitted (track_object x scope_rect) intersections.
+//
+// Args:
+//   track_name   : str  - 2D RECTS or POINTS track name
+//   intervals    : dict of 6 numpy arrays (chrom1/start1/end1/chrom2/start2/end2)
+//   band         : (int, int) | None
+//
+// Returns: dict with keys chrom1/start1/end1/chrom2/start2/end2 (numpy arrays).
+//---------------------------------------------------------------------------
+
+PyObject *pm_test_track_rects_iterator(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *track_name = nullptr;
+    PyObject   *intervals_dict = nullptr;
+    PyObject   *band_obj = Py_None;
+
+    if (!PyArg_ParseTuple(args, "sOO", &track_name, &intervals_dict, &band_obj))
+        return nullptr;
+
+    // Parse scope dict.
+    std::vector<GInterval2D> scope;
+    if (_parse_scope_dict(intervals_dict, scope) < 0) return nullptr;
+
+    // Parse optional band.
+    std::unique_ptr<quadtree::DiagonalBand> band_ptr;
+    if (band_obj != Py_None) {
+        long long d1, d2;
+        if (!PyArg_ParseTuple(band_obj, "LL", &d1, &d2))
+            return nullptr;
+        band_ptr = std::make_unique<quadtree::DiagonalBand>(
+            static_cast<int64_t>(d1), static_cast<int64_t>(d2));
+    }
+
+    std::vector<int>     out_c1, out_c2;
+    std::vector<int64_t> out_s1, out_e1, out_s2, out_e2;
+
+    try {
+        if (!g_pmdb)
+            throw std::runtime_error("Database not initialized");
+
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+
+        PMTrackExpressionTrackRectsIterator it(
+            track_name,
+            std::move(scope),
+            chromkey,
+            band_ptr.get());
+        it.begin();
+
+        while (!it.isend()) {
+            const GInterval2D &iv = it.last_interval();
+            out_c1.push_back(iv.chromid1);
+            out_c2.push_back(iv.chromid2);
+            out_s1.push_back(iv.start1);
+            out_e1.push_back(iv.end1);
+            out_s2.push_back(iv.start2);
+            out_e2.push_back(iv.end2);
+            it.next();
+        }
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return nullptr;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+
+    npy_intp m = static_cast<npy_intp>(out_c1.size());
+    npy_intp dims[1] = {m};
+
+    PyObject *result = PyDict_New();
+    if (!result) return nullptr;
+
+    #define SET_INT32_TRI(name, vec)                                          \
+        do {                                                                  \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT32);              \
+            if (!a) { Py_DECREF(result); return nullptr; }                    \
+            if (m > 0) {                                                      \
+                int32_t *ptr = (int32_t *)PyArray_DATA((PyArrayObject *)a);   \
+                for (npy_intp i = 0; i < m; ++i) ptr[i] = (vec)[i];          \
+            }                                                                 \
+            PyDict_SetItemString(result, name, a);                            \
+            Py_DECREF(a);                                                     \
+        } while (0)
+
+    #define SET_INT64_TRI(name, vec)                                          \
+        do {                                                                  \
+            PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);              \
+            if (!a) { Py_DECREF(result); return nullptr; }                    \
+            if (m > 0)                                                        \
+                memcpy(PyArray_DATA((PyArrayObject *)a),                      \
+                       (vec).data(), m * sizeof(int64_t));                    \
+            PyDict_SetItemString(result, name, a);                            \
+            Py_DECREF(a);                                                     \
+        } while (0)
+
+    SET_INT32_TRI("chrom1", out_c1);
+    SET_INT64_TRI("start1", out_s1);
+    SET_INT64_TRI("end1",   out_e1);
+    SET_INT32_TRI("chrom2", out_c2);
+    SET_INT64_TRI("start2", out_s2);
+    SET_INT64_TRI("end2",   out_e2);
+
+    #undef SET_INT32_TRI
+    #undef SET_INT64_TRI
+
+    return result;
+}
+
+//---------------------------------------------------------------------------
+// pm_test_cartesian_grid_iterator
+//
+// Test-only binding: construct a CartesianGridIterator and return all emitted
+// 2D intervals as a 6-array dict.
+//
+// Args:
+//   intervals1_dict  : dict {chrom: int32[N], start: int64[N], end: int64[N]}
+//   expansion1       : int64 numpy array (at least 2 unique values)
+//   intervals2_dict  : dict or None  (None => reuse intervals1)
+//   expansion2       : int64 numpy array or None  (None => reuse expansion1)
+//   band_idx         : (min_idx, max_idx) tuple of ints or None
+//   scope_dict       : 6-array 2D-intervals dict (chrom1/start1/end1/chrom2/start2/end2)
+//   band             : (d1, d2) tuple or None
+//
+// Returns: dict with keys chrom1/start1/end1/chrom2/start2/end2.
+//---------------------------------------------------------------------------
+
+// Helper: parse a 1D intervals dict {chrom: int32[], start: int64[], end: int64[]}
+// into a vector of GridPoints (coord = floor((start+end)/2)).
+static int _parse_1d_intervals_to_centers(
+    PyObject *d,
+    std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> &out)
+{
+    PyObject *key_chrom = PyUnicode_FromString("chrom");
+    PyObject *key_start = PyUnicode_FromString("start");
+    PyObject *key_end   = PyUnicode_FromString("end");
+    PyObject *arr_c = PyDict_GetItem(d, key_chrom);
+    PyObject *arr_s = PyDict_GetItem(d, key_start);
+    PyObject *arr_e = PyDict_GetItem(d, key_end);
+    Py_DECREF(key_chrom); Py_DECREF(key_start); Py_DECREF(key_end);
+
+    if (!arr_c || !arr_s || !arr_e) {
+        PyErr_SetString(PyExc_KeyError, "intervals dict must have 'chrom', 'start', 'end' keys");
+        return -1;
+    }
+    if (!PyArray_Check(arr_c) || !PyArray_Check(arr_s) || !PyArray_Check(arr_e)) {
+        PyErr_SetString(PyExc_ValueError, "'chrom', 'start', 'end' must be numpy arrays");
+        return -1;
+    }
+
+    PyArrayObject *ac = (PyArrayObject *)arr_c;
+    PyArrayObject *as_ = (PyArrayObject *)arr_s;
+    PyArrayObject *ae = (PyArrayObject *)arr_e;
+
+    npy_intp n = PyArray_DIM(ac, 0);
+    if (PyArray_DIM(as_, 0) != n || PyArray_DIM(ae, 0) != n) {
+        PyErr_SetString(PyExc_ValueError, "chrom/start/end arrays must have same length");
+        return -1;
+    }
+
+    out.reserve(static_cast<size_t>(n));
+    for (npy_intp i = 0; i < n; ++i) {
+        int32_t chromid = *(int32_t *)PyArray_GETPTR1(ac, i);
+        int64_t start   = *(int64_t *)PyArray_GETPTR1(as_, i);
+        int64_t end_    = *(int64_t *)PyArray_GETPTR1(ae, i);
+        int64_t coord   = (start + end_) / 2;
+        out.emplace_back(chromid, coord);
+    }
+    return 0;
+}
+
+PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *intervals1_dict = nullptr;
+    PyObject *expansion1_obj  = nullptr;
+    PyObject *intervals2_dict = nullptr;   // may be None
+    PyObject *expansion2_obj  = nullptr;   // may be None
+    PyObject *band_idx_obj    = nullptr;   // may be None
+    PyObject *scope_dict      = nullptr;
+    PyObject *band_obj        = nullptr;   // may be None
+
+    if (!PyArg_ParseTuple(args, "OOOOOOO",
+                          &intervals1_dict, &expansion1_obj,
+                          &intervals2_dict, &expansion2_obj,
+                          &band_idx_obj, &scope_dict, &band_obj))
+        return nullptr;
+
+    try {
+        if (!g_pmdb)
+            throw std::runtime_error("Database not initialized");
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+
+        // Parse intervals1.
+        std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> centers1;
+        if (_parse_1d_intervals_to_centers(intervals1_dict, centers1) < 0)
+            return nullptr;
+
+        // Parse expansion1.
+        if (!PyArray_Check(expansion1_obj)) {
+            PyErr_SetString(PyExc_ValueError, "expansion1 must be a numpy array");
+            return nullptr;
+        }
+        PyArrayObject *exp1_arr = (PyArrayObject *)expansion1_obj;
+        npy_intp ne1 = PyArray_DIM(exp1_arr, 0);
+        std::vector<int64_t> expansion1;
+        expansion1.reserve(static_cast<size_t>(ne1));
+        for (npy_intp i = 0; i < ne1; ++i)
+            expansion1.push_back(*(int64_t *)PyArray_GETPTR1(exp1_arr, i));
+        std::sort(expansion1.begin(), expansion1.end());
+        expansion1.erase(std::unique(expansion1.begin(), expansion1.end()), expansion1.end());
+        if (expansion1.size() < 2) {
+            PyErr_SetString(PyExc_RuntimeError, "expansion must contain at least 2 unique values");
+            return nullptr;
+        }
+
+        // Parse intervals2 (None => reuse centers1).
+        std::vector<PMTrackExpressionCartesianGridIterator::GridPoint> centers2;
+        if (intervals2_dict == Py_None) {
+            centers2 = centers1;
+        } else {
+            if (_parse_1d_intervals_to_centers(intervals2_dict, centers2) < 0)
+                return nullptr;
+        }
+
+        // Parse expansion2 (None => reuse expansion1).
+        std::vector<int64_t> expansion2;
+        if (expansion2_obj == Py_None) {
+            expansion2 = expansion1;
+        } else {
+            if (!PyArray_Check(expansion2_obj)) {
+                PyErr_SetString(PyExc_ValueError, "expansion2 must be a numpy array or None");
+                return nullptr;
+            }
+            PyArrayObject *exp2_arr = (PyArrayObject *)expansion2_obj;
+            npy_intp ne2 = PyArray_DIM(exp2_arr, 0);
+            expansion2.reserve(static_cast<size_t>(ne2));
+            for (npy_intp i = 0; i < ne2; ++i)
+                expansion2.push_back(*(int64_t *)PyArray_GETPTR1(exp2_arr, i));
+            std::sort(expansion2.begin(), expansion2.end());
+            expansion2.erase(std::unique(expansion2.begin(), expansion2.end()), expansion2.end());
+            if (expansion2.size() < 2) {
+                PyErr_SetString(PyExc_RuntimeError, "expansion2 must contain at least 2 unique values");
+                return nullptr;
+            }
+        }
+
+        // Build corrected grid points.
+        auto gp_axis0 = PMTrackExpressionCartesianGridIterator::build_grid_points(
+            centers1, expansion1, chromkey);
+        auto gp_axis1 = PMTrackExpressionCartesianGridIterator::build_grid_points(
+            centers2, expansion2, chromkey);
+
+        // Parse band_idx (None or (min, max) tuple).
+        bool    use_band_idx = false;
+        int32_t min_band_idx = 0, max_band_idx = 0;
+        if (band_idx_obj != Py_None) {
+            long long bmin, bmax;
+            if (!PyArg_ParseTuple(band_idx_obj, "LL", &bmin, &bmax))
+                return nullptr;
+            use_band_idx = true;
+            min_band_idx = static_cast<int32_t>(bmin);
+            max_band_idx = static_cast<int32_t>(bmax);
+        }
+
+        // Parse scope dict.
+        std::vector<GInterval2D> scope;
+        if (_parse_scope_dict(scope_dict, scope) < 0)
+            return nullptr;
+
+        // Parse band (None or (d1, d2) tuple).
+        std::unique_ptr<quadtree::DiagonalBand> band_ptr;
+        if (band_obj != Py_None) {
+            long long d1, d2;
+            if (!PyArg_ParseTuple(band_obj, "LL", &d1, &d2))
+                return nullptr;
+            band_ptr = std::make_unique<quadtree::DiagonalBand>(
+                static_cast<int64_t>(d1), static_cast<int64_t>(d2));
+        }
+
+        // Construct and walk the iterator.
+        std::vector<int>     out_c1, out_c2;
+        std::vector<int64_t> out_s1, out_e1, out_s2, out_e2;
+
+        PMTrackExpressionCartesianGridIterator it(
+            std::move(gp_axis0),
+            std::move(gp_axis1),
+            expansion1,
+            expansion2,
+            use_band_idx,
+            min_band_idx,
+            max_band_idx,
+            std::move(scope),
+            band_ptr.get());
+        it.begin();
+
+        while (!it.isend()) {
+            const GInterval2D &iv = it.last_interval();
+            out_c1.push_back(iv.chromid1);
+            out_c2.push_back(iv.chromid2);
+            out_s1.push_back(iv.start1);
+            out_e1.push_back(iv.end1);
+            out_s2.push_back(iv.start2);
+            out_e2.push_back(iv.end2);
+            it.next();
+        }
+
+        npy_intp m = static_cast<npy_intp>(out_c1.size());
+        npy_intp dims[1] = {m};
+
+        PyObject *result = PyDict_New();
+        if (!result) return nullptr;
+
+        #define SET_INT32_CGI(name, vec)                                          \
+            do {                                                                  \
+                PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT32);              \
+                if (!a) { Py_DECREF(result); return nullptr; }                    \
+                if (m > 0) {                                                      \
+                    int32_t *ptr = (int32_t *)PyArray_DATA((PyArrayObject *)a);   \
+                    for (npy_intp i = 0; i < m; ++i) ptr[i] = (vec)[i];          \
+                }                                                                 \
+                PyDict_SetItemString(result, name, a);                            \
+                Py_DECREF(a);                                                     \
+            } while (0)
+
+        #define SET_INT64_CGI(name, vec)                                          \
+            do {                                                                  \
+                PyObject *a = PyArray_SimpleNew(1, dims, NPY_INT64);              \
+                if (!a) { Py_DECREF(result); return nullptr; }                    \
+                if (m > 0)                                                        \
+                    memcpy(PyArray_DATA((PyArrayObject *)a),                      \
+                           (vec).data(), m * sizeof(int64_t));                    \
+                PyDict_SetItemString(result, name, a);                            \
+                Py_DECREF(a);                                                     \
+            } while (0)
+
+        SET_INT32_CGI("chrom1", out_c1);
+        SET_INT64_CGI("start1", out_s1);
+        SET_INT64_CGI("end1",   out_e1);
+        SET_INT32_CGI("chrom2", out_c2);
+        SET_INT64_CGI("start2", out_s2);
+        SET_INT64_CGI("end2",   out_e2);
+
+        #undef SET_INT32_CGI
+        #undef SET_INT64_CGI
+
+        return result;
+
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return nullptr;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
 }

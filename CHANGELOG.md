@@ -1,5 +1,107 @@
 # Changelog
 
+## v0.1.84 (2026-05-20)
+
+### Fixes
+- **`gtrack_create`, `gtrack_modify`, `gtrack_smooth` now resolve virtual tracks in their `expr` argument.** Previously these handed the raw expression string to the C++ engine without forwarding the Python-side vtrack registry, so any expression referencing a `gvtrack_create`-registered name failed with `name '<vtrack>' is not defined`. The canonical R misha pattern `gvtrack.create(...) ; gtrack.create("smoothed", ..., expr="log2(vt_sum + 1)", iterator=20)` now works in pymisha.
+
+## v0.1.83 (2026-05-20)
+
+### Features
+- **2D vtrack shifts now work through all scanner paths (R parity).** `gvtrack_iterator_2d(name, sshift1=, eshift1=, sshift2=, eshift2=)` shifts are now applied per-var when querying the underlying 2D track, for `gextract` calls using `iterator=(N, M)`, `iterator=track_name`, or `iterator=CartesianGridSpec(...)`. Previously any vtrack with non-zero shifts fell back to the slow legacy path or raised `NotImplementedError` with FixedRect/CartesianGrid iterators.
+
+### Limitations
+- `global.percentile` is not routed through the scanner (deferred - requires a two-pass population accumulation). It continues to work via the legacy path for plain `gextract` calls, but raises `NotImplementedError` with FixedRect/CartesianGrid iterators.
+
+## v0.1.82 (2026-05-20)
+
+### Features
+- **`gvtrack_array_slice(vtrack, slice, func)` - R-aligned API for `gvtrack.array.slice`.** Mutates an existing vtrack (created via `gvtrack_create(name, src=array_track)`) rather than creating one. Matches R's two-step pattern: `gvtrack_create` then `gvtrack_array_slice`. Supports all R functions: `avg`, `min`, `max`, `sum`, `stddev`. `gextract("vtrack_name", intervals=...)` on such a vtrack returns one scalar per iterator interval.
+- **Array-slice vtracks work in `gextract` without an explicit iterator.** When all expressions are array-slice vtracks and no physical track is present, the query intervals serve as the iterator (one row per input interval).
+
+### Limitations
+- Bare `gextract("array_track", ...)` (without a vtrack) still raises, pointing to `gtrack_array_extract`. Use `gvtrack_array_slice` to aggregate first.
+- `quantile` func not supported (requires a different data path); deferred.
+
+## v0.1.81 (2026-05-20)
+
+### Fixes
+- **`exists` and `size` 2D vtracks now return 0 (not NaN) for chrom pairs with no track data.** R parity. Affects `gextract(vtrack, intervals=scope, iterator=...)` where the iterator emits cells on pairs the track does not cover.
+
+## v0.1.80 (2026-05-20)
+
+### Features
+- **Scanner supports object-level reducer funcs (R parity).** `PMTrackExpression2DVars` now handles `exists`, `size`, `first`, `last`, `sample` for use with 2D iterators. `gextract(vtrack_name, intervals=scope, iterator=(N,M))` (or CartesianGrid iterator) now works when the vtrack has any of these five object-level funcs. Closes the remaining R-parity gap from v0.1.79 for reducing 2D vtracks + 2D iterators.
+
+### Limitations
+- `global.percentile` not yet supported through the scanner path (deferred - requires a precomputed population).
+- 2D vtracks with shifts still raise (deferred).
+
+## v0.1.79 (2026-05-20)
+
+### Features
+- **Reducing 2D vtracks now supported with 2D iterators (R parity).** `gextract(vtrack_name, intervals=scope, iterator=(N,M))` (or `iterator="<2D track>"` or `iterator=CartesianGridSpec(...)`) now computes one aggregated value per emitted cell when the vtrack has a 2D reducer func (`area`, `avg`, `min`, `max`, `weighted.sum`). Previously raised `NotImplementedError` or fell through to the wrong path. Closes 8 xfail-strict R-parity gaps from v0.1.75-v0.1.77.
+
+### Limitations
+- Vtracks with 2D shifts (`sshift1`/`sshift2`) still raise - deferred.
+- Multi-vtrack compound expressions still raise - deferred.
+- `exists`, `size`, `first`, `last`, `sample`, `global.percentile` funcs still raise - C++ scanner does not support object-level funcs; deferred.
+
+## v0.1.78 (2026-05-20)
+
+### Features
+- **Intervals iterator via scanner (opt-in).** `PYMISHA_USE_SCANNER_FOR_INTERVALS=1` routes the implicit intervals-iterator case (`gextract(track, intervals=scope_df)`) through the new C++ scanner path. The scanner returns one row per scope interval (per-rect aggregation via the var's func, e.g. `avg`). This complements the existing default path which returns one row per (scope_rect, track_object) intersection (per-object enumeration). The two paths solve different problems; both remain available.
+- Bench (testdb, 10 scope rects on chr1 x chr1): scanner path ~4.9 ms (10 rows, aggregated); existing per-object enumeration path ~7.3 ms (7 rows, per-object). Different output shapes; the numbers are informational only.
+
+### Internal
+- New `IntervalsPolicy` dataclass + parser support in `pymisha/_iterator_policy.py`.
+- `pm_extract_2d_scanner` accepts `kind="intervals"`.
+- The bypass paths `pm_extract_2d` and `pm_extract_2d_objects` are intentionally retained as the default - they provide per-object enumeration semantics that the scanner aggregation cannot directly replace.
+- Multitask regression guard added: `test_intervals_via_scanner_multitask_equivalence` confirms scanner result is identical under single-process and multi-process CONFIG.
+
+### Limitations
+- Same as v0.1.77.
+- `PYMISHA_USE_SCANNER_FOR_INTERVALS=1` only affects the default no-iterator case for bare physical tracks. vtracks and explicit-DataFrame iterators continue to use the legacy path.
+- Scanner is single-process; multitasking deferred.
+
+## v0.1.77 (2026-05-20)
+
+### Features
+- **CartesianGrid 2D iterator (`giterator_cartesian_grid(..., stream=True)` + `gextract(iterator=spec)`).** New C++ streaming iterator generates the cartesian product of 1D windows around two sets of interval centers. Optional `band_idx` filtering keeps only (center-i, center-j) pairs within a specified index-delta range. Bench (testdb rects_track, 5 centers, 3 windows/axis, 225 cells, chr1 x chr1): ~5.5 ms pymisha vs ~8.0 ms R misha 5.7.2 (1.45x faster).
+
+### Internal
+- `giterator_cartesian_grid` accepts a new `stream=True` kwarg that returns a `CartesianGridSpec` instead of a materialized DataFrame. The materialize path (`stream=False`) remains the default for backward compatibility. Stream path produces one row per cell (avg aggregation); materialize path produces one row per (cell, track-object) intersection.
+- `bench_2d_iterators.py` extended with Workload D (CartesianGrid) including an R misha comparison.
+
+### Limitations
+- Same as v0.1.76 (vtrack + iterator policies, multitasking, memory materialization deferred).
+- Reducing-vtrack regression-guard xfail remains.
+
+## v0.1.76 (2026-05-20)
+
+### Features
+- **TrackRects 2D iterator (`gextract(..., iterator="<2D track name>")`).** New C++ streaming iterator yields the rects from a 2D rects/points track that intersect the user's 2D scope. Bench (testdb rects_track, chr1 x chr1 scope, 76 rows): 6.3 ms pymisha vs 8.0 ms R misha 5.7.2 (1.27x faster).
+
+### Fixes
+- **`gextract` with `iterator=<1D track>` or `iterator=<unknown track>`** now raises a clear `ValueError`. Previously the argument was silently ignored.
+
+### Internal
+- Iterator constructor contract: 2D iterators no longer prime in the constructor; callers must call `begin()` explicitly. Affects FixedRect (v0.1.75-shipped) and the new TrackRects. Externally visible only via the test bindings.
+
+### Limitations
+- Same as v0.1.75 (vtrack + iterator policies, multitasking, memory materialization deferred).
+- Reducing 2D vtracks (e.g. `func="avg"`) with `iterator=<2D track>` still routes through the legacy one-row-per-scope path - gap documented with xfail-strict regression test.
+
+## v0.1.75 (2026-05-20)
+
+### Features
+- **FixedRect 2D iterator (`gextract(..., iterator=(N1, N2))`).** New C++ streaming iterator subdivides each 2D scope rect into an `N1 x N2` grid, yielding cells in row-major order with diagonal-band shrinking. Replaces the Python materialize-then-iterate path for this case. Bench (testdb, 100-bin scope): ~5.5 ms in pymisha vs ~106 ms in R misha (~19x speedup). First step of Group K parity.
+
+### Limitations
+- `iterator=(N, M)` with virtual tracks raises `NotImplementedError` until vtrack support lands in a later release. Use a bare physical 2D track name.
+- The FixedRect path runs single-process. Multitask integration is deferred to a later release.
+- Large grids (N1 × N2 cells across many chrom pairs) materialize the full rect set in memory before aggregation; for genome-wide Hi-C resolution grids this can exceed available RAM. Streaming aggregation is planned for a later release.
+
 ## v0.1.74 (2026-05-19)
 
 ### Fixes

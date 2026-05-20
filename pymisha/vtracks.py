@@ -1060,6 +1060,41 @@ def _project_intervals_by_dim(intervals: pd.DataFrame, dim: int) -> pd.DataFrame
     raise ValueError(f"dim must be 1 or 2, got {dim}")
 
 
+def _compute_array_slice_vtrack(
+    vtrack_config: dict,
+    intervals: _pandas.DataFrame,
+) -> _numpy.ndarray:
+    """Evaluate an ``array_slice`` virtual track for *intervals*.
+
+    Returns a 1-D float64 array (one value per row of *intervals*).
+    """
+    from pathlib import Path
+
+    from ._array_track import extract_array, read_colnames, reduce_array_extract
+
+    src = vtrack_config["src"]
+    slice_cols = vtrack_config.get("slice_cols")  # None = all columns
+    func = vtrack_config.get("func", "avg")
+
+    track_path = Path(_pymisha.pm_track_path(src))
+    colnames = read_colnames(track_path)
+
+    if slice_cols is None:
+        sel_idx = None
+        val_cols = colnames
+    else:
+        sel_idx = slice_cols
+        val_cols = [colnames[i] for i in sel_idx]
+
+    n_intervals = len(intervals)
+
+    # extract_array returns one row per overlapping track interval.
+    # intervalID is 1-based, matching the row order of *intervals*.
+    extracted = extract_array(track_path, intervals, sel_idx, colnames)
+
+    return reduce_array_extract(extracted, val_cols, func, n_intervals)
+
+
 def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     """
     Compute values for a virtual track.
@@ -1075,6 +1110,10 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     vtrack_config = _shared._VTRACKS.get(vtrack_name)
     if vtrack_config is None:
         return None
+
+    # Array-slice vtracks are handled entirely in Python.
+    if vtrack_config.get("kind") == "array_slice":
+        return _compute_array_slice_vtrack(vtrack_config, intervals)
 
     # Handle dim parameter: project 2D intervals to 1D
     dim = vtrack_config.get("dim")
@@ -1969,3 +2008,138 @@ def gvtrack_clear() -> None:
     []
     """
     _shared._VTRACKS.clear()
+
+
+def gvtrack_array_slice(
+    vtrack: str,
+    slice: list[str] | list[int] | None = None,
+    func: str = "avg",
+    params=None,
+) -> None:
+    """Configure an existing virtual track as an array-slice aggregator.
+
+    Mirrors R ``gvtrack.array.slice``. The vtrack must already exist (created
+    via ``gvtrack_create(name, src=<array_track>)``). This function mutates
+    the vtrack in place, setting the column selection and aggregation function.
+    The vtrack can then be referenced in ``gextract``, ``gsummary``, etc.
+    and returns one value per iterator interval.
+
+    Parameters
+    ----------
+    vtrack : str
+        Name of an existing virtual track. The vtrack must have been created
+        with an array track as its source. Raises ``ValueError`` if the vtrack
+        does not exist or its source is not an array track.
+    slice : list of str or int, optional
+        Column subset to use. Strings are matched against track colnames;
+        integers are 0-based column indices. ``None`` uses all columns.
+    func : str, default ``'avg'``
+        Aggregation function applied across all non-NaN values in the
+        selected columns for each iterator interval.  Supported values:
+        ``'avg'``, ``'min'``, ``'max'``, ``'sum'``, ``'stddev'``
+        (R's ``stdev`` is also accepted).
+    params : None
+        Reserved for future use. Must be ``None``; raises
+        ``NotImplementedError`` if provided.
+
+    See Also
+    --------
+    gvtrack_create : Create a virtual track from any source.
+    gvtrack_rm : Remove a virtual track.
+    gtrack_array_extract : Extract per-position values from an array track.
+    gtrack_array_get_colnames : List column names of an array track.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gvtrack_create("v_avg", src="array_track")
+    >>> pm.gvtrack_array_slice("v_avg", func="avg")
+    >>> pm.gvtrack_create("v_col0", src="array_track")
+    >>> pm.gvtrack_array_slice("v_col0", slice=["col0"], func="avg")
+    >>> pm.gvtrack_ls()
+    ['v_avg', 'v_col0']
+    >>> pm.gvtrack_clear()
+    """
+    _shared._checkroot()
+
+    if params is not None:
+        raise NotImplementedError("array_slice params not yet supported")
+
+    # Vtrack must already exist.
+    if vtrack not in _shared._VTRACKS:
+        raise ValueError(f"gvtrack_array_slice: no such vtrack '{vtrack}'")
+
+    existing = _shared._VTRACKS[vtrack]
+    src = existing.get("src")
+
+    # src must be a string (track name) pointing to an array track.
+    if not isinstance(src, str):
+        raise ValueError(
+            f"gvtrack_array_slice: vtrack '{vtrack}' is not an array track vtrack "
+            f"(src is not a track name)"
+        )
+
+    from .tracks import gtrack_exists, gtrack_info
+
+    if not gtrack_exists(src):
+        raise ValueError(
+            f"gvtrack_array_slice: vtrack '{vtrack}' source track '{src}' does not exist"
+        )
+    info = gtrack_info(src)
+    if info.get("type") != "array":
+        raise ValueError(
+            f"gvtrack_array_slice: vtrack '{vtrack}' source track '{src}' is not an array track "
+            f"(type={info.get('type')!r}). "
+            f"Use gvtrack_create for dense/sparse tracks."
+        )
+
+    from ._array_track import ARRAY_REDUCE_FUNCS
+
+    func_lc = func.lower()
+    if func_lc not in ARRAY_REDUCE_FUNCS:
+        raise ValueError(
+            f"gvtrack_array_slice: func must be one of "
+            f"{sorted(ARRAY_REDUCE_FUNCS)!r}, got {func!r}"
+        )
+
+    # Resolve slice to a list of 0-based int indices (or None = all columns)
+    if slice is not None:
+        from pathlib import Path
+
+        from ._array_track import read_colnames
+
+        track_path = Path(_pymisha.pm_track_path(src))
+        colnames = read_colnames(track_path)
+        slice_list = list(slice)
+        if all(isinstance(s, str) for s in slice_list):
+            cn_idx = {name: i for i, name in enumerate(colnames)}
+            bad = [s for s in slice_list if s not in cn_idx]
+            if bad:
+                raise ValueError(
+                    f"gvtrack_array_slice: column(s) not found in '{src}': {bad!r}"
+                )
+            slice_cols: list[int] | None = [cn_idx[s] for s in slice_list]
+        elif all(isinstance(s, (int, _numpy.integer)) for s in slice_list):
+            ncols = len(colnames)
+            bad_idx = [int(s) for s in slice_list if int(s) < 0 or int(s) >= ncols]
+            if bad_idx:
+                raise ValueError(
+                    f"gvtrack_array_slice: column indices out of range [0, {ncols}): {bad_idx!r}"
+                )
+            slice_cols = [int(s) for s in slice_list]
+        else:
+            raise ValueError(
+                "gvtrack_array_slice: slice must be a list of strings (column names) "
+                "or ints (0-based column indices)"
+            )
+    else:
+        slice_cols = None
+
+    # Mutate the existing vtrack config in place.
+    _shared._VTRACKS[vtrack] = {
+        "kind": "array_slice",
+        "src": src,
+        "slice_cols": slice_cols,  # None = all columns
+        "func": func_lc,
+    }

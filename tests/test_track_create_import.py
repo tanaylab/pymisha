@@ -191,6 +191,76 @@ def test_gtrack_create_expression_dense_streaming(tmp_path):
         pm.gdb_init(str(TEST_DB))
 
 
+def test_gtrack_create_expression_with_vtrack(tmp_path):
+    """gtrack_create must accept expressions referencing virtual tracks.
+
+    Regression test for the bug where gtrack_create handed the raw expression
+    string to the C++ engine without resolving Python-side vtracks, producing
+    a confusing ``name '<vtrack>' is not defined`` error.
+    """
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        pm.gvtrack_clear()
+        pm.gvtrack_create("vt_sum", "dense_track", func="sum")
+        pm.gvtrack_iterator("vt_sum", sshift=-40, eshift=40)
+
+        pm.gtrack_create(
+            "created_expr_vtrack", "vt expr", expr="vt_sum * 2", iterator=20
+        )
+        assert pm.gtrack_exists("created_expr_vtrack")
+
+        query = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [400]})
+        out = pm.gextract("created_expr_vtrack", query, iterator=20)
+        ref = pm.gextract("vt_sum * 2", query, iterator=20)
+        assert out is not None and ref is not None
+        np.testing.assert_allclose(
+            out["created_expr_vtrack"].to_numpy(dtype=float),
+            ref["vt_sum * 2"].to_numpy(dtype=float),
+            equal_nan=True,
+        )
+    finally:
+        pm.gvtrack_clear()
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_create_expression_with_compound_vtracks(tmp_path):
+    """gtrack_create must support expressions combining multiple vtracks.
+
+    Mirrors the gcnorm pattern: two pre-iterated vtracks combined with
+    arithmetic. Catches regressions where only single-vtrack references work.
+    """
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        pm.gvtrack_clear()
+        pm.gvtrack_create("vt_sum", "dense_track", func="sum")
+        pm.gvtrack_iterator("vt_sum", sshift=-40, eshift=40)
+        pm.gvtrack_create("vt_avg", "dense_track", func="avg")
+        pm.gvtrack_iterator("vt_avg", sshift=-40, eshift=40)
+
+        pm.gtrack_create(
+            "created_expr_two_vtracks",
+            "two-vtrack expr",
+            expr="vt_sum + vt_avg",
+            iterator=20,
+        )
+        assert pm.gtrack_exists("created_expr_two_vtracks")
+
+        query = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [400]})
+        out = pm.gextract("created_expr_two_vtracks", query, iterator=20)
+        ref = pm.gextract("vt_sum + vt_avg", query, iterator=20)
+        assert out is not None and ref is not None
+        np.testing.assert_allclose(
+            out["created_expr_two_vtracks"].to_numpy(dtype=float),
+            ref["vt_sum + vt_avg"].to_numpy(dtype=float),
+            equal_nan=True,
+        )
+    finally:
+        pm.gvtrack_clear()
+        pm.gdb_init(str(TEST_DB))
+
+
 def test_gtrack_copy_mv_rm(tmp_path):
     root = _copy_db(tmp_path)
     try:

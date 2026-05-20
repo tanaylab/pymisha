@@ -3813,9 +3813,18 @@ def giterator_cartesian_grid(
     expansion2: Any | None = None,
     min_band_idx: int | None = None,
     max_band_idx: int | None = None,
-) -> pd.DataFrame:
+    *,
+    stream: bool = False,
+) -> pd.DataFrame | Any:
     """
     Create a 2D cartesian-grid iterator as 2D intervals.
+
+    When ``stream=True``, returns a :class:`~pymisha._iterator_policy.CartesianGridSpec`
+    that can be passed to :func:`gextract` as the ``iterator=`` argument.
+    The C++ scanner will generate the cartesian-product cells on the fly
+    during extraction, without materializing the full grid first.
+
+    When ``stream=False`` (default), materializes all cells as a DataFrame.
 
     The grid is built from 1D interval centers and expansion breakpoints.
     For each center ``C`` and consecutive expansion pair ``(E[i], E[i+1])``,
@@ -3853,6 +3862,18 @@ def giterator_cartesian_grid(
     ValueError
         If inputs are invalid.
     """
+    if stream:
+        from ._iterator_policy import CartesianGridSpec
+
+        return CartesianGridSpec(
+            intervals1=intervals1,
+            expansion1=tuple(int(x) for x in expansion1),
+            intervals2=intervals2,
+            expansion2=tuple(int(x) for x in expansion2) if expansion2 is not None else None,
+            min_band_idx=min_band_idx,
+            max_band_idx=max_band_idx,
+        )
+
     _checkroot()
 
     if intervals1 is None or expansion1 is None:
