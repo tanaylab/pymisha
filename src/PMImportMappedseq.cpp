@@ -22,6 +22,7 @@
 #include <vector>
 #include <cstdio>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <zlib.h>
 
@@ -102,26 +103,83 @@ public:
     }
 };
 
-// FdSource: wraps an arbitrary file descriptor (e.g. the read end of a pipe
-// opened by the Python layer via subprocess.Popen + os.dup). Ownership of the
-// fd is transferred to FdSource; fclose() closes the fd which signals EOF to
-// the writer (e.g. samtools). The Python layer must os.dup() the pipe fd
-// before passing it here so that proc.stdout can still be managed by Python.
+// FdSource: wraps an arbitrary file descriptor (used by the "-" / "fd:N"
+// public paths for shell-pipeline composition). Ownership of the fd is
+// transferred to FdSource; fclose() closes the fd which signals EOF to the
+// writer. Callers that need the fd to stay open elsewhere must dup() first.
 class FdSource : public ByteSource {
     FILE *fp_;
-    bool owns_fp_;
 public:
-    explicit FdSource(int fd) : fp_(nullptr), owns_fp_(true) {
+    explicit FdSource(int fd) : fp_(nullptr) {
         fp_ = fdopen(fd, "rb");
         if (!fp_)
             verror("Failed to fdopen fd %d: %s", fd, strerror(errno));
     }
     ~FdSource() override {
-        if (owns_fp_ && fp_) fclose(fp_);
+        if (fp_) fclose(fp_);
     }
     int getc() override { return ::getc(fp_); }
     bool error() const override { return fp_ ? ferror(fp_) != 0 : true; }
 };
+
+// PipeSource: popen-based source. Used for BAM auto-detect (samtools view).
+// finish() is called explicitly after the FSM has drained the pipe so the
+// caller can inspect the child's exit status; pclose in the destructor is a
+// fallback for the exception path.
+class PipeSource : public ByteSource {
+    FILE *fp_;
+    std::string cmd_;
+    bool finished_;
+    int finish_status_;
+public:
+    explicit PipeSource(const std::string &cmd)
+        : fp_(nullptr), cmd_(cmd), finished_(false), finish_status_(-1)
+    {
+        fp_ = popen(cmd.c_str(), "r");
+        if (!fp_)
+            verror("Failed to popen '%s': %s", cmd.c_str(), strerror(errno));
+    }
+    ~PipeSource() override {
+        if (fp_) pclose(fp_);  // best-effort cleanup on exception paths
+    }
+    int getc() override { return ::getc(fp_); }
+    bool error() const override { return fp_ ? ferror(fp_) != 0 : true; }
+    // Drains the rest of the pipe and waits for the child. Returns the raw
+    // status from pclose (use WEXITSTATUS to extract the exit code).
+    int finish() {
+        if (finished_) return finish_status_;
+        finished_ = true;
+        finish_status_ = pclose(fp_);
+        fp_ = nullptr;
+        return finish_status_;
+    }
+    const std::string &cmd() const { return cmd_; }
+};
+
+// Single-quote escape for paths handed to /bin/sh via popen: every ' becomes
+// '\'' and the whole string is wrapped in '...'. Safe against shell
+// metacharacters in filesystem paths.
+static std::string shellquote_single(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') out.append("'\\''");
+        else out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+}
+
+// Returns 0 if no magic bytes could be read, otherwise fills buf and returns
+// number of bytes read (up to nbuf).
+static size_t read_magic_bytes(const std::string &path, unsigned char *buf, size_t nbuf) {
+    FILE *fp = fopen(path.c_str(), "rb");
+    if (!fp) return 0;
+    size_t n = fread(buf, 1, nbuf, fp);
+    fclose(fp);
+    return n;
+}
 
 static std::unique_ptr<ByteSource> open_source(const std::string &path) {
     // stdin shorthand
@@ -135,14 +193,18 @@ static std::unique_ptr<ByteSource> open_source(const std::string &path) {
             verror("Invalid fd path: %s (expected fd:N for non-negative integer N)", path.c_str());
         return std::unique_ptr<ByteSource>(new FdSource((int)fd));
     }
-    // regular path: magic-byte sniff for gzip detection
-    FILE *fp = fopen(path.c_str(), "rb");
-    if (!fp)
-        verror("Failed to open %s: %s", path.c_str(), strerror(errno));
-    unsigned char magic[2] = {0, 0};
-    size_t n = fread(magic, 1, 2, fp);
-    fclose(fp);
-    if (n == 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+    // Regular path: peek magic bytes. BAM is bgzip = gzip with FLG=0x04
+    // (FEXTRA - block-size subfield); plain gzip has FLG=0x00 or 0x08, so
+    // byte 3 distinguishes BAM. Pipe BAM through samtools view; gzip and
+    // plain stay as before.
+    unsigned char magic[4] = {0, 0, 0, 0};
+    size_t n = read_magic_bytes(path, magic, 4);
+    if (n == 4 && magic[0] == 0x1f && magic[1] == 0x8b &&
+                  magic[2] == 0x08 && magic[3] == 0x04) {
+        const std::string cmd = "samtools view " + shellquote_single(path);
+        return std::unique_ptr<ByteSource>(new PipeSource(cmd));
+    }
+    if (n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b)
         return std::unique_ptr<ByteSource>(new GzipSource(path));
     return std::unique_ptr<ByteSource>(new PlainSource(path));
 }
@@ -338,6 +400,27 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
 
         if (src->error())
             verror("Error while reading %s", file_path.c_str());
+
+        // If we routed through samtools (BAM auto-detect), drain the pipe and
+        // surface a non-zero exit. 127 is "command not found" - tell the user
+        // samtools isn't installed; other codes mean samtools itself failed.
+        if (auto *pipe_src = dynamic_cast<PipeSource *>(src.get())) {
+            int raw_status = pipe_src->finish();
+            if (raw_status != 0) {
+                int code = WIFEXITED(raw_status) ? WEXITSTATUS(raw_status) : -1;
+                if (code == 127) {
+                    verror("BAM input detected at %s but samtools is not on PATH. "
+                           "Install samtools (e.g. `apt-get install samtools` or "
+                           "`conda install -c bioconda samtools`) or pre-convert: "
+                           "`samtools view %s > %s.sam`.",
+                           file_path.c_str(), file_path.c_str(), file_path.c_str());
+                } else {
+                    verror("samtools view %s exited with code %d (raw status %d). "
+                           "Run `samtools view %s | head` to see the underlying error.",
+                           file_path.c_str(), code, raw_status, file_path.c_str());
+                }
+            }
+        }
 
         // Write track files (Tasks 4-5).
         ensure_track_dir_pm(track_dir);

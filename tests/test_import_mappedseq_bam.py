@@ -116,7 +116,10 @@ def test_import_mappedseq_bam_no_samtools(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", "/nonexistent")
     try:
         pm.gdb_init(str(root))
-        with pytest.raises(RuntimeError, match="samtools is not on PATH"):
+        # C++ side surfaces a pymisha.error (TGLException-derived) with the
+        # actionable install hint. Match the hint substring so test stays
+        # green if the prefix wording is later tweaked.
+        with pytest.raises(Exception, match="samtools is not on PATH"):
             pm.gtrack_import_mappedseq(
                 "bam_no_samtools", "BAM", str(bam),
                 pileup=10, binsize=10, cols_order=None,

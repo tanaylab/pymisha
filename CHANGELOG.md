@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 (2026-05-21)
+
+- Internal: BAM auto-detect for `gtrack_import_mappedseq` moved from the Python wrapper into the C++ entry. `samtools view` is now spawned via `popen()` inside `pm_import_mappedseq`; the Python side no longer manages a subprocess or dups file descriptors. User-visible behavior is unchanged. This makes the architecture symmetric with the upcoming R misha port (R can't easily share fds with C, but both languages can let C drive `popen`).
+- The C++ side surfaces a clear `pymisha.error` when `samtools` is missing (exit code 127) or when `samtools view` exits non-zero. The exception type changed from `RuntimeError` to `pymisha.error` - both are catchable as `Exception`.
+
 ## v0.2.1 (2026-05-21)
 
 - `gtrack_import_mappedseq` now accepts BAM files directly: bgzip magic bytes (`1f 8b 08 04`) are auto-detected and the file is streamed through `samtools view` into the existing C++ FSM. Requires `samtools` on PATH; a clear `RuntimeError` is raised otherwise. The legacy default `cols_order=(9, 11, 13, 14)` is silently switched to SAM mode (`None`) for BAM inputs since `samtools view` always emits SAM-format payload.

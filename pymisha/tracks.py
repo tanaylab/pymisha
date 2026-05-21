@@ -18,7 +18,6 @@ import re
 import secrets
 import shutil
 import struct
-import subprocess
 import tempfile
 import warnings
 import zipfile
@@ -2852,31 +2851,11 @@ def gtrack_import_mappedseq(
     if not os.path.exists(path):
         raise ValueError(f"File not found: {path}")
 
-    samtools_proc = None
-    samtools_dup_fd = None
-    cpp_file_arg = path
-
+    # BAM auto-detect: keep the cols_order auto-switch in Python (the legacy
+    # default (9, 11, 13, 14) is a tab-mode layout, but BAM payload via
+    # samtools view is always SAM-format). The actual I/O - including the
+    # samtools subprocess - happens in C++ pm_import_mappedseq.
     if _is_bam_file(path):
-        samtools_bin = shutil.which("samtools")
-        if samtools_bin is None:
-            raise RuntimeError(
-                f"{path} looks like a BAM file (bgzip magic detected) but "
-                "samtools is not on PATH. Install samtools (e.g. "
-                "`apt-get install samtools` or `conda install -c bioconda "
-                "samtools`) or pre-convert: `samtools view file.bam > file.sam`."
-            )
-        samtools_proc = subprocess.Popen(
-            [samtools_bin, "view", path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Dup the pipe-read fd so the C++ side can fclose it freely without
-        # confusing subprocess.Popen's own bookkeeping on proc.stdout.
-        samtools_dup_fd = os.dup(samtools_proc.stdout.fileno())
-        cpp_file_arg = f"fd:{samtools_dup_fd}"
-        # BAM payload via samtools view is always SAM format. Silently switch
-        # the legacy default cols_order=(9,11,13,14) to SAM mode (None). If
-        # the caller passed an explicit non-default value, warn before overriding.
         _default_cols = (9, 11, 13, 14)
         if cols_arg is not None and cols_arg != _default_cols:
             warnings.warn(
@@ -2891,32 +2870,18 @@ def gtrack_import_mappedseq(
         f"pileup={pileup_i}, binsize={binsize_i}, remove.dups={bool(remove_dups)})"
     )
 
-    try:
-        with _atomic_track_create(track) as tmp_dir:
-            res = _pymisha.pm_import_mappedseq(
-                str(tmp_dir), cpp_file_arg,
-                pileup_i, binsize_i, cols_arg, bool(remove_dups),
+    with _atomic_track_create(track) as tmp_dir:
+        res = _pymisha.pm_import_mappedseq(
+            str(tmp_dir), path,
+            pileup_i, binsize_i, cols_arg, bool(remove_dups),
+        )
+        if pileup_i > 0:
+            _write_created_attrs_at_path(
+                tmp_dir, description, created_by,
+                {"type": "dense", "binsize": str(binsize_i)},
             )
-            if pileup_i > 0:
-                _write_created_attrs_at_path(
-                    tmp_dir, description, created_by,
-                    {"type": "dense", "binsize": str(binsize_i)},
-                )
-            else:
-                _write_created_attrs_at_path(tmp_dir, description, created_by)
-    finally:
-        if samtools_proc is not None:
-            # C++ closed samtools_dup_fd via fclose, which signals EOF to
-            # samtools' stdout. Drain stderr + wait for the process to exit.
-            samtools_proc.stdout.close()
-            stderr_data = samtools_proc.stderr.read()
-            samtools_proc.stderr.close()
-            rc = samtools_proc.wait()
-            if rc != 0:
-                raise RuntimeError(
-                    f"samtools view {path} exited with code {rc}: "
-                    f"{stderr_data.decode('utf-8', errors='replace').strip()}"
-                )
+        else:
+            _write_created_attrs_at_path(tmp_dir, description, created_by)
 
     _pm_dbreload()
 
