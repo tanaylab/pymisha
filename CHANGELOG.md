@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 (2026-05-21)
+
+- `gtrack_import_mappedseq` now accepts BAM files directly: bgzip magic bytes (`1f 8b 08 04`) are auto-detected and the file is streamed through `samtools view` into the existing C++ FSM. Requires `samtools` on PATH; a clear `RuntimeError` is raised otherwise. The legacy default `cols_order=(9, 11, 13, 14)` is silently switched to SAM mode (`None`) for BAM inputs since `samtools view` always emits SAM-format payload.
+- New stdin / fd source in the C++ FSM: `file="-"` reads from stdin and `file="fd:N"` reads from an arbitrary file descriptor. Lets users compose pipelines such as `samtools view -q 30 reads.bam | python -c "pm.gtrack_import_mappedseq(...)"` or pre-filter via `samtools markdup` / region restriction.
+
 ## v0.2.0 (2026-05-21)
 
 Bundle release covering v0.1.75 through v0.1.95. Major themes:

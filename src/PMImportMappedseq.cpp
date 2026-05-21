@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cstdio>
 #include <sys/stat.h>
 
 #include <zlib.h>
@@ -101,7 +102,40 @@ public:
     }
 };
 
+// FdSource: wraps an arbitrary file descriptor (e.g. the read end of a pipe
+// opened by the Python layer via subprocess.Popen + os.dup). Ownership of the
+// fd is transferred to FdSource; fclose() closes the fd which signals EOF to
+// the writer (e.g. samtools). The Python layer must os.dup() the pipe fd
+// before passing it here so that proc.stdout can still be managed by Python.
+class FdSource : public ByteSource {
+    FILE *fp_;
+    bool owns_fp_;
+public:
+    explicit FdSource(int fd) : fp_(nullptr), owns_fp_(true) {
+        fp_ = fdopen(fd, "rb");
+        if (!fp_)
+            verror("Failed to fdopen fd %d: %s", fd, strerror(errno));
+    }
+    ~FdSource() override {
+        if (owns_fp_ && fp_) fclose(fp_);
+    }
+    int getc() override { return ::getc(fp_); }
+    bool error() const override { return fp_ ? ferror(fp_) != 0 : true; }
+};
+
 static std::unique_ptr<ByteSource> open_source(const std::string &path) {
+    // stdin shorthand
+    if (path == "-")
+        return std::unique_ptr<ByteSource>(new FdSource(0));
+    // explicit fd: "fd:N"
+    if (path.size() > 3 && path.compare(0, 3, "fd:") == 0) {
+        char *endptr = nullptr;
+        long fd = strtol(path.c_str() + 3, &endptr, 10);
+        if (*endptr != '\0' || fd < 0)
+            verror("Invalid fd path: %s (expected fd:N for non-negative integer N)", path.c_str());
+        return std::unique_ptr<ByteSource>(new FdSource((int)fd));
+    }
+    // regular path: magic-byte sniff for gzip detection
     FILE *fp = fopen(path.c_str(), "rb");
     if (!fp)
         verror("Failed to open %s: %s", path.c_str(), strerror(errno));
@@ -184,7 +218,9 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
             }
         }
 
-        if (!file_exists_pm(file_path))
+        const bool is_fd_path = (file_path == "-" ||
+            (file_path.size() > 3 && file_path.compare(0, 3, "fd:") == 0));
+        if (!is_fd_path && !file_exists_pm(file_path))
             verror("File not found: %s", file_path.c_str());
 
         if (!g_pmdb || !g_pmdb->is_initialized())

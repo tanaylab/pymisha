@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import struct
+import subprocess
 import tempfile
 import warnings
 import zipfile
@@ -44,6 +45,25 @@ from ._shared import (
     _track_names_set,
 )
 from ._types import Intervals, NumpyArray
+
+# bgzip magic: gzip (1f 8b) with FLG byte 0x04 (FEXTRA set - bgzip block-size
+# subfield). Plain gzip files have FLG=0x00 or 0x08, so byte 4 reliably
+# distinguishes BAM from other gzip-compressed files.
+_BGZF_MAGIC = b"\x1f\x8b\x08\x04"
+
+
+def _is_bam_file(path: str) -> bool:
+    """Return True if path begins with bgzip magic bytes (BAM detection).
+
+    Works even when the file is not named .bam. Returns False on any OSError
+    (missing file, permission denied) so callers do not need to guard.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    return head == _BGZF_MAGIC
 
 
 def _load_track_attributes(track_name: str) -> dict[str, str]:
@@ -2832,23 +2852,71 @@ def gtrack_import_mappedseq(
     if not os.path.exists(path):
         raise ValueError(f"File not found: {path}")
 
+    samtools_proc = None
+    samtools_dup_fd = None
+    cpp_file_arg = path
+
+    if _is_bam_file(path):
+        samtools_bin = shutil.which("samtools")
+        if samtools_bin is None:
+            raise RuntimeError(
+                f"{path} looks like a BAM file (bgzip magic detected) but "
+                "samtools is not on PATH. Install samtools (e.g. "
+                "`apt-get install samtools` or `conda install -c bioconda "
+                "samtools`) or pre-convert: `samtools view file.bam > file.sam`."
+            )
+        samtools_proc = subprocess.Popen(
+            [samtools_bin, "view", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Dup the pipe-read fd so the C++ side can fclose it freely without
+        # confusing subprocess.Popen's own bookkeeping on proc.stdout.
+        samtools_dup_fd = os.dup(samtools_proc.stdout.fileno())
+        cpp_file_arg = f"fd:{samtools_dup_fd}"
+        # BAM payload via samtools view is always SAM format. Silently switch
+        # the legacy default cols_order=(9,11,13,14) to SAM mode (None). If
+        # the caller passed an explicit non-default value, warn before overriding.
+        _default_cols = (9, 11, 13, 14)
+        if cols_arg is not None and cols_arg != _default_cols:
+            warnings.warn(
+                "BAM input with non-default cols_order. samtools view emits "
+                "SAM format; pass cols_order=None to use SAM defaults.",
+                stacklevel=2,
+            )
+        cols_arg = None
+
     created_by = (
         f'gtrack.import_mappedseq("{track}", description, "{path}", '
         f"pileup={pileup_i}, binsize={binsize_i}, remove.dups={bool(remove_dups)})"
     )
 
-    with _atomic_track_create(track) as tmp_dir:
-        res = _pymisha.pm_import_mappedseq(
-            str(tmp_dir), path,
-            pileup_i, binsize_i, cols_arg, bool(remove_dups),
-        )
-        if pileup_i > 0:
-            _write_created_attrs_at_path(
-                tmp_dir, description, created_by,
-                {"type": "dense", "binsize": str(binsize_i)},
+    try:
+        with _atomic_track_create(track) as tmp_dir:
+            res = _pymisha.pm_import_mappedseq(
+                str(tmp_dir), cpp_file_arg,
+                pileup_i, binsize_i, cols_arg, bool(remove_dups),
             )
-        else:
-            _write_created_attrs_at_path(tmp_dir, description, created_by)
+            if pileup_i > 0:
+                _write_created_attrs_at_path(
+                    tmp_dir, description, created_by,
+                    {"type": "dense", "binsize": str(binsize_i)},
+                )
+            else:
+                _write_created_attrs_at_path(tmp_dir, description, created_by)
+    finally:
+        if samtools_proc is not None:
+            # C++ closed samtools_dup_fd via fclose, which signals EOF to
+            # samtools' stdout. Drain stderr + wait for the process to exit.
+            samtools_proc.stdout.close()
+            stderr_data = samtools_proc.stderr.read()
+            samtools_proc.stderr.close()
+            rc = samtools_proc.wait()
+            if rc != 0:
+                raise RuntimeError(
+                    f"samtools view {path} exited with code {rc}: "
+                    f"{stderr_data.decode('utf-8', errors='replace').strip()}"
+                )
 
     _pm_dbreload()
 

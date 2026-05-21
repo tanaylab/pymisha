@@ -367,19 +367,18 @@ pm.gtrack_create_dense("atac.es",
 
 Preferred path for any read-intervals-in-Python source.
 
-**Mapped reads from a SAM-style text file.**
+**Mapped reads from a BAM, SAM, or tab-delimited file.**
 
 ```python
 pm.gtrack_import_mappedseq("atac.es",
                            description="ATAC ES read coverage",
-                           file="atac_es.txt.gz",
+                           file="atac_es.bam",   # BAM auto-detected; SAM / .txt.gz also accepted
                            pileup=200,
                            binsize=20,
-                           cols_order=(9, 11, 13, 14),
                            remove_dups=True)
 ```
 
-C++ fast-path since v0.1.95 (3-5x over the legacy Python loop). R-parity: chromosome names in the input must match the DB's chromkey verbatim (no `chr1` → `1` rewrite). Gzip files are auto-detected. Pass `cols_order=None` for SAM-format inputs (then sequence is column 10, chromosome 3, coordinate 4, FLAG 2). `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1` selects the pure-Python fallback if you need it for debugging.
+BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). C++ fast-path since v0.1.95 (3-5x over the legacy Python loop). R-parity: chromosome names must match the DB's chromkey verbatim (no `chr1` → `1` rewrite). `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1` selects the pure-Python fallback if you need it for debugging.
 
 **Per-fragment 2D contacts → 2D track.**
 
@@ -413,6 +412,7 @@ pm.gtrack_export_bedgraph("epi.k27me3.es",
 **Avoid:**
 - `gtrack_import` without `binsize` for a continuous-signal source - resulting bin grid may not align with the rest of your trackdb.
 - `gtrack_import_mappedseq` without `remove_dups=True` for ChIP / ATAC - PCR duplicates inflate per-bin counts.
+- Pre-converting BAM to SAM manually before calling `gtrack_import_mappedseq` - BAM is now auto-detected and piped through `samtools view` internally.
 - Per-chromosome `multiprocessing` + `pd.concat` + `gtrack_create_sparse` to build a coverage track from a BAM - `gtrack_create_dense(..., func="coverage")` does it in one call.
 
 ## 6. Side topics (pointers)

@@ -3,7 +3,11 @@
 Full end-to-end semantics are tested via gtrack_import_mappedseq once
 the Python dispatcher is wired up (Task 6 of the plan).
 """
+import json
 import shutil
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -372,3 +376,33 @@ def test_pm_import_mappedseq_dense_multibin(tmp_path):
         np.testing.assert_allclose(vals[5:6], np.array([0.0]))
     finally:
         pm.gdb_init(str(TEST_DB))
+
+
+def test_pm_import_mappedseq_stdin_dash(tmp_path):
+    """file='-' reads from fd 0. Smoke test by redirecting stdin via
+    a child Python process so we don't trample the pytest stdin."""
+    root = _copy_db(tmp_path)
+    sam = tmp_path / "reads.sam"
+    sam.write_text("A\t1\t10\t+\nA\t1\t20\t-\n")
+    track_dir = str(root / "tracks" / "stdin_test.track")
+    repo_root = str(Path(__file__).resolve().parent.parent)
+
+    code = textwrap.dedent(f"""
+        import os, sys, json
+        sys.path.insert(0, {repr(repo_root)})
+        import pymisha as pm
+        from pymisha import _pymisha
+        from pathlib import Path
+        pm.gdb_init({repr(str(root))})
+        os.makedirs(Path({repr(track_dir)}).parent, exist_ok=True)
+        res = _pymisha.pm_import_mappedseq(
+            {repr(track_dir)}, "-", 0, -1, (1, 2, 3, 4), True,
+        )
+        print(json.dumps({{"mapped": res["total"]["total.mapped"]}}))
+    """)
+    out = subprocess.check_output(
+        [sys.executable, "-c", code],
+        stdin=open(sam, "rb"),
+    )
+    res = json.loads(out.strip().splitlines()[-1])
+    assert res["mapped"] == 2.0
