@@ -25,6 +25,7 @@ setup(
         Extension('_pymisha',
             sources=src_files,
             include_dirs=[numpy.get_include(), 'src'],
+            libraries=['z'],
             extra_compile_args=compile_args,
             extra_link_args=link_args,
         ),

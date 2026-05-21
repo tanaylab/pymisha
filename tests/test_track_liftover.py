@@ -108,7 +108,8 @@ class TestGtrackLiftover:
 
             assert pm.gtrack_exists("lifted_dense")
             info = pm.gtrack_info("lifted_dense")
-            assert info["type"] == "sparse"  # liftover creates sparse track
+            assert info["type"] == "dense"   # dense source -> dense target (R-parity)
+            assert info["bin_size"] == 100
 
             # Extract lifted values
             intervs = pm.gintervals("chr1", 5000, 6000)

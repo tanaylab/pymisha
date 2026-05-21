@@ -128,6 +128,26 @@ See the [Creating Genome Databases](https://tanaylab.github.io/pymisha/tutorials
 - `pyreadr` + `Rscript`: For loading R-serialized big interval sets.
 - `PyYAML`: For richer `gdataset_info` metadata parsing.
 
+## Using pymisha with an LLM agent
+
+LLM coding agents (Claude Code, Copilot, Cursor) writing pymisha analysis code can pre-load these reference docs into context for fewer hallucinated APIs and more idiomatic recipes:
+
+- [agent-guides/pymisha-core.md](agent-guides/pymisha-core.md) — concepts, chooser tables, everyday recipes.
+- [agent-guides/pymisha-advanced.md](agent-guides/pymisha-advanced.md) — 2D/Hi-C, PWM, import/export, new genomes, gsynth.
+- [agent-guides/pymisha-anti-patterns.md](agent-guides/pymisha-anti-patterns.md) — silent footguns cross-referenced from the above.
+- [agent-guides/skills/importing-tracks/SKILL.md](agent-guides/skills/importing-tracks/SKILL.md) — full track-import reference.
+
+For agents that fetch context by URL (rather than from a cloned repo), drop these raw URLs into the system prompt:
+
+```
+https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-core.md
+https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-advanced.md
+https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-anti-patterns.md
+https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/skills/importing-tracks/SKILL.md
+```
+
+The guides mirror the equivalent set in [R misha](https://github.com/tanaylab/misha/tree/master/agent-guides) — same section numbering, same recipes, translated to the pymisha API.
+
 ## Missing features
 
 Compared to R misha, the following are not yet implemented:

@@ -211,7 +211,16 @@ class TestLoadChain:
         assert len(chain) == 0
 
     def test_load_chain_src_overlap_discard_wide_interval(self, tmp_path):
-        """Discard policy removes non-adjacent overlaps caused by a wide source interval."""
+        """src=discard uses R's pair-only scan (rdbinterval.cpp:820-841).
+
+        A wide row encloses two non-adjacent narrow rows. R only inspects
+        consecutive pairs after sort_by_src, so the wide+first-narrow pair
+        is dropped but the second-narrow row (separated by a gap from the
+        first narrow) survives because its only neighbor in src-sorted
+        order is the prior narrow row and they don't pair-overlap. Pymisha
+        switched from whole-cluster discard (v0.1.90 and earlier) to R-parity
+        pair-only in v0.1.91.
+        """
         entries = [
             ({"score": 1000, "src_chrom": "srcA", "src_size": 10000,
               "src_strand": "+", "src_start": 0, "src_end": 1000,
@@ -235,7 +244,10 @@ class TestLoadChain:
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="discard",
                                          tgt_overlap_policy="keep")
-        assert len(chain) == 0
+        # R-parity: pair (chain1, chain2) overlap at src -> drop both.
+        # Pair (chain2, chain3) doesn't overlap (200 < 300) -> chain3 kept.
+        assert len(chain) == 1
+        assert chain["chain_id"].tolist() == [3]
 
     def test_load_chain_src_overlap_error(self, tmp_path):
         """Source overlap with error policy raises."""

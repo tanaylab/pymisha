@@ -109,6 +109,15 @@ PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args);
+PyObject *pm_liftover_aggregate(PyObject *self, PyObject *args);
+PyObject *pm_parse_chain_file(PyObject *self, PyObject *args);
+PyObject *pm_read_source_track_1d(PyObject *self, PyObject *args);
+PyObject *pm_chain_intervals_resolve(PyObject *self, PyObject *args);
+PyObject *pm_map_intervals(PyObject *self, PyObject *args);
+PyObject *pm_liftover_track(PyObject *self, PyObject *args);
+PyObject *pm_read_source_track_2d(PyObject *self, PyObject *args);
+PyObject *pm_liftover_track_2d(PyObject *self, PyObject *args);
+PyObject *pm_import_mappedseq(PyObject *self, PyObject *args);
 
 static PyMethodDef module_methods[] = {
     {"pm_dbinit", pm_dbinit, METH_VARARGS, "Initialize database connection"},
@@ -179,6 +188,14 @@ static PyMethodDef module_methods[] = {
     {"pm_ggenome_implant", pm_ggenome_implant, METH_VARARGS, "Implant donor sequences into reference FASTA (C++ fast path)"},
     {"pm_intervals_random", pm_intervals_random, METH_VARARGS, "Generate random non-overlapping genomic intervals (C++ fast path)"},
     {"pm_parse_wig_or_bedgraph", pm_parse_wig_or_bedgraph, METH_VARARGS, "Parse a WIG/BedGraph file into chrom/start/end/value arrays (C++ fast path)"},
+    {"pm_liftover_aggregate", pm_liftover_aggregate, METH_VARARGS, "Aggregate overlapping intervals per chrom (C++ fast path for liftover)"},
+    {"pm_parse_chain_file", pm_parse_chain_file, METH_VARARGS, "Parse a UCSC chain file into 10 columns (C++ fast path for gintervals_load_chain)"},
+    {"pm_read_source_track_1d", pm_read_source_track_1d, METH_VARARGS, "Read a 1D source-track directory into a (type, df_dict) tuple (C++ fast path for gtrack_liftover)"},
+    {"pm_chain_intervals_resolve", pm_chain_intervals_resolve, METH_VARARGS, "Resolve src+tgt overlap policies on a chain DataFrame (C++ fast path for gintervals_load_chain)"},
+    {"pm_map_intervals", pm_map_intervals, METH_VARARGS, "Map source intervals through a resolved chain (G1.P3.B.2 fast path)"},
+    {"pm_liftover_track", pm_liftover_track, METH_VARARGS, "Lift + aggregate a 1D source track to the current target DB (G1.P3.C fast path for gtrack_liftover)"},
+    {"pm_read_source_track_2d", pm_read_source_track_2d, METH_VARARGS, "Read a 2D source-track directory into a rectangle dict (G1.P3.D fast path for gtrack_liftover)"},
+    {"pm_liftover_track_2d", pm_liftover_track_2d, METH_VARARGS, "Lift a 2D source track to the current target DB (G1.P3.D fast path for gtrack_liftover)"},
     {"pm_test_2d_iterator", pm_test_2d_iterator, METH_VARARGS, "Test-only: drive PMTrackExpressionIntervals2DIterator and return emissions"},
     {"pm_test_fixed_rect_iterator", pm_test_fixed_rect_iterator, METH_VARARGS, "Test-only: walk a FixedRect 2D iterator. Args: width, height, intervals_dict, band|None."},
     {"pm_test_fixed_rect_scanner", pm_test_fixed_rect_scanner, METH_VARARGS, "Test-only: FixedRect iterator + 2D scanner end-to-end. Args: width, height, track, func, intervals_dict, band|None."},
@@ -190,6 +207,7 @@ static PyMethodDef module_methods[] = {
     {"pm_extract_2d_objects", pm_extract_2d_objects, METH_VARARGS, "Reduce a 2D RECTS/POINTS track to a per-interval scalar via exists/size/first/last/sample"},
     {"pm_extract_2d_scanner", pm_extract_2d_scanner, METH_VARARGS,
      "Run the 2D scanner with an iterator policy. Args: policy_dict, intervals_dict, vars_list, colnames_list, band|None. Returns dict of per-colname value arrays plus _chrom1/_start1/_end1/_chrom2/_start2/_end2 coord arrays."},
+    {"pm_import_mappedseq", pm_import_mappedseq, METH_VARARGS, "Import mapped sequences (SAM/tab) into a sparse or dense track"},
     {NULL, NULL, 0, NULL}
 };
 

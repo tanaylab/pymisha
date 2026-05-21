@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.2.0 (2026-05-21)
+
+Bundle release covering v0.1.75 through v0.1.95. Major themes:
+
+- **Liftover ported to C++ end-to-end** (G1, v0.1.87-v0.1.94). `_aggregate_overlapping`, chain-file parser, source-track reader (1D dense / sparse / indexed + 2D RECTS / POINTS), overlap-policy resolution, `_map_intervals`, the `gtrack_liftover` orchestrator, and the dispatcher all run in C++ with R-parity semantics. ARRAYS source tracks still wait on G3. Env-var fallbacks: `PYMISHA_FORCE_PY_AGGREGATE_OVERLAPPING`, `_PARSE_CHAIN_FILE`, `_READ_SOURCE_TRACK`, `_CHAIN_INTERVALS_RESOLVE`, `_MAP_INTERVALS`, `_LIFTOVER_TRACK`.
+- **SAM import ported to C++** (G2, v0.1.95). `pm_import_mappedseq` per-byte FSM + direct dense / sparse writers. 3-5x on 100k synthetic SAM. R-parity: exact chrom-name match, tab-only split. Gzip auto-detect retained. `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1` keeps the Python path.
+- **2D scanner + virtual-track R-parity** (v0.1.75-v0.1.85). FixedRect, TrackRects, CartesianGrid iterators. Opt-in scanner routing for the intervals iterator. Reducing 2D vtracks, scanner-side `exists` / `size` / `first` / `last` / `sample` object functions. ARRAYS branch in the C++ scanner + `gvtrack_array_slice`. 2D vtrack shifts through the scanner. Multi-track 2D compound expressions (Spec C).
+- **LLM agent guides** (`agent-guides/`) ported from the R misha guides. Excluded from the sdist; designed for raw-github-URL fetch by downstream agents.
+- **Misc**: `gtrack_create / _modify / _smooth` now resolve vtracks in expressions (v0.1.84); various R-parity corrections for 2D vtracks (`exists` / `size` NaN handling, v0.1.81); CI green on main (mypy + test isolation, v0.1.86).
+
+R parity is the spec wherever the prior Python implementation diverged. See individual v0.1.x entries below for per-release details.
+
+## v0.1.95 (2026-05-21)
+
+- `gtrack_import_mappedseq` ported to C++ (`pm_import_mappedseq`): per-byte
+  FSM SAM/tab parser + direct dense / sparse track writers. Dense speedup
+  3.34x and sparse speedup 5.41x on a 100k-read synthetic SAM (measured
+  vs. the prior pure-Python implementation). R-parity: chromosome names
+  must match the DB exactly (no normalization), tab is the only field
+  separator. Gzip auto-detect via the magic bytes is retained.
+  `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1` selects the Python fallback.
+
+## v0.1.94 (2026-05-21)
+
+- `gtrack_liftover` now supports 2D source tracks (RECTS and POINTS) end-to-end in C++ via the new `pm_liftover_track_2d` entry point. The dispatcher auto-detects 2D sources by quadtree signature and routes them through the dedicated 2D path. No aggregation is performed on the 2D side, matching R behavior. ARRAYS source tracks are still out of scope.
+
+## v0.1.93 (2026-05-21)
+
+- `gtrack_liftover` now preserves source track type: dense (FIXED_BIN) source produces a dense target track; sparse source produces sparse. Previously always produced sparse. This is a breaking change for code relying on the always-sparse output; aggregation semantics now match R for both paths.
+- `gtrack_liftover` runs end-to-end in C++ via the new `pm_liftover_track` entry point (~3.56x faster on a 1M-bin + 10k-chain workload). Set `PYMISHA_FORCE_PY_LIFTOVER_TRACK=1` to fall back to the pure-Python path.
+
+## v0.1.92 (2026-05-21)
+
+- `gintervals_liftover`: ~1.7x end-to-end speedup on 100k src x 100k chain.
+- `best_cluster_*` policies now union by `chain_id` AND source overlap,
+  matching R behavior. Fixes a divergence where multi-block chains were
+  incorrectly split into multiple clusters.
+- Set `PYMISHA_FORCE_PY_MAP_INTERVALS=1` to fall back to the pure-Python
+  liftover path.
+
+## v0.1.91 (2026-05-20)
+
+### Fixes (R-parity)
+- `gintervals_load_chain` now matches R `misha` behavior on two edge cases that v0.1.90 (and earlier) handled differently:
+  - `src_overlap_policy="discard"` uses a pair-only scan after sort by source coordinates (matching R `rdbinterval.cpp` `handle_src_overlaps`). Previously this was a whole-cluster discard that also dropped non-overlapping intervals nested inside a wider overlap. A nested interval separated by a gap from the prior overlap pair is now kept.
+  - `tgt_overlap_policy="auto_score"`/`"auto_first"`/`"auto_longer"`/`"agg"` no longer collapse the split pieces of a negative-strand chain back into a single row via `min(startsrc)` / `max(endsrc)`. The merge step now requires `prev.endsrc == slice.startsrc` (matching R `append_slice`), so negative-strand chains that were split by an overlapping target chain stay as N separate rows with their reversed source coordinates intact.
+
+## v0.1.90 (2026-05-20)
+
+### Performance
+- Chain overlap-policy resolution ported to C++ (~22x faster on a 100k-row synthetic chain under `auto_score`). `gintervals_load_chain` picks up the speedup automatically for all `src_overlap_policy` / `tgt_overlap_policy` combinations. Set `PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE=1` (or pass `_force_pure_python=True`) to fall back to the pure-Python implementation.
+
+### Fixes
+- C++ tgt-overlap sweep now skips zero-length intervals (matching the Python `np.unique`/coverage path) instead of emitting a phantom slice spanning to the next event.
+
+## v0.1.89 (2026-05-20)
+
+### Performance
+- `gtrack.liftover` source-track reader (`_read_source_track`) ported to C++. Per-chrom dense, per-chrom sparse (32-bit + 64-bit record layouts), and indexed `track.idx`/`track.dat` formats all decode directly into numpy arrays. ~6x speedup on a 1M-bin synthetic dense track. Set `PYMISHA_FORCE_PY_READ_SOURCE_TRACK=1` (or pass `_force_pure_python=True`) to fall back to the pure-Python reader.
+
+### Fixes
+- Indexed source tracks with sibling subdirectories (e.g. the `vars/` directory created by `gtrack.convert_to_indexed`) were silently being read as empty sparse tracks. Subdirectories are now filtered out of the per-chrom file list, so the indexed branch runs as intended.
+
+## v0.1.88 (2026-05-20)
+
+### Performance
+- `gintervals_load_chain` is ~5x faster on large chain files. Set `PYMISHA_FORCE_PY_CHAIN_PARSER=1` to fall back to the pure-Python parser.
+
+## v0.1.87 (2026-05-20)
+
+### Performance
+- `gtrack.liftover` overlap aggregation ported to C++. The per-chrom sweep-line in `_aggregate_overlapping` now runs through `_pymisha.pm_liftover_aggregate`. Pure-Python fallback retained for custom aggregator callables.
+
+### Fixes
+- `_aggregate_overlapping` now iterates the active set in row order (was hash order, non-deterministic by value). Affects `first`/`last`/`nth` aggregators.
+
 ## v0.1.86 (2026-05-20)
 
 ### Fixes

@@ -98,6 +98,39 @@ def _parse_chain_file(
     path: str,
     db_chrom_sizes: dict[str, int],
     min_score: float | None = None,
+    _force_pure_python: bool = False,
+) -> dict[str, Any] | None:
+    """Parse a UCSC chain file. Dispatches to C++ by default.
+
+    Returns a dict whose values are numpy arrays on the C++ path and Python
+    lists on the pure-Python path. Downstream callers consume both via
+    ``pd.DataFrame(...)``, which infers the same dtypes either way.
+
+    The `_force_pure_python` kwarg is used by the G1.P2 cross-validation tests
+    in tests/test_chain_parser_cpp.py to compare the C++ and Python paths.
+    Setting the env var PYMISHA_FORCE_PY_CHAIN_PARSER=1 has the same effect
+    globally.
+    """
+    chain_path = Path(path)
+    if not chain_path.exists():
+        raise FileNotFoundError(f"Chain file does not exist: {path}")
+    if not chain_path.is_file():
+        raise ValueError(f"Chain path is not a regular file: {path}")
+
+    use_py = _force_pure_python or os.environ.get(
+        "PYMISHA_FORCE_PY_CHAIN_PARSER", ""
+    ) == "1"
+    if use_py:
+        return _parse_chain_file_python(path, db_chrom_sizes, min_score=min_score)
+
+    ms = float("nan") if min_score is None else float(min_score)
+    return _pymisha.pm_parse_chain_file(str(chain_path), ms)
+
+
+def _parse_chain_file_python(
+    path: str,
+    db_chrom_sizes: dict[str, int],
+    min_score: float | None = None,
 ) -> dict[str, list[Any]] | None:
     """Parse a UCSC chain file and return list of chain block dicts.
 
@@ -348,7 +381,7 @@ def _parse_chain_file(
 # Overlap handling
 # ===================================================================
 
-def _handle_src_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
+def _handle_src_overlaps_python(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Handle source-side overlaps according to policy."""
     if df.empty or policy == "keep":
         return df
@@ -375,12 +408,31 @@ def _handle_src_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         return df
 
     if policy == "discard":
-        return _discard_overlapping_intervals(df, "chromsrc", "startsrc", "endsrc")
+        # R parity (rdbinterval.cpp:820-841): mark each consecutive pair that
+        # overlaps on the same chromsrc. Strictly weaker than whole-cluster
+        # discard - a row nested inside a larger row with a gap to its prev
+        # neighbor stays kept. Replaces the prior _discard_overlapping_intervals
+        # whole-cluster call which over-discarded on nested-with-gap inputs.
+        n = len(df)
+        if n < 2:
+            return df
+        chroms = df["chromsrc"].to_numpy()
+        starts = df["startsrc"].to_numpy(dtype=np.int64, copy=False)
+        ends = df["endsrc"].to_numpy(dtype=np.int64, copy=False)
+        pair_overlap = (chroms[1:] == chroms[:-1]) & (ends[:-1] > starts[1:])
+        discard_mask = np.zeros(n, dtype=bool)
+        if pair_overlap.any():
+            idx = np.flatnonzero(pair_overlap)
+            discard_mask[idx] = True
+            discard_mask[idx + 1] = True
+        if discard_mask.any():
+            return df.loc[~discard_mask].reset_index(drop=True)
+        return df
 
     raise ValueError(f"Unknown src_overlap_policy: {policy}")
 
 
-def _handle_tgt_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
+def _handle_tgt_overlaps_python(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Handle target-side overlaps according to policy."""
     if df.empty or policy == "keep":
         return df
@@ -422,6 +474,67 @@ def _handle_tgt_overlaps(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         return df
 
     raise ValueError(f"Unknown tgt_overlap_policy: {policy}")
+
+
+def _resolve_chain_overlaps(
+    chain_dict: dict[str, Any],
+    src_overlap_policy: str,
+    tgt_overlap_policy: str,
+    _force_pure_python: bool = False,
+) -> dict[str, Any]:
+    """Apply src + tgt overlap policies on a chain DataFrame dict.
+
+    Dispatches to C++ ``_pymisha.pm_chain_intervals_resolve`` by default.
+    Setting ``_force_pure_python=True`` or the env var
+    ``PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE=1`` falls back to the pure-Python
+    pair ``_handle_src_overlaps_python`` + ``_handle_tgt_overlaps_python``.
+
+    Cluster policies (``best_source_cluster`` etc.) are NOT resolved here; they
+    are normalized to ``"keep"`` for the load-time pass and resolved later by
+    ``_resolve_cluster_policy`` after interval mapping. This matches the
+    existing ``effective_tgt_policy`` semantics in ``gintervals_load_chain``.
+    """
+    if src_overlap_policy not in _SRC_POLICIES:
+        raise ValueError(
+            f"src_overlap_policy must be one of {sorted(_SRC_POLICIES)}, "
+            f"got '{src_overlap_policy}'"
+        )
+    if tgt_overlap_policy not in _TGT_POLICIES:
+        raise ValueError(
+            f"tgt_overlap_policy must be one of {sorted(_TGT_POLICIES)}, "
+            f"got '{tgt_overlap_policy}'"
+        )
+
+    use_py = _force_pure_python or os.environ.get(
+        "PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE", ""
+    ).lower() in ("1", "true", "yes")
+
+    effective_tgt = tgt_overlap_policy
+    if effective_tgt in (
+        "best_source_cluster", "best_cluster_union",
+        "best_cluster_sum", "best_cluster_max",
+    ):
+        effective_tgt = "keep"
+    if effective_tgt == "auto":
+        effective_tgt = "auto_score"
+
+    if use_py:
+        df = pd.DataFrame(chain_dict)[_EMPTY_CHAIN_COLS]
+        df = _handle_src_overlaps_python(df, src_overlap_policy)
+        df = _handle_tgt_overlaps_python(df, effective_tgt)
+        return {c: df[c].to_numpy() for c in _EMPTY_CHAIN_COLS}
+
+    return _pymisha.pm_chain_intervals_resolve(
+        chain_dict, src_overlap_policy, effective_tgt
+    )
+
+
+# Deprecation aliases. test_liftover.py imports these by name. They now
+# delegate to the pure-Python implementations - observable behavior unchanged.
+# The dispatcher routes through _resolve_chain_overlaps for the production
+# path used by gintervals_load_chain.
+_handle_src_overlaps = _handle_src_overlaps_python
+_handle_tgt_overlaps = _handle_tgt_overlaps_python
 
 
 def _discard_overlapping_intervals(
@@ -650,12 +763,17 @@ def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         if ns == 0:
             continue
 
-        # A new group starts where chain_id changes or segments are not adjacent
+        # A new group starts where chain_id changes, tgt is not adjacent,
+        # OR src is not adjacent (R-parity: rdbinterval.cpp:889-902 requires
+        # `prev.end_src == slice.start_src` for the merge to fire). The src
+        # check matters only for negative-strand chains, whose slices have
+        # reversed src coords across consecutive tgt segments.
         new_group = np.ones(ns, dtype=bool)
         if ns > 1:
             new_group[1:] = (
                 (seg_chain_ids[1:] != seg_chain_ids[:-1])
                 | (seg_starts_v[1:] != seg_ends_v[:-1])
+                | (seg_src_starts[1:] != seg_src_ends[:-1])
             )
 
         group_ids = np.cumsum(new_group) - 1
@@ -950,29 +1068,52 @@ def _resolve_cluster_policy(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         starts = ordered["__src_start"].to_numpy(dtype=np.int64, copy=False)
         ends = ordered["__src_end"].to_numpy(dtype=np.int64, copy=False)
 
-        # Connected components in 1D interval graphs: a new cluster starts
-        # where start[i] >= running_max_end (touching = separate).
-        # We need the running max of ends computed only within each cluster,
-        # but cluster boundaries depend on the running max. This requires
-        # sequential propagation, but we can vectorize partially.
+        # Connected components combining (a) chain_id equality and (b) source
+        # overlap. Mirrors R IntervalsLiftover.cpp:226-258.
         n_ord = len(ordered)
         if n_ord == 1:
             ordered["__cluster_id"] = np.zeros(1, dtype=np.int64)
         else:
-            # Compute running max of ends — this needs a scan because max_end
-            # resets at cluster boundaries. Use a simple vectorized pass:
-            # First pass: check if start[i] >= max_end_so_far to find breaks.
-            # Since max_end propagation depends on breaks, we iterate but
-            # with numpy scalars (faster than .loc indexing).
-            max_end_arr = ends.copy()
-            new_cluster = np.zeros(n_ord, dtype=bool)
-            for i in range(1, n_ord):
-                if starts[i] >= max_end_arr[i - 1]:
-                    new_cluster[i] = True
+            # Union-find structure
+            parent = np.arange(n_ord, dtype=np.int64)
+
+            def _find(x: int, _p: np.ndarray = parent) -> int:
+                while _p[x] != x:
+                    _p[x] = _p[_p[x]]
+                    x = int(_p[x])
+                return x
+
+            def _union(a: int, b: int, _p: np.ndarray = parent) -> None:
+                ra, rb = _find(a, _p), _find(b, _p)
+                if ra != rb:
+                    _p[ra] = rb
+
+            # (a) Union by chain_id
+            chain_id_arr = ordered["chain_id"].to_numpy(dtype=np.int64, copy=False)
+            first_for_chain: dict[int, int] = {}
+            for i_pos in range(n_ord):
+                cid = int(chain_id_arr[i_pos])
+                if cid in first_for_chain:
+                    _union(i_pos, first_for_chain[cid])
                 else:
-                    max_end_arr[i] = max(max_end_arr[i], max_end_arr[i - 1])
-            cluster_ids = np.cumsum(new_cluster).astype(np.int64)
-            ordered["__cluster_id"] = cluster_ids
+                    first_for_chain[cid] = i_pos
+
+            # (b) Union by source overlap (sweep-line)
+            sort_idx = np.argsort(starts, kind="mergesort")
+            max_end = -1
+            max_end_pos = -1
+            for k in range(n_ord):
+                pos = int(sort_idx[k])
+                if max_end_pos >= 0 and starts[pos] < max_end:
+                    _union(pos, max_end_pos)
+                if ends[pos] > max_end:
+                    max_end = int(ends[pos])
+                    max_end_pos = pos
+
+            roots = np.array([_find(i_pos, parent) for i_pos in range(n_ord)], dtype=np.int64)
+            # Compact root ids → contiguous cluster ids
+            _, cluster_ids = np.unique(roots, return_inverse=True)
+            ordered["__cluster_id"] = cluster_ids.astype(np.int64, copy=False)
 
         best_cluster: Any = None
         best_score: float | None = None
@@ -1152,9 +1293,14 @@ def gintervals_load_chain(
 
     chain = _empty_chain_df() if blocks is None else pd.DataFrame(blocks)[_EMPTY_CHAIN_COLS]
 
-    # Handle overlaps
-    chain = _handle_src_overlaps(chain, src_overlap_policy)
-    chain = _handle_tgt_overlaps(chain, effective_tgt_policy)
+    # Handle overlaps via dispatcher (C++ by default; pure-Python under
+    # PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE=1). Convert the current chain
+    # DataFrame to a numpy dict for the call.
+    chain_dict = {c: chain[c].to_numpy() for c in _EMPTY_CHAIN_COLS}
+    resolved_dict = _resolve_chain_overlaps(
+        chain_dict, src_overlap_policy, effective_tgt_policy,
+    )
+    chain = pd.DataFrame(resolved_dict)[_EMPTY_CHAIN_COLS]
 
     # Store policies as DataFrame attrs
     chain.attrs["src_overlap_policy"] = src_overlap_policy
@@ -1279,6 +1425,73 @@ def gintervals_as_chain(
 # ===================================================================
 
 def _map_intervals_vectorized(
+    intervals: pd.DataFrame,
+    chain_df: pd.DataFrame,
+    include_metadata: bool,
+    value_col: str | None,
+    cluster_strategy: str = "",
+    _force_pure_python: bool = False,
+) -> pd.DataFrame:
+    """Dispatch _map_intervals_vectorized to C++ by default; Python fallback.
+
+    The C++ path is used unless ``_force_pure_python=True`` or the env var
+    ``PYMISHA_FORCE_PY_MAP_INTERVALS=1`` is set. The Python path remains the
+    reference implementation and is exercised by ``TestCrossValidatePython``.
+
+    ``cluster_strategy``: when ``"union"``, ``"sum"``, or ``"max"``, per-src-interval
+    cluster resolution is applied inside the C++ call. The Python fallback path
+    returns un-resolved candidates and expects the caller to apply
+    ``_resolve_cluster_policy`` separately.
+    """
+    use_py = _force_pure_python or os.environ.get(
+        "PYMISHA_FORCE_PY_MAP_INTERVALS", ""
+    ).lower() in ("1", "true", "yes")
+
+    if use_py:
+        return _map_intervals_vectorized_python(
+            intervals, chain_df, include_metadata, value_col,
+        )
+
+    empty_cols = ["chrom", "start", "end", "intervalID", "chain_id"]
+    if include_metadata:
+        empty_cols.append("score")
+    if value_col:
+        empty_cols.append(value_col)
+
+    def _empty_result() -> pd.DataFrame:
+        return pd.DataFrame({
+            c: pd.Series(
+                dtype="object" if c == "chrom" else "int64" if c in (
+                    "start", "end", "intervalID", "chain_id"
+                ) else "float64"
+            ) for c in empty_cols
+        })
+
+    if chain_df.empty or len(intervals) == 0:
+        return _empty_result()
+
+    # Marshal to numpy dicts.
+    src_dict = {
+        "chrom": intervals["chrom"].to_numpy(),
+        "start": intervals["start"].to_numpy(dtype=np.int64, copy=False),
+        "end":   intervals["end"].to_numpy(dtype=np.int64, copy=False),
+    }
+    if value_col and value_col in intervals.columns:
+        src_dict[value_col] = intervals[value_col].to_numpy(dtype=np.float64, copy=False)
+        value_col_arg = value_col
+    else:
+        value_col_arg = ""
+
+    chain_dict = {c: chain_df[c].to_numpy() for c in _EMPTY_CHAIN_COLS}
+
+    result = _pymisha.pm_map_intervals(
+        src_dict, chain_dict, value_col_arg, bool(include_metadata),
+        cluster_strategy,
+    )
+    return pd.DataFrame(result)
+
+
+def _map_intervals_vectorized_python(
     intervals: pd.DataFrame,
     chain_df: pd.DataFrame,
     include_metadata: bool,
@@ -1711,14 +1924,25 @@ def gintervals_liftover(
     if effective_tgt_policy == "auto":
         effective_tgt_policy = "auto_score"
 
+    # Map cluster policy to the C++ strategy enum.
+    _STRAT_MAP = {
+        "best_source_cluster": "union",
+        "best_cluster_union":  "union",
+        "best_cluster_sum":    "sum",
+        "best_cluster_max":    "max",
+    }
+    strat = _STRAT_MAP.get(effective_tgt_policy, "")
+
     result = _map_intervals_vectorized(
         intervals, chain_df, include_metadata, value_col,
+        cluster_strategy=strat,
     )
-
-    if effective_tgt_policy in (
-        "best_source_cluster", "best_cluster_union",
-        "best_cluster_sum", "best_cluster_max",
-    ):
+    # When the C++ path runs with strat != "", cluster resolution is already
+    # done. The Python fallback path returns un-resolved candidates; apply
+    # _resolve_cluster_policy when the env var forces Python.
+    if strat and os.environ.get(
+        "PYMISHA_FORCE_PY_MAP_INTERVALS", ""
+    ).lower() in ("1", "true", "yes"):
         result = _resolve_cluster_policy(result, effective_tgt_policy)
 
     # Canonic merging: merge adjacent target blocks from same intervalID + chain_id
@@ -1805,6 +2029,39 @@ _TRACK_IDX_VERSION = 1
 _TRACK_IDX_FLAG_LITTLE_ENDIAN = 0x01
 _TRACK_TYPE_DENSE = 0
 _TRACK_TYPE_SPARSE = 1
+
+# 2D quadtree signatures (R misha GenomeTrack.cpp).
+_SIGNATURE_RECTS_2D = -9
+_SIGNATURE_POINTS_2D = -10
+
+
+def _detect_source_track_2d(src_track_dir: str) -> bool:
+    """Return True if the source-track directory contains 2D quadtree per-pair files.
+
+    Signatures: ``-9`` (RECTS) or ``-10`` (POINTS) in the first 4 bytes of any
+    non-index data file. Any 1D signature (dense > 0 or sparse == -1) returns
+    False immediately. Directories with neither are treated as 1D-by-default
+    so empty directories don't accidentally route through the 2D path.
+    """
+    src_track_dir = str(src_track_dir)
+    if not os.path.isdir(src_track_dir):
+        return False
+    for fname in sorted(os.listdir(src_track_dir)):
+        if fname.startswith(".") or fname in ("track.idx", "track.dat"):
+            continue
+        fpath = os.path.join(src_track_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        with open(fpath, "rb") as f:
+            head = f.read(4)
+        if len(head) < 4:
+            continue
+        sig = struct.unpack("<i", head)[0]
+        if sig in (_SIGNATURE_RECTS_2D, _SIGNATURE_POINTS_2D):
+            return True
+        if sig > 0 or sig == -1:
+            return False
+    return False
 
 
 def _compute_track_idx_checksum(entries: list[tuple[int, int, int, int]]) -> int:
@@ -2027,8 +2284,274 @@ def _read_indexed_source_track(src_track_dir: str) -> tuple[str, pd.DataFrame]:
     return track_type, pd.DataFrame(rows, columns=["chrom", "start", "end", "value"])
 
 
-def _read_source_track(src_track_dir: str) -> tuple[str, pd.DataFrame]:
+def _detect_source_bin_size(src_track_dir: str) -> int:
+    """Detect bin_size from a dense source-track directory.
+
+    Returns the bin_size in bp for dense sources, 0 for sparse/empty.
+    Raises ValueError if dense per-chrom files have mismatched bin_sizes
+    (matches GTrackLiftover.cpp:528-530 binsize consistency check).
+    """
+    src_track_dir = str(src_track_dir)
+    data_files = [
+        f for f in sorted(os.listdir(src_track_dir))
+        if not f.startswith(".")
+        and f not in ("track.idx", "track.dat")
+        and os.path.isfile(os.path.join(src_track_dir, f))
+    ]
+    prev_bin_size: int | None = None
+    prev_file: str | None = None
+    for fname in data_files:
+        fpath = os.path.join(src_track_dir, fname)
+        with open(fpath, "rb") as fh:
+            head = fh.read(4)
+        if len(head) < 4:
+            continue
+        sig = struct.unpack("<i", head)[0]
+        if sig > 0:
+            if prev_bin_size is not None and sig != prev_bin_size:
+                raise ValueError(
+                    f"Binsize of track file {fname} differs from the "
+                    f"binsize of track file {prev_file} ({sig} vs. {prev_bin_size})"
+                )
+            prev_bin_size = sig
+            prev_file = fname
+    if prev_bin_size is not None:
+        return prev_bin_size
+
+    # No per-chrom dense files; check indexed format.
+    # Indexed-format dense tracks store a single track-level type header; bin_size
+    # is uniform by file invariant. No cross-chrom consistency check needed (unlike
+    # per-chrom files where each file has its own header).
+    idx_path = os.path.join(src_track_dir, "track.idx")
+    dat_path = os.path.join(src_track_dir, "track.dat")
+    if os.path.isfile(idx_path) and os.path.isfile(dat_path):
+        track_type_raw, entries = _read_track_idx(idx_path)
+        if track_type_raw == _TRACK_TYPE_DENSE:
+            for _chrom_id, offset, length, _reserved in entries:
+                if length == 0:
+                    continue
+                with open(dat_path, "rb") as fh:
+                    fh.seek(offset)
+                    head = fh.read(4)
+                if len(head) < 4:
+                    continue
+                bs = struct.unpack("<i", head)[0]
+                if bs > 0:
+                    return bs
+    return 0
+
+
+def _aggregate_value_for_bin(
+    contribs: list[dict],
+    agg_name: str,
+    na_rm: bool,
+    min_n: int | None,
+    nth_index: int,
+) -> float:
+    """Per-bin reducer matching R's aggregate_values for the 9 supported types.
+
+    Matches AggregationHelpers.h semantics:
+    1. Merge contributions sharing the same chain_id (sum overlap_len).
+    2. Apply na_rm / min_n filtering.
+    3. Reduce via agg_name.
+    """
+    # Step 1: merge contribs sharing chain_id.
+    merged: list[dict] = []
+    for c in contribs:
+        found = False
+        for m in merged:
+            if m["chain_id"] == c["chain_id"]:
+                m["overlap_len"] += c["overlap_len"]
+                m["start"] = min(m["start"], c["start"])
+                m["end"] = max(m["end"], c["end"])
+                m["is_na"] = m["is_na"] or c["is_na"]
+                found = True
+                break
+        if not found:
+            merged.append(dict(c))
+    used = merged if merged else contribs
+
+    # Step 2: na_rm / min_n.
+    valid = []
+    for c in used:
+        if c["is_na"]:
+            if not na_rm:
+                return float("nan")
+            continue
+        valid.append(c)
+
+    if min_n is not None and min_n >= 0 and len(valid) < min_n:
+        return float("nan")
+
+    if agg_name == "count":
+        return float(len(valid))
+
+    if not valid:
+        return float("nan")
+
+    vals = [c["value"] for c in valid]
+
+    if agg_name == "mean":
+        return sum(vals) / len(vals)
+    if agg_name == "sum":
+        return sum(vals)
+    if agg_name == "min":
+        return min(vals)
+    if agg_name == "max":
+        return max(vals)
+    if agg_name == "median":
+        vs = sorted(vals)
+        n = len(vs)
+        m = n // 2
+        return (vs[m - 1] + vs[m]) / 2.0 if n % 2 == 0 else vs[m]
+    if agg_name in ("first", "last", "nth"):
+        # Sort by (start asc, end asc, value desc) matching R ordering.
+        sorted_v = sorted(valid, key=lambda c: (c["start"], c["end"], -c["value"]))
+        if agg_name == "first":
+            return sorted_v[0]["value"]
+        if agg_name == "last":
+            return sorted_v[-1]["value"]
+        # nth
+        if nth_index is None or nth_index <= 0 or nth_index > len(sorted_v):
+            return float("nan")
+        return sorted_v[nth_index - 1]["value"]
+    raise ValueError(f"Unhandled agg_name: {agg_name}")
+
+
+def _aggregate_per_bin_python(
+    intervals_df: pd.DataFrame,
+    bin_size: int,
+    tgt_chrom_sizes: dict[str, int],
+    *,
+    agg_name: str,
+    na_rm: bool = True,
+    min_n: int | None = None,
+    nth_index: int = 0,
+) -> pd.DataFrame:
+    """FIXED_BIN per-bin aggregation matching R GTrackLiftover.cpp:702-768.
+
+    For each target chrom in tgt_chrom_sizes, iterate output bins. Per bin,
+    collect (value, overlap_len, chain_id) contributions from every interval
+    overlapping [bin_start, bin_end). Merge contributions sharing the same
+    chain_id (sum overlap_len). Apply the agg function. Emit one row per bin
+    (NaN value for bins with no contributions).
+
+    intervals_df must have columns chrom, start, end, value, chain_id.
+    """
+    if agg_name not in _AGG_FUNCS and agg_name != "nth":
+        raise ValueError(f"Unsupported agg: {agg_name}")
+    if bin_size <= 0:
+        raise ValueError(f"bin_size must be positive, got {bin_size}")
+
+    # Group by chrom for fast lookup.
+    by_chrom: dict[str, tuple] = {}
+    for chrom, group in intervals_df.groupby("chrom", sort=False):
+        g = group.sort_values(["start", "end"], kind="mergesort")
+        by_chrom[str(chrom)] = (
+            g["start"].to_numpy(dtype=np.int64, copy=False),
+            g["end"].to_numpy(dtype=np.int64, copy=False),
+            g["value"].to_numpy(dtype=np.float64, copy=False),
+            g["chain_id"].to_numpy(dtype=np.int64, copy=False),
+        )
+
+    out_rows: list[tuple] = []
+    for chrom, chrom_size in tgt_chrom_sizes.items():
+        if chrom in by_chrom:
+            starts, ends, vals, cids = by_chrom[chrom]
+        else:
+            starts = ends = vals = cids = np.array([], dtype=np.int64)
+
+        end_bin = (chrom_size + bin_size - 1) // bin_size
+        cursor = 0
+        for bin_idx in range(end_bin):
+            bs = bin_idx * bin_size
+            be = min((bin_idx + 1) * bin_size, chrom_size)
+
+            # R's exact iterator semantics from GTrackLiftover.cpp:719-751.
+            # cursor is saved between bins. Within a bin we walk forward;
+            # if the first non-overlapping interval that lies AT or AFTER the
+            # bin has a start beyond be AND at least one contribution was seen,
+            # we step back one so the last contributing interval is reconsidered
+            # for the next bin (the --iter step-back in the C++ code).
+            contribs: list[dict] = []
+            k = cursor
+            intersect = False
+            while k < len(starts):
+                s_k = int(starts[k])
+                e_k = int(ends[k])
+                ovl_s = max(bs, s_k)
+                ovl_e = min(be, e_k)
+                if ovl_s < ovl_e:
+                    # Interval overlaps this bin — contribute and advance.
+                    v = float(vals[k])
+                    contribs.append({
+                        "value": v,
+                        "overlap_len": float(ovl_e - ovl_s),
+                        "start": ovl_s,
+                        "end": ovl_e,
+                        "is_na": bool(np.isnan(v)),
+                        "chain_id": int(cids[k]),
+                    })
+                    intersect = True
+                    k += 1
+                    continue
+                if e_k > bs:
+                    # No overlap, but interval is at or after this bin.
+                    # Step back one if we already had a contribution and the
+                    # interval starts strictly after be — mirrors --iter in R.
+                    if intersect and s_k > be:
+                        k -= 1
+                    break
+                # e_k <= bs: interval is entirely before this bin. Consume it.
+                k += 1
+            cursor = k
+
+            v_out = _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
+            out_rows.append((chrom, bs, be, v_out))
+
+    return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"])
+
+
+def _read_source_track(
+    src_track_dir: str,
+    *,
+    _force_pure_python: bool = False,
+) -> tuple[str, pd.DataFrame]:
     """Read a source track directory and return (type, intervals_df).
+
+    Dispatches to ``_pymisha.pm_read_source_track_1d`` by default. Falls back
+    to the pure-Python implementation when ``_force_pure_python=True`` or when
+    the env var ``PYMISHA_FORCE_PY_READ_SOURCE_TRACK=1`` is set. The fallback
+    path is exercised by the G1.P3.A cross-validation tests in
+    ``tests/test_source_track_cpp.py``.
+
+    Returns a DataFrame with columns: chrom, start, end, value. Source chrom
+    names are the raw file names (per-chrom case) or the names from
+    ``chrom_sizes.txt`` (indexed case), not normalized to the target DB.
+    """
+    src_track_dir = str(src_track_dir)
+    if not os.path.isdir(src_track_dir):
+        raise ValueError(f"Source track directory does not exist: {src_track_dir}")
+
+    use_py = _force_pure_python or os.environ.get(
+        "PYMISHA_FORCE_PY_READ_SOURCE_TRACK", ""
+    ) == "1"
+    if use_py:
+        return _read_source_track_python(src_track_dir)
+
+    track_type, df_dict = _pymisha.pm_read_source_track_1d(src_track_dir)
+    if len(df_dict["chrom"]) == 0:
+        return track_type, pd.DataFrame(columns=["chrom", "start", "end", "value"])
+    return track_type, pd.DataFrame({
+        "chrom": df_dict["chrom"],
+        "start": df_dict["start"],
+        "end":   df_dict["end"],
+        "value": df_dict["value"],
+    })
+
+
+def _read_source_track_python(src_track_dir: str) -> tuple[str, pd.DataFrame]:
+    """Read a source track directory and return (type, intervals_df). (Python reference impl.)
 
     Returns a DataFrame with columns: chrom, start, end, value.
     Source chrom names are the raw file names (not normalized to target DB).
@@ -2092,15 +2615,43 @@ def _aggregate_overlapping(
     agg_func: Callable[[np.ndarray], float],
     na_rm: bool = True,
     min_n: int | None = None,
+    *,
+    agg_name: str | None = None,
+    nth_index: int = 0,
 ) -> pd.DataFrame:
     """Aggregate values for overlapping target intervals.
 
     Segments each chromosome into disjoint regions using interval breakpoints,
     applies the aggregation function to values covering each segment, and
     merges adjacent segments with identical aggregated values.
+
+    When *agg_name* is one of the named aggregators in :data:`_AGG_FUNCS` (or
+    ``"nth"``), the work runs through the C++ fast path
+    :func:`_pymisha.pm_liftover_aggregate`. When *agg_name* is None or a custom
+    callable is supplied as *agg_func*, the pure-Python sweep is used.
     """
     if len(intervals_df) == 0:
         return intervals_df
+
+    if agg_name is not None and (agg_name in _AGG_FUNCS or agg_name == "nth"):
+        from _pymisha import pm_liftover_aggregate
+        df = intervals_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
+        chrom_arr = df["chrom"].to_numpy(dtype=object, copy=False)
+        start_arr = df["start"].to_numpy(dtype=np.int64, copy=False)
+        end_arr = df["end"].to_numpy(dtype=np.int64, copy=False)
+        value_arr = df["value"].to_numpy(dtype=np.float64, copy=False)
+        df_dict = {"chrom": chrom_arr, "start": start_arr, "end": end_arr, "value": value_arr}
+        out = pm_liftover_aggregate(
+            df_dict, agg_name, bool(na_rm),
+            int(-1 if min_n is None else min_n),
+            int(nth_index),
+        )
+        return pd.DataFrame({
+            "chrom": out["chrom"],
+            "start": out["start"],
+            "end": out["end"],
+            "value": out["value"],
+        }).reset_index(drop=True)
 
     def _agg_vals(vals: np.ndarray) -> float:
         vals = np.asarray(vals, dtype=np.float64)
@@ -2149,7 +2700,7 @@ def _aggregate_overlapping(
             if next_coord <= coord or not active:
                 continue
 
-            seg_val = _agg_vals(vals[list(active)])
+            seg_val = _agg_vals(vals[sorted(active)])
             if np.isnan(seg_val):
                 continue
 
@@ -2187,6 +2738,165 @@ def gtrack_liftover(
     na_rm: bool = True,
     min_n: int | None = None,
     min_score: float | None = None,
+    *,
+    _force_pure_python: bool = False,
+) -> None:
+    """Import a track from another assembly via coordinate liftover.
+
+    Dispatches to the C++ fast path (G1.P3.C) by default. Falls back to the
+    pure-Python implementation when ``_force_pure_python=True`` or when
+    ``PYMISHA_FORCE_PY_LIFTOVER_TRACK=1`` in the environment.
+
+    See :func:`_gtrack_liftover_python` for the full parameter docstring.
+    """
+    # 2D source tracks route through the dedicated 2D path. Detection is by
+    # quadtree file signature (R-parity: GTrackLiftover.cpp:843 dispatches on
+    # GenomeTrack::RECTS / POINTS). multi_target_agg / min_n / nth_index / na_rm
+    # are not used by the 2D path (R does no aggregation on the 2D side).
+    if _detect_source_track_2d(src_track_dir):
+        return _gtrack_liftover_2d(
+            track, description, src_track_dir, chain,
+            src_overlap_policy=src_overlap_policy,
+            tgt_overlap_policy=tgt_overlap_policy,
+            min_score=min_score,
+        )
+
+    use_py = _force_pure_python or os.environ.get(
+        "PYMISHA_FORCE_PY_LIFTOVER_TRACK", ""
+    ) == "1"
+    if use_py:
+        return _gtrack_liftover_python(
+            track, description, src_track_dir, chain,
+            src_overlap_policy=src_overlap_policy,
+            tgt_overlap_policy=tgt_overlap_policy,
+            multi_target_agg=multi_target_agg,
+            params=params, na_rm=na_rm, min_n=min_n,
+            min_score=min_score,
+        )
+
+    # C++ path: pre-validate, build chain dict + tgt_chrom_sizes, call C++.
+    from .tracks import (
+        _load_track_attributes,
+        _save_track_attributes,
+        _set_created_attrs,
+        _track_dir_for_create,
+        _track_exists,
+        _validate_track_name,
+        gtrack_create_dense,
+        gtrack_create_sparse,
+    )
+
+    _checkroot()
+    _validate_track_name(track)
+    if _track_exists(track):
+        raise ValueError(f"Track '{track}' already exists")
+    if multi_target_agg not in _AGG_FUNCS:
+        raise ValueError(
+            f"Unsupported aggregation: {multi_target_agg}. "
+            f"Supported: {', '.join(sorted(_AGG_FUNCS))}"
+        )
+
+    if isinstance(chain, str):
+        chain = gintervals_load_chain(
+            chain, src_overlap_policy=src_overlap_policy,
+            tgt_overlap_policy=tgt_overlap_policy,
+            min_score=min_score,
+        )
+    elif not isinstance(chain, pd.DataFrame):
+        raise TypeError("chain must be a file path string or a chain DataFrame")
+
+    effective_tgt_policy = chain.attrs.get(
+        "tgt_overlap_policy", tgt_overlap_policy
+    )
+    if effective_tgt_policy == "auto":
+        effective_tgt_policy = "auto_score"
+    cluster_strategy = {
+        "best_source_cluster": "union",
+        "best_cluster_union":  "union",
+        "best_cluster_sum":    "sum",
+        "best_cluster_max":    "max",
+    }.get(effective_tgt_policy, "")
+
+    chain_dict = {
+        "chrom":     chain["chrom"].to_numpy(dtype=object),
+        "start":     chain["start"].to_numpy(dtype=np.int64),
+        "end":       chain["end"].to_numpy(dtype=np.int64),
+        "strand":    chain["strand"].to_numpy(dtype=np.int64),
+        "chromsrc":  chain["chromsrc"].to_numpy(dtype=object),
+        "startsrc":  chain["startsrc"].to_numpy(dtype=np.int64),
+        "endsrc":    chain["endsrc"].to_numpy(dtype=np.int64),
+        "strandsrc": chain["strandsrc"].to_numpy(dtype=np.int64),
+        "chain_id":  chain["chain_id"].to_numpy(dtype=np.int64),
+        "score":     chain["score"].to_numpy(dtype=np.float64),
+    }
+    tgt_chrom_sizes = _get_db_chrom_sizes()
+    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
+    result = _pymisha.pm_liftover_track(
+        str(src_track_dir), chain_dict, tgt_chrom_sizes,
+        cluster_strategy, multi_target_agg, bool(na_rm),
+        int(-1 if min_n is None else min_n),
+        int(nth_index),
+    )
+
+    created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
+    track_type = result["track_type"]
+    bin_size = int(result["bin_size"])
+    if len(result["chrom"]) == 0:
+        track_dir = _track_dir_for_create(track)
+        track_dir.mkdir(parents=True, exist_ok=True)
+        _pm_dbreload()
+        _set_created_attrs(track, description, created_by)
+        return None
+
+    target_df = pd.DataFrame({
+        "chrom": result["chrom"],
+        "start": result["start"],
+        "end":   result["end"],
+        "value": result["value"],
+    })
+    if track_type == "dense":
+        # FIXED_BIN preservation: aggregate_per_bin_cpp pre-aggregated to one
+        # row per bin per target chrom. Filter NaN bins (gtrack_create_dense
+        # fills empty bins via defval=NaN). func="weighted.mean" of a single-
+        # contribution bin returns that value as-is.
+        target_df = target_df[~target_df["value"].isna()].reset_index(drop=True)
+        if len(target_df) == 0:
+            track_dir = _track_dir_for_create(track)
+            track_dir.mkdir(parents=True, exist_ok=True)
+            _pm_dbreload()
+            _set_created_attrs(track, description, created_by)
+            return None
+        gtrack_create_dense(
+            track, description,
+            target_df[["chrom", "start", "end"]],
+            target_df["value"].to_numpy(),
+            binsize=bin_size,
+            func="weighted.mean",
+        )
+    else:
+        gtrack_create_sparse(
+            track, description,
+            target_df[["chrom", "start", "end"]],
+            target_df["value"].to_numpy(),
+        )
+    attrs = _load_track_attributes(track)
+    attrs["created.by"] = created_by
+    _save_track_attributes(track, attrs)
+    return None
+
+
+def _gtrack_liftover_python(
+    track: str,
+    description: str,
+    src_track_dir: str,
+    chain: str | pd.DataFrame,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    multi_target_agg: str = "mean",
+    params: dict[str, Any] | None = None,
+    na_rm: bool = True,
+    min_n: int | None = None,
+    min_score: float | None = None,
 ) -> None:
     """Import a track from another assembly via coordinate liftover.
 
@@ -2194,7 +2904,8 @@ def gtrack_liftover(
     per-chromosome binary track files or an indexed ``track.idx``/``track.dat``
     pair), maps its intervals through *chain* to the current target genome,
     aggregates values when multiple source intervals land on the same target
-    region, and creates a new sparse track in the current database.
+    region, and creates a new track (sparse or dense, matching the source
+    track type) in the current database.
 
     When *chain* is a file path it is loaded with the specified overlap
     policies. When it is a pre-loaded DataFrame the policies stored in its
@@ -2246,8 +2957,9 @@ def gtrack_liftover(
     Returns
     -------
     None
-        The function creates a new sparse track in the current database as
-        a side effect and does not return a value.
+        The function creates a new track (sparse or dense, matching the
+        source track type) in the current database as a side effect and
+        does not return a value.
 
     Raises
     ------
@@ -2283,10 +2995,13 @@ def gtrack_liftover(
     """
     from .tracks import (
         _checkroot,
+        _load_track_attributes,
+        _save_track_attributes,
         _set_created_attrs,
         _track_dir_for_create,
         _track_exists,
         _validate_track_name,
+        gtrack_create_dense,
         gtrack_create_sparse,
     )
 
@@ -2320,18 +3035,13 @@ def gtrack_liftover(
     # Read source track
     src_type, src_data = _read_source_track(src_track_dir)
 
+    created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
+
     if len(src_data) == 0 or len(chain) == 0:
-        # Create empty sparse track
-        pd.DataFrame({"chrom": pd.Series(dtype=str),
-                                       "start": pd.Series(dtype=int),
-                                       "end": pd.Series(dtype=int)})
-        # Need at least one interval for track creation, create an empty track dir
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        # Write .attributes file
         _pm_dbreload()
-        _set_created_attrs(track, description,
-                           f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
+        _set_created_attrs(track, description, created_by)
         return
 
     # Liftover source intervals to target coordinates
@@ -2343,7 +3053,7 @@ def gtrack_liftover(
     )
 
     # If gintervals_liftover didn't carry values (shouldn't happen with value_col),
-    # merge values back via intervalID
+    # merge values back via intervalID.
     if "value" not in lifted.columns and "intervalID" in lifted.columns:
         lifted = lifted.merge(
             src_data[["value"]].reset_index().rename(columns={"index": "intervalID"}),
@@ -2351,35 +3061,163 @@ def gtrack_liftover(
         )
 
     if len(lifted) == 0:
-        # No intervals mapped — create empty track
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
         _pm_dbreload()
-        _set_created_attrs(track, description,
-                           f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
+        _set_created_attrs(track, description, created_by)
         return
 
-    # Aggregate overlapping target intervals
+    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
+
+    if src_type == "dense":
+        # R-parity: FIXED_BIN source -> FIXED_BIN target (GTrackLiftover.cpp:702-768).
+        bin_size = _detect_source_bin_size(src_track_dir)
+        if bin_size <= 0:
+            # Fallback: dense type but no readable bin_size -> treat as sparse.
+            bin_size = None
+
+        if bin_size is not None:
+            tgt_chrom_sizes = _get_db_chrom_sizes()
+            per_bin = _aggregate_per_bin_python(
+                lifted[["chrom", "start", "end", "value", "chain_id"]],
+                bin_size,
+                tgt_chrom_sizes,
+                agg_name=multi_target_agg,
+                na_rm=na_rm,
+                min_n=min_n,
+                nth_index=nth_index,
+            )
+            # Filter NaN bins; gtrack_create_dense fills uncovered bins with defval=NaN.
+            per_bin_nonnan = per_bin[~per_bin["value"].isna()].reset_index(drop=True)
+            if len(per_bin_nonnan) == 0:
+                track_dir = _track_dir_for_create(track)
+                track_dir.mkdir(parents=True, exist_ok=True)
+                _pm_dbreload()
+                _set_created_attrs(track, description, created_by)
+                return
+            # Each interval is exactly 1 bin wide and we pre-aggregated via the
+            # per-bin helper; func="weighted.mean" of a single-contribution bin
+            # returns that pre-aggregated value as-is. (Any single-row reduction
+            # would also work; "weighted.mean" is clearest in intent.)
+            gtrack_create_dense(
+                track, description,
+                per_bin_nonnan[["chrom", "start", "end"]],
+                per_bin_nonnan["value"].to_numpy(),
+                binsize=bin_size,
+                func="weighted.mean",
+            )
+            attrs = _load_track_attributes(track)
+            attrs["created.by"] = created_by
+            _save_track_attributes(track, attrs)
+            return
+
+    # SPARSE path (also used as fallback when dense bin_size cannot be detected).
     target_data = lifted[["chrom", "start", "end", "value"]].copy()
-    target_data = _aggregate_overlapping(target_data, agg_func, na_rm=na_rm, min_n=min_n)
+    target_data = _aggregate_overlapping(
+        target_data, agg_func,
+        na_rm=na_rm, min_n=min_n,
+        agg_name=multi_target_agg,
+        nth_index=nth_index,
+    )
 
     if len(target_data) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
         _pm_dbreload()
-        _set_created_attrs(track, description,
-                           f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)')
+        _set_created_attrs(track, description, created_by)
         return
 
-    # Create sparse track with the lifted data
     gtrack_create_sparse(
         track, description,
         target_data[["chrom", "start", "end"]],
         target_data["value"].to_numpy(),
     )
 
-    # Update the created.by attribute to reflect liftover (bypass readonly check)
-    from .tracks import _load_track_attributes, _save_track_attributes
+    # Update the created.by attribute to reflect liftover (bypass readonly check).
     attrs = _load_track_attributes(track)
-    attrs["created.by"] = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
+    attrs["created.by"] = created_by
+    _save_track_attributes(track, attrs)
+
+
+# ===================================================================
+# 2D source-track liftover (G1.P3.D)
+# ===================================================================
+
+def _gtrack_liftover_2d(
+    track: str,
+    description: str,
+    src_track_dir: str,
+    chain: str | pd.DataFrame,
+    *,
+    src_overlap_policy: str = "error",
+    tgt_overlap_policy: str = "auto",
+    min_score: float | None = None,
+) -> None:
+    """Lift a 2D source track (RECTS or POINTS) to the current target DB.
+
+    Routed to from ``gtrack_liftover`` whenever the source-track directory
+    contains 2D quadtree files. Mirrors R ``GTrackLiftover.cpp:843-984``.
+    """
+    from .tracks import (
+        _load_track_attributes,
+        _save_track_attributes,
+        _set_created_attrs,
+        _track_dir_for_create,
+        _track_exists,
+        _validate_track_name,
+        gtrack_2d_create,
+    )
+
+    _checkroot()
+    _validate_track_name(track)
+    if _track_exists(track):
+        raise ValueError(f"Track '{track}' already exists")
+
+    if isinstance(chain, str):
+        chain = gintervals_load_chain(
+            chain,
+            src_overlap_policy=src_overlap_policy,
+            tgt_overlap_policy=tgt_overlap_policy,
+            min_score=min_score,
+        )
+    elif not isinstance(chain, pd.DataFrame):
+        raise TypeError("chain must be a file path string or a chain DataFrame")
+
+    chain_dict = {
+        "chrom":     chain["chrom"].to_numpy(dtype=object),
+        "start":     chain["start"].to_numpy(dtype=np.int64),
+        "end":       chain["end"].to_numpy(dtype=np.int64),
+        "strand":    chain["strand"].to_numpy(dtype=np.int64),
+        "chromsrc":  chain["chromsrc"].to_numpy(dtype=object),
+        "startsrc":  chain["startsrc"].to_numpy(dtype=np.int64),
+        "endsrc":    chain["endsrc"].to_numpy(dtype=np.int64),
+        "strandsrc": chain["strandsrc"].to_numpy(dtype=np.int64),
+        "chain_id":  chain["chain_id"].to_numpy(dtype=np.int64),
+        "score":     chain["score"].to_numpy(dtype=np.float64),
+    }
+
+    result = _pymisha.pm_liftover_track_2d(str(src_track_dir), chain_dict)
+
+    created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
+
+    if len(result["chrom1"]) == 0:
+        # No target rectangles produced - create an empty track directory.
+        track_dir = _track_dir_for_create(track)
+        track_dir.mkdir(parents=True, exist_ok=True)
+        _pm_dbreload()
+        _set_created_attrs(track, description, created_by)
+        return
+
+    target_df = pd.DataFrame({
+        "chrom1": result["chrom1"],
+        "start1": result["x1"],
+        "end1":   result["x2"],
+        "chrom2": result["chrom2"],
+        "start2": result["y1"],
+        "end2":   result["y2"],
+    })
+    gtrack_2d_create(track, description, target_df, result["value"])
+
+    attrs = _load_track_attributes(track)
+    attrs["created.by"] = created_by
     _save_track_attributes(track, attrs)

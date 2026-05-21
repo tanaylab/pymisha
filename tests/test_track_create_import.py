@@ -286,9 +286,9 @@ def test_gtrack_import_mappedseq_sparse_dedup(tmp_path):
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
         inp.write_text(
-            "A\tchr1\t10\t+\n"
-            "A\tchr1\t10\t+\n"
-            "A\tchr1\t20\t-\n",
+            "A\t1\t10\t+\n"
+            "A\t1\t10\t+\n"
+            "A\t1\t20\t-\n",
             encoding="utf-8",
         )
         stats = pm.gtrack_import_mappedseq(
@@ -303,7 +303,7 @@ def test_gtrack_import_mappedseq_sparse_dedup(tmp_path):
         assert "total" in stats and "chrom" in stats
         out = pm.gextract(
             "mapped_sparse",
-            pd.DataFrame({"chrom": ["chr1", "chr1"], "start": [10, 21], "end": [11, 22]}),
+            pd.DataFrame({"chrom": ["1", "1"], "start": [10, 21], "end": [11, 22]}),
         )
         assert out is not None
         np.testing.assert_allclose(out["mapped_sparse"].to_numpy(dtype=float), np.array([1.0, 1.0]), equal_nan=True)
@@ -317,8 +317,8 @@ def test_gtrack_import_mappedseq_dense(tmp_path):
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped_dense.tsv"
         inp.write_text(
-            "AAA\tchr1\t10\t+\n"
-            "AAA\tchr1\t30\t+\n",
+            "AAA\t1\t10\t+\n"
+            "AAA\t1\t30\t+\n",
             encoding="utf-8",
         )
         pm.gtrack_import_mappedseq(
@@ -334,7 +334,7 @@ def test_gtrack_import_mappedseq_dense(tmp_path):
         assert info["type"] == "dense"
         out = pm.gextract(
             "mapped_dense",
-            pd.DataFrame({"chrom": ["chr1", "chr1"], "start": [10, 30], "end": [15, 35]}),
+            pd.DataFrame({"chrom": ["1", "1"], "start": [10, 30], "end": [15, 35]}),
             iterator=5,
         )
         assert out is not None
@@ -451,5 +451,209 @@ def test_gtrack_import_set_mixed_success(tmp_path):
         assert "bad.bed" in res.get("files_failed", [])
         assert pm.gtrack_exists("batch_good")
         assert not pm.gtrack_exists("batch_bad")
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_chrom_mismatch_rparity(tmp_path):
+    """SAM chrom names that don't exact-match DB chroms are silently
+    unmapped (R parity, no chrom normalization)."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        inp = tmp_path / "mapped.tsv"
+        # DB has chrom '1' (no 'chr' prefix). 'chr1' must NOT be remapped.
+        inp.write_text(
+            "A\tchr1\t10\t+\n"
+            "A\t1\t20\t+\n",
+            encoding="utf-8",
+        )
+        stats = pm.gtrack_import_mappedseq(
+            "mapped_rparity",
+            "rparity",
+            str(inp),
+            pileup=0,
+            binsize=-1,
+            cols_order=(1, 2, 3, 4),
+            remove_dups=True,
+        )
+        assert stats["total"]["total.mapped"] == 1.0
+        assert stats["total"]["total.unmapped"] == 1.0
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_tab_only_rparity(tmp_path):
+    """Space-separated lines without tabs are not parsed (R parity:
+    tab-only split)."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        inp = tmp_path / "mapped.tsv"
+        inp.write_text(
+            "A 1 10 +\n"
+            "A\t1\t20\t+\n",
+            encoding="utf-8",
+        )
+        stats = pm.gtrack_import_mappedseq(
+            "mapped_tabonly",
+            "tabonly",
+            str(inp),
+            pileup=0,
+            binsize=-1,
+            cols_order=(1, 2, 3, 4),
+            remove_dups=True,
+        )
+        assert stats["total"]["total.mapped"] == 1.0
+        assert stats["total"]["total.unmapped"] == 1.0
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_sparse_value_rparity(tmp_path):
+    """Sparse dedup-value: remove_dups=True -> val=1; remove_dups=False
+    -> val=count (R parity verified)."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        inp = tmp_path / "mapped.tsv"
+        inp.write_text(
+            "A\t1\t10\t+\n"
+            "A\t1\t10\t+\n"
+            "A\t1\t10\t+\n",
+            encoding="utf-8",
+        )
+        stats = pm.gtrack_import_mappedseq(
+            "mapped_rd_false",
+            "rd",
+            str(inp),
+            pileup=0,
+            binsize=-1,
+            cols_order=(1, 2, 3, 4),
+            remove_dups=False,
+        )
+        out = pm.gextract(
+            "mapped_rd_false",
+            pd.DataFrame({"chrom": ["1"], "start": [10], "end": [11]}),
+        )
+        np.testing.assert_allclose(out["mapped_rd_false"].to_numpy(dtype=float), np.array([3.0]))
+        assert stats["total"]["total.mapped"] == 3.0
+        assert stats["total"]["total.dups"] == 2.0
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_cpp_matches_python_dense(tmp_path, monkeypatch):
+    """Run the same SAM through both paths; require identical track output."""
+    root = _copy_db(tmp_path)
+    inp = tmp_path / "m.sam"
+    inp.write_text(
+        "@HD\tVN:1.6\n"
+        "@SQ\tSN:1\tLN:500000\n"
+        "r1\t0\t1\t100\t30\t10M\t*\t0\t0\tAAAAAAAAAA\t*\n"
+        "r2\t16\t1\t200\t30\t10M\t*\t0\t0\tAAAAAAAAAA\t*\n"
+        "r3\t0\t1\t100\t30\t10M\t*\t0\t0\tAAAAAAAAAA\t*\n"
+        "r4\t0\t2\t1000\t30\t10M\t*\t0\t0\tAAAAAAAAAA\t*\n"
+    )
+    try:
+        pm.gdb_init(str(root))
+
+        cpp_stats = pm.gtrack_import_mappedseq(
+            "m_cpp", "cpp", str(inp), pileup=10, binsize=10,
+            cols_order=None, remove_dups=True,
+        )
+        cpp_out = pm.gextract(
+            "m_cpp",
+            pd.DataFrame({
+                "chrom": ["1", "1", "2"],
+                "start": [100, 200, 1000],
+                "end":   [110, 210, 1010],
+            }),
+            iterator=10,
+        )
+
+        monkeypatch.setenv("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", "1")
+        py_stats = pm.gtrack_import_mappedseq(
+            "m_py", "py", str(inp), pileup=10, binsize=10,
+            cols_order=None, remove_dups=True,
+        )
+        py_out = pm.gextract(
+            "m_py",
+            pd.DataFrame({
+                "chrom": ["1", "1", "2"],
+                "start": [100, 200, 1000],
+                "end":   [110, 210, 1010],
+            }),
+            iterator=10,
+        )
+
+        assert cpp_stats["total"] == py_stats["total"]
+        np.testing.assert_allclose(
+            cpp_out["m_cpp"].to_numpy(dtype=float),
+            py_out["m_py"].to_numpy(dtype=float),
+        )
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_cpp_matches_python_sparse(tmp_path, monkeypatch):
+    """Sparse cross-validation: tab-delimited fixture, remove_dups=True."""
+    root = _copy_db(tmp_path)
+    inp = tmp_path / "m.tsv"
+    inp.write_text(
+        "A\t1\t10\t+\n"
+        "A\t1\t10\t+\n"
+        "A\t1\t20\t-\n"
+        "A\t2\t100\t+\n"
+    )
+    try:
+        pm.gdb_init(str(root))
+
+        cpp_stats = pm.gtrack_import_mappedseq(
+            "s_cpp", "cpp", str(inp), pileup=0, binsize=-1,
+            cols_order=(1, 2, 3, 4), remove_dups=True,
+        )
+        cpp_out = pm.gextract(
+            "s_cpp",
+            pd.DataFrame({"chrom": ["1", "1", "2"], "start": [10, 21, 100], "end": [11, 22, 101]}),
+        )
+
+        monkeypatch.setenv("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", "1")
+        py_stats = pm.gtrack_import_mappedseq(
+            "s_py", "py", str(inp), pileup=0, binsize=-1,
+            cols_order=(1, 2, 3, 4), remove_dups=True,
+        )
+        py_out = pm.gextract(
+            "s_py",
+            pd.DataFrame({"chrom": ["1", "1", "2"], "start": [10, 21, 100], "end": [11, 22, 101]}),
+        )
+
+        assert cpp_stats["total"] == py_stats["total"]
+        np.testing.assert_allclose(
+            cpp_out["s_cpp"].to_numpy(dtype=float),
+            py_out["s_py"].to_numpy(dtype=float),
+        )
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_mappedseq_env_var_routes_to_python(tmp_path, monkeypatch):
+    """PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1 selects the Python fallback path."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        monkeypatch.setenv("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", "1")
+        inp = tmp_path / "m.tsv"
+        inp.write_text("A\t1\t10\t+\n")
+        stats = pm.gtrack_import_mappedseq(
+            "py_route", "py", str(inp), pileup=0, binsize=-1,
+            cols_order=(1, 2, 3, 4), remove_dups=True,
+        )
+        assert stats["total"]["total.mapped"] == 1.0
+        out = pm.gextract(
+            "py_route",
+            pd.DataFrame({"chrom": ["1"], "start": [10], "end": [11]}),
+        )
+        np.testing.assert_allclose(out["py_route"].to_numpy(dtype=float), np.array([1.0]))
     finally:
         pm.gdb_init(str(TEST_DB))

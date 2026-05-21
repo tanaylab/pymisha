@@ -2802,6 +2802,79 @@ def gtrack_import_mappedseq(
     if file is None:
         raise ValueError("file cannot be None")
 
+    if os.environ.get("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", "0") == "1":
+        return _gtrack_import_mappedseq_python(
+            track, description, file, pileup, binsize, cols_order, remove_dups,
+        )
+
+    pileup_i = int(pileup)
+    binsize_i = int(binsize)
+    if pileup_i < 0:
+        raise ValueError("pileup cannot be negative")
+    if pileup_i == 0 and binsize_i >= 0:
+        raise ValueError("For pileup=0 (sparse), binsize must be -1")
+    if pileup_i > 0 and binsize_i <= 0:
+        raise ValueError("For pileup>0 (dense), binsize must be > 0")
+
+    if cols_order is None:
+        cols_arg: Any = None
+    else:
+        if len(cols_order) != 4:
+            raise ValueError("cols_order must have 4 entries: sequence, chromosome, coordinate, strand")
+        cols_tuple = tuple(int(x) for x in cols_order)
+        if min(cols_tuple) <= 0:
+            raise ValueError("cols_order indices are 1-based and must be positive")
+        if len(set(cols_tuple)) != 4:
+            raise ValueError("cols_order entries must be unique")
+        cols_arg = cols_tuple
+
+    path = str(file)
+    if not os.path.exists(path):
+        raise ValueError(f"File not found: {path}")
+
+    created_by = (
+        f'gtrack.import_mappedseq("{track}", description, "{path}", '
+        f"pileup={pileup_i}, binsize={binsize_i}, remove.dups={bool(remove_dups)})"
+    )
+
+    with _atomic_track_create(track) as tmp_dir:
+        res = _pymisha.pm_import_mappedseq(
+            str(tmp_dir), path,
+            pileup_i, binsize_i, cols_arg, bool(remove_dups),
+        )
+        if pileup_i > 0:
+            _write_created_attrs_at_path(
+                tmp_dir, description, created_by,
+                {"type": "dense", "binsize": str(binsize_i)},
+            )
+        else:
+            _write_created_attrs_at_path(tmp_dir, description, created_by)
+
+    _pm_dbreload()
+
+    cs = res["chrom_stats"]
+    chrom_stat = pd.DataFrame({
+        "chrom": list(cs["chrom"]),
+        "mapped": np.asarray(cs["mapped"], dtype=float),
+        "dups": np.asarray(cs["dups"], dtype=float),
+    })
+    return {"total": dict(res["total"]), "chrom": chrom_stat}
+
+
+def _gtrack_import_mappedseq_python(
+    track: str,
+    description: str,
+    file: str,
+    pileup: int = 0,
+    binsize: int = -1,
+    cols_order: tuple[int, int, int, int] | None = (9, 11, 13, 14),
+    remove_dups: bool = True,
+) -> dict[str, Any]:
+    """Pure-Python R-parity fallback for gtrack_import_mappedseq.
+
+    Selected when env-var PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1. Otherwise
+    the C++ pm_import_mappedseq path is used.
+    """
     pileup = int(pileup)
     binsize = int(binsize)
     if pileup < 0:
@@ -2836,9 +2909,6 @@ def gtrack_import_mappedseq(
     plus: list[list[int]] = [[] for _ in range(nchrom)]
     minus: list[list[int]] = [[] for _ in range(nchrom)]
 
-    # Cache for chromosome name normalization (avoids repeated C++ calls)
-    _chrom_norm_cache: dict[str, str | None] = {}
-
     path = str(file)
     if not os.path.exists(path):
         raise ValueError(f"File not found: {path}")
@@ -2853,8 +2923,6 @@ def gtrack_import_mappedseq(
                 continue
 
             fields = line.split("\t")
-            if len(fields) == 1:
-                fields = line.split()
 
             try:
                 if is_sam:
@@ -2873,25 +2941,9 @@ def gtrack_import_mappedseq(
                 total_unmapped += 1
                 continue
 
-            # Cached chromosome normalization
-            if chrom in _chrom_norm_cache:
-                chrom = _chrom_norm_cache[chrom]
-                if chrom is None:
-                    total_unmapped += 1
-                    continue
-            else:
-                try:
-                    norm = _pymisha.pm_normalize_chroms([chrom])[0]
-                except Exception:
-                    _chrom_norm_cache[chrom] = None
-                    total_unmapped += 1
-                    continue
-                if norm not in chrom_sizes:
-                    _chrom_norm_cache[chrom] = None
-                    total_unmapped += 1
-                    continue
-                _chrom_norm_cache[chrom] = norm
-                chrom = norm
+            if chrom not in chrom_sizes:
+                total_unmapped += 1
+                continue
 
             chrom_len = chrom_sizes[chrom]
             if coord < 0 or coord >= chrom_len:

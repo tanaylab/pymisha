@@ -3,3 +3,7 @@ include LICENSE
 include setup.py
 recursive-include src *.cpp *.h
 recursive-include pymisha/examples *
+
+# LLM agent reference docs live at the repo root for raw-github-URL fetch.
+# Not part of the pip-installed package; keep them out of the sdist.
+prune agent-guides
