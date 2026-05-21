@@ -124,7 +124,7 @@ def _parse_chain_file(
         return _parse_chain_file_python(path, db_chrom_sizes, min_score=min_score)
 
     ms = float("nan") if min_score is None else float(min_score)
-    return _pymisha.pm_parse_chain_file(str(chain_path), ms)
+    return _pymisha.pm_parse_chain_file(str(chain_path), ms)  # type: ignore[no-any-return]
 
 
 def _parse_chain_file_python(
@@ -524,7 +524,7 @@ def _resolve_chain_overlaps(
         df = _handle_tgt_overlaps_python(df, effective_tgt)
         return {c: df[c].to_numpy() for c in _EMPTY_CHAIN_COLS}
 
-    return _pymisha.pm_chain_intervals_resolve(
+    return _pymisha.pm_chain_intervals_resolve(  # type: ignore[no-any-return]
         chain_dict, src_overlap_policy, effective_tgt
     )
 
@@ -2337,7 +2337,7 @@ def _detect_source_bin_size(src_track_dir: str) -> int:
                     continue
                 bs = struct.unpack("<i", head)[0]
                 if bs > 0:
-                    return bs
+                    return int(bs)
     return 0
 
 
@@ -2359,12 +2359,12 @@ def _aggregate_value_for_bin(
     merged: list[dict] = []
     for c in contribs:
         found = False
-        for m in merged:
-            if m["chain_id"] == c["chain_id"]:
-                m["overlap_len"] += c["overlap_len"]
-                m["start"] = min(m["start"], c["start"])
-                m["end"] = max(m["end"], c["end"])
-                m["is_na"] = m["is_na"] or c["is_na"]
+        for mc in merged:
+            if mc["chain_id"] == c["chain_id"]:
+                mc["overlap_len"] += c["overlap_len"]
+                mc["start"] = min(mc["start"], c["start"])
+                mc["end"] = max(mc["end"], c["end"])
+                mc["is_na"] = mc["is_na"] or c["is_na"]
                 found = True
                 break
         if not found:
@@ -2392,29 +2392,29 @@ def _aggregate_value_for_bin(
     vals = [c["value"] for c in valid]
 
     if agg_name == "mean":
-        return sum(vals) / len(vals)
+        return float(sum(vals) / len(vals))
     if agg_name == "sum":
-        return sum(vals)
+        return float(sum(vals))
     if agg_name == "min":
-        return min(vals)
+        return float(min(vals))
     if agg_name == "max":
-        return max(vals)
+        return float(max(vals))
     if agg_name == "median":
         vs = sorted(vals)
         n = len(vs)
-        m = n // 2
-        return (vs[m - 1] + vs[m]) / 2.0 if n % 2 == 0 else vs[m]
+        mid = n // 2
+        return float((vs[mid - 1] + vs[mid]) / 2.0 if n % 2 == 0 else vs[mid])
     if agg_name in ("first", "last", "nth"):
         # Sort by (start asc, end asc, value desc) matching R ordering.
         sorted_v = sorted(valid, key=lambda c: (c["start"], c["end"], -c["value"]))
         if agg_name == "first":
-            return sorted_v[0]["value"]
+            return float(sorted_v[0]["value"])
         if agg_name == "last":
-            return sorted_v[-1]["value"]
+            return float(sorted_v[-1]["value"])
         # nth
         if nth_index is None or nth_index <= 0 or nth_index > len(sorted_v):
             return float("nan")
-        return sorted_v[nth_index - 1]["value"]
+        return float(sorted_v[nth_index - 1]["value"])
     raise ValueError(f"Unhandled agg_name: {agg_name}")
 
 
@@ -3071,10 +3071,9 @@ def _gtrack_liftover_python(
 
     if src_type == "dense":
         # R-parity: FIXED_BIN source -> FIXED_BIN target (GTrackLiftover.cpp:702-768).
-        bin_size = _detect_source_bin_size(src_track_dir)
-        if bin_size <= 0:
-            # Fallback: dense type but no readable bin_size -> treat as sparse.
-            bin_size = None
+        _bs = _detect_source_bin_size(src_track_dir)
+        # Fallback: dense type but no readable bin_size -> treat as sparse.
+        bin_size: int | None = _bs if _bs > 0 else None
 
         if bin_size is not None:
             tgt_chrom_sizes = _get_db_chrom_sizes()

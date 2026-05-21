@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.3 (2026-05-21)
+
+- **CI green again on main**. 15 mypy errors in `pymisha/liftover.py` were silently introduced during the G1 liftover C++ port (v0.1.87-v0.1.94) and only surfaced once dev shipped to main as v0.2.0. All fixed: `# type: ignore[no-any-return]` on the two C++-entry returns (`pm_parse_chain_file`, `pm_chain_intervals_resolve`), explicit `float()` / `int()` conversions on the aggregate reducers, and an inner-loop variable rename (`m` -> `mc`) that was shadowing the outer median-index `m`.
+- **Conda package builds again**. `conda-recipe/meta.yaml` now lists `zlib` in `host` and `run` requirements (broken since v0.2.0 added zlib for SAM gzip support).
+
 ## v0.2.2 (2026-05-21)
 
 - Internal: BAM auto-detect for `gtrack_import_mappedseq` moved from the Python wrapper into the C++ entry. `samtools view` is now spawned via `popen()` inside `pm_import_mappedseq`; the Python side no longer manages a subprocess or dups file descriptors. User-visible behavior is unchanged. This makes the architecture symmetric with the upcoming R misha port (R can't easily share fds with C, but both languages can let C drive `popen`).

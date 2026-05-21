@@ -23,11 +23,16 @@ requirements:
     - setuptools >=45
     - wheel
     - numpy
+    - zlib
   run:
     - python
     - {{ pin_compatible("numpy") }}
     - pandas >=1.3
     - pyyaml
+    - zlib
+    # samtools is an optional runtime dep used by gtrack_import_mappedseq
+    # for direct BAM input. Without it, BAM imports raise a clear error
+    # at runtime; SAM / TSV / gzipped imports work unchanged.
 
 test:
   imports:
