@@ -137,14 +137,20 @@ LLM coding agents (Claude Code, Copilot, Cursor) writing pymisha analysis code c
 - [agent-guides/pymisha-anti-patterns.md](agent-guides/pymisha-anti-patterns.md) — silent footguns cross-referenced from the above.
 - [agent-guides/skills/importing-tracks/SKILL.md](agent-guides/skills/importing-tracks/SKILL.md) — full track-import reference.
 
-For agents that fetch context by URL (rather than from a cloned repo), drop these raw URLs into the system prompt:
+**Drop-in prompt (no clone needed).** Paste the block below into your agent at the start of a pymisha task. It points the agent at the raw files on GitHub, so it works without a local checkout:
 
 ```
-https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-core.md
-https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-advanced.md
-https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-anti-patterns.md
-https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/skills/importing-tracks/SKILL.md
+Before writing any pymisha code, fetch and read:
+
+- https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-core.md  (mandatory: concepts + everyday recipes)
+- https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-anti-patterns.md  (silent footguns; cross-referenced from core)
+- https://raw.githubusercontent.com/tanaylab/pymisha/main/agent-guides/pymisha-advanced.md  (consult on demand: 2D/Hi-C, PWM, import/export, new genomes)
+
+Follow the conventions in those files. When you hit a recipe with an
+"Avoid:" block, treat it as a hard rule.
 ```
+
+Pin to a release tag for stability by replacing `main` with any tag that contains `agent-guides/`. The `skills/importing-tracks/SKILL.md` guide listed above is load-on-demand; pull it in only when the task specifically calls for track import.
 
 The guides mirror the equivalent set in [R misha](https://github.com/tanaylab/misha/tree/master/agent-guides) — same section numbering, same recipes, translated to the pymisha API.
 
