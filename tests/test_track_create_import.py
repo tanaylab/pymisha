@@ -123,6 +123,62 @@ def test_gtrack_import_wig_fixedstep_dense(tmp_path):
         pm.gdb_init(str(TEST_DB))
 
 
+def test_gtrack_import_func_passthrough(tmp_path):
+    """gtrack_import(func=...) routes the per-bin reduction to gtrack_create_dense."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        # Two intervals covering the same bin so max != weighted.mean.
+        bed_path = tmp_path / "overlap.bed"
+        bed_path.write_text("chr1\t0\t10\ta\t2\nchr1\t0\t10\tb\t8\n", encoding="utf-8")
+        q = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [10]})
+
+        pm.gtrack_import("imp_max", "max import", str(bed_path), binsize=10, func="max")
+        pm.gtrack_import("imp_default", "default import", str(bed_path), binsize=10)
+
+        intervals = pd.DataFrame({"chrom": ["chr1", "chr1"], "start": [0, 0], "end": [10, 10]})
+        pm.gtrack_create_dense("direct_max", "dense max", intervals, [2.0, 8.0], binsize=10, func="max")
+
+        imp_max = pm.gextract("imp_max", q, iterator=10)["imp_max"].to_numpy(dtype=float)
+        imp_default = pm.gextract("imp_default", q, iterator=10)["imp_default"].to_numpy(dtype=float)
+        direct_max = pm.gextract("direct_max", q, iterator=10)["direct_max"].to_numpy(dtype=float)
+
+        # func passed through: import-max matches create_dense-max ...
+        np.testing.assert_allclose(imp_max, direct_max, rtol=1e-6)
+        np.testing.assert_allclose(imp_max, np.array([8.0]), rtol=1e-6)
+        # ... and differs from the default weighted.mean.
+        np.testing.assert_allclose(imp_default, np.array([5.0]), rtol=1e-6)
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_func_requires_binsize(tmp_path):
+    """A non-default func without a binsize (sparse path) is rejected."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        bed_path = tmp_path / "sparse.bed"
+        bed_path.write_text("chr1\t0\t10\ta\t5\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="binsize"):
+            pm.gtrack_import("imp_bad", "no binsize", str(bed_path), binsize=0, func="coverage")
+        assert not pm.gtrack_exists("imp_bad")
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+def test_gtrack_import_invalid_func_errors(tmp_path):
+    """An unknown func value is rejected (delegated to gtrack_create_dense)."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        bed_path = tmp_path / "bogus.bed"
+        bed_path.write_text("chr1\t0\t10\ta\t5\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            pm.gtrack_import("imp_bogus", "bad func", str(bed_path), binsize=10, func="bogus")
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
 def test_gtrack_import_bigwig_optional(tmp_path):
     pybw = pytest.importorskip("pyBigWig")
     root = _copy_db(tmp_path)

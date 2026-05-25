@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.4 (2026-05-25)
+
+- `gtrack_import()` gains a `func` argument selecting the per-bin reduction when importing with a `binsize` (Dense track): one of `"weighted.mean"` (default), `"weighted.sum"`, `"max"`, `"min"`, `"median"`, `"count"`, `"coverage"`. For example `gtrack_import("pileup", desc, "reads.bed", binsize=20, func="coverage")` builds a ChIP-style pileup track in one call. Works for every input format (BED/WIG/bedGraph/BigWig/tab). Passing a non-default `func` without a `binsize` raises an error.
+
 ## v0.2.3 (2026-05-21)
 
 - **CI green again on main**. 15 mypy errors in `pymisha/liftover.py` were silently introduced during the G1 liftover C++ port (v0.1.87-v0.1.94) and only surfaced once dev shipped to main as v0.2.0. All fixed: `# type: ignore[no-any-return]` on the two C++-entry returns (`pm_parse_chain_file`, `pm_chain_intervals_resolve`), explicit `float()` / `int()` conversions on the aggregate reducers, and an inner-loop variable rename (`m` -> `mc`) that was shadowing the outer median-index `m`.

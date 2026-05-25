@@ -1993,6 +1993,7 @@ def gtrack_import(
     binsize: int | None = None,
     defval: float = np.nan,
     attrs: dict[str, str] | None = None,
+    func: str = "weighted.mean",
 ) -> None:
     """
     Create a track from a WIG, BigWig, BedGraph, BED, or tab-delimited file.
@@ -2023,6 +2024,14 @@ def gtrack_import(
     attrs : dict or None, optional
         Additional attributes to set on the track after import, as a
         dict mapping attribute names to string values.
+    func : str, default "weighted.mean"
+        Per-bin reduction applied when creating a Dense track (i.e. when
+        *binsize* is positive). Forwarded to :func:`gtrack_create_dense`;
+        one of ``"weighted.mean"``, ``"weighted.sum"``, ``"max"``,
+        ``"min"``, ``"median"``, ``"count"``, ``"coverage"``. Passing
+        ``func="coverage"`` with ``values`` of 1 yields a ChIP-style
+        pileup track in one call. Must be left at the default when no
+        *binsize* is given (the Sparse path has no per-bin reduction).
 
     Returns
     -------
@@ -2072,11 +2081,22 @@ def gtrack_import(
     binsize = int(binsize)
 
     if binsize > 0:
-        gtrack_create_dense(track, description, parsed[["chrom", "start", "end"]], parsed["value"], binsize, defval)
+        # func validation (allowed values) is delegated to gtrack_create_dense.
+        gtrack_create_dense(
+            track, description, parsed[["chrom", "start", "end"]], parsed["value"], binsize, defval, func=func
+        )
     else:
+        if func != "weighted.mean":
+            raise ValueError(
+                f"func={func!r} requires a positive binsize; the sparse import path has no per-bin reduction"
+            )
         gtrack_create_sparse(track, description, parsed[["chrom", "start", "end"]], parsed["value"])
 
-    created_by = f'gtrack.import("{track}", description, "{file_path}", {binsize}, {float(defval):g}, attrs)'
+    func_suffix = "" if func == "weighted.mean" else f', func="{func}"'
+    created_by = (
+        f'gtrack.import("{track}", description, "{file_path}", '
+        f"{binsize}, {float(defval):g}, attrs{func_suffix})"
+    )
     _set_created_attrs(track, description, created_by, attrs=attrs)
 
 
