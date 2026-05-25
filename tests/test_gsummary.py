@@ -107,6 +107,34 @@ def test_gsummary_vtrack_streaming_uses_stable_variance(monkeypatch):
     assert result["Std dev"] > 0.0
 
 
+def test_gsummary_near_constant_large_input_finite_stdev():
+    """C++ pm_summary returns a finite std dev (not NaN) on near-constant
+    large-magnitude input.
+
+    The streaming summary uses the naive two-term variance formula
+    (sum(x^2)/(n-1) - n*mean^2/(n-1)), which underflows to a tiny negative
+    value from catastrophic cancellation when the spread is small relative
+    to the mean. Mirrors R misha 5.7.4: std dev returns 0 instead of NaN on
+    nearly-constant input. The clamp guarantees finiteness; it does not
+    recover the accurate value (already lost to cancellation).
+    """
+    # ``dense_track * 0`` forces the C++ (pm_summary) path and yields an
+    # exactly-constant large value (1e9) at every non-NaN bin; true std is 0.
+    summary = pm.gsummary("dense_track * 0 + 1e9", pm.gintervals_all())
+    std = summary["Std dev"]
+    assert np.isfinite(std)
+    assert std >= 0.0
+
+
+def test_gintervals_summary_near_constant_large_input_finite_stdev():
+    """Per-interval C++ summary returns finite std dev on near-constant
+    large input (same 5.7.4 catastrophic-cancellation clamp)."""
+    res = pm.gintervals_summary("dense_track * 0 + 1e9", pm.gintervals_all())
+    stds = res["Std dev"].to_numpy(dtype=float)
+    assert np.isfinite(stds).all()
+    assert (stds >= 0.0).all()
+
+
 # ---------------------------------------------------------------------------
 # Edge case tests
 # ---------------------------------------------------------------------------

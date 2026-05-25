@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 (2026-05-25)
+
+- **Fixed a correctness bug in coarsening-iterator extraction.** When a numeric `iterator` larger than a dense track's native bin size was used, `gextract`, `gsummary`, `gquantiles`, `gbins_summary` and `gbins_quantiles` sampled the value at each output bin's midpoint instead of averaging the native bins it covers, returning wrong values. They now average, matching R misha. Extraction with the default (native) iterator was unaffected.
+- **Mixed dense and sparse tracks in one expression are now supported.** Expressions such as `gextract("dense_track + sparse_track", intervals, iterator=50)` work with an explicit iterator, and (as in R) raise when no iterator can be inferred. Previously any dense+sparse mix raised "Mixed track types in expression are not supported".
+- `gintervals_canonic`, `gintervals_intersect`, `gintervals_union` and `gintervals_diff` now reject intervals with `start >= end` or `start < 0` instead of silently dropping zero-width intervals or passing inverted intervals through unchanged.
+- `gintervals_neighbors(..., na_if_notfound=True)` returns `NaN` for the start/end coordinates of rows with no neighbor, matching R (previously a `-1` sentinel).
+- Fixed two small reference leaks (result-dict float objects in `gtrack_import_mappedseq` and the strands-autocorrelation routine).
+
 ## v0.2.4 (2026-05-25)
 
 - `gtrack_import()` gains a `func` argument selecting the per-bin reduction when importing with a `binsize` (Dense track): one of `"weighted.mean"` (default), `"weighted.sum"`, `"max"`, `"min"`, `"median"`, `"count"`, `"coverage"`. For example `gtrack_import("pileup", desc, "reads.bed", binsize=20, func="coverage")` builds a ChIP-style pileup track in one call. Works for every input format (BED/WIG/bedGraph/BigWig/tab). Passing a non-default `func` without a `binsize` raises an error.

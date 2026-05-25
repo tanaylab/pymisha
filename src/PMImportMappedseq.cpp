@@ -571,11 +571,18 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
             tot_mapped += num_mapped[i];
             tot_dups   += num_dups[i];
         }
-        PyDict_SetItemString(total, "total",
-            PyFloat_FromDouble((double)(tot_mapped + (uint64_t)total_unmapped + tot_dups)));
-        PyDict_SetItemString(total, "total.mapped",   PyFloat_FromDouble((double)tot_mapped));
-        PyDict_SetItemString(total, "total.unmapped", PyFloat_FromDouble((double)total_unmapped));
-        PyDict_SetItemString(total, "total.dups",     PyFloat_FromDouble((double)tot_dups));
+        // PyDict_SetItemString does NOT steal a reference, so each freshly
+        // created float must be DECREF'd after insertion to avoid leaking it.
+        auto set_float = [](PyObject *d, const char *key, double v) {
+            PyObject *f = PyFloat_FromDouble(v);
+            PyDict_SetItemString(d, key, f);
+            Py_DECREF(f);
+        };
+        set_float(total, "total",
+                  (double)(tot_mapped + (uint64_t)total_unmapped + tot_dups));
+        set_float(total, "total.mapped",   (double)tot_mapped);
+        set_float(total, "total.unmapped", (double)total_unmapped);
+        set_float(total, "total.dups",     (double)tot_dups);
 
         PyObject *chroms_l = PyList_New(num_chroms);
         PyObject *mapped_l = PyList_New(num_chroms);

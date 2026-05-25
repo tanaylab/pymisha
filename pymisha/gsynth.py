@@ -2278,7 +2278,9 @@ def gsynth_random(
         Genomic intervals to generate.  If ``None``, uses all chromosomes.
     nuc_probs : dict, optional
         Nucleotide probabilities keyed by ``'A'``, ``'C'``, ``'G'``,
-        ``'T'``.  Values are automatically normalised to sum to 1.
+        ``'T'`` (case-insensitive). All four keys must be present exactly
+        once; a dict with missing, extra, or duplicated keys raises
+        ``ValueError``. Values are automatically normalised to sum to 1.
         Default is uniform (0.25 each).
     output : str, optional
         Output file path.  If ``None``, sequences are returned in memory.
@@ -2354,12 +2356,20 @@ def gsynth_random(
     if nuc_probs is None:
         probs = _numpy.array([0.25, 0.25, 0.25, 0.25])
     else:
-        probs = _numpy.array([
-            nuc_probs.get("A", 0.25),
-            nuc_probs.get("C", 0.25),
-            nuc_probs.get("G", 0.25),
-            nuc_probs.get("T", 0.25),
-        ], dtype=float)
+        # Require exactly one each of A, C, G, T (case-insensitive, any
+        # order). Previously missing keys silently defaulted to 0.25,
+        # producing a wrong distribution. Matches R misha gsynth.random.
+        upper_keys = [str(k).upper() for k in nuc_probs]
+        if sorted(upper_keys) != ["A", "C", "G", "T"]:
+            raise ValueError(
+                "nuc_probs must be a dict with exactly one each of "
+                "'A', 'C', 'G', 'T'"
+            )
+        by_base = {str(k).upper(): v for k, v in nuc_probs.items()}
+        probs = _numpy.array(
+            [by_base["A"], by_base["C"], by_base["G"], by_base["T"]],
+            dtype=float,
+        )
         probs = probs / probs.sum()
 
     cdf = _numpy.cumsum(probs)

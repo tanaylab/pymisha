@@ -191,12 +191,11 @@ def _read_item(fh: BinaryIO, ref_table: list[Any]) -> Any:
         if length < 0:
             return None  # NA_STRING
         raw = _read_bytes(fh, length)
-        # Levels (bits 12-13) carry the encoding hint; UTF-8 is the only one we honour.
-        encoding = "utf-8"
-        if (flags >> 12) & 0b11 == 0b00 and length > 0:
-            encoding = "utf-8"
+        # R's CHARSXP carries an encoding hint in the level bits, but misha
+        # strings (chrom names, set/attr names) are ASCII/UTF-8 in practice, so
+        # we decode as UTF-8 and fall back to latin-1 for any stray bytes.
         try:
-            return raw.decode(encoding)
+            return raw.decode("utf-8")
         except UnicodeDecodeError:
             return raw.decode("latin-1")
 

@@ -129,6 +129,11 @@ public:
     // Whether a common track type was detected
     bool has_common_track_type() const { return m_common_track_type_valid; }
 
+    // Whether the expression mixes 1D scalar formats (dense + sparse). R allows
+    // this only with an explicit iterator; implicit iterator inference must
+    // refuse it.
+    bool has_mixed_track_types() const { return m_mixed_track_types; }
+
     // Track path for the first track variable (for iterator selection)
     const std::string &first_track_path() const { return m_track_vars.front().track_path; }
 
@@ -144,6 +149,7 @@ private:
     int64_t m_bin_size;  // Uniform bin size (0 if mixed)
     GenomeTrack::Type m_common_track_type{GenomeTrack::NUM_TYPES};
     bool m_common_track_type_valid{false};
+    bool m_mixed_track_types{false};  // dense + sparse mixed in one expression
 
     // Convert track name to valid Python variable name
     void name2var(const std::string &name, std::string &var_name) const;

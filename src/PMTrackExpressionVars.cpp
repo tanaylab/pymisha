@@ -189,9 +189,27 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
         m_common_track_type = track_type;
         m_common_track_type_valid = true;
     } else if (track_type != m_common_track_type) {
-        TGLError("Mixed track types in expression are not supported: '%s' is %s, expected %s",
-                 track_name.c_str(), GenomeTrack::TYPE_NAMES[track_type],
-                 GenomeTrack::TYPE_NAMES[m_common_track_type]);
+        // R misha allows mixing the two 1D scalar formats - dense (FIXED_BIN)
+        // and sparse (SPARSE) - in a single track expression, but only when an
+        // explicit iterator is supplied (each track is read per iterator bin via
+        // read_interval). Permit that combination and flag the expression as
+        // mixed-format so implicit iterator inference refuses it (matching R's
+        // "cannot implicitly determine iterator policy"). Any other type
+        // mismatch (e.g. 1D vs 2D, arrays) remains unsupported.
+        const bool a_scalar_1d = track_type == GenomeTrack::FIXED_BIN ||
+                                 track_type == GenomeTrack::SPARSE;
+        const bool b_scalar_1d = m_common_track_type == GenomeTrack::FIXED_BIN ||
+                                 m_common_track_type == GenomeTrack::SPARSE;
+        if (a_scalar_1d && b_scalar_1d) {
+            // Keep m_common_track_type as the first track's type so any later
+            // genuinely-incompatible track (2D/array) still trips this guard;
+            // the sticky m_mixed_track_types flag is what callers consult.
+            m_mixed_track_types = true;
+        } else {
+            TGLError("Mixed track types in expression are not supported: '%s' is %s, expected %s",
+                     track_name.c_str(), GenomeTrack::TYPE_NAMES[track_type],
+                     GenomeTrack::TYPE_NAMES[m_common_track_type]);
+        }
     }
 
     if (track_type == GenomeTrack::FIXED_BIN) {
@@ -251,6 +269,7 @@ void PMTrackExpressionVars::parse_exprs(const std::vector<std::string> &track_ex
     m_bin_size = 0;
     m_common_track_type = GenomeTrack::NUM_TYPES;
     m_common_track_type_valid = false;
+    m_mixed_track_types = false;
 
     // Collect vtrack names from the dict so we can recognize them in expressions
     std::unordered_map<std::string, PyObject *> vtrack_specs;
@@ -461,21 +480,15 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             continue;
         }
 
-        // Read track value at interval midpoint
-        int64_t pos = (interval.start + interval.end) / 2;
-        int64_t bin = pos / var.bin_size;
-
-        // Only seek when bin is not sequential — avoids fseek overhead for common scan patterns
-        if (bin != var.last_bin + 1) {
-            fixed_bin->goto_bin(bin);
-        }
-        float val;
-        if (fixed_bin->read_next_bin(val)) {
-            var.values[idx] = val;
-        } else {
-            var.values[idx] = std::nan("");
-        }
-        var.last_bin = bin;
+        // Average the track over the WHOLE interval, matching R misha and the
+        // sparse path above. The previous implementation point-sampled the
+        // single native bin at the interval midpoint, which is only correct
+        // when the iterator bin equals the native bin; for a coarsening
+        // iterator (bin spans several native bins) it returned the midpoint
+        // bin's value instead of the mean. read_interval() handles the cursor
+        // and the common sequential single-bin case (its fast path) itself.
+        fixed_bin->read_interval(interval);
+        var.values[idx] = fixed_bin->last_avg();
     }
 
     // Evaluate virtual track variables

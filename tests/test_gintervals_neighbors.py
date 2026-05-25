@@ -181,6 +181,25 @@ class TestGintervalsNeighborsEdgeCases:
         assert result.iloc[0]['qid'] == 1  # Query info preserved
         assert pd.isna(result.iloc[0]['dist'])
 
+    def test_neighbors_na_if_notfound_coords_are_nan(self):
+        """R-parity: not-found rows get NaN (not a -1 sentinel) for the
+        target start1/end1 coordinates, matching R misha."""
+        intervs1 = make_intervals([('1', 1000, 1100), ('1', 8000, 8100)])
+        intervs2 = make_intervals([('1', 900, 950)])
+
+        result = pm.gintervals_neighbors(intervs1, intervs2, maxneighbors=1,
+                                         maxdist=60, na_if_notfound=True)
+        assert result is not None and len(result) == 2
+        # The second query (8000) has no neighbor within maxdist=60.
+        nf = result[result['chrom1'].isna()]
+        assert len(nf) == 1
+        assert pd.isna(nf.iloc[0]['start1'])
+        assert pd.isna(nf.iloc[0]['end1'])
+        # The found row keeps its real coordinates.
+        found = result[result['chrom1'].notna()]
+        assert int(found.iloc[0]['start1']) == 900
+        assert int(found.iloc[0]['end1']) == 950
+
     def test_neighbors_different_chromosomes(self):
         """Neighbors only found on same chromosome."""
         intervs1 = make_intervals([('1', 1000, 1100), ('2', 1000, 1100)])

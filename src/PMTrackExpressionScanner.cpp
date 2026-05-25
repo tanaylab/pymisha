@@ -57,6 +57,13 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
         return std::make_unique<PMFixedBinIterator>(intervals, iterator_policy);
     } else if (iterator_policy == 0) {
         // 0 = infer iterator from track type
+        if (m_expr_vars.has_mixed_track_types()) {
+            // Dense + sparse in one expression: there is no single natural
+            // iterator. Match R misha, which refuses to guess here.
+            TGLError("Cannot implicitly determine iterator policy:\n"
+                     "track expression contains tracks in different formats.\n"
+                     "Supply an explicit iterator (e.g. iterator=<bin size> or a track/intervals).");
+        }
         if (m_expr_vars.has_common_track_type() &&
             m_expr_vars.get_common_track_type() == GenomeTrack::SPARSE) {
             return std::make_unique<PMSparseIterator>(intervals, m_expr_vars.first_track_path());

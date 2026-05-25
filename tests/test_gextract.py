@@ -218,3 +218,17 @@ class TestGextractSmallIterator:
         result = pm.gextract("dense_track", intervals, iterator=1000)
         assert result is not None
         assert len(result) == 1
+
+    def test_coarsening_iterator_averages_native_bins(self):
+        """A coarsening iterator (bin > native bin) must return the MEAN of the
+        covered native bins, matching R misha - not a point sample of the
+        midpoint native bin. Regression for the midpoint-sampling bug."""
+        intervals = pm.gintervals("1", 0, 400)
+        native = pm.gextract("dense_track", intervals)["dense_track"].to_numpy(float)
+        # native bin size is 50; iterator=100 -> 2 native bins per output bin
+        coarse = pm.gextract("dense_track", intervals, iterator=100)
+        coarse = coarse.sort_values("start")["dense_track"].to_numpy(float)
+        expected = (native.reshape(-1, 2)).mean(axis=1)
+        assert np.allclose(coarse, expected, rtol=1e-5, atol=1e-7), (
+            f"coarse={coarse} expected_mean={expected}"
+        )

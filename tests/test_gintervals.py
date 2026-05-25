@@ -1200,3 +1200,54 @@ class TestGintervalsIsBigset:
             assert pm.gintervals_is_bigset(name) is False
         finally:
             pm.gintervals_rm(name, force=True)
+
+
+# ============================================================================
+# Coordinate validation in set operations (R-parity: misha errors on
+# start >= end or start < 0 for intervals passed to canonic/intersect/etc.)
+# ============================================================================
+
+
+class TestSetOpCoordinateValidation:
+    """pymisha must reject invalid coordinates instead of silently dropping
+    zero-width intervals or passing inverted (start > end) intervals through.
+    R misha raises 'start coordinate must be lesser than end coordinate'."""
+
+    def test_canonic_rejects_inverted(self):
+        bad = pd.DataFrame({"chrom": ["1"], "start": [150], "end": [100]})
+        with pytest.raises(ValueError, match="start must be < end"):
+            pm.gintervals_canonic(bad)
+
+    def test_canonic_rejects_zero_width(self):
+        bad = pd.DataFrame({"chrom": ["1", "1"], "start": [100, 100], "end": [100, 200]})
+        with pytest.raises(ValueError, match="start must be < end"):
+            pm.gintervals_canonic(bad)
+
+    def test_intersect_rejects_inverted(self):
+        bad = pd.DataFrame({"chrom": ["1"], "start": [150], "end": [100]})
+        good = pd.DataFrame({"chrom": ["1"], "start": [100], "end": [200]})
+        with pytest.raises(ValueError, match="start must be < end"):
+            pm.gintervals_intersect(bad, good)
+
+    def test_union_rejects_inverted(self):
+        bad = pd.DataFrame({"chrom": ["1"], "start": [150], "end": [100]})
+        good = pd.DataFrame({"chrom": ["1"], "start": [100], "end": [200]})
+        with pytest.raises(ValueError, match="start must be < end"):
+            pm.gintervals_union(bad, good)
+
+    def test_diff_rejects_inverted(self):
+        bad = pd.DataFrame({"chrom": ["1"], "start": [150], "end": [100]})
+        good = pd.DataFrame({"chrom": ["1"], "start": [100], "end": [200]})
+        with pytest.raises(ValueError, match="start must be < end"):
+            pm.gintervals_diff(bad, good)
+
+    def test_canonic_rejects_negative_start(self):
+        bad = pd.DataFrame({"chrom": ["1"], "start": [-5], "end": [100]})
+        with pytest.raises(ValueError, match="start must be >= 0"):
+            pm.gintervals_canonic(bad)
+
+    def test_valid_intervals_still_work(self):
+        good = pd.DataFrame({"chrom": ["1", "1"], "start": [100, 150], "end": [200, 300]})
+        res = pm.gintervals_canonic(good)
+        assert res is not None
+        assert len(res) == 1  # merged overlapping

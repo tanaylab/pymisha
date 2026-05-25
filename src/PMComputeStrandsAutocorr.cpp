@@ -240,10 +240,17 @@ PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args)
         // Stats dict
         PMPY py_stats(PyDict_New(), true);
         if (!py_stats) return nullptr;
-        PyDict_SetItemString(*py_stats, "forward_mean", PyFloat_FromDouble(mean_f));
-        PyDict_SetItemString(*py_stats, "forward_stdev", PyFloat_FromDouble(std_f));
-        PyDict_SetItemString(*py_stats, "reverse_mean", PyFloat_FromDouble(mean_r));
-        PyDict_SetItemString(*py_stats, "reverse_stdev", PyFloat_FromDouble(std_r));
+        // PyDict_SetItemString does NOT steal a reference, so each freshly
+        // created float must be DECREF'd after insertion to avoid leaking it.
+        auto set_float = [](PyObject *d, const char *key, double v) {
+            PyObject *f = PyFloat_FromDouble(v);
+            PyDict_SetItemString(d, key, f);
+            Py_DECREF(f);
+        };
+        set_float(*py_stats, "forward_mean", mean_f);
+        set_float(*py_stats, "forward_stdev", std_f);
+        set_float(*py_stats, "reverse_mean", mean_r);
+        set_float(*py_stats, "reverse_stdev", std_r);
 
         // Bin and correlation arrays
         npy_intp dims[1] = {(npy_intp)n_offsets};

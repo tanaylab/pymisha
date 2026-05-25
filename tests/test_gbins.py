@@ -341,7 +341,9 @@ def test_gbins_quantiles_r_parity_iter10():
 
 
 def test_gbins_quantiles_r_parity_iter100():
-    """Port of: gbins.quantiles with iterator=100 — golden-master regression."""
+    """gbins.quantiles with iterator=100. Values verified against R misha 5.7.x
+    (gbins.quantiles("dense_track", c(0,0.2,0.3,0.9,1.2), "sparse_track",
+    percentiles=c(0.2,0.5,0.6), iterator=100))."""
     result = pm.gbins_quantiles(
         "dense_track", [0, 0.2, 0.3, 0.9, 1.2],
         expr="sparse_track",
@@ -349,27 +351,30 @@ def test_gbins_quantiles_r_parity_iter100():
         iterator=100,
     )
     assert result.shape == (4, 3)
-    np.testing.assert_allclose(result[0, 0], 0.36000001, rtol=1e-5)
-    np.testing.assert_allclose(result[0, 1], 0.40000001, rtol=1e-5)
-    np.testing.assert_allclose(result[2, 1], 0.60000002, rtol=1e-5)
+    np.testing.assert_allclose(result[0], [0.3600000, 0.4133333, 0.440], rtol=1e-5)
+    np.testing.assert_allclose(result[1], [0.4400000, 0.5000000, 0.520], rtol=1e-5)
+    np.testing.assert_allclose(result[2], [0.5356191, 0.6160000, 0.636], rtol=1e-5)
     assert np.all(np.isnan(result[3, :]))
 
 
 def test_gbins_summary_r_parity():
-    """Port of: gbins.summary with iterator=100 — golden-master regression."""
+    """gbins.summary with iterator=100. Values verified against R misha 5.7.x
+    (gbins.summary("dense_track", c(0,0.2,0.3,0.9,1.2), "sparse_track",
+    iterator=100))."""
     result = pm.gbins_summary(
         "dense_track", [0, 0.2, 0.3, 0.9, 1.2],
         expr="sparse_track",
         iterator=100,
     )
     assert result.shape == (4, 7)
-    # First bin: total ~6202, nans ~5128
-    np.testing.assert_allclose(result[0, 0], 6202, rtol=1e-3)
-    np.testing.assert_allclose(result[0, 1], 5128, rtol=1e-3)
-    # Second bin: total ~641
-    np.testing.assert_allclose(result[1, 0], 641, rtol=1e-3)
-    # Third bin: total ~140
-    np.testing.assert_allclose(result[2, 0], 140, rtol=1e-3)
+    # First bin (0,0.2]: total 7125, nans 5699
+    np.testing.assert_allclose(result[0, 0], 7125, rtol=1e-3)
+    np.testing.assert_allclose(result[0, 1], 5699, rtol=1e-3)
+    np.testing.assert_allclose(result[0, 5], 0.4318710, rtol=1e-5)  # mean
+    # Second bin (0.2,0.3]: total 407
+    np.testing.assert_allclose(result[1, 0], 407, rtol=1e-3)
+    # Third bin (0.3,0.9]: total 47
+    np.testing.assert_allclose(result[2, 0], 47, rtol=1e-3)
     # Fourth bin: 0 total, NaN stats
     assert result[3, 0] == 0
     assert np.isnan(result[3, 2])

@@ -1626,8 +1626,12 @@ struct SummaryStats {
 
     double stdev() const {
         double mean_val = mean();
-        return std::sqrt(mean_square_sum / (num_non_nan - 1) -
-                         (mean_val * mean_val) * (num_non_nan / (num_non_nan - 1)));
+        // Clamp tiny negatives from catastrophic cancellation (the two terms
+        // are close when variance is small relative to mean^2); return 0
+        // instead of NaN on nearly-constant input.
+        double var = mean_square_sum / (num_non_nan - 1) -
+                     (mean_val * mean_val) * (num_non_nan / (num_non_nan - 1));
+        return var > 0 ? std::sqrt(var) : 0;
     }
 
     void merge(const SummaryStats &other) {

@@ -1670,12 +1670,40 @@ def _intervals_to_cpp(intervals: pd.DataFrame) -> Any:
         chrom_arr = chrom_series.to_numpy()
     start_arr = intervals['start'].to_numpy()
     end_arr = intervals['end'].to_numpy()
+    _validate_interval_coords(chrom_arr, start_arr, end_arr)
     return [
         _numpy.array(['chrom', 'start', 'end'], dtype=object),
         chrom_arr,
         start_arr,
         end_arr,
     ]
+
+
+def _validate_interval_coords(
+    chrom_arr: Any, start_arr: Any, end_arr: Any
+) -> None:
+    """Validate 1D interval coordinates before a C++ set operation.
+
+    R misha raises on any interval with ``start >= end`` or ``start < 0``
+    (e.g. in gintervals.canonic / intersect / union / diff). Without this
+    check pymisha silently dropped zero-width intervals and passed inverted
+    (start > end) intervals straight through, corrupting downstream results.
+    Vectorized so it adds negligible cost on large inputs.
+    """
+    bad = start_arr >= end_arr
+    if bad.any():
+        i = int(_numpy.argmax(bad))
+        raise ValueError(
+            f"Invalid interval ({chrom_arr[i]}, {start_arr[i]}, {end_arr[i]}): "
+            "start must be < end"
+        )
+    neg = start_arr < 0
+    if neg.any():
+        i = int(_numpy.argmax(neg))
+        raise ValueError(
+            f"Invalid interval ({chrom_arr[i]}, {start_arr[i]}, {end_arr[i]}): "
+            "start must be >= 0"
+        )
 
 
 def gintervals_union(
@@ -2200,6 +2228,27 @@ def gintervals_neighbors(
     )
 
     df = _pymisha2df(result)
+
+    if (
+        na_if_notfound
+        and df is not None
+        and len(df) > 0
+        and isinstance(intervals1, _pandas.DataFrame)
+    ):
+        # The C++ layer stores a -1 long sentinel for the target start/end of
+        # rows with no neighbor (it can't put NaN in an int column). R misha
+        # returns NaN there, so coerce those coordinates to NaN to match.
+        # Not-found rows are exactly those whose target chrom became NaN.
+        n_left = len(intervals1.columns)
+        target_cols = list(df.columns[n_left:-1])  # intervals2 cols (excl. dist)
+        if target_cols:
+            notfound = df[target_cols[0]].isna()
+            if notfound.any():
+                for col in target_cols:
+                    if df[col].dtype.kind in "iu":
+                        df[col] = df[col].astype(float)
+                    df.loc[notfound, col] = _numpy.nan
+
     if intervals_set_out is not None:
         if df is not None and len(df) > 0:
             gintervals_save(df, intervals_set_out)

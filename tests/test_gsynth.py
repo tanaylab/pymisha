@@ -2042,16 +2042,51 @@ class TestGsynthRandomAdvanced:
             frac = sum(1 for c in chars if c == base) / total
             assert 0.22 < frac < 0.28, f"Base {base} fraction {frac} out of range"
 
-    def test_random_partial_probs_defaults_missing_to_zero(self):
-        """nuc_probs with only 2 keys defaults missing to 0."""
+    def test_random_rejects_partial_nuc_probs(self):
+        """nuc_probs missing a nucleotide is rejected (no silent defaulting).
+
+        Mirrors R misha 5.7.4: previously missing keys silently defaulted,
+        producing a wrong distribution.
+        """
+        with pytest.raises(ValueError, match="A.*C.*G.*T"):
+            pm.gsynth_random(
+                intervals=pm.gintervals("1", 0, 1000),
+                nuc_probs={"A": 0.5, "C": 0.5},
+                seed=60427,
+            )
+
+    def test_random_rejects_extra_nuc_probs(self):
+        """nuc_probs with an unexpected key is rejected."""
+        with pytest.raises(ValueError, match="A.*C.*G.*T"):
+            pm.gsynth_random(
+                intervals=pm.gintervals("1", 0, 1000),
+                nuc_probs={"A": 0.25, "C": 0.25, "G": 0.25, "T": 0.25, "N": 0.0},
+                seed=60427,
+            )
+
+    def test_random_rejects_duplicate_case_nuc_probs(self):
+        """nuc_probs with case-duplicated keys (A and a) is rejected."""
+        with pytest.raises(ValueError, match="A.*C.*G.*T"):
+            pm.gsynth_random(
+                intervals=pm.gintervals("1", 0, 1000),
+                nuc_probs={"A": 0.25, "a": 0.25, "C": 0.25, "G": 0.25, "T": 0.25},
+                seed=60427,
+            )
+
+    def test_random_accepts_lowercase_nuc_probs(self):
+        """nuc_probs keys are case-insensitive (matches R toupper handling).
+
+        Lowercase AT-only probs must actually be honoured (no G/C output);
+        previously lowercase keys were ignored and silently defaulted.
+        """
         seqs = pm.gsynth_random(
-            intervals=pm.gintervals("1", 0, 1000),
-            nuc_probs={"A": 0.5, "C": 0.5},
+            intervals=pm.gintervals("1", 0, 10000),
+            nuc_probs={"a": 0.5, "c": 0.0, "g": 0.0, "t": 0.5},
             seed=60427,
         )
-        # Should still produce valid output
-        assert len(seqs[0]) == 1000
-        assert all(c in "ACGT" for c in seqs[0])
+        chars = list(seqs[0][5:])  # skip initial 5 seed bases
+        gc = sum(1 for c in chars if c in "GC")
+        assert gc == 0, f"Found {gc} G/C bases with zero probability"
 
     def test_random_at_only_probs(self):
         """Probabilities with only A and T produce AT-rich sequence."""
