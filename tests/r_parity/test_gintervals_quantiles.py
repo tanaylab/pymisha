@@ -53,8 +53,8 @@ def _q4():
 _CASES = {
     "gintervals.quantiles.1": (_q1, None),
     "gintervals.quantiles.2": (_q2, None),
-    "gintervals.quantiles.3": (_q3, GAP_SUMMARY_ITER),
-    "gintervals.quantiles.4": (_q4, GAP_SUMMARY_ITER),
+    "gintervals.quantiles.3": (_q3, None),
+    "gintervals.quantiles.4": (_q4, None),
 }
 
 

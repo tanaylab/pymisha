@@ -42,7 +42,7 @@ _CASES = {
     "9": (lambda: _gi(None, _i1([2, 3]), iterator="test.sparse"), None),
     "10": (lambda: _gi(None, _i1([2, 3]), iterator="test.fixedbin"), None),
     "11": (lambda: _gi("test.sparse", _i1([1, 2], 0, 1000000)), None),
-    "12": (lambda: _gi(None, iterator="test.rects_big_rects", band=(-187435, 234560)), GAP_2D_ITER),
+    "12": (lambda: _gi(None, iterator="test.rects_big_rects", band=(-187435, 234560)), None),
     "13": (lambda: _gi(None, _i2([2, 3]), iterator=(12345, 789), band=(-18743, 23456)), GAP_2D_ITER),
     "14": (lambda: _gi("test.generated_1d_1", intervals=_gi("test.generated_1d_2"), iterator=_gi("test.generated_1d_1")), None),
     "15": (lambda: _gi("test.generated_1d_1", intervals=_gi("test.generated_1d_2"), iterator="test.bigintervs_1d_1"), None),

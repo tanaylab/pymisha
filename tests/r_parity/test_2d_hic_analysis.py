@@ -38,6 +38,7 @@ from .baseline import assert_matches_baseline, assert_matches_list_baseline
 GAP_2D_BAND = "2D band query near the diagonal returns a different contact set/coords than R"
 GAP_2D_ITER = "2D iterator semantics differ (default 2D iterator / gvtrack.iterator.2d shifts / 2D span)"
 GAP_BAND_GITER = "giterator_intervals has no band= argument"
+GAP_2D_NEIGHBORS = "2D gintervals_neighbors not implemented"
 GAP_INSU_DOMS = "gtrack_2d_get_insu_doms not implemented"
 GAP_R_POSTPROC = "baseline is pure R post-processing (cut/table or rpois seed) not reproducible cross-impl"
 GAP_GCIS_DECAY = "gcis_decay over Hi-C differs from R (valued-source gcis_decay gap)"
@@ -293,7 +294,6 @@ def test_gcis_decay_domains_symmetric(hg19_overlay):
     assert_matches_baseline(combined, "gcis_decay.domains.symmetric.hic.1")
 
 
-@pytest.mark.xfail(reason=GAP_BAND_GITER, strict=True)
 def test_giterator_intervals_band(hg19_overlay):
     pm.giterator_intervals("hic.test_basic", band=(-5e5, -1e4), intervals_set_out="test.band_set")
     try:
@@ -304,8 +304,10 @@ def test_giterator_intervals_band(hg19_overlay):
             pm.gintervals_rm("test.band_set", force=True)
 
 
-@pytest.mark.xfail(reason=GAP_BAND_GITER, strict=True)
+@pytest.mark.xfail(reason=GAP_2D_NEIGHBORS, strict=True)
 def test_gintervals_neighbors_2d(hg19_overlay):
+    # giterator_intervals(band=...) now works; the remaining blocker is 2D
+    # gintervals_neighbors (unimplemented), not GAP_BAND_GITER.
     pm.giterator_intervals("hic.test_basic", band=(-5e5, -1e4), intervals_set_out="test.neigh_set")
     try:
         s1 = np.arange(5e5, 1e6 + 1, 1e5)

@@ -58,7 +58,7 @@ _CASES = {
     "gintervals.chrom_sizes.5": (lambda: pm.gintervals_chrom_sizes("test.sparse"), None),
     "gintervals.chrom_sizes.6": (lambda: pm.gintervals_chrom_sizes("test.rects"), None),
     "gintervals.diff.1": (lambda: pm.gintervals_diff(_scr("test.fixedbin > 0.2", _i1([1, 2], 0, -1)), _scr("test.fixedbin > 0.4", _i1([1, 2], 0, -1))), None),
-    "gintervals.diff.2": (lambda: pm.gintervals_diff(_rb(_scr("test.fixedbin > 0.1 & test.fixedbin < 0.3", _i1([1, 2])), _scr("test.fixedbin > 0.2 & test.fixedbin < 0.4", _i1([1, 2]))), _scr("(test.fixedbin > 0.25 & test.fixedbin < 0.32) | test.fixedbin > 0.35", _i1([1, 2]))), GAP_DIFF_OVERLAP),
+    "gintervals.diff.2": (lambda: pm.gintervals_diff(_rb(_scr("test.fixedbin > 0.1 & test.fixedbin < 0.3", _i1([1, 2])), _scr("test.fixedbin > 0.2 & test.fixedbin < 0.4", _i1([1, 2]))), _scr("(test.fixedbin > 0.25 & test.fixedbin < 0.32) | test.fixedbin > 0.35", _i1([1, 2]))), None),
     "gintervals.diff.3": (lambda: pm.gintervals_diff(_scr("test.fixedbin > 0.2", _i1([1, 2, 4, 8, 9], 0, -1)), _scr("test.fixedbin > 0.4", _i1([1, 2, 4, 7, 9], 0, -1))), None),
     "gintervals.diff.binintervs": (lambda: pm.gintervals_diff("test.bigintervs_1d_1", "test.bigintervs_1d_2"), None),
     "gintervals.load.1": (lambda: pm.gintervals_load("test.foodgene"), None),

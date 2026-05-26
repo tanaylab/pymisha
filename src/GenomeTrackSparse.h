@@ -113,7 +113,11 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 
     // Generic path: full function bookkeeping
     float num_vs = 0;
-    double mean_square_sum = 0;
+    // Welford's online algorithm for stddev (numerically stable; matches R
+    // misha and avoids the one-pass Sum(x^2)-n*mean^2 cancellation that yields
+    // a tiny nonzero stddev for constant bins).
+    double stddev_mean = 0;
+    double stddev_m2 = 0;
 
     std::vector<float> all_values;
     std::vector<double> all_positions;
@@ -152,9 +156,6 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
                     m_last_max_pos = cur.start;
             }
 
-            if (has_function(STDDEV))
-                mean_square_sum += v * v;
-
             if (m_use_quantile)
                 m_sp.add(v, s_rnd_func);
 
@@ -179,6 +180,12 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
                 all_positions.push_back(cur.start);
 
             ++num_vs;
+            if (has_function(STDDEV)) {
+                const double delta = v - stddev_mean;
+                stddev_mean += delta / static_cast<double>(num_vs);
+                const double delta2 = v - stddev_mean;
+                stddev_m2 += delta * delta2;
+            }
         }
     }
 
@@ -218,7 +225,7 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 
     if (has_function(STDDEV))
         m_last_stddev = num_vs > 1
-            ? std::sqrt(mean_square_sum / (num_vs - 1) - (m_last_avg * (double)m_last_avg) * (num_vs / (num_vs - 1)))
+            ? std::sqrt(stddev_m2 / static_cast<double>(num_vs - 1))
             : std::numeric_limits<float>::quiet_NaN();
 }
 

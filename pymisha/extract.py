@@ -257,6 +257,38 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
     return True
 
 
+def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | None:
+    """Infer the implicit iterator (bin size) from value-based vtrack sources.
+
+    R determines the implicit iterator of a virtual-track expression from the
+    vtrack's *source* track. For value-based vtracks over dense 1D tracks this
+    is the source track's native bin size. Returns that bin size when every
+    listed vtrack is a (non-array-slice, unfiltered) value vtrack over a dense
+    1D track sharing a single bin size, otherwise ``None`` (leaving the caller's
+    existing behavior unchanged for sparse/array/2D/sequence sources).
+    """
+    from .tracks import gtrack_exists, gtrack_info
+
+    bin_sizes: set[int] = set()
+    for name in vtrack_names:
+        cfg = _shared._VTRACKS.get(name)
+        if cfg is None or cfg.get("kind") == "array_slice":
+            return None
+        src = cfg.get("src")
+        if not isinstance(src, str) or not gtrack_exists(src):
+            return None
+        info = gtrack_info(src)
+        if int(info.get("dimensions", 1) or 1) != 1:
+            return None
+        bs = info.get("bin_size") or info.get("bin.size")
+        if bs is None:
+            return None  # sparse / array source: native iterator deferred
+        bin_sizes.add(int(float(bs)))
+    if len(bin_sizes) == 1:
+        return bin_sizes.pop()
+    return None
+
+
 def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[str, Any]]:
     """Build a Python dict of vtrack specs to pass to C++.
 
@@ -2354,6 +2386,13 @@ def gextract(
             compile_safe_expression(expr_eval, allowed_names)
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
+
+    # When no explicit iterator is given, a value-based vtrack defaults to its
+    # source track's native iterator (R parity), not the whole interval.
+    if iterator is None and used_vtracks and not all_user_vars:
+        _inferred_it = _infer_iterator_from_vtracks(used_vtracks)
+        if _inferred_it is not None:
+            iterator = _inferred_it
 
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars

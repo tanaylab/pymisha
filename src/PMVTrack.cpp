@@ -842,21 +842,21 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 }
 
                 if (func == "distance.center") {
+                    // R locates the source interval containing the bin *center*
+                    // by lower_bound on the center coordinate (not the bin start).
+                    // Searching by eval.start misses the containing interval when
+                    // several source intervals begin within [eval.start, coord].
                     int64_t coord = (eval.start + eval.end) / 2;
-                    size_t idx = adaptive_lb_start(eval);
+                    GInterval ceval = eval;
+                    ceval.start = coord;
+                    ceval.end = coord + 1;
+                    size_t idx = adaptive_lb_start(ceval);
                     auto it = sintervs.begin() + idx;
                     double dist = std::numeric_limits<double>::quiet_NaN();
-                    if (it != sintervs.begin()) {
-                        auto prev = it - 1;
-                        if (prev->chromid == eval.chromid && coord >= prev->start && coord < prev->end) {
-                            dist = prev->dist2center(coord);
-                        }
-                    }
-                    if (std::isnan(dist) && it != sintervs.end() && it->chromid == eval.chromid) {
-                        if (coord >= it->start && coord < it->end) {
-                            dist = it->dist2center(coord);
-                        }
-                    }
+                    if (it != sintervs.end() && it->chromid == eval.chromid)
+                        dist = it->dist2center(coord);
+                    if (std::isnan(dist) && it != sintervs.begin() && (it - 1)->chromid == eval.chromid)
+                        dist = (it - 1)->dist2center(coord);
                     out[i] = dist;
                     continue;
                 }

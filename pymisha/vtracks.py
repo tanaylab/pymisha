@@ -56,6 +56,34 @@ _FILTER_EDIT_DISTANCE_FUNCS = {
     "pwm.edit_distance.lse.pos",
 }
 _DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
+# Columns that never count as a "value" column when inferring a DataFrame source's
+# default function (mirrors R's TrackExpressionVars value-column detection).
+_NON_VALUE_COLS = {"chrom", "start", "end", "strand", "intervalID", "intervalID1", "intervalID2"}
+
+
+def _infer_default_vtrack_func(src: pd.DataFrame | str | None) -> str:
+    """Infer the default ``func`` when none is given (R parity).
+
+    R defaults a virtual track's function to ``"distance"`` when its source
+    resolves to an intervals set (no value column) and to ``"avg"`` when the
+    source is a track or a value-bearing intervals set.
+    """
+    if isinstance(src, _pandas.DataFrame):
+        has_value = any(
+            c not in _NON_VALUE_COLS and _pandas.api.types.is_numeric_dtype(src[c])
+            for c in src.columns
+        )
+        return "avg" if has_value else "distance"
+    if isinstance(src, str):
+        from .tracks import _track_exists
+
+        if _track_exists(src):
+            return "avg"
+        from .intervals import gintervals_exists
+
+        if gintervals_exists(src):
+            return "distance"
+    return "avg"
 _VALUE_DF_PY_FUNCS = {
     "avg", "mean", "sum", "min", "max", "first", "last", "size", "exists",
     "stddev", "std", "quantile", "nearest",
@@ -1316,7 +1344,7 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
 def gvtrack_create(
     vtrack_name: str,
     src: pd.DataFrame | str | None,
-    func: str = "avg",
+    func: str | None = None,
     params: float | str | None = None,
     sshift: int = 0,
     eshift: int = 0,
@@ -1349,8 +1377,10 @@ def gvtrack_create(
         - ``None`` -- for sequence-based functions (``'pwm'``, ``'pwm.max'``,
           ``'pwm.count'``, ``'kmer.count'``, ``'kmer.frac'``,
           ``'masked.count'``, ``'masked.frac'``).
-    func : str, default 'avg'
-        Aggregation function to apply. Supported functions include:
+    func : str, optional
+        Aggregation function to apply. When omitted, defaults to ``'avg'``
+        for a track or value-bearing source and to ``'distance'`` for an
+        intervals-set source (R parity). Supported functions include:
 
         - **Track-based**: ``'avg'``, ``'sum'``, ``'min'``, ``'max'``,
           ``'stddev'``, ``'nearest'``, ``'quantile'``, ``'coverage'``,
@@ -1473,6 +1503,8 @@ def gvtrack_create(
     ...                   kmer="CG", strand=1)
     """
     _checkroot()
+    if func is None:
+        func = _infer_default_vtrack_func(src)
     func_lc = str(func).lower()
 
     if isinstance(src, _pandas.DataFrame):

@@ -1887,8 +1887,20 @@ def gintervals_diff(
 
     if len(intervals1) == 0:
         return None
+
+    # R's gintervdiff sorts and unifies overlaps (incl. touching) on both
+    # operands before the difference; mirror that so non-canonic (e.g.
+    # rbind-ed) inputs give the same result as in R.
+    canon1 = gintervals_canonic(intervals1[['chrom', 'start', 'end']].copy())
+    assert isinstance(canon1, pd.DataFrame)
+    intervals1 = canon1[['chrom', 'start', 'end']]
+
     if len(intervals2) == 0:
-        return _sort_intervals(intervals1[['chrom', 'start', 'end']].copy())
+        return _sort_intervals(intervals1.copy())
+
+    canon2 = gintervals_canonic(intervals2[['chrom', 'start', 'end']].copy())
+    assert isinstance(canon2, pd.DataFrame)
+    intervals2 = canon2[['chrom', 'start', 'end']]
 
     _checkroot()
     result = _pymisha.pm_intervals_diff(
@@ -4078,6 +4090,8 @@ def giterator_intervals(
     expr: str | None = None,
     intervals: pd.DataFrame | str | None = None,
     iterator: Any = None,
+    band: tuple[int, int] | tuple[float, float] | None = None,
+    intervals_set_out: str | None = None,
     interval_relative: bool = False,
     partial_bins: str = "clip",
 ) -> pd.DataFrame | None:
@@ -4097,6 +4111,14 @@ def giterator_intervals(
         Genomic scope.  Defaults to :func:`gintervals_all` (whole genome).
     iterator : int or str, optional
         Numeric bin size or track name that defines the iterator.
+    band : tuple of (int, int), optional
+        Diagonal band ``(d1, d2)`` restricting a 2D iterator to rectangles
+        whose offset from the diagonal lies within the band (as in
+        :func:`gextract`). Ignored for 1D iterators.
+    intervals_set_out : str, optional
+        If given, save the resulting iterator intervals as a named interval
+        set under this name and return ``None`` instead of a DataFrame
+        (mirrors R's ``intervals.set.out``).
     interval_relative : bool, default False
         When ``True``, bins are aligned to each input interval's start
         rather than to chromosome position 0.  Requires a numeric
@@ -4186,11 +4208,15 @@ def giterator_intervals(
                 if not isinstance(intervals, _pandas.DataFrame) or "chrom1" not in intervals.columns:
                     raise ValueError("2D track iterator requires 2D intervals")
 
-                res = gextract(itr, intervals=intervals, iterator=itr)
+                res = gextract(itr, intervals=intervals, iterator=itr, band=band)
                 if res is None or len(res) == 0:
                     return None
                 cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
-                return res[cols].drop_duplicates().reset_index(drop=True)
+                df2d = res[cols].drop_duplicates().reset_index(drop=True)
+                if intervals_set_out is not None:
+                    gintervals_save(df2d, intervals_set_out)
+                    return None
+                return df2d
 
             bin_size = info.get("bin_size") or info.get("bin.size")
             if bin_size is not None:
@@ -4241,6 +4267,12 @@ def giterator_intervals(
         bin_size = int(itr)
         sizes = df["end"] - df["start"]
         df = df[sizes >= bin_size].reset_index(drop=True)
+
+    if intervals_set_out is not None:
+        if df is None or len(df) == 0:
+            raise ValueError("Cannot save empty intervals")
+        gintervals_save(df, intervals_set_out)
+        return None
 
     return df
 

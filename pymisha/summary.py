@@ -1218,6 +1218,8 @@ def gintervals_summary(
     _checkroot()
 
     intervals = _maybe_load_intervals_set(intervals)
+    orig_intervals = intervals
+    orig_iterator = iterator
 
     # Handle DataFrame-as-iterator
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
@@ -1226,8 +1228,20 @@ def gintervals_summary(
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_summary")
 
+    # When the iterator is an interval-set/track that resolves to a DataFrame of
+    # bins, ``_preprocess_intervals_iterator`` intersects the scope with those
+    # bins (one piece per bin ∩ scope). Summarizing the pieces would emit one
+    # row per piece; R emits one row per SCOPE interval (empty ones get
+    # Total=0 / NaN). ``gextract`` maps ``intervalID`` back to the scope, so
+    # route DataFrame-iterator summaries through the extract path on the
+    # ORIGINAL scope + iterator and aggregate per scope interval.
+    df_iterator = _itr_id_map is not None
     vtracks_used = _find_vtracks_in_expr(expr)
-    use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals)
+    use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals) or df_iterator
+    if df_iterator:
+        intervals = orig_intervals
+        iterator = orig_iterator
+        assert isinstance(intervals, _pandas.DataFrame)
     if not use_extract_path:
         with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, _cfg)
@@ -1275,19 +1289,31 @@ def gintervals_summary(
                 id_arr = result["intervalID"].to_numpy(dtype=int, copy=False)
                 valid_id = (id_arr >= 1) & (id_arr <= n)
                 if valid_id.any():
-                    grouped = result.loc[valid_id].groupby("intervalID")[col]
+                    sub = result.loc[valid_id, ["intervalID", col]].copy()
+                    sub["_sq"] = sub[col] * sub[col]
+                    grouped = sub.groupby("intervalID")
                     total_counts = grouped.size()
-                    stats = grouped.agg(["min", "max", "sum", "mean", "std", "count"])
+                    stats = grouped[col].agg(["min", "max", "sum", "mean", "count"])
+                    sumsq = grouped["_sq"].sum()
                     idx = total_counts.index.to_numpy(dtype=int) - 1
+                    cnt = stats["count"].to_numpy(dtype=float)
+                    ssum = stats["sum"].to_numpy(dtype=float)
+                    ssq = sumsq.to_numpy(dtype=float)
+                    # R's gintervals.summary uses the one-pass unbiased variance
+                    # sqrt(sum(x^2)/(N-1) - N*mean^2/(N-1)). For a single bin
+                    # (N=1) this is sqrt(inf-inf)=NaN, matching R's frozen output;
+                    # pandas' two-pass std differs by ~1e-5 and trips tolerance.
+                    with _numpy.errstate(invalid="ignore", divide="ignore"):
+                        mean = ssum / cnt
+                        var = ssq / (cnt - 1.0) - (mean * mean) * (cnt / (cnt - 1.0))
+                        std = _numpy.sqrt(var)
                     out.iloc[idx, out.columns.get_loc("Total intervals")] = total_counts.to_numpy(dtype=float)
-                    out.iloc[idx, out.columns.get_loc("NaN intervals")] = total_counts.to_numpy(dtype=float) - stats[
-                        "count"
-                    ].to_numpy(dtype=float)
+                    out.iloc[idx, out.columns.get_loc("NaN intervals")] = total_counts.to_numpy(dtype=float) - cnt
                     out.iloc[idx, out.columns.get_loc("Min")] = stats["min"].to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("Max")] = stats["max"].to_numpy(dtype=float)
-                    out.iloc[idx, out.columns.get_loc("Sum")] = stats["sum"].to_numpy(dtype=float)
+                    out.iloc[idx, out.columns.get_loc("Sum")] = ssum
                     out.iloc[idx, out.columns.get_loc("Mean")] = stats["mean"].to_numpy(dtype=float)
-                    out.iloc[idx, out.columns.get_loc("Std dev")] = stats["std"].to_numpy(dtype=float)
+                    out.iloc[idx, out.columns.get_loc("Std dev")] = std
             out = out.reset_index(drop=True)
     if intervals_set_out is not None:
         from .intervals import gintervals_save
@@ -1348,6 +1374,8 @@ def gintervals_quantiles(
     _checkroot()
 
     intervals = _maybe_load_intervals_set(intervals)
+    orig_intervals = intervals
+    orig_iterator = iterator
 
     # Handle DataFrame-as-iterator
     intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
@@ -1362,8 +1390,17 @@ def gintervals_quantiles(
     if _numpy.any((pct < 0) | (pct > 1)):
         raise ValueError("percentiles must be within [0, 1]")
 
+    # As in gintervals_summary: a DataFrame/interval-set iterator was intersected
+    # into per-bin pieces; R reports one row per SCOPE interval. Route through the
+    # extract path on the ORIGINAL scope + iterator (gextract maps intervalID back
+    # to the scope) so empties get NaN quantiles.
+    df_iterator = _itr_id_map is not None
     vtracks_used = _find_vtracks_in_expr(expr)
-    use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals)
+    use_extract_path = bool(vtracks_used) or band is not None or _is_2d_intervals(intervals) or df_iterator
+    if df_iterator:
+        intervals = orig_intervals
+        iterator = orig_iterator
+        assert isinstance(intervals, _pandas.DataFrame)
     if not use_extract_path:
         with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
