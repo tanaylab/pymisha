@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymisha"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python interface for misha genomic databases with C++ streaming backends"
 readme = "README.md"
 license = {text = "MIT"}
@@ -70,6 +70,9 @@ select = ["E", "F", "I", "UP", "W", "B", "SIM", "PIE", "RET", "C4"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "B017", "B023"]
+# r_parity modules are mechanical translation tables of R misha calls; long
+# single-line gextract/gintervals.2d translations are clearer kept intact.
+"tests/r_parity/**" = ["S101", "B017", "B023", "E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pymisha"]
@@ -92,6 +95,7 @@ python_functions = ["test_*"]
 markers = [
     "benchmark: mark test as a benchmark",
     "network: mark test as requiring network access (skipped by default)",
+    "r_parity: mark test as an R misha baseline-parity test (needs lab NFS DB; skipped if absent)",
 ]
 
 [tool.coverage.run]

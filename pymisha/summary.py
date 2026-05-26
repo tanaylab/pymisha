@@ -150,7 +150,10 @@ def gdist(
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import gintervals_2d_all
+        _str_exprs = [a for a in args if isinstance(a, str)]
+        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(_str_exprs) else gintervals_all()
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gdist")
@@ -973,7 +976,9 @@ def gsummary(
     _check_computed_tracks(expr)
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import gintervals_2d_all
+        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1098,7 +1103,9 @@ def gquantiles(
     _check_computed_tracks(expr)
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import gintervals_2d_all
+        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1498,7 +1505,9 @@ def gpartition(
         raise ValueError("gpartition requires at least 2 break values (for 1 bin)")
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import gintervals_2d_all
+        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 

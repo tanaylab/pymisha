@@ -144,6 +144,103 @@ def validate_expression_ast(expr, allowed_names):
                     )
 
 
+def _split_top_level(s, op):
+    """Split ``s`` on top-level occurrences of single-char operator ``op``.
+
+    Occurrences inside parentheses/brackets/braces or string literals are not
+    split.
+    """
+    parts = []
+    depth = 0
+    instr = None
+    last = 0
+    for i, c in enumerate(s):
+        if instr is not None:
+            if c == instr:
+                instr = None
+        elif c in "\"'":
+            instr = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and c == op:
+            parts.append(s[last:i])
+            last = i + 1
+    parts.append(s[last:])
+    return parts
+
+
+def _recurse_into_parens(atom):
+    """Reassociate &/| inside top-level parenthesized groups of ``atom``.
+
+    ``atom`` has no top-level ``&``/``|``; recurse so user-written parentheses
+    like ``(a > x & b < y)`` are fixed too.
+    """
+    res = []
+    instr = None
+    i = 0
+    n = len(atom)
+    while i < n:
+        c = atom[i]
+        if instr is not None:
+            res.append(c)
+            if c == instr:
+                instr = None
+            i += 1
+        elif c in "\"'":
+            instr = c
+            res.append(c)
+            i += 1
+        elif c == "(":
+            depth = 1
+            j = i + 1
+            while j < n and depth:
+                if atom[j] == "(":
+                    depth += 1
+                elif atom[j] == ")":
+                    depth -= 1
+                j += 1
+            inner = atom[i + 1:j - 1]
+            res.append("(" + _reassociate_logical(inner) + ")")
+            i = j
+        else:
+            res.append(c)
+            i += 1
+    return "".join(res)
+
+
+def _reassociate_logical(expr):
+    out_or = []
+    for or_part in _split_top_level(expr, "|"):
+        and_parts = _split_top_level(or_part, "&")
+        if len(and_parts) == 1:
+            out_or.append(_recurse_into_parens(or_part.strip()))
+        else:
+            out_or.append(" & ".join(f"({_recurse_into_parens(p.strip())})" for p in and_parts))
+    if len(out_or) == 1:
+        return out_or[0]
+    return " | ".join(f"({p})" for p in out_or)
+
+
+def _normalize_logical_precedence(expr):
+    """Reparenthesize ``&`` / ``|`` to R operator precedence.
+
+    In R, ``&`` and ``|`` bind *looser* than comparisons (and ``&`` tighter than
+    ``|``), so ``track > a & track < b`` means ``(track > a) & (track < b)``.
+    Python binds ``&``/``|`` *tighter* than comparisons, which mis-parses such
+    expressions (and raises a bitwise ufunc error on floats). Reassociate the
+    operands of ``|`` then ``&`` (recursing into parentheses) to restore R
+    precedence. Track expressions are R, so this is the intended semantics.
+    """
+    if "&" not in expr and "|" not in expr:
+        return expr
+    # R's scalar && / || are element-wise here; treat them as & / |.
+    expr = expr.replace("&&", "&").replace("||", "|")
+    return _reassociate_logical(expr)
+
+
 def compile_safe_expression(expr, allowed_names):
+    expr = _normalize_logical_precedence(expr)
     validate_expression_ast(expr, allowed_names)
     return compile(expr, "<string>", "eval")

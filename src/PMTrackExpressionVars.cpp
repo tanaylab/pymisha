@@ -423,7 +423,13 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
                     g_pmdb->chromkey(), var.track_path, interval.chromid);
 
                 std::string full_path = var.track_path + "/" + chrom_file;
-                if (access(full_path.c_str(), F_OK) != 0) {
+                // Indexed tracks have no per-chrom file (data is in track.dat via
+                // track.idx); init_read reads through the index. Only gate on the
+                // per-chrom file for the per-chromosome layout, else indexed
+                // sparse tracks always read back NaN.
+                const bool indexed =
+                    access((var.track_path + "/track.idx").c_str(), F_OK) == 0;
+                if (!indexed && access(full_path.c_str(), F_OK) != 0) {
                     var.cur_chromid = interval.chromid;
                     var.cur_chromid_valid = false;
                 } else {
@@ -835,7 +841,12 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
         std::string chrom_file = GenomeTrack::find_existing_1d_filename(
             chromkey, vvar.src_track_path, eval.chromid);
         std::string full_path = vvar.src_track_path + "/" + chrom_file;
-        if (access(full_path.c_str(), F_OK) != 0) {
+        // Indexed tracks have no per-chrom file; init_read reads through
+        // track.idx. Gating on the per-chrom file made value-based vtracks over
+        // indexed source tracks always return NaN.
+        const bool indexed =
+            access((vvar.src_track_path + "/track.idx").c_str(), F_OK) == 0;
+        if (!indexed && access(full_path.c_str(), F_OK) != 0) {
             vvar.src_cur_chromid = eval.chromid;
             vvar.src_cur_chromid_valid = false;
         } else {

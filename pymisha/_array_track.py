@@ -22,6 +22,7 @@ file in the track directory is an R-serialized named integer vector
 
 from __future__ import annotations
 
+import io
 import struct
 from collections import defaultdict
 from pathlib import Path
@@ -33,6 +34,17 @@ from ._r_serialize import read as _r_read
 
 _ARRAYS_SIGNATURE = -8
 _RECORD_SIZE = 24  # 2*int64 + int64
+
+# Indexed single-file storage (track.idx / track.dat). See src/TrackIndex.h:
+# 36-byte header (magic, version, track_type, num_contigs, flags, checksum),
+# then num_contigs * 24-byte entries (chrom_id, offset, length, reserved). Each
+# contig's payload in track.dat is the verbatim per-chrom block (offsets inside
+# it are block-relative), so it parses exactly like a standalone per-chrom file.
+_INDEX_MAGIC = b"MISHATDX"
+_INDEX_HEADER_FMT = "<8sIIIQQ"
+_INDEX_HEADER_SIZE = 36
+_INDEX_ENTRY_FMT = "<IQQI"
+_INDEX_ENTRY_SIZE = 24
 
 
 def read_colnames(track_dir: Path | str) -> list[str]:
@@ -139,25 +151,110 @@ def _resolve_chrom_file(track_dir: Path, chrom: str) -> Path | None:
     return None
 
 
+def _read_intervals_from_fh(fh) -> tuple[
+    _numpy.ndarray, _numpy.ndarray, _numpy.ndarray
+]:
+    """Parse the interval table from an open array-track block (file or BytesIO).
+
+    Offsets are read relative to the start of ``fh`` (block-relative), so this
+    works for both a standalone per-chrom file and an indexed ``track.dat`` slice.
+    Returns ``(starts, ends, vals_pos)`` as int64 numpy arrays.
+    """
+    fh.seek(0)
+    signature = struct.unpack("<i", fh.read(4))[0]
+    if signature != _ARRAYS_SIGNATURE:
+        raise ValueError(
+            f"expected array-track signature -8, got {signature}"
+        )
+    intervals_pos = struct.unpack("<q", fh.read(8))[0]
+    fh.seek(intervals_pos)
+    num_intervals = struct.unpack("<Q", fh.read(8))[0]
+    raw = fh.read(num_intervals * _RECORD_SIZE)
+    arr = _numpy.frombuffer(raw, dtype=_numpy.int64).reshape(num_intervals, 3)
+    return arr[:, 0].copy(), arr[:, 1].copy(), arr[:, 2].copy()
+
+
 def read_chrom_intervals(filepath: Path) -> tuple[
     _numpy.ndarray, _numpy.ndarray, _numpy.ndarray
 ]:
-    """Parse the interval table of an array-track chromosome file.
-
-    Returns ``(starts, ends, vals_pos)`` as int64 numpy arrays.
-    """
+    """Parse the interval table of an array-track per-chromosome file."""
     with open(filepath, "rb") as fh:
-        signature = struct.unpack("<i", fh.read(4))[0]
-        if signature != _ARRAYS_SIGNATURE:
-            raise ValueError(
-                f"{filepath}: expected array-track signature -8, got {signature}"
-            )
-        intervals_pos = struct.unpack("<q", fh.read(8))[0]
-        fh.seek(intervals_pos)
-        num_intervals = struct.unpack("<Q", fh.read(8))[0]
-        raw = fh.read(num_intervals * _RECORD_SIZE)
-    arr = _numpy.frombuffer(raw, dtype=_numpy.int64).reshape(num_intervals, 3)
-    return arr[:, 0].copy(), arr[:, 1].copy(), arr[:, 2].copy()
+        return _read_intervals_from_fh(fh)
+
+
+def _read_track_index(track_dir: Path) -> dict[int, tuple[int, int]] | None:
+    """Parse ``track.idx``; return ``{chrom_id: (offset, length)}`` or ``None``.
+
+    ``None`` means the track is in legacy per-chromosome format (no ``track.idx``).
+    """
+    idx_path = Path(track_dir) / "track.idx"
+    if not idx_path.exists():
+        return None
+    with open(idx_path, "rb") as fh:
+        header = fh.read(_INDEX_HEADER_SIZE)
+        if len(header) != _INDEX_HEADER_SIZE or header[:8] != _INDEX_MAGIC:
+            return None
+        num_contigs = struct.unpack(_INDEX_HEADER_FMT, header)[3]
+        entries: dict[int, tuple[int, int]] = {}
+        for _ in range(num_contigs):
+            rec = fh.read(_INDEX_ENTRY_SIZE)
+            if len(rec) != _INDEX_ENTRY_SIZE:
+                break
+            chrom_id, offset, length, _reserved = struct.unpack(_INDEX_ENTRY_FMT, rec)
+            entries[chrom_id] = (offset, length)
+    return entries
+
+
+def _groot_from_track_dir(track_dir: Path) -> Path | None:
+    """Walk up from a ``.track`` dir to the DB root (parent of ``tracks/``)."""
+    track_dir = Path(track_dir)
+    for parent in track_dir.parents:
+        if parent.name == "tracks":
+            return parent.parent
+    return None
+
+
+def _add_chrom_aliases(mapping: dict[str, int], name: str, chrom_id: int) -> None:
+    """Register ``name`` and its chr-prefixed/stripped aliases -> ``chrom_id``."""
+    stripped = name[3:] if name.startswith("chr") else name
+    mapping[name] = chrom_id
+    mapping.setdefault(stripped, chrom_id)
+    mapping.setdefault(f"chr{stripped}", chrom_id)
+
+
+def chrom_id_map_from_order(chrom_order: list[str]) -> dict[str, int]:
+    """Map chromosome name -> chrom_id from the genome's chrom-key order.
+
+    The indexed ``track.idx`` keys contigs by the genome chrom-key id, which is
+    the position of each chromosome in ``gintervals_all()`` order. Passing that
+    order here yields the authoritative mapping, independent of whether the
+    *genome* (vs just the track) is in indexed format.
+    """
+    mapping: dict[str, int] = {}
+    for chrom_id, name in enumerate(chrom_order):
+        _add_chrom_aliases(mapping, str(name), chrom_id)
+    return mapping
+
+
+def _chrom_name_to_id(track_dir: Path) -> dict[str, int]:
+    """Fallback chrom name -> chrom_id from ``seq/genome.idx`` (indexed genome).
+
+    Used only when the caller does not supply the genome chrom order. Returns
+    ``{}`` if the genome index is unavailable (e.g. a per-chromosome genome whose
+    track alone was converted to indexed).
+    """
+    groot = _groot_from_track_dir(track_dir)
+    if groot is None:
+        return {}
+    genome_idx = groot / "seq" / "genome.idx"
+    if not genome_idx.exists():
+        return {}
+    from .db import _iter_genome_idx_entries
+
+    mapping: dict[str, int] = {}
+    for chrom_id, name, _offset, _length in _iter_genome_idx_entries(str(genome_idx)):
+        _add_chrom_aliases(mapping, name, chrom_id)
+    return mapping
 
 
 def _read_one_interval_values(
@@ -253,12 +350,16 @@ def extract_array(
     intervals: _pd.DataFrame,
     slice_cols: list[int] | None,
     colnames: list[str],
+    chrom_order: list[str] | None = None,
 ) -> _pd.DataFrame:
     """Extract per-interval array values for *intervals*.
 
     Returns a DataFrame with ``chrom, start, end, intervalID`` plus one
     column per slice column. ``slice_cols`` are 0-based column indices
-    (``None`` = all columns).
+    (``None`` = all columns). ``chrom_order`` is the genome chrom-key order
+    (``gintervals_all()`` chroms) used to map a chromosome to its ``track.idx``
+    contig id for indexed-format tracks; if omitted it is read from
+    ``seq/genome.idx`` when present.
     """
     if slice_cols is None:
         slice_cols = list(range(len(colnames)))
@@ -272,23 +373,53 @@ def extract_array(
     vals_out: list[_numpy.ndarray] = []
     num_cols = len(colnames)
 
+    # Indexed single-file storage has no per-chrom files: data lives in
+    # track.dat keyed by track.idx. Detect once and prepare the chrom-id map.
+    track_index = _read_track_index(track_dir)
+    if track_index is not None:
+        chrom_id_map = (
+            chrom_id_map_from_order(chrom_order)
+            if chrom_order is not None
+            else _chrom_name_to_id(track_dir)
+        )
+    else:
+        chrom_id_map = {}
+    dat_path = Path(track_dir) / "track.dat"
+
     # Group intervals by chrom for efficient per-chrom processing.
     iv = intervals[["chrom", "start", "end"]].reset_index(drop=True)
     iv["__iid__"] = _numpy.arange(1, len(iv) + 1, dtype=_numpy.int64)
     for chrom, group in iv.groupby("chrom", sort=False):
+        # Obtain a seekable block for this chrom: a per-chrom file, or the
+        # chrom's slice of the indexed track.dat read into memory.
         filepath = _resolve_chrom_file(track_dir, str(chrom))
-        if filepath is None:
+        if filepath is not None:
+            # Closed in the finally below; uniform handling with the BytesIO path.
+            fh: io.IOBase = open(filepath, "rb")  # noqa: SIM115
+        elif track_index is not None:
+            chrom_id = chrom_id_map.get(str(chrom))
+            if chrom_id is None:
+                continue
+            entry = track_index.get(chrom_id)
+            if entry is None or entry[1] == 0:
+                continue
+            offset, length = entry
+            with open(dat_path, "rb") as dfh:
+                dfh.seek(offset)
+                fh = io.BytesIO(dfh.read(length))
+        else:
             continue
-        ivs_start, ivs_end, ivs_pos = read_chrom_intervals(filepath)
-        if ivs_start.size == 0:
-            continue
-        starts = group["start"].to_numpy(dtype=_numpy.int64)
-        ends = group["end"].to_numpy(dtype=_numpy.int64)
-        iids = group["__iid__"].to_numpy(dtype=_numpy.int64)
 
-        # For each query interval, emit a row for every track interval that
-        # overlaps it. Use a sweep with searchsorted for O((N+M)*log) lookup.
-        with open(filepath, "rb") as fh:
+        try:
+            ivs_start, ivs_end, ivs_pos = _read_intervals_from_fh(fh)
+            if ivs_start.size == 0:
+                continue
+            starts = group["start"].to_numpy(dtype=_numpy.int64)
+            ends = group["end"].to_numpy(dtype=_numpy.int64)
+            iids = group["__iid__"].to_numpy(dtype=_numpy.int64)
+
+            # For each query interval, emit a row for every track interval that
+            # overlaps it. Sweep with searchsorted for O((N+M)*log) lookup.
             for q_start, q_end, q_iid in zip(starts, ends, iids, strict=False):
                 lo = int(_numpy.searchsorted(ivs_end, q_start, side="right"))
                 hi = int(_numpy.searchsorted(ivs_start, q_end, side="left"))
@@ -301,6 +432,8 @@ def extract_array(
                     ends_out.append(min(int(ivs_end[j]), int(q_end)))
                     iid_out.append(int(q_iid))
                     vals_out.append(block[sel_idx])
+        finally:
+            fh.close()
 
     if not chroms_out:
         return _pd.DataFrame(

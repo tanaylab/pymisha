@@ -101,6 +101,34 @@ def _find_vtracks_in_expr(expr: str) -> list[str]:
     return [name for name in _shared._VTRACKS if name in matched]
 
 
+def _expr_is_2d(exprs: str | list[str]) -> bool:
+    """True if any identifier in the expression(s) is a 2D physical track.
+
+    Used to choose the implicit whole-genome scope (2D ``gintervals_2d_all`` vs
+    1D ``gintervals_all``) when no intervals are given - R parity.
+    """
+    from .tracks import gtrack_exists, gtrack_info
+
+    names = exprs if isinstance(exprs, (list, tuple)) else [exprs]
+    checked: set[str] = set()
+    for e in names:
+        for token in set(_IDENTIFIER_TOKEN_RE.findall(str(e))):
+            candidates = [token]
+            if "." in token:
+                parts = token.split(".")
+                candidates += [".".join(parts[:i]) for i in range(len(parts) - 1, 0, -1)]
+            for cand in candidates:
+                if cand in checked:
+                    continue
+                checked.add(cand)
+                try:
+                    if gtrack_exists(cand) and int(gtrack_info(cand).get("dimensions", 1) or 1) == 2:
+                        return True
+                except Exception:
+                    pass
+    return False
+
+
 def _parse_expr_vars(
     expr: str,
     track_names: AbstractSet[str],

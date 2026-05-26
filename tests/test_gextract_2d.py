@@ -1154,10 +1154,14 @@ class TestIntervals2dChromSizes:
         )
         sizes = pm.gintervals_chrom_sizes(intervals)
         assert sizes is not None
-        assert "chrom" in sizes.columns
-        # Should have chroms 1 and 2
-        chrom_set = set(sizes["chrom"].tolist())
-        assert "1" in chrom_set or "chr1" in chrom_set
+        # R returns chrom1/chrom2/size (interval count per chromosome pair).
+        assert list(sizes.columns) == ["chrom1", "chrom2", "size"]
+        sizes = sizes.copy()
+        sizes["chrom1"] = sizes["chrom1"].astype(str)
+        sizes["chrom2"] = sizes["chrom2"].astype(str)
+        pairs = set(zip(sizes["chrom1"], sizes["chrom2"], strict=True))
+        assert pairs == {("1", "1"), ("1", "2")}
+        assert int(sizes["size"].sum()) == len(intervals)
 
 
 class TestLargeScale2d:

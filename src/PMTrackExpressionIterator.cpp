@@ -201,13 +201,21 @@ size_t PMSparseIterator::find_first_overlap(const std::vector<GInterval> &interv
 
 bool PMSparseIterator::load_chrom(size_t chrom_order_idx)
 {
+    // Indexed tracks keep their data in track.dat (addressed via track.idx) and
+    // have no per-chromosome files. GenomeTrackSparse::init_read detects the
+    // index from the track dir and reads through it, so we must NOT gate on the
+    // existence of a per-chrom file there -- doing so skipped every chromosome
+    // and made indexed sparse tracks read back empty.
+    const std::string idx_path = m_track_dir + "/track.idx";
+    const bool indexed = access(idx_path.c_str(), F_OK) == 0;
+
     while (chrom_order_idx < m_chrom_order.size()) {
         int chromid = m_chrom_order[chrom_order_idx];
         std::string chrom_file = GenomeTrack::find_existing_1d_filename(
             g_pmdb->chromkey(), m_track_dir, chromid);
         std::string full_path = m_track_dir + "/" + chrom_file;
 
-        if (access(full_path.c_str(), F_OK) == 0) {
+        if (indexed || access(full_path.c_str(), F_OK) == 0) {
             m_cur_track.init_read(full_path.c_str(), chromid);
             m_cur_track_intervals = &m_cur_track.get_intervals();
             if (!m_cur_track_intervals->empty()) {

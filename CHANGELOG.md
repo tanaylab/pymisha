@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.0 (2026-05-26)
+
+- **Track expressions now follow R operator precedence for `&` and `|`.** Expressions such as `gscreen("track > 0.1 & track < 0.3")` previously raised a bitwise-operator error because `&`/`|` bound tighter than the comparisons. They now bind looser, as in R, so `a > x & b < y` means `(a > x) & (b < y)` (and `&` binds tighter than `|`). Affects `gscreen`, `gextract`, `gsummary`, `gdist`, `gquantiles`, `gpartition` and any other track-expression evaluation.
+- **Indexed sparse tracks no longer read back empty.** `gextract`, `gsummary` and value-based virtual tracks returned no data (and `gsummary` reported 0 intervals) for sparse tracks stored in the indexed format; dense tracks were unaffected. They now read correctly.
+- **The iterator and scope may be a track or interval-set name.** `gextract(expr, intervals, iterator="some.track")` iterates over that track's bins (dense) or intervals (sparse); a track or interval-set name passed as `intervals` uses its intervals/rectangles as the scope; `giterator_intervals` infers the grid from a sparse track. Previously only a numeric bin size or an explicit intervals DataFrame was accepted.
+- **Bare 2D expressions no longer require explicit intervals.** `gscreen("rects_track > 10")`, `gsummary("rects_track")` and similar now default to the whole 2D genome (as in R) instead of raising "rectangles not yet supported".
+- **`gintervals` / `gintervals_2d` recycle shorter argument vectors.** `gintervals([1, 2], starts, ends)` with longer `starts`/`ends` now repeats the chromosome list to match (as in R), instead of raising "chroms, starts, and ends must have the same length". Lengths must still be multiples.
+- **`gintervals_chrom_sizes` now returns interval counts per chromosome.** It returns `chrom`/`size` for 1D intervals and `chrom1`/`chrom2`/`size` for 2D (the number of intervals on each chromosome or chromosome pair), matching R. Previously it returned only the unique chromosome names with no counts. It also accepts an interval-set or track name directly.
+- **`global.percentile` virtual tracks no longer read back empty on indexed databases.** `gvtrack.create(..., func="global.percentile" / "global.percentile.min" / "global.percentile.max")` returned all-`NaN` for source tracks stored in the indexed format; these functions use a read path whose per-chromosome-file gate skipped indexed tracks (which keep their data in `track.dat`). They now read correctly. Per-chromosome databases were unaffected.
+- **`gtrack_array_extract` no longer returns an empty result for array tracks stored in the indexed format.** The array reader only knew the legacy per-chromosome files, so on an indexed database it found no data and returned zero rows (column names still read correctly). It now also reads each chromosome's block from `track.dat`/`track.idx`. Per-chromosome databases were unaffected.
+
 ## v0.3.0 (2026-05-25)
 
 - **Fixed a correctness bug in coarsening-iterator extraction.** When a numeric `iterator` larger than a dense track's native bin size was used, `gextract`, `gsummary`, `gquantiles`, `gbins_summary` and `gbins_quantiles` sampled the value at each output bin's midpoint instead of averaging the native bins it covers, returning wrong values. They now average, matching R misha. Extraction with the default (native) iterator was unaffected.
@@ -7,6 +18,8 @@
 - `gintervals_canonic`, `gintervals_intersect`, `gintervals_union` and `gintervals_diff` now reject intervals with `start >= end` or `start < 0` instead of silently dropping zero-width intervals or passing inverted intervals through unchanged.
 - `gintervals_neighbors(..., na_if_notfound=True)` returns `NaN` for the start/end coordinates of rows with no neighbor, matching R (previously a `-1` sentinel).
 - Fixed two small reference leaks (result-dict float objects in `gtrack_import_mappedseq` and the strands-autocorrelation routine).
+- `gsummary` and `gintervals_summary` no longer return `NaN` for the standard deviation of near-constant, large-magnitude input; the tiny negative variance produced by catastrophic cancellation is clamped to 0 (matching R misha 5.7.4).
+- `gsynth_random` now validates `nuc_probs`: a missing, extra, or duplicated nucleotide name is rejected with a clear error instead of being silently mishandled.
 
 ## v0.2.4 (2026-05-25)
 

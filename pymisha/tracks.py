@@ -4790,4 +4790,9 @@ def gtrack_array_extract(
         else:
             raise ValueError("slice must be a list of strings or ints")
 
-    return extract_array(track_path, intervals, slice_idx, colnames)
+    # Genome chrom-key order (used to map a chromosome to its track.idx contig
+    # id when the track is in indexed format).
+    from .intervals import gintervals_all
+    chrom_order = gintervals_all()["chrom"].astype(str).tolist()
+
+    return extract_array(track_path, intervals, slice_idx, colnames, chrom_order=chrom_order)

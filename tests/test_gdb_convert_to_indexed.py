@@ -123,6 +123,168 @@ def test_gdb_convert_to_indexed_converts_tracks_and_intervals(tmp_path, restore_
     assert not (intervals_dir / "chr1").exists()
 
 
+def test_gdb_convert_to_indexed_sparse_track_data_roundtrip(tmp_path, restore_db):
+    """An indexed sparse track must read back the same intervals and values.
+
+    Regression: ``PMSparseIterator::load_chrom`` gated chromosome loading on the
+    existence of a per-chromosome file. Indexed tracks keep their data in
+    ``track.dat`` (addressed via ``track.idx``) with no per-chrom file, so every
+    chromosome was skipped and ``gextract`` returned ``None`` (``gsummary`` saw
+    0 intervals). The earlier convert test only asserted the index files exist,
+    never that the data is readable.
+    """
+    import _pymisha
+
+    root = tmp_path / "db"
+    _write_per_chrom_db(root, [("chr1", "A" * 1000), ("chr2", "C" * 1000)])
+    pm.gdb_init(str(root))
+
+    intervals = pm.gintervals(
+        ["chr1", "chr1", "chr2"], [0, 100, 200], [10, 150, 250]
+    )
+    pm.gtrack_create_sparse("s", "sparse roundtrip", intervals, [1.5, 2.5, 3.5])
+
+    before = pm.gextract("s", pm.gintervals_all())
+    assert before is not None and len(before) == 3
+    before = before.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    pm.gtrack_convert_to_indexed("s")
+
+    # A real indexed track keeps its data in track.dat/track.idx with no
+    # per-chromosome files. Remove them so the read path must go through the
+    # index (this is the condition under which the bug surfaced: the lab
+    # indexed test DB has no per-chrom files).
+    track_dir = root / "tracks" / "s.track"
+    keep = {"track.idx", "track.dat", ".attributes", ".attributes.yaml", ".meta", "vars"}
+    for entry in track_dir.iterdir():
+        if entry.name not in keep and entry.is_file():
+            entry.unlink()
+    assert (track_dir / "track.idx").is_file()
+    assert (track_dir / "track.dat").is_file()
+
+    _pymisha.pm_dbreload()
+    pm.gdb_init(str(root))
+    assert pm.gtrack_info("s")["format"] == "indexed"
+
+    after = pm.gextract("s", pm.gintervals_all())
+    assert after is not None, "indexed sparse track read back as empty (None)"
+    after = after.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    assert len(after) == 3
+    assert list(after["start"]) == list(before["start"])
+    assert list(after["end"]) == list(before["end"])
+    assert list(after["s"]) == pytest.approx(list(before["s"]))
+
+
+def test_gdb_convert_to_indexed_dense_global_percentile_roundtrip(tmp_path, restore_db):
+    """A ``global.percentile`` vtrack over an indexed dense track must read back.
+
+    Regression: ``pm_vtrack_compute`` (the Python-fallback C++ entry used by the
+    ``global.percentile*`` vtrack functions, which are not scanner-eligible)
+    gated chromosome loading on the existence of a per-chromosome file. Indexed
+    tracks keep their data in ``track.dat`` (addressed via ``track.idx``) with no
+    per-chrom file, so every chromosome was skipped and the per-interval
+    statistic came back ``NaN`` -- making the whole ``global.percentile`` result
+    ``NaN``. The scanner path (``avg``/``min``/``max`` etc.) was already fixed;
+    this standalone entry was not.
+    """
+    import _pymisha
+
+    from pymisha.vtracks import _GLOBAL_PERCENTILE_CACHE
+
+    root = tmp_path / "db"
+    _write_per_chrom_db(root, [("chr1", "A" * 1000), ("chr2", "C" * 1000)])
+    pm.gdb_init(str(root))
+
+    # Dense track with distinct per-bin values so percentiles are well-defined.
+    intervals = pm.gintervals(["chr1", "chr1", "chr2"], [0, 100, 200], [50, 150, 260])
+    pm.gtrack_create_dense("d", "dense pct", intervals, [0.2, 0.7, 0.9], binsize=10)
+
+    pm.gvtrack_create("vp", "d", func="global.percentile")
+    before = pm.gextract("vp", pm.gintervals_all(), iterator=10)
+    assert before is not None
+    before = before.sort_values(["chrom", "start"]).reset_index(drop=True)
+    vcol = next(c for c in before.columns if c not in ("chrom", "start", "end", "intervalID"))
+    assert before[vcol].notna().any(), "expected some non-NaN percentiles pre-conversion"
+
+    pm.gtrack_convert_to_indexed("d")
+
+    # Force the read through the index: a real indexed track has no per-chrom files.
+    track_dir = root / "tracks" / "d.track"
+    keep = {"track.idx", "track.dat", ".attributes", ".attributes.yaml", ".meta", "vars"}
+    for entry in track_dir.iterdir():
+        if entry.name not in keep and entry.is_file():
+            entry.unlink()
+    assert (track_dir / "track.idx").is_file()
+    assert (track_dir / "track.dat").is_file()
+
+    _pymisha.pm_dbreload()
+    pm.gdb_init(str(root))
+    _GLOBAL_PERCENTILE_CACHE.clear()  # recompute reference + stats against the indexed track
+    assert pm.gtrack_info("d")["format"] == "indexed"
+
+    pm.gvtrack_create("vp", "d", func="global.percentile")
+    after = pm.gextract("vp", pm.gintervals_all(), iterator=10)
+    assert after is not None
+    after = after.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    assert after[vcol].notna().any(), "indexed dense global.percentile read back as all-NaN"
+    assert list(after["start"]) == list(before["start"])
+    # Same non-NaN mask and values as the per-chrom result.
+    assert list(after[vcol].isna()) == list(before[vcol].isna())
+    m = before[vcol].notna().to_numpy()
+    assert list(after[vcol][m]) == pytest.approx(list(before[vcol][m]))
+
+
+def test_gdb_convert_to_indexed_array_track_data_roundtrip(tmp_path, restore_db):
+    """An indexed array track must read back the same per-column values.
+
+    Regression: ``_array_track.extract_array`` only knew the legacy
+    per-chromosome files. Indexed tracks keep their data in ``track.dat``
+    (addressed via ``track.idx``) with no per-chrom file, so every chromosome was
+    skipped and ``gtrack_array_extract`` returned an empty DataFrame (column
+    names still read from ``.colnames``). The reader now also reads each
+    chromosome's block from the index.
+    """
+    import _pymisha
+
+    root = tmp_path / "db"
+    _write_per_chrom_db(root, [("chr1", "A" * 1000), ("chr2", "C" * 1000)])
+    pm.gdb_init(str(root))
+
+    intervals = pm.gintervals(["chr1", "chr1", "chr2"], [0, 100, 200], [10, 150, 250])
+    values = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+    colnames = ["a", "b", "c"]
+    pm.gtrack_array_create("arr", "array roundtrip", intervals, values, colnames)
+
+    before = pm.gtrack_array_extract("arr", None, pm.gintervals_all())
+    assert before is not None and len(before) == 3
+    before = before.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    pm.gtrack_convert_to_indexed("arr")
+
+    # Force the read through the index: a real indexed track has no per-chrom files.
+    track_dir = root / "tracks" / "arr.track"
+    keep = {"track.idx", "track.dat", ".attributes", ".attributes.yaml", ".meta", ".colnames", "vars"}
+    for entry in track_dir.iterdir():
+        if entry.name not in keep and entry.is_file():
+            entry.unlink()
+    assert (track_dir / "track.idx").is_file()
+    assert (track_dir / "track.dat").is_file()
+
+    _pymisha.pm_dbreload()
+    pm.gdb_init(str(root))
+    assert pm.gtrack_info("arr")["format"] == "indexed"
+
+    after = pm.gtrack_array_extract("arr", None, pm.gintervals_all())
+    assert after is not None and len(after) > 0, "indexed array track read back as empty"
+    after = after.sort_values(["chrom", "start"]).reset_index(drop=True)
+
+    assert len(after) == len(before)
+    for col in colnames:
+        assert list(after[col]) == pytest.approx(list(before[col]))
+
+
 def test_gdb_convert_to_indexed_reverse_chr_prefix(tmp_path, restore_db):
     """Port of: gdb.convert_to_indexed preserves order when removing chr prefix.
 

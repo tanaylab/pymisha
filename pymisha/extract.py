@@ -307,6 +307,29 @@ def _maybe_load_intervals_set(intervals: pd.DataFrame | str) -> pd.DataFrame | s
 
     if gintervals_exists(intervals):
         return gintervals_load(intervals)
+
+    # R parity: a track name used as the scope means "the intervals over which
+    # the track is defined" (1D: its intervals; 2D: its rectangles/points).
+    from .tracks import gtrack_exists, gtrack_info
+
+    if gtrack_exists(intervals):
+        info = gtrack_info(intervals)
+        if int(info.get("dimensions", 1) or 1) == 2:
+            from .intervals import gintervals_2d_all
+
+            res = gextract(intervals, gintervals_2d_all(mode="full"))
+            if res is None or len(res) == 0:
+                return intervals
+            cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+            return res[cols].drop_duplicates().reset_index(drop=True)
+
+        from .intervals import gintervals_all
+
+        res = gextract(intervals, gintervals_all())
+        if res is None or len(res) == 0:
+            return intervals
+        return res[["chrom", "start", "end"]].drop_duplicates().reset_index(drop=True)
+
     return intervals
 
 
@@ -2587,9 +2610,10 @@ def gscreen(
     _check_computed_tracks(expr)
 
     if intervals is None:
-        from .intervals import gintervals_all
+        from .expr import _expr_is_2d
+        from .intervals import gintervals_2d_all, gintervals_all
 
-        intervals = gintervals_all()
+        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 

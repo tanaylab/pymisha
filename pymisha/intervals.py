@@ -410,15 +410,19 @@ def _make_1d_intervals(
     ends = [int(e) for e in ends]
 
     n = max(len(chroms), len(starts), len(ends))
-    if len(chroms) == 1:
-        chroms = chroms * n
-    if len(starts) == 1:
-        starts = starts * n
-    if len(ends) == 1:
-        ends = ends * n
 
-    if not (len(chroms) == len(starts) == len(ends)):
+    # Recycle each argument to the common length, as R does (a shorter vector is
+    # repeated when its length divides the longest).
+    def _recycle(vec: list, label: str) -> list:
+        if len(vec) == n:
+            return vec
+        if len(vec) and n % len(vec) == 0:
+            return vec * (n // len(vec))
         raise ValueError("chroms, starts, and ends must have the same length")
+
+    chroms = _recycle(chroms, "chroms")
+    starts = _recycle(starts, "starts")
+    ends = _recycle(ends, "ends")
 
     chroms = _normalize_chroms(chroms)
 
@@ -2735,14 +2739,15 @@ def gintervals_dataset(intervals: str | None = None) -> str | None:
     return None
 
 
-def gintervals_chrom_sizes(intervals: pd.DataFrame) -> pd.DataFrame:
+def gintervals_chrom_sizes(intervals: pd.DataFrame | str) -> pd.DataFrame:
     """
-    Get chromosome sizes for intervals.
+    Count intervals per chromosome (1D) or chromosome pair (2D).
 
     Parameters
     ----------
-    intervals : DataFrame
-        Intervals with 'chrom' column.
+    intervals : DataFrame or str
+        Intervals (with a ``chrom`` or ``chrom1``/``chrom2`` column), or the
+        name of an interval set or track (resolved to its intervals).
 
     Returns
     -------
@@ -2763,21 +2768,40 @@ def gintervals_chrom_sizes(intervals: pd.DataFrame) -> pd.DataFrame:
     gintervals_exists : Check if a named interval set exists.
     gintervals_ls : List named interval sets.
     """
+    if isinstance(intervals, str):
+        from .extract import _maybe_load_intervals_set
+
+        resolved = _maybe_load_intervals_set(intervals)
+        if isinstance(resolved, str):
+            raise ValueError(f"Interval set or track '{intervals}' does not exist")
+        intervals = resolved
+
     if intervals is None or len(intervals) == 0:
         return _pandas.DataFrame(columns=["chrom"])
 
-    # Get unique chromosomes
+    # Count intervals per chromosome (1D) or chromosome pair (2D), as R does.
     if "chrom" in intervals.columns:
-        chroms = intervals["chrom"].unique()
-    elif "chrom1" in intervals.columns:
-        # 2D intervals
-        chroms1 = intervals["chrom1"].unique()
-        chroms2 = intervals["chrom2"].unique()
-        chroms = _numpy.union1d(chroms1, chroms2)
-    else:
-        raise ValueError("intervals must have 'chrom' or 'chrom1'/'chrom2' columns")
-
-    return _pandas.DataFrame({"chrom": sorted(chroms)})
+        return (
+            intervals.assign(chrom=intervals["chrom"].astype(str))
+            .groupby("chrom", observed=True)
+            .size()
+            .reset_index(name="size")
+            .sort_values("chrom")
+            .reset_index(drop=True)
+        )
+    if "chrom1" in intervals.columns:
+        return (
+            intervals.assign(
+                chrom1=intervals["chrom1"].astype(str),
+                chrom2=intervals["chrom2"].astype(str),
+            )
+            .groupby(["chrom1", "chrom2"], observed=True)
+            .size()
+            .reset_index(name="size")
+            .sort_values(["chrom1", "chrom2"])
+            .reset_index(drop=True)
+        )
+    raise ValueError("intervals must have 'chrom' or 'chrom1'/'chrom2' columns")
 
 
 def _read_serialized_dataframe(payload: bytes) -> pd.DataFrame:
@@ -4128,8 +4152,11 @@ def giterator_intervals(
         if isinstance(expr, str) and gtrack_exists(expr):
             info = gtrack_info(expr)
             bin_size = info.get("bin_size") or info.get("bin.size")
-            if bin_size is not None:
-                itr = int(float(bin_size))
+            # Dense track -> its fixed bins. Sparse / array / 2D track -> iterate
+            # over the track's own intervals: pass the track name through, to be
+            # resolved by the 2D branch below (dims==2) or by
+            # _preprocess_intervals_iterator (1D sparse/array -> its intervals).
+            itr = int(float(bin_size)) if bin_size is not None else expr
         if itr is None:
             raise ValueError(
                 "Could not determine iterator from expression. "
@@ -4172,7 +4199,13 @@ def giterator_intervals(
     if intervals is None:
         intervals = gintervals_all()
     elif isinstance(intervals, str):
-        intervals = gintervals_load(intervals)
+        # Resolve a named intervals set or a track name used as the scope
+        # (1D track -> its intervals, 2D track -> its rectangles) - R parity.
+        from .extract import _maybe_load_intervals_set
+
+        intervals = _maybe_load_intervals_set(intervals)
+        if isinstance(intervals, str):
+            raise ValueError(f"Intervals set '{intervals}' does not exist")
         if intervals is None:
             return None
 

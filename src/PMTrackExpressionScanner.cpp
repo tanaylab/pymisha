@@ -7,9 +7,145 @@
 #include <sys/time.h>
 #include <cmath>
 #include <algorithm>
+#include <string>
+#include <vector>
 
 #include "PMTrackExpressionScanner.h"
 #include "TGLException.h"
+
+namespace {
+
+// Reparenthesize & and | to R operator precedence before Python compilation.
+// In R these bind looser than comparisons (and & tighter than |), so
+// "track > a & track < b" means "(track > a) & (track < b)". Python binds
+// &/| tighter than comparisons, which mis-parses the expression (and raises a
+// bitwise ufunc error on floats). Track expressions are R, so wrap the operands
+// of top-level | then & in parentheses to restore R precedence.
+std::vector<std::string> split_top_level(const std::string &s, char op)
+{
+    std::vector<std::string> parts;
+    int depth = 0;
+    char instr = 0;
+    size_t last = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (instr) {
+            if (c == instr)
+                instr = 0;
+        } else if (c == '"' || c == '\'') {
+            instr = c;
+        } else if (c == '(' || c == '[' || c == '{') {
+            ++depth;
+        } else if (c == ')' || c == ']' || c == '}') {
+            --depth;
+        } else if (depth == 0 && c == op) {
+            parts.push_back(s.substr(last, i - last));
+            last = i + 1;
+        }
+    }
+    parts.push_back(s.substr(last));
+    return parts;
+}
+
+std::string strip_ws(const std::string &s)
+{
+    size_t a = s.find_first_not_of(" \t\n");
+    if (a == std::string::npos)
+        return std::string();
+    size_t b = s.find_last_not_of(" \t\n");
+    return s.substr(a, b - a + 1);
+}
+
+std::string reassociate_logical(const std::string &expr);
+
+// Recurse into top-level parenthesized groups of an atom (a sub-expression with
+// no top-level & or |), reassociating &/| inside each group so user-written
+// parentheses like "(a > x & b < y)" are also fixed.
+std::string recurse_into_parens(const std::string &atom)
+{
+    std::string res;
+    char instr = 0;
+    for (size_t i = 0; i < atom.size();) {
+        char c = atom[i];
+        if (instr) {
+            res += c;
+            if (c == instr)
+                instr = 0;
+            ++i;
+        } else if (c == '"' || c == '\'') {
+            instr = c;
+            res += c;
+            ++i;
+        } else if (c == '(') {
+            int depth = 1;
+            size_t j = i + 1;
+            for (; j < atom.size() && depth; ++j) {
+                if (atom[j] == '(')
+                    ++depth;
+                else if (atom[j] == ')')
+                    --depth;
+            }
+            // inner spans (i+1 .. j-2); j points just past the matching ')'
+            std::string inner = atom.substr(i + 1, (j - 1) - (i + 1));
+            res += "(" + reassociate_logical(inner) + ")";
+            i = j;
+        } else {
+            res += c;
+            ++i;
+        }
+    }
+    return res;
+}
+
+std::string reassociate_logical(const std::string &expr)
+{
+    std::vector<std::string> out_or;
+    for (const std::string &or_part : split_top_level(expr, '|')) {
+        std::vector<std::string> ands = split_top_level(or_part, '&');
+        if (ands.size() == 1) {
+            out_or.push_back(recurse_into_parens(strip_ws(or_part)));
+        } else {
+            std::string joined;
+            for (size_t k = 0; k < ands.size(); ++k) {
+                if (k)
+                    joined += " & ";
+                joined += "(" + recurse_into_parens(strip_ws(ands[k])) + ")";
+            }
+            out_or.push_back(joined);
+        }
+    }
+    if (out_or.size() == 1)
+        return out_or[0];
+    std::string res;
+    for (size_t k = 0; k < out_or.size(); ++k) {
+        if (k)
+            res += " | ";
+        res += "(" + out_or[k] + ")";
+    }
+    return res;
+}
+
+std::string normalize_logical_precedence(const std::string &expr)
+{
+    if (expr.find('&') == std::string::npos && expr.find('|') == std::string::npos)
+        return expr;
+
+    // Collapse R's scalar && / || to & / | so the single-char split applies.
+    std::string e;
+    e.reserve(expr.size());
+    for (size_t i = 0; i < expr.size(); ++i) {
+        if (i + 1 < expr.size() &&
+            ((expr[i] == '&' && expr[i + 1] == '&') || (expr[i] == '|' && expr[i + 1] == '|'))) {
+            e += expr[i];
+            ++i;
+        } else {
+            e += expr[i];
+        }
+    }
+    return reassociate_logical(e);
+}
+
+}  // namespace
 
 const int PMTrackExprScanner::INIT_REPORT_STEP = 10000;
 const int PMTrackExprScanner::REPORT_INTERVAL = 3000;
@@ -109,7 +245,9 @@ void PMTrackExprScanner::check(const std::vector<std::string> &exprs,
         if (!var && !vvar) {
             // Need to compile: not a simple track name
             m_py_compiled_exprs[iexpr].assign(
-                Py_CompileString(exprs4compile[iexpr].c_str(), "<string>", Py_eval_input), true);
+                Py_CompileString(normalize_logical_precedence(exprs4compile[iexpr]).c_str(),
+                                 "<string>", Py_eval_input),
+                true);
 
             if (!m_py_compiled_exprs[iexpr]) {
                 PyObject *py_type, *py_value, *py_traceback;

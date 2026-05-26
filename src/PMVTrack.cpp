@@ -1128,7 +1128,12 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 if (cur_chromid != eval.chromid) {
                     std::string chrom_file = GenomeTrack::find_existing_1d_filename(chromkey, track_path, eval.chromid);
                     std::string full_path = track_path + "/" + chrom_file;
-                    if (access(full_path.c_str(), F_OK) != 0) {
+                    // Indexed tracks have no per-chrom file; init_read reads
+                    // through track.idx. Gating on the per-chrom file made
+                    // value-based vtracks over indexed sources return all-NaN.
+                    const bool indexed =
+                        access((track_path + "/track.idx").c_str(), F_OK) == 0;
+                    if (!indexed && access(full_path.c_str(), F_OK) != 0) {
                         cur_chromid = eval.chromid;
                         cur_chromid_valid = false;
                     } else {
@@ -1231,7 +1236,12 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             if (cur_chromid != eval.chromid) {
                 std::string chrom_file = GenomeTrack::find_existing_1d_filename(chromkey, track_path, eval.chromid);
                 std::string full_path = track_path + "/" + chrom_file;
-                if (access(full_path.c_str(), F_OK) != 0) {
+                // Indexed tracks have no per-chrom file; init_read reads through
+                // track.idx. Gating on the per-chrom file made value-based
+                // vtracks over indexed source tracks return all-NaN.
+                const bool indexed =
+                    access((track_path + "/track.idx").c_str(), F_OK) == 0;
+                if (!indexed && access(full_path.c_str(), F_OK) != 0) {
                     cur_chromid = eval.chromid;
                     cur_chromid_valid = false;
                 } else {

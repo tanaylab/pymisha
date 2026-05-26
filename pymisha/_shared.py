@@ -482,10 +482,49 @@ def _preprocess_intervals_iterator(intervals, iterator):
                 return intervals, iterator, None
             iterator = loaded
         else:
-            # Not an interval set — let downstream handle it (track name, etc.)
-            return intervals, iterator, None
+            # Maybe a track name used as the iterator (R parity): a 1D dense
+            # track iterates over its fixed bins, a 1D sparse/array track over
+            # its own intervals. 2D tracks are left as a string for the 2D
+            # iterator path downstream.
+            from .tracks import gtrack_exists, gtrack_info
+
+            if gtrack_exists(iterator):
+                info = gtrack_info(iterator)
+                if int(info.get("dimensions", 1) or 1) == 2:
+                    return intervals, iterator, None  # 2D track iterator path
+                # A 1D track iterator is invalid for a 2D scope; leave it as a
+                # string so the 2D path raises the proper "1D track" error
+                # (R parity: this combination errors).
+                scope_is_2d = (
+                    isinstance(intervals, _pandas.DataFrame)
+                    and "chrom1" in intervals.columns
+                )
+                if scope_is_2d:
+                    return intervals, iterator, None
+                bin_size = info.get("bin_size") or info.get("bin.size")
+                if bin_size is not None:
+                    # Dense track -> iterate over its fixed bins.
+                    return intervals, int(float(bin_size)), None
+                # Sparse / array track -> iterate over its own intervals.
+                from .extract import gextract
+
+                track_iv = gextract(iterator, intervals)
+                if track_iv is None or len(track_iv) == 0:
+                    empty = _pandas.DataFrame(
+                        {"chrom": _pandas.Series([], dtype=str),
+                         "start": _pandas.Series([], dtype=int),
+                         "end": _pandas.Series([], dtype=int)})
+                    return empty, -1, _numpy.array([], dtype=int)
+                iterator = track_iv[["chrom", "start", "end"]]
+            else:
+                # Not an interval set or track — let downstream handle it.
+                return intervals, iterator, None
 
     if not isinstance(iterator, _pandas.DataFrame):
+        return intervals, iterator, None
+
+    # 2D iterator DataFrame: leave for the 2D extraction path to handle.
+    if "chrom1" in iterator.columns:
         return intervals, iterator, None
 
     if len(iterator) == 0 or len(intervals) == 0:
