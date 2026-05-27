@@ -640,8 +640,11 @@ def gcis_decay(
             continue
 
         # --- Vectorized distance computation (integer division as in C++) ---
-        # distance = abs((s1 + e1 - s2 - e2) // 2)
-        distances = _numpy.abs((s1 + e1 - s2 - e2) // 2).astype(_numpy.float64)
+        # R computes llabs((s1 + e1 - s2 - e2) / 2). C++ integer division
+        # truncates toward zero; abs(D) // 2 reproduces llabs(D / 2) exactly
+        # (Python's D // 2 floors toward -inf and would differ by 1 for
+        # negative odd D).
+        distances = (_numpy.abs(s1 + e1 - s2 - e2) // 2).astype(_numpy.float64)
 
         # --- Vectorized binning ---
         bin_idx = _val2bin_vec(distances, breaks_arr, include_lowest)

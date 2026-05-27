@@ -13,7 +13,12 @@ import pymisha as pm
 from .baseline import assert_matches_baseline
 
 GAP_2D = "2D gintervals_neighbors not implemented"
-GAP_INVESTIGATE = "1D neighbors result differs from R (swap / nearest selection; investigate)"
+# maxneighbors=1 with two equidistant neighbors (one upstream, one downstream at
+# the same gap): pymisha's SegmentFinder NNIterator pops the upstream one first,
+# R the downstream one. Both are valid nearest neighbors at the same distance;
+# the order among equal-distance objects is a priority_queue/tree tie-break
+# artifact (the NN code is byte-identical to R). ~1% of rows differ in target.
+GAP_NN_TIE = "maxn=1 equidistant tie-break differs from R (NNIterator pop order)"
 
 _N = pm.gintervals_neighbors
 
@@ -53,12 +58,12 @@ _CASES = {
     "gintervals.neighbors.1": (lambda: _N("test.tss", _intervs(), 100, mindist=-10000, maxdist=10000), None),
     "gintervals.neighbors.2": (lambda: _N("test.tss", _intervs(), 100, mindist=2000, maxdist=10000), None),
     "gintervals.neighbors.3": (lambda: _N("test.tss", _intervs(), 100, mindist=-10000, maxdist=-2000), None),
-    "gintervals.neighbors.4": (lambda: _N(_intervs(), "test.tss", 100, mindist=-10000, maxdist=-2000), GAP_INVESTIGATE),
+    "gintervals.neighbors.4": (lambda: _N(_intervs(), "test.tss", 100, mindist=-10000, maxdist=-2000), None),
     "gintervals.neighbors.5": (lambda: _N(_i2(1), _i2(1)), GAP_2D),
     "gintervals.neighbors.2d.1": (lambda: _nb_2d(100, mindist1=10000, maxdist1=20000, mindist2=50000, maxdist2=70000), GAP_2D),
     "gintervals.neighbors.2d.4": (lambda: _N("test.bigintervs_2d_5", "test.bigintervs_2d_6"), GAP_2D),
     "gintervals.neighbors.2d.5": (lambda: _N("test.generated_2d_5", "test.generated_2d_6"), GAP_2D),
-    "gintervals.neighbors.8": (_nb8, GAP_INVESTIGATE),
+    "gintervals.neighbors.8": (_nb8, GAP_NN_TIE),
     "gintervals.neighbors.9": (_nb_2d, GAP_2D),
 }
 

@@ -7,15 +7,17 @@ this port:
 * **Fixed:** ``global.percentile*`` vtracks read back as all-NaN on indexed-
   format databases. ``pm_vtrack_compute`` (the non-scanner C++ entry these funcs
   use) gated chromosome loading on a per-chrom file that indexed tracks don't
-  have. Fixed in ``PMVTrack.cpp`` (see CHANGELOG). These cases now return real
-  values, but the percentile *rank* still differs from R's algorithm
-  (``GAP_GLOBAL_PCT``) -- a separate Wave-2 item.
+  have. Fixed in ``PMVTrack.cpp`` (see CHANGELOG).
+* **Fixed:** ``global.percentile.min`` / ``.max`` now map each per-bin value
+  through R's frozen ``vars/pv.percentiles`` binned table (instead of an exact
+  empirical CDF), matching R bit-for-bit. The ``global.percentile`` (avg) variant
+  remains off (``GAP_GLOBAL_PCT_AVG``).
 
 Open gaps marked ``xfail(strict=True)``:
 
 * ``GAP_ARRAY`` -- array-track extraction / ``gvtrack.array.slice`` extraction.
 * ``GAP_COMPUTED`` -- COMPUTED 2D Hi-C tracks (``test.computed2d``).
-* ``GAP_GLOBAL_PCT`` -- global.percentile rank value vs R.
+* ``GAP_GLOBAL_PCT_AVG`` -- global.percentile (avg) per-bin value vs R (float32 ULP).
 * ``GAP_VTRACK_ITER`` -- default iterator not inferred from a value-based
   vtrack's source track (+ ``gvtrack.iterator`` shifts).
 * ``GAP_2D_ITER`` -- a 1D vtrack ``dim``-projected over a 2D iterator.
@@ -36,7 +38,12 @@ from .baseline import assert_matches_baseline, load_baseline
 
 GAP_ARRAY = "array-track gextract / gvtrack.array.slice extraction not supported"
 GAP_COMPUTED = "COMPUTED 2D Hi-C tracks (test.computed2d) not supported"
-GAP_GLOBAL_PCT = "global.percentile rank value differs from R (rank algorithm / avg-then-rank ordering)"
+# global.percentile.min/.max now read R's frozen vars/pv.percentiles binned table
+# (exact native per-bin values -> exact bin). The AVG variant remains off: the
+# weighted/averaged per-bin value differs from R by ~1 float32 ULP, so values
+# that land exactly on a break (the breaks are the track's float32 quantiles)
+# flip to an adjacent bin. Matching needs bit-exact AVG float32 accumulation order.
+GAP_GLOBAL_PCT_AVG = "global.percentile (avg) per-bin value differs from R by ~1 float32 ULP at break boundaries"
 GAP_VTRACK_ITER = "default iterator not inferred from value-based vtrack source (+ gvtrack.iterator shifts)"
 GAP_2D_ITER = "1D vtrack dim-projection over a 2D iterator differs from R"
 GAP_STDDEV = "stddev one-pass numerical cancellation vs R two-pass (tiny diffs)"
@@ -184,9 +191,9 @@ _CASES: dict[str, tuple] = {
     "vtrack.array_sum": (_value("test.array", "sum", 10000), GAP_ARRAY),
     "vtrack.fixedbin_quantile": (_two_quantile(233), None),
     "vtrack.fixedbin.quantile_extraction_1": (_two_quantile(10000), None),
-    "vtrack.fixedbin.global_percentile_extraction": (_value("test.fixedbin", "global.percentile", 233), GAP_GLOBAL_PCT),
-    "vtrack.fixedbin.global_percentile_max_extraction": (_value("test.fixedbin", "global.percentile.max", 233), GAP_GLOBAL_PCT),
-    "vtrack.fixedbin.result": (_value("test.fixedbin", "global.percentile.min", 233), GAP_GLOBAL_PCT),
+    "vtrack.fixedbin.global_percentile_extraction": (_value("test.fixedbin", "global.percentile", 233), GAP_GLOBAL_PCT_AVG),
+    "vtrack.fixedbin.global_percentile_max_extraction": (_value("test.fixedbin", "global.percentile.max", 233), None),
+    "vtrack.fixedbin.result": (_value("test.fixedbin", "global.percentile.min", 233), None),
     "vtrack.fixedbin.gscreen.result": (_intervs_vtrack(None, 533), None),
     "vtrack.fixedbin.positive.result": (_intervs_vtrack("distance", 533, strand=1), None),
     "vtrack.fixedbin.negative.result": (_intervs_vtrack("distance", 533, strand=-1), None),

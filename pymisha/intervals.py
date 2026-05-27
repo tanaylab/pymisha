@@ -4086,6 +4086,142 @@ def giterator_cartesian_grid(
     ).reset_index(drop=True)
 
 
+def _resolve_2d_scope(intervals: pd.DataFrame | str | None) -> pd.DataFrame:
+    """Resolve a scope argument to a 2D-intervals DataFrame for a 2D iterator.
+
+    - ``None`` -> the whole 2D genome (all chromosome pairs, full rectangles),
+      matching R's use of ``.misha$ALLGENOME`` as a 2D-iterator scope.
+    - a 2D-track name -> the track's rectangles.
+    - a named 2D interval set -> its rectangles.
+    - a 2D DataFrame -> returned as-is.
+    """
+    from .extract import gextract
+    from .tracks import gtrack_exists, gtrack_info
+
+    if intervals is None:
+        return gintervals_2d_all(mode="full")
+
+    if isinstance(intervals, str):
+        if gtrack_exists(intervals):
+            if int(gtrack_info(intervals).get("dimensions", 1) or 1) != 2:
+                raise ValueError(
+                    f"Track '{intervals}' is not 2D; a cartesian-grid iterator "
+                    "requires a 2D scope"
+                )
+            res = gextract(intervals, gintervals_2d_all(mode="full"))
+            if res is None or len(res) == 0:
+                return _pandas.DataFrame(
+                    columns=["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+                )
+            return res[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+        loaded = gintervals_load(intervals)
+        if loaded is None or "chrom1" not in getattr(loaded, "columns", []):
+            raise ValueError(
+                f"Scope '{intervals}' is not a 2D interval set / 2D track"
+            )
+        return loaded
+
+    if isinstance(intervals, _pandas.DataFrame) and "chrom1" in intervals.columns:
+        return intervals
+
+    raise ValueError(
+        "A cartesian-grid iterator requires a 2D scope (2D DataFrame, 2D track "
+        "name, or None for the whole 2D genome)"
+    )
+
+
+def _enumerate_cartesian_grid_cells(
+    spec: Any,
+    intervals: pd.DataFrame | str | None,
+    band: tuple[int, int] | tuple[float, float] | None,
+    intervals_set_out: str | None,
+) -> pd.DataFrame | None:
+    """Enumerate the 2D cells of a CartesianGrid iterator over a 2D scope.
+
+    Mirrors R's ``giterator.intervals(expr, scope, iterator = cartesian_grid)``:
+    builds the grid (centers de-duplicated, adjacent-center expansions clipped
+    at midpoints), intersects each cell with the scope rectangles, and applies
+    the optional diagonal ``band``. Delegates to the C++ iterator port.
+    """
+    from .extract import _validate_band
+
+    scope_df = _resolve_2d_scope(intervals)
+
+    # chrom name <-> chromid (gintervals_all order == the C++ chromkey order).
+    allg = gintervals_all()
+    chrom2id = {str(c): i for i, c in enumerate(allg["chrom"].tolist())}
+    id2chrom = {i: c for c, i in chrom2id.items()}
+
+    def _chromids(names: Any) -> _numpy.ndarray:
+        return _numpy.array(
+            [chrom2id[str(c)] for c in names], dtype=_numpy.int32
+        )
+
+    def _to_1d_dict(df: pd.DataFrame) -> dict[str, Any]:
+        d = df.copy()
+        d["chrom"] = _normalize_chroms(d["chrom"].astype(str).tolist())
+        return {
+            "chrom": _chromids(d["chrom"]),
+            "start": d["start"].to_numpy(_numpy.int64),
+            "end": d["end"].to_numpy(_numpy.int64),
+        }
+
+    empty_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    if len(scope_df) == 0 or len(spec.intervals1) == 0:
+        result = _pandas.DataFrame(columns=empty_cols)
+        if intervals_set_out is not None:
+            return None
+        return result
+
+    s = scope_df.copy()
+    s["chrom1"] = _normalize_chroms(s["chrom1"].astype(str).tolist())
+    s["chrom2"] = _normalize_chroms(s["chrom2"].astype(str).tolist())
+    scope_dict = {
+        "chrom1": _chromids(s["chrom1"]),
+        "start1": s["start1"].to_numpy(_numpy.int64),
+        "end1": s["end1"].to_numpy(_numpy.int64),
+        "chrom2": _chromids(s["chrom2"]),
+        "start2": s["start2"].to_numpy(_numpy.int64),
+        "end2": s["end2"].to_numpy(_numpy.int64),
+    }
+
+    i1 = _to_1d_dict(spec.intervals1)
+    i2 = None if spec.intervals2 is None else _to_1d_dict(spec.intervals2)
+    e1 = _numpy.asarray(spec.expansion1, dtype=_numpy.int64)
+    e2 = (
+        None if spec.expansion2 is None
+        else _numpy.asarray(spec.expansion2, dtype=_numpy.int64)
+    )
+    band_idx = (
+        None if spec.min_band_idx is None
+        else (int(spec.min_band_idx), int(spec.max_band_idx))
+    )
+    band_t = _validate_band(band)
+    band_arg = None if band_t is None else (int(band_t[0]), int(band_t[1]))
+
+    out = _pymisha.pm_cartesian_grid_intervals(
+        i1, e1, i2, e2, band_idx, scope_dict, band_arg
+    )
+
+    result = _pandas.DataFrame(
+        {
+            "chrom1": [id2chrom[i] for i in out["chrom1"]],
+            "start1": out["start1"],
+            "end1": out["end1"],
+            "chrom2": [id2chrom[i] for i in out["chrom2"]],
+            "start2": out["start2"],
+            "end2": out["end2"],
+        }
+    )
+
+    if intervals_set_out is not None:
+        if len(result) == 0:
+            raise ValueError("Cannot save empty intervals")
+        gintervals_save(result, intervals_set_out)
+        return None
+    return result
+
+
 def giterator_intervals(
     expr: str | None = None,
     intervals: pd.DataFrame | str | None = None,
@@ -4165,6 +4301,14 @@ def giterator_intervals(
             "At least one of 'expr' or 'iterator' must be provided."
         )
     _checkroot()
+
+    # CartesianGrid 2D iterator: enumerate the grid cells over the 2D scope
+    # (R's giterator.intervals(expr, scope, iterator = cartesian_grid[, band])).
+    from ._iterator_policy import CartesianGridSpec
+    if isinstance(iterator, CartesianGridSpec):
+        return _enumerate_cartesian_grid_cells(
+            iterator, intervals, band=band, intervals_set_out=intervals_set_out
+        )
 
     # Determine iterator policy
     itr = iterator

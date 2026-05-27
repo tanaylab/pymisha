@@ -123,6 +123,8 @@ _FILTER_SUPPORTED_FUNCS = (
 )
 
 _GLOBAL_PERCENTILE_CACHE: dict[tuple[str, str, int], np.ndarray] = {}
+# Cache of a track's frozen pv.percentiles table: src -> (bins, breaks) or None.
+_PV_TABLE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray] | None] = {}
 
 
 def _canonicalize_filter_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -979,6 +981,65 @@ def _percentile_from_reference(values: np.ndarray, ref_sorted: np.ndarray) -> np
     return out
 
 
+def _load_pv_table(src: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Read R's frozen ``vars/pv.percentiles`` binned quantile table for *src*.
+
+    Returns ``(bins, breaks)`` - the percentile values and their track-value
+    thresholds (same length) - or ``None`` if the track has no such file (a
+    pymisha-created track, or one never prepared for percentile queries).
+    """
+    import os
+
+    key = (str(_shared._GROOT), str(src))
+    if key in _PV_TABLE_CACHE:
+        return _PV_TABLE_CACHE[key]
+
+    result: tuple[np.ndarray, np.ndarray] | None = None
+    try:
+        track_path = _pymisha.pm_track_path(src)
+    except Exception:
+        track_path = None
+    if track_path:
+        fpath = os.path.join(track_path, "vars", "pv.percentiles")
+        if os.path.exists(fpath):
+            from ._r_serialize import read as _r_read
+
+            obj = _r_read(fpath)
+            attrs = getattr(obj, "attributes", None)
+            breaks = None if attrs is None else attrs.get("breaks")
+            if breaks is not None:
+                bins = _numpy.asarray(obj, dtype=float).ravel()
+                br = _numpy.asarray(breaks, dtype=float).ravel()
+                if bins.size == br.size and bins.size >= 2:
+                    result = (bins, br)
+    _PV_TABLE_CACHE[key] = result
+    return result
+
+
+def _percentile_from_pv_table(
+    values: np.ndarray, bins: np.ndarray, breaks: np.ndarray
+) -> np.ndarray:
+    """Map per-bin statistics through R's binned pv.percentiles table.
+
+    Mirrors R ``TrackVarProcessor`` + ``BinFinder::val2bin`` (right-closed
+    bins): ``bin = val2bin(val)``; ``bins[bin]`` in range; for out-of-range,
+    ``bins[0]`` when ``val <= breaks[0]`` else ``1.0``. NaN stays NaN.
+    """
+    from .summary import _bin_values
+
+    out = _numpy.full(values.shape, _numpy.nan, dtype=float)
+    valid = ~_numpy.isnan(values)
+    if not valid.any():
+        return out
+    vals = values[valid]
+    bin_idx = _bin_values(vals, breaks, include_lowest=False)
+    res = _numpy.where(vals <= breaks[0], bins[0], 1.0)
+    in_range = bin_idx >= 0
+    res[in_range] = bins[bin_idx[in_range]]
+    out[valid] = res
+    return out
+
+
 def _compute_filtered_global_percentile(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
@@ -1013,6 +1074,9 @@ def _compute_filtered_global_percentile(
         if raw_vals:
             stats[orig_idx] = float(stat_fn(raw_vals))
 
+    table = _load_pv_table(src)
+    if table is not None:
+        return _percentile_from_pv_table(stats, table[0], table[1])
     ref = _global_percentile_reference_values(src, int(bin_size))
     return _percentile_from_reference(stats, ref)
 
@@ -1052,6 +1116,12 @@ def _compute_global_percentile_unfiltered(
         dtype=float,
     )
 
+    # Path A (R parity): map through R's frozen binned pv.percentiles table.
+    # Path B (fallback): the exact empirical CDF over native bins, used when
+    # the track has no pv.percentiles file (e.g. pymisha-created tracks).
+    table = _load_pv_table(src)
+    if table is not None:
+        return _percentile_from_pv_table(stats, table[0], table[1])
     ref = _global_percentile_reference_values(src, int(bin_size))
     return _percentile_from_reference(stats, ref)
 

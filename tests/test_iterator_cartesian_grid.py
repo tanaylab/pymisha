@@ -545,3 +545,54 @@ def test_cartesian_grid_multitask_equals_single_task(_init_db, rects_track):
     r1s = r1.sort_values(["start1", "start2"]).reset_index(drop=True)
     r4s = r4.sort_values(["start1", "start2"]).reset_index(drop=True)
     pd.testing.assert_frame_equal(r1s, r4s)
+
+
+def test_giterator_intervals_consumes_cartesian_grid_spec(_init_db):
+    """giterator_intervals enumerates CartesianGrid cells over a 2D scope.
+
+    Regression for GAP_GRID: giterator_intervals now consumes a
+    CartesianGridSpec (R's giterator.intervals(expr, scope, iterator=grid)),
+    delegating to the C++ iterator (center de-dup + adjacent-center midpoint
+    clipping + scope intersection). No NFS / no track values needed - the cells
+    depend only on the 1D centers, expansion, chrom sizes, and the 2D scope.
+    """
+    # Two centers on chrom "1" (size 500_000): 25_000 and 125_000.
+    intervals_1d = _1d([("1", 0, 50_000), ("1", 100_000, 150_000)])
+    grid = pm.giterator_cartesian_grid(intervals_1d, [-30_000, 30_000], stream=True)
+    scope_2d = pd.DataFrame({
+        "chrom1": ["1"], "start1": [0], "end1": [500_000],
+        "chrom2": ["1"], "start2": [0], "end2": [500_000],
+    })
+    cells = pm.giterator_intervals("1", scope_2d, iterator=grid)
+
+    # center 25_000 -> window [0, 55_000) (left clipped at chrom start 0);
+    # center 125_000 -> window [95_000, 155_000); the two windows do not
+    # overlap so no midpoint clipping. 2 x 2 = 4 cells, all inside the scope.
+    got = set(
+        cells[["start1", "end1", "start2", "end2"]].itertuples(index=False, name=None)
+    )
+    expected = {
+        (0, 55_000, 0, 55_000),
+        (0, 55_000, 95_000, 155_000),
+        (95_000, 155_000, 0, 55_000),
+        (95_000, 155_000, 95_000, 155_000),
+    }
+    assert got == expected
+    assert (cells["chrom1"].astype(str) == "1").all()
+    assert (cells["chrom2"].astype(str) == "1").all()
+
+
+def test_giterator_intervals_cartesian_grid_scope_clips_cells(_init_db):
+    """A narrow 2D scope drops cells that fall outside it."""
+    intervals_1d = _1d([("1", 0, 50_000), ("1", 100_000, 150_000)])
+    grid = pm.giterator_cartesian_grid(intervals_1d, [-30_000, 30_000], stream=True)
+    # Scope covers only the first window on both axes -> just the (c0, c0) cell.
+    scope_2d = pd.DataFrame({
+        "chrom1": ["1"], "start1": [0], "end1": [60_000],
+        "chrom2": ["1"], "start2": [0], "end2": [60_000],
+    })
+    cells = pm.giterator_intervals("1", scope_2d, iterator=grid)
+    got = set(
+        cells[["start1", "end1", "start2", "end2"]].itertuples(index=False, name=None)
+    )
+    assert got == {(0, 55_000, 0, 55_000)}

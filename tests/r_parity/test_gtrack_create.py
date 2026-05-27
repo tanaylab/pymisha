@@ -54,7 +54,7 @@ _CASES = {
     # "test.rects+10": 2D track creation from an expression
     "gtrack.create.5": (
         lambda n: _create_extract(n, "test.rects+10", pm.gintervals_2d([2, 3], chroms2=[2, 4])),
-        GAP_2D_CREATE,
+        None,
     ),
     # iterator = a sparse-intervals DataFrame
     "gtrack.create.6": (
@@ -78,7 +78,7 @@ _CASES = {
             pm.gintervals_2d([2, 3, 3], chroms2=[2, 3, 4]),
             pm.giterator_intervals("test.rects", pm.gintervals_2d([2, 3, 5], chroms2=[2, 4, 7])),
         ),
-        GAP_2D_CREATE,
+        None,
     ),
 }
 

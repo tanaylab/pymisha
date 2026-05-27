@@ -351,3 +351,46 @@ class TestPwmCountSpatialBidirectSliding:
             np.array(per_interval_vals),
             atol=1e-6,
         )
+
+
+class TestPwmSpatialSingleStrandSeed:
+    """Regression: the spatial sliding-window seed must score a single strand
+    for a non-bidirectional PSSM.
+
+    PWMScorer::compute_motif_at decided which strands to score from m_strand
+    using `m_strand != +1` for the reverse strand. With the default unstranded
+    m_strand==0 that test was true, so a non-bidirectional PSSM had BOTH strands
+    summed into the spatial TOTAL/MAX aggregation (the seed path), inflating the
+    score to equal the bidirectional result.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        _remove_all_vtracks()
+        yield
+        _remove_all_vtracks()
+
+    def test_nonbidirect_spatial_is_single_strand(self):
+        # Non-palindromic PSSM so the reverse strand contributes a different,
+        # finite amount (otherwise fwd==rev and the bug would be invisible).
+        pssm = np.array([
+            [0.7, 0.1, 0.1, 0.1],
+            [0.1, 0.7, 0.1, 0.1],
+            [0.1, 0.1, 0.7, 0.1],
+        ])
+        iv = pm.gintervals("1", 200, 300)
+        spat = dict(spat_factor=[0.5, 1.0, 2.0, 2.5, 2.0, 1.0, 0.5], spat_bin=20)
+
+        pm.gvtrack_create("v_bi", None, func="pwm", pssm=pssm, bidirect=True,
+                          extend=False, prior=0.01, **spat)
+        pm.gvtrack_create("v_nb", None, func="pwm", pssm=pssm, bidirect=False,
+                          extend=False, prior=0.01, **spat)
+
+        bi = pm.gextract("v_bi", iv, iterator=iv)["v_bi"].iloc[0]
+        nb = pm.gextract("v_nb", iv, iterator=iv)["v_nb"].iloc[0]
+
+        # Both strands (bidirect) is a log-sum-exp union over fwd+rev, so it must
+        # be strictly greater than the single forward strand. Before the fix the
+        # non-bidirect seed counted both strands too, making nb == bi.
+        assert np.isfinite(bi) and np.isfinite(nb)
+        assert nb < bi - 1e-4, f"non-bidirect spatial ({nb}) should be < bidirect ({bi})"

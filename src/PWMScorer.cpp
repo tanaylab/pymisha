@@ -930,9 +930,14 @@ void PWMScorer::compute_motif_at(const std::string& target, size_t i_in_target,
     fwd = -std::numeric_limits<float>::infinity();
     rc = -std::numeric_limits<float>::infinity();
 
-    // Respect strand / bidirect rules
+    // Respect strand / bidirect rules. A non-bidirectional PSSM scores a SINGLE
+    // strand (forward, or reverse only when the minus strand is explicitly
+    // selected) - matching pos_value_with_spat and R's DnaPSSM::integrate_energy
+    // (forward only unless m_bidirect). Treating the default m_strand==0 as
+    // "score both" here double-counted the reverse strand into the spatial
+    // TOTAL/MAX aggregation.
     const bool check_fwd = (m_pssm.is_bidirect() || m_strand != -1);
-    const bool check_rc  = (m_pssm.is_bidirect() || m_strand != +1);
+    const bool check_rc  = (m_pssm.is_bidirect() || m_strand == -1);
 
     if (check_fwd) {
         fwd = score_forward_original(m_pssm, target, i_in_target, m_strand);

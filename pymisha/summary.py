@@ -316,7 +316,13 @@ def _bin_values(values: np.ndarray, breaks: np.ndarray, include_lowest: bool) ->
     """
     breaks = _numpy.asarray(breaks, dtype=float)
     n_bins = len(breaks) - 1
-    indices = _numpy.searchsorted(breaks, values, side="right") - 1
+    # Bins are right-closed (breaks[i], breaks[i+1]] (R BinFinder, right=True):
+    # a value exactly equal to a break belongs to the bin *ending* at it, not
+    # the one starting at it. searchsorted(side="left")-1 reproduces this;
+    # side="right" would assign break-equal values one bin too high (harmless
+    # for continuous data, but visible for integer values landing on breaks,
+    # e.g. gcis_decay distances vs multiple-of-1000 breaks).
+    indices = _numpy.searchsorted(breaks, values, side="left") - 1
 
     # Exclude values at or below breaks[0] (bins are open on the left)
     indices[values <= breaks[0]] = -1

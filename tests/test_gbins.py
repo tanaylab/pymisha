@@ -448,6 +448,32 @@ def test_gbins_quantiles_sort_based_matches_itertools():
             assert np.all(np.isnan(result[b1, b2]))
 
 
+def test_assign_bins_right_closed_boundary():
+    """A value exactly on an interior break belongs to the bin ending at it.
+
+    R's BinFinder uses right-closed bins (breaks[i], breaks[i+1]] (right=True),
+    so a value equal to a break goes to the *lower* bin, not the one starting
+    at it. Regression for the gcis_decay last-bin off-by-N gap: integer values
+    landing exactly on multiple-of-1000 breaks were mis-binned one bin too high
+    because _bin_values used searchsorted(side="right").
+    """
+    from pymisha.summary import _bin_values
+
+    breaks = np.array([0.0, 1000.0, 2000.0, 3000.0])
+    # values exactly on interior breaks, plus interior/edge cases
+    vals = np.array([1000.0, 2000.0, 1500.0, 0.0, 3000.0, 500.0, 3001.0])
+    idx = _bin_values(vals, breaks, include_lowest=False)
+    # 1000 -> bin 0 (0,1000];  2000 -> bin 1 (1000,2000];  1500 -> bin 1
+    # 0 -> -1 (open lower edge); 3000 -> bin 2 (closed upper edge); 500 -> bin 0
+    # 3001 -> -1 (above range)
+    np.testing.assert_array_equal(idx, np.array([0, 1, 1, -1, 2, 0, -1]))
+
+    # include_lowest closes the first bin on the left: [0,1000]
+    idx_lo = _bin_values(vals, breaks, include_lowest=True)
+    # only the 0 changes: now bin 0
+    np.testing.assert_array_equal(idx_lo, np.array([0, 1, 1, 0, 2, 0, -1]))
+
+
 def test_gbins_summary_single_value_bin_stddev_nan():
     """A bin with exactly one non-NaN value should have NaN stddev."""
     # Use narrow breaks to get a bin with exactly 1 value

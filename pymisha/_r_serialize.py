@@ -52,6 +52,12 @@ _ALTREP_SXP = 238  # added in R 3.5 for compact sequences / wrappers
 _NA_INT = -2147483648  # R's NA_INTEGER sentinel
 _NA_LOGICAL = -2147483648
 
+# R attributes consumed/handled structurally elsewhere; presence of anything
+# else on an atomic vector triggers preserving the full attribute dict.
+_STRUCTURAL_ATTRS = frozenset(
+    {"names", "class", "levels", "dim", "dimnames", "row.names"}
+)
+
 
 class _NamedList(list):
     """A Python list that also carries a ``names`` attribute."""
@@ -521,10 +527,18 @@ def _apply_attributes(
             return named
         return value
 
-    if isinstance(value, _numpy.ndarray) and isinstance(names, list):
-        wrapped = value.view(_NamedArray)
-        wrapped.names = list(names)
-        return wrapped
+    # Wrap an ndarray that carries a `names` attribute, or any non-structural
+    # R attribute we want to preserve (e.g. the `breaks`/`minval`/`maxval` on a
+    # track's pv.percentiles table, used by global.percentile virtual tracks).
+    # Structural attributes (dim/dimnames/class/...) are handled elsewhere or
+    # not needed, so a plain matrix/vector baseline stays a plain ndarray.
+    if isinstance(value, _numpy.ndarray):
+        extra = set(attrs) - _STRUCTURAL_ATTRS
+        if isinstance(names, list) or extra:
+            wrapped = value.view(_NamedArray)
+            wrapped.names = list(names) if isinstance(names, list) else None
+            wrapped.attributes = dict(attrs)
+            return wrapped
 
     return value
 
@@ -536,14 +550,16 @@ def _ndarray_or_passthrough(v: Any) -> Any:
 
 
 class _NamedArray(_numpy.ndarray):
-    """A numpy ndarray that carries a ``names`` attribute."""
+    """A numpy ndarray that carries ``names`` and other R ``attributes``."""
 
     names: list[str] | None = None
+    attributes: dict[str, Any] | None = None
 
     def __array_finalize__(self, obj: Any) -> None:
         if obj is None:
             return
         self.names = getattr(obj, "names", None)
+        self.attributes = getattr(obj, "attributes", None)
 
 
 def read(path: str | Path) -> Any:

@@ -70,6 +70,21 @@ class TestRSerializeReader:
         assert val.dtype == bool
         np.testing.assert_array_equal(val, [True, False, True])
 
+    def test_vector_preserves_extra_attributes(self, tmp_path):
+        # A numeric vector with non-structural attributes (as in a track's
+        # pv.percentiles table: bins + a `breaks` value-threshold attribute)
+        # must keep those attributes so global.percentile* can read them.
+        _save_with_r(
+            'structure(c(0.1, 0.4, 0.9), breaks=c(0.2, 0.5, 1.0), '
+            'minval=0, maxval=1)',
+            tmp_path / "x.rds",
+        )
+        val = _r_serialize.read(tmp_path / "x.rds")
+        np.testing.assert_array_equal(np.asarray(val), [0.1, 0.4, 0.9])
+        attrs = getattr(val, "attributes", None)
+        assert attrs is not None
+        np.testing.assert_array_equal(np.asarray(attrs["breaks"]), [0.2, 0.5, 1.0])
+
     def test_null(self, tmp_path):
         _save_with_r('NULL', tmp_path / "x.rds")
         assert _r_serialize.read(tmp_path / "x.rds") is None

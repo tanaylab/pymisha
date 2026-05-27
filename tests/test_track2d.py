@@ -151,6 +151,35 @@ class TestGtrack2dCreate:
         info = pm.gtrack_info("rects_track")
         assert info["type"] == "rectangles"
 
+    def test_create_2d_track_from_expression(self):
+        """gtrack_create on a 2D track expression writes a 2D RECTS track.
+
+        Regression for GAP_2D_CREATE: gtrack_create("t", "", "<2d expr>")
+        evaluates the expression over the source track's rectangles and writes
+        a 2D track (R's gtrack.create on a 2D expression).
+        """
+        tname = "test.derived_2d_expr"
+        self._cleanup_track(tname)
+        try:
+            pm.gtrack_create(tname, "rects + 10", "rects_track + 10")
+            assert pm.gtrack_exists(tname)
+            assert pm.gtrack_info(tname)["type"] == "rectangles"
+
+            scope = pm.gintervals_2d_all(mode="full")
+            src = pm.gextract("rects_track", scope, colnames=["v"])
+            got = pm.gextract(tname, scope, colnames=["v"])
+            assert src is not None and got is not None
+            coords = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+            src = src.sort_values(coords).reset_index(drop=True)
+            got = got.sort_values(coords).reset_index(drop=True)
+            assert len(got) == len(src)
+            # every derived rectangle is the source rectangle's value + 10
+            np.testing.assert_allclose(
+                got["v"].to_numpy(), src["v"].to_numpy() + 10.0, rtol=1e-5
+            )
+        finally:
+            self._cleanup_track(tname)
+
 
 class TestGtrack2dImport:
     """Tests for gtrack_2d_import."""

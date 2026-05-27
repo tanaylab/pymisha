@@ -5,9 +5,21 @@ Creating a 1D track from a 2D lookup table over two expressions
 
 Open gap marked ``xfail(strict=True)``:
 
-* ``GAP_2D`` -- the 2D lookup case builds a *rectangles* track; pymisha's
-  ``gtrack_lookup`` produces no readable 2D track (gextract returns ``None``),
-  the same 2D-track-creation gap seen in ``gtrack.create``.
+* ``GAP_2D`` -- the 2D lookup case builds a *rectangles* track with
+  ``force_binning=False``, so out-of-range cells get a NaN value (baseline:
+  9740 NaN + 4322 non-NaN = 14062). This is a MULTI-LAYER NaN-retention gap
+  (the generic 2D-create path was fixed in gtrack_create); investigated and
+  deferred as a deeper 2D-writer effort:
+  (1) ``gtrack_lookup`` evaluates the 2D scope over ``gintervals_2d_all()``
+  (diagonal) rather than ``mode="full"`` -> off-diagonal cells missing
+  (returns ``None`` for the off-diagonal query without this);
+  (2) ``QuadTree.insert`` (``_quadtree.py``) drops NaN-valued objects to keep
+  the stat-tree aggregations NaN-free; storing them (but excluding from stats)
+  recovers ~94% (4322 -> 13283 rows);
+  (3) a further ~779 NaN rects are still dropped by another layer (NOT the C++
+  indexed converter, which has no NaN filter - likely glookup's expression-NaN
+  handling or a full-mode scope boundary). Completing this needs all three
+  layers + validation that 2D-vtrack stat aggregations stay NaN-safe.
 """
 
 from __future__ import annotations
@@ -19,7 +31,7 @@ import pymisha as pm
 
 from .baseline import assert_matches_baseline
 
-GAP_2D = "2D lookup track creation not supported (gextract returns None); same gap as 2D gtrack_create"
+GAP_2D = "2D lookup builds a RECTS track with NaN values; QuadTree.insert drops NaN-valued rects (R retains them) + diagonal-vs-full scope"
 
 # R: m1 <- matrix(1:15, nrow = 5, ncol = 3) -- column-major fill.
 _M1 = np.arange(1, 16).reshape((5, 3), order="F")

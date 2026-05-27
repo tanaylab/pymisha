@@ -5,13 +5,11 @@ package *and* freezes the misha result with ``expect_regression``. We port the
 frozen misha side only (no ``prego`` needed): build the same ``pwm`` / ``pwm.max``
 vtrack and extract over the test intervals.
 
-8 of 10 match R exactly (basic, extend, iterator-shift, bidirectional spatial,
-max mode). Open gap marked ``xfail(strict=True)``:
-
-* ``GAP_PWM_SPATIAL_1STRAND`` -- spatial weighting combined with
-  ``bidirect=False`` differs from R/prego (the bidirectional spatial cases match,
-  and single-strand *without* spatial matches, so the divergence is specifically
-  single-strand spatial bin weighting).
+All 10 match R exactly (basic, extend, iterator-shift, single- and
+bidirectional spatial, max mode). The previously-failing single-strand spatial
+cases were fixed: the spatial sliding-window seed (``PWMScorer::compute_motif_at``)
+double-counted the reverse strand for a non-bidirectional PSSM when no strand was
+explicitly selected; it now scores a single strand, matching R.
 """
 
 from __future__ import annotations
@@ -22,8 +20,6 @@ import pytest
 import pymisha as pm
 
 from .baseline import assert_matches_baseline
-
-GAP_PWM_SPATIAL_1STRAND = "spatial PWM weighting with bidirect=False differs from R (single-strand spatial bins)"
 
 # PSSMs as (position x [A, C, G, T]) matrices, matching the R data frames.
 _PSSM4 = np.array(
@@ -92,14 +88,14 @@ _CASES = {
     "pwm_genome_spatial": (
         _pwm("pwm_spatial", _PSSM2_GENOME, "pwm", _iv3_280, extend=False, bidirect=False,
              spat_factor=[0.5, 1.0, 2.0, 2.5, 2.0, 1.0, 0.5], spat_bin=40),
-        GAP_PWM_SPATIAL_1STRAND,
+        None,
     ),
     "pwm_max_no_extend": (_pwm("pwm_max_test", _PSSM4, "pwm.max", _iv3_100, extend=False), None),
     "pwm_max_with_extend": (_pwm("pwm_max_extend", _PSSM4, "pwm.max", _iv3_100, extend=True), None),
     "pwm_spatial_binning": (
         _pwm("pwm_bintest", _PSSM2_BIN, "pwm", _iv2_300, extend=False, bidirect=False,
              spat_factor=[10.0, 1.0, 1.0], spat_bin=100),
-        GAP_PWM_SPATIAL_1STRAND,
+        None,
     ),
 }
 

@@ -2350,3 +2350,32 @@ class TestValueBasedEquivalencePartialGaps:
                 np.testing.assert_allclose(t, v, atol=1e-3)
             else:
                 np.testing.assert_allclose(t, v, rtol=1e-4)
+
+
+def test_percentile_from_pv_table_right_closed_lookup():
+    """global.percentile* table lookup mirrors R's BinFinder val2bin.
+
+    Regression for GAP_GLOBAL_PCT: a per-bin statistic is mapped through the
+    track's frozen pv.percentiles table (right-closed bins (breaks[i],
+    breaks[i+1]] -> bins[i]); out-of-range below -> bins[0], above -> 1.0;
+    NaN -> NaN). No DB / no R required.
+    """
+    from pymisha.vtracks import _percentile_from_pv_table
+
+    bins = np.array([0.1, 0.4, 0.7, 0.9, 1.0])
+    breaks = np.array([0.0, 0.2, 0.5, 0.8, 1.0])  # value thresholds
+    vals = np.array([
+        0.2,     # == break[1] -> bin 0 (right-closed) -> bins[0]=0.1
+        0.3,     # in (0.2, 0.5] -> bin 1 -> bins[1]=0.4
+        0.5,     # == break[2] -> bin 1 -> bins[1]=0.4
+        1.0,     # == break[-1] -> last bin (3) -> bins[3]=0.9
+        0.0,     # == break[0] -> below range -> bins[0]=0.1
+        -0.5,    # below range -> bins[0]=0.1
+        1.5,     # above range -> 1.0
+        np.nan,  # NaN -> NaN
+    ])
+    out = _percentile_from_pv_table(vals, bins, breaks)
+    expected = np.array([0.1, 0.4, 0.4, 0.9, 0.1, 0.1, 1.0, np.nan])
+    np.testing.assert_array_equal(np.isnan(out), np.isnan(expected))
+    m = ~np.isnan(expected)
+    np.testing.assert_allclose(out[m], expected[m])

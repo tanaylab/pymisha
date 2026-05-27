@@ -1667,6 +1667,50 @@ def gtrack_smooth(
         raise
 
 
+def _gtrack_create_2d_from_expr(
+    track: str,
+    description: str,
+    expr: str,
+    iterator: Any = None,
+) -> None:
+    """Create a 2D RECTS/POINTS track from a 2D track expression.
+
+    Evaluates *expr* over the 2D scope (the source track's native rectangles
+    when *iterator* is ``None``, or an explicit 2D-intervals iterator) and
+    writes one rectangle per iterated cell with the expression's value -
+    R's ``gtrack.create(track, desc, "<2d expr>"[, iterator])``.
+    """
+    from .extract import gextract
+    from .intervals import gintervals_2d_all
+
+    if iterator is None:
+        scope: Any = gintervals_2d_all(mode="full")
+        res = gextract(expr, scope, colnames=["value"])
+    elif isinstance(iterator, pd.DataFrame) and "chrom1" in iterator.columns:
+        # Explicit 2D iterator set: its rectangles are the cells to evaluate.
+        res = gextract(expr, iterator, iterator=iterator, colnames=["value"])
+    else:
+        raise ValueError(
+            "A 2D track expression requires either no iterator (use the source "
+            "track's rectangles) or a 2D-intervals iterator"
+        )
+
+    coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    if res is None or len(res) == 0:
+        raise ValueError(
+            f"2D track expression {expr!r} produced no intervals to create a track"
+        )
+
+    intervals_2d = res[coord_cols].copy()
+    values = res["value"].to_numpy()
+
+    # gtrack_2d_create handles its own (atomic) track-dir creation, attribute
+    # writing, dbreload and indexed-format conversion - it must NOT run inside
+    # _atomic_track_create (which is for the C++ pm_track_create_* writers that
+    # honour the dir override).
+    gtrack_2d_create(track, description, intervals_2d, values)
+
+
 def gtrack_create(
     track: str,
     description: str,
@@ -1731,6 +1775,14 @@ def gtrack_create(
     if expr is None:
         raise ValueError("expr cannot be None")
     _validate_track_name(track)
+
+    # 2D track expression (e.g. "test.rects+10"): the 1D scanner cannot iterate
+    # a rectangles track, so evaluate the expression over the 2D scope and write
+    # a 2D RECTS/POINTS track (R's gtrack.create on a 2D expression).
+    from .expr import _expr_is_2d
+    if _expr_is_2d(expr):
+        _gtrack_create_2d_from_expr(track, description, str(expr), iterator)
+        return
 
     if band is not None:
         from .extract import _validate_band

@@ -68,10 +68,24 @@ static void parse_intervals(PMDataFrame &df,
 
         int chromid = chromkey.chrom2id(chrom);
 
-        GInterval interv(chromid, start, end, 0, GInterval::cast2udata(i));
+        // Store the strand column on the GInterval itself (default 0 = no
+        // strand, matching R's convert_rintervs). dist2interv uses the
+        // *target* interval's strand to sign the distance: strand 0 yields an
+        // unsigned (positive) distance, strand +/-1 yields a signed one. Not
+        // setting it here would make every distance unsigned, so a signed
+        // (e.g. all-negative) distance window would never match.
+        char gi_strand = 0;
+        if (strand_col >= 0) {
+            gi_strand = (char)df.val_long(i, strand_col);
+        }
+
+        GInterval interv(chromid, start, end, gi_strand, GInterval::cast2udata(i));
         intervals.push_back(interv);
 
         if (strands) {
+            // Separate query-strand vector for the use_intervals1_strand path,
+            // which (like R's get_strand_value) defaults a missing/zero strand
+            // to + (1) rather than 0.
             int strand = 1;  // default to + strand
             if (strand_col >= 0) {
                 strand = (int)df.val_long(i, strand_col);

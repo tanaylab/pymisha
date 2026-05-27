@@ -16,7 +16,6 @@ def _domain():
     )
 
 
-@pytest.mark.xfail(reason="gcis_decay with a valued src differs from R (last bins; investigate)", strict=True)
 def test_gcis_decay_1():
     dom = _domain()
     src = pm.gextract("test.sparse", pm.gintervals([1, 2, 3, 4, 5]))
