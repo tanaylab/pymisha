@@ -54,7 +54,6 @@ def _screen_2d():
     return i1, i2
 
 
-@pytest.mark.xfail(reason=GAP_2D_ITER, strict=True)
 def test_gscreen_2d_rects():
     i1, i2 = _screen_2d()
     assert_matches_baseline(pm.gextract("test.rects", i1, iterator=i2), "gextract.gscreen.2d.rects")
@@ -69,7 +68,6 @@ def test_gscreen_2d_computed2d():
 # ── 2D ALLGENOME with explicit 2D iterator DataFrame ─────────────────────────
 
 
-@pytest.mark.xfail(reason=GAP_2D_ITER, strict=True)
 def test_2d_allgenome_rects():
     iv = pd.concat([
         pm.gintervals_2d(1, 10, 100, 1, 10, 100),

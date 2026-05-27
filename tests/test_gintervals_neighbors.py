@@ -514,10 +514,20 @@ class TestGintervalsNeighborsRParity:
         )
         assert result is not None and len(result) == 1
 
-    def test_2d_input_raises_not_implemented(self):
+    def test_2d_neighbors_self_is_zero_distance(self):
+        # 2D neighbors are now supported (bounded windows / small inputs); a
+        # rectangle's nearest neighbour against itself is itself, at distance 0.
         ivs2d = pm.gintervals_2d('1', 0, 100, '1', 200, 300)
-        with pytest.raises(NotImplementedError, match="2D"):
-            pm.gintervals_neighbors(ivs2d, ivs2d)
+        res = pm.gintervals_neighbors(ivs2d, ivs2d)
+        assert res is not None and len(res) == 1
+        assert int(res.iloc[0]['dist1']) == 0
+        assert int(res.iloc[0]['dist2']) == 0
+
+    def test_2d_neighbors_intermix_1d_2d_raises(self):
+        ivs2d = pm.gintervals_2d('1', 0, 100, '1', 200, 300)
+        ivs1d = pm.gintervals('1', 0, 100)
+        with pytest.raises(ValueError, match="intermix"):
+            pm.gintervals_neighbors(ivs2d, ivs1d)
 
     def test_warn_ignored_strand_default_true(self, recwarn):
         intervs1 = make_intervals(

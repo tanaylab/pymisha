@@ -222,6 +222,44 @@ class QuadTree:
                 if inter is not None:
                     self._insert(kid, inter, depth + 1, oi, obj_rect)
 
+    def query(self, qx1: int, qy1: int, qx2: int, qy2: int) -> list[int]:
+        """Return indices of inserted objects that strictly overlap the query rect.
+
+        Mirrors R misha's ``StatQuadTree::intersect`` membership test: each
+        object whose stored rectangle has a non-empty (strict ``<``)
+        intersection with ``(qx1, qy1, qx2, qy2)`` is returned exactly once,
+        regardless of how many leaves it spans.  Touching edges do not count.
+        The returned indices are sorted ascending.
+        """
+        found: set[int] = set()
+        self._query_node(self.root, int(qx1), int(qy1), int(qx2), int(qy2), found)
+        return sorted(found)
+
+    def _query_node(
+        self,
+        node: _QuadNode,
+        qx1: int,
+        qy1: int,
+        qx2: int,
+        qy2: int,
+        found: set[int],
+    ) -> None:
+        ax1, ay1, ax2, ay2 = node.arena
+        # Prune subtrees whose arena does not overlap the query.
+        if not (max(ax1, qx1) < min(ax2, qx2) and max(ay1, qy1) < min(ay2, qy2)):
+            return
+        if node.is_leaf:
+            for oi in node.obj_indices:
+                if oi in found:
+                    continue
+                rx1, ry1, rx2, ry2 = self._get_rect(oi)
+                if max(rx1, qx1) < min(rx2, qx2) and max(ry1, qy1) < min(ry2, qy2):
+                    found.add(oi)
+            return
+        for kid in node.kids:
+            if kid is not None:
+                self._query_node(kid, qx1, qy1, qx2, qy2, found)
+
     def _count_subtree_bytes(self, node: _QuadNode) -> int:
         """Estimate serialized byte size of a subtree (excluding chunk header)."""
         obj_size = 32 if self.is_points else 48

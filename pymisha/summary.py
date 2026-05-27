@@ -1224,6 +1224,18 @@ def gintervals_summary(
     _checkroot()
 
     intervals = _maybe_load_intervals_set(intervals)
+
+    # A 2D-rect-set iterator named by string (a 2D track or a 2D interval set)
+    # is loaded to its rectangles so the 2D extract path routes it through the
+    # scalable intersect, stamping each row with its scope-interval index - the
+    # grouping key that lets us emit one summary row per scope interval. (Without
+    # this, a 2D track-name iterator goes through the C++ TrackRects scanner,
+    # whose intervalID is a per-cell index, not the scope index.)
+    if isinstance(iterator, str) and _is_2d_intervals(intervals):
+        _loaded_iter = _maybe_load_intervals_set(iterator)
+        if isinstance(_loaded_iter, _pandas.DataFrame) and _is_2d_intervals(_loaded_iter):
+            iterator = _loaded_iter
+
     orig_intervals = intervals
     orig_iterator = iterator
 

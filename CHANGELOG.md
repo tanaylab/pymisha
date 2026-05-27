@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.0 (2026-05-28)
+
+- **`gextract` now honors a 2D-intervals iterator (DataFrame or interval-set name).** `gextract("rects_track", scope_2d, iterator=other_2d_intervals)` (or `iterator="my_2d_set"`) iterates the rectangles of `iterator ∩ scope` and evaluates the expression on each (with `intervalID` attributing each row to its scope interval), matching R's 2D intervals iterator. Previously the 2D iterator was ignored and the whole scope was object-enumerated.
+- **`giterator_intervals` over a bare 2D track now visits all chrom pairs.** `giterator_intervals("rects_track")` (no scope) now enumerates every rectangle of the track, not just the intra-chromosomal (diagonal) ones, matching R's whole-genome 2D scope. It also accepts a 2D-intervals DataFrame or interval-set name as the `iterator` (returning `iterator ∩ scope` cells), and a 2D-track name as the scope.
+- **`gintervals_summary` now supports a 2D-intervals iterator (DataFrame, interval-set name, or 2D-track name).** `gintervals_summary("rects_track", scope_2d, iterator=other_2d_intervals)` summarizes the expression over the iterator cells within each scope interval (one row per scope interval), matching R.
+- **`gintervals_neighbors` now supports 2D intervals.** For two 2D-interval sets it finds, per query rectangle, the nearest target rectangles on the same chrom-pair within a per-axis distance window (`mindist1`/`maxdist1`/`mindist2`/`maxdist2`), ordered by Manhattan distance, returning `dist1`/`dist2` columns - matching R. Previously any 2D input raised `NotImplementedError`. (A nearest-neighbour search over very large *unbounded* sets still needs a scalable quadtree NN iterator and raises a clear error.)
+- **`gintervals_2d_intersect` is now scalable.** The pairwise rectangle intersection is computed per chrom-pair with an in-memory quadtree instead of an `O(n1·n2)` broadcast, so intersecting large 2D screens (e.g. 10^5 × 10^5 rectangles on one chrom-pair) no longer exhausts memory. Results are unchanged.
+
 ## v0.6.0 (2026-05-27)
 
 - **Array tracks now work in the track-expression scanner.** A `array` track can be used directly in a track expression (`gextract("my.array", ...)`, `gextract("2 * my.array + 17", ...)`), mixed with dense/sparse tracks under an explicit iterator, as the iterator itself (`iterator="my.array"`, one bin per row), and as the source of a value-based virtual track (`gvtrack_create("v", "my.array", "min")`). Each bin's columns are reduced to a scalar (default: average over all columns) which is then aggregated over the iterator interval, matching R. Previously any array track in an expression or as an iterator raised "scanner does not support array tracks".

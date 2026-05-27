@@ -743,6 +743,121 @@ def _validate_2d_intervals(intervals: pd.DataFrame, name: str = "intervals") -> 
         )
 
 
+def _intersect_2d_rects(
+    a: pd.DataFrame, b: pd.DataFrame, *, return_b_index: bool = False
+) -> pd.DataFrame | tuple[pd.DataFrame, Any]:
+    """Clipped pairwise intersection of two 2D rectangle sets, scalably.
+
+    Groups both sets by ``(chrom1, chrom2)``; for each shared chrom-pair builds
+    an in-memory quadtree over the smaller side and queries it with each rect of
+    the larger side, emitting the clipped (strict-overlap) intersection of every
+    overlapping pair.  This mirrors R misha's quadtree-based ``gintervintersect``
+    and avoids the ``O(n1*n2)`` broadcast that OOMs on the 10^5-rect 2D screens.
+
+    Returns an *unsorted* DataFrame with columns ``chrom1, start1, end1,
+    chrom2, start2, end2``.  Each overlapping ``(a, b)`` rectangle pair yields
+    one row (same multiplicity as a brute-force broadcast).
+
+    When ``return_b_index`` is True, also returns a parallel int64 array giving,
+    for each output row, the 0-based positional index into ``b`` of the source
+    rectangle (used to attribute each intersection back to its scope interval).
+    """
+    from ._quadtree import QuadTree
+
+    np = _numpy
+    cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    if a is None or b is None or len(a) == 0 or len(b) == 0:
+        empty = _pandas.DataFrame(columns=cols)
+        return (empty, np.empty(0, dtype=np.int64)) if return_b_index else empty
+
+    ga = a.groupby(["chrom1", "chrom2"], observed=True)
+    gb = b.groupby(["chrom1", "chrom2"], observed=True)
+    common = set(ga.groups.keys()) & set(gb.groups.keys())
+
+    out_c1: list[Any] = []
+    out_c2: list[Any] = []
+    out_s1: list[Any] = []
+    out_e1: list[Any] = []
+    out_s2: list[Any] = []
+    out_e2: list[Any] = []
+    out_bidx: list[Any] = []
+
+    for key in common:
+        da = ga.get_group(key)
+        db = gb.get_group(key)
+        # Positions of this group's rows in the original `b` (get_group and
+        # .indices share the original-row order, so they align element-wise).
+        db_pos = gb.indices[key]
+        # Build the tree over the smaller side; query with the larger side.
+        b_is_tree = len(db) <= len(da)
+        tree_df, query_df = (db, da) if b_is_tree else (da, db)
+
+        ts1 = tree_df["start1"].to_numpy(np.int64)
+        te1 = tree_df["end1"].to_numpy(np.int64)
+        ts2 = tree_df["start2"].to_numpy(np.int64)
+        te2 = tree_df["end2"].to_numpy(np.int64)
+        qs1 = query_df["start1"].to_numpy(np.int64)
+        qe1 = query_df["end1"].to_numpy(np.int64)
+        qs2 = query_df["start2"].to_numpy(np.int64)
+        qe2 = query_df["end2"].to_numpy(np.int64)
+
+        bound1 = int(max(int(te1.max()), int(qe1.max()))) + 1
+        bound2 = int(max(int(te2.max()), int(qe2.max()))) + 1
+
+        qt = QuadTree(0, 0, bound1, bound2, is_points=False)
+        for i in range(len(ts1)):
+            qt.insert((int(ts1[i]), int(ts2[i]), int(te1[i]), int(te2[i]), 0.0))
+
+        q_idx_list: list[int] = []
+        o_idx_list: list[int] = []
+        for j in range(len(qs1)):
+            cand = qt.query(int(qs1[j]), int(qs2[j]), int(qe1[j]), int(qe2[j]))
+            if cand:
+                q_idx_list.extend([j] * len(cand))
+                o_idx_list.extend(cand)
+        if not o_idx_list:
+            continue
+
+        qi = np.asarray(q_idx_list, dtype=np.int64)
+        oi = np.asarray(o_idx_list, dtype=np.int64)
+        ix1 = np.maximum(qs1[qi], ts1[oi])
+        iy1 = np.maximum(qs2[qi], ts2[oi])
+        ix2 = np.minimum(qe1[qi], te1[oi])
+        iy2 = np.minimum(qe2[qi], te2[oi])
+        # query() already guarantees strict overlap; the mask is a safety net.
+        m = (ix1 < ix2) & (iy1 < iy2)
+        if not np.any(m):
+            continue
+        c1, c2 = key
+        n = int(m.sum())
+        out_c1.extend([c1] * n)
+        out_c2.extend([c2] * n)
+        out_s1.append(ix1[m])
+        out_e1.append(ix2[m])
+        out_s2.append(iy1[m])
+        out_e2.append(iy2[m])
+        if return_b_index:
+            # b's local row index for each pair = tree-object index when b is
+            # the tree, else the query index.
+            b_local = oi if b_is_tree else qi
+            out_bidx.append(db_pos[b_local][m])
+
+    if not out_c1:
+        empty = _pandas.DataFrame(columns=cols)
+        return (empty, np.empty(0, dtype=np.int64)) if return_b_index else empty
+    result = _pandas.DataFrame({
+        "chrom1": out_c1,
+        "start1": np.concatenate(out_s1),
+        "end1": np.concatenate(out_e1),
+        "chrom2": out_c2,
+        "start2": np.concatenate(out_s2),
+        "end2": np.concatenate(out_e2),
+    })
+    if return_b_index:
+        return result, np.concatenate(out_bidx).astype(np.int64)
+    return result
+
+
 def gintervals_2d_intersect(intervals1: pd.DataFrame, intervals2: pd.DataFrame) -> pd.DataFrame | None:
     """
     Compute the intersection of two 2D interval sets.
@@ -787,8 +902,6 @@ def gintervals_2d_intersect(intervals1: pd.DataFrame, intervals2: pd.DataFrame) 
     >>> iv2 = pm.gintervals_2d("1", 500, 1500, "1", 500, 1500)
     >>> pm.gintervals_2d_intersect(iv1, iv2)  # doctest: +SKIP
     """
-    np = _numpy
-
     if intervals1 is None or intervals2 is None:
         raise ValueError("intervals1 and intervals2 cannot be None")
 
@@ -798,69 +911,9 @@ def gintervals_2d_intersect(intervals1: pd.DataFrame, intervals2: pd.DataFrame) 
     if len(intervals1) == 0 or len(intervals2) == 0:
         return None
 
-    # Group both sets by (chrom1, chrom2) pair
-    g1 = intervals1.groupby(['chrom1', 'chrom2'], observed=True)
-    g2 = intervals2.groupby(['chrom1', 'chrom2'], observed=True)
-
-    common_keys = set(g1.groups.keys()) & set(g2.groups.keys())
-    if not common_keys:
+    result = _intersect_2d_rects(intervals1, intervals2)
+    if len(result) == 0:
         return None
-
-    res_chrom1 = []
-    res_start1 = []
-    res_end1 = []
-    res_chrom2 = []
-    res_start2 = []
-    res_end2 = []
-
-    for key in sorted(common_keys):
-        df1 = g1.get_group(key)
-        df2 = g2.get_group(key)
-
-        s1_1 = df1['start1'].values
-        e1_1 = df1['end1'].values
-        s2_1 = df1['start2'].values
-        e2_1 = df1['end2'].values
-
-        s1_2 = df2['start1'].values
-        e1_2 = df2['end1'].values
-        s2_2 = df2['start2'].values
-        e2_2 = df2['end2'].values
-
-        # Vectorized pairwise comparison using broadcasting
-        # Shape: (n1, n2)
-        new_s1 = np.maximum(s1_1[:, None], s1_2[None, :])
-        new_e1 = np.minimum(e1_1[:, None], e1_2[None, :])
-        new_s2 = np.maximum(s2_1[:, None], s2_2[None, :])
-        new_e2 = np.minimum(e2_1[:, None], e2_2[None, :])
-
-        valid = (new_s1 < new_e1) & (new_s2 < new_e2)
-
-        if not np.any(valid):
-            continue
-
-        idx = np.nonzero(valid)
-        c1, c2 = key
-
-        count = len(idx[0])
-        res_chrom1.extend([c1] * count)
-        res_start1.append(new_s1[idx])
-        res_end1.append(new_e1[idx])
-        res_chrom2.extend([c2] * count)
-        res_start2.append(new_s2[idx])
-        res_end2.append(new_e2[idx])
-
-    if not res_chrom1:
-        return None
-
-    result = _pandas.DataFrame({
-        'chrom1': res_chrom1,
-        'start1': np.concatenate(res_start1),
-        'end1': np.concatenate(res_end1),
-        'chrom2': res_chrom2,
-        'start2': np.concatenate(res_start2),
-        'end2': np.concatenate(res_end2),
-    })
 
     return _sort_2d_intervals(result)
 
@@ -2106,6 +2159,174 @@ def gintervals_coverage_fraction(
     return covered_bp / total_bp
 
 
+_NEIGHBORS_2D_BRUTE_LIMIT = 100_000_000
+
+
+def _neighbors_2d(
+    i1: pd.DataFrame,
+    i2: pd.DataFrame,
+    maxneighbors: int,
+    mindist1: float,
+    maxdist1: float,
+    mindist2: float,
+    maxdist2: float,
+    na_if_notfound: bool,
+) -> pd.DataFrame | None:
+    """2D nearest-neighbor search between two 2D-interval sets (R parity).
+
+    For each rectangle of *i1*, finds up to *maxneighbors* rectangles of *i2* on
+    the SAME chrom-pair whose per-axis unsigned gaps ``(dist1, dist2)`` lie in
+    ``[mindist1, maxdist1] x [mindist2, maxdist2]``, ordered by Manhattan
+    distance ``dist1 + dist2`` (then by target index).  Mirrors R's
+    ``gfind_neighbors`` 2D branch (``StatQuadTree::NNIterator``); the result is
+    sorted by ``(query index, dist1 + dist2, target index)``.
+
+    A bounded distance window uses the in-memory quadtree (expanded-rectangle
+    query); an unbounded window (the default ``maxdist = 1e9`` sentinel) falls
+    back to a per-chrom-pair brute force and raises ``NotImplementedError`` when
+    that would exceed a safety budget (a scalable quadtree NN iterator for huge
+    unbounded sets is not yet ported).
+    """
+    from ._quadtree import QuadTree
+
+    np = _numpy
+    _BIG = 1e9
+    bounded = maxdist1 < _BIG and maxdist2 < _BIG
+
+    def _axis_gap(qa1: int, qa2: int, ta1: int, ta2: int) -> int:
+        if qa1 >= ta2:
+            return qa1 - ta2
+        if qa2 <= ta1:
+            return ta1 - qa2
+        return 0
+
+    c1q = i1["chrom1"].astype(str).to_numpy()
+    c2q = i1["chrom2"].astype(str).to_numpy()
+    qx1 = i1["start1"].to_numpy(np.int64)
+    qx2 = i1["end1"].to_numpy(np.int64)
+    qy1 = i1["start2"].to_numpy(np.int64)
+    qy2 = i1["end2"].to_numpy(np.int64)
+
+    tx1 = i2["start1"].to_numpy(np.int64)
+    tx2 = i2["end1"].to_numpy(np.int64)
+    ty1 = i2["start2"].to_numpy(np.int64)
+    ty2 = i2["end2"].to_numpy(np.int64)
+    g2_indices = i2.groupby(["chrom1", "chrom2"], observed=True).indices
+
+    # Brute-force budget guard for unbounded windows.
+    if not bounded:
+        budget = 0
+        g1_indices = i1.groupby(["chrom1", "chrom2"], observed=True).indices
+        for key, q_pos in g1_indices.items():
+            t_pos = g2_indices.get(key)
+            if t_pos is not None:
+                budget += len(q_pos) * len(t_pos)
+        if budget > _NEIGHBORS_2D_BRUTE_LIMIT:
+            raise NotImplementedError(
+                "2D nearest-neighbor search over large unbounded interval sets "
+                "is not yet supported (needs a quadtree NN iterator); supply a "
+                "bounded maxdist1/maxdist2 window or use smaller inputs."
+            )
+
+    pair_tree: dict[tuple, Any] = {}
+
+    def _candidates(key: tuple, j: int) -> Any:
+        t_pos = g2_indices.get(key)
+        if t_pos is None:
+            return None
+        if not bounded:
+            return t_pos
+        tree = pair_tree.get(key)
+        if tree is None:
+            bx = int(max(int(tx2[t_pos].max()), int(qx2.max()))) + 1
+            by = int(max(int(ty2[t_pos].max()), int(qy2.max()))) + 1
+            tree = QuadTree(0, 0, bx, by, is_points=False)
+            for k in t_pos:
+                tree.insert((int(tx1[k]), int(ty1[k]), int(tx2[k]), int(ty2[k]), 0.0))
+            # Map local quadtree object index -> global i2 index.
+            pair_tree[key] = (tree, np.asarray(t_pos, dtype=np.int64))
+            tree, t_pos_arr = pair_tree[key]
+        else:
+            tree, t_pos_arr = tree
+        ex1 = int(qx1[j]) - int(maxdist1) - 1
+        ey1 = int(qy1[j]) - int(maxdist2) - 1
+        ex2 = int(qx2[j]) + int(maxdist1) + 1
+        ey2 = int(qy2[j]) + int(maxdist2) + 1
+        local = tree.query(ex1, ey1, ex2, ey2)
+        return t_pos_arr[local] if len(local) else np.empty(0, dtype=np.int64)
+
+    out_id1: list[int] = []
+    out_id2: list[int] = []
+    out_d1: list[float] = []
+    out_d2: list[float] = []
+
+    for j in range(len(i1)):
+        key = (c1q[j], c2q[j])
+        cands = _candidates(key, j)
+        kept: list[tuple[int, int, int, int]] = []
+        if cands is not None:
+            for k in cands:
+                k = int(k)
+                d1 = _axis_gap(int(qx1[j]), int(qx2[j]), int(tx1[k]), int(tx2[k]))
+                d2 = _axis_gap(int(qy1[j]), int(qy2[j]), int(ty1[k]), int(ty2[k]))
+                if mindist1 <= d1 <= maxdist1 and mindist2 <= d2 <= maxdist2:
+                    kept.append((d1 + d2, k, d1, d2))
+        kept.sort(key=lambda t: (t[0], t[1]))
+        if kept:
+            for (_m, k, d1, d2) in kept[:maxneighbors]:
+                out_id1.append(j)
+                out_id2.append(k)
+                out_d1.append(float(d1))
+                out_d2.append(float(d2))
+        elif na_if_notfound:
+            out_id1.append(j)
+            out_id2.append(-1)
+            out_d1.append(float("nan"))
+            out_d2.append(float("nan"))
+
+    if not out_id1:
+        return None
+
+    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, id2).
+    order = sorted(
+        range(len(out_id1)),
+        key=lambda i: (
+            out_id1[i],
+            abs((out_d1[i] + out_d2[i]) if out_id2[i] >= 0 else 0.0),
+            out_id2[i],
+        ),
+    )
+    id1_arr = [out_id1[i] for i in order]
+    id2_arr = [out_id2[i] for i in order]
+    d1_arr = [out_d1[i] for i in order]
+    d2_arr = [out_d2[i] for i in order]
+
+    # Build the output: i1 columns, then i2 columns (collisions get a "1"
+    # suffix, R make.unique style), then dist1, dist2.
+    left = i1.iloc[id1_arr].reset_index(drop=True)
+    used = set(i1.columns)
+    rename2: dict[str, str] = {}
+    for col in i2.columns:
+        new = col
+        while new in used:
+            new = new + "1"
+        rename2[col] = new
+        used.add(new)
+    has_na = any(t < 0 for t in id2_arr)
+    safe_id2 = [t if t >= 0 else 0 for t in id2_arr]
+    right = i2.iloc[safe_id2].reset_index(drop=True).rename(columns=rename2)
+    out = _pandas.concat([left, right], axis=1)
+    if has_na:
+        na_mask = _numpy.array([t < 0 for t in id2_arr])
+        for col in rename2.values():
+            if out[col].dtype.kind in "iu":
+                out[col] = out[col].astype(float)
+            out.loc[na_mask, col] = _numpy.nan
+    out["dist1"] = d1_arr
+    out["dist2"] = d2_arr
+    return out.reset_index(drop=True)
+
+
 def gintervals_neighbors(
     intervals1: pd.DataFrame | str,
     intervals2: pd.DataFrame | str,
@@ -2194,10 +2415,25 @@ def gintervals_neighbors(
         raise ValueError("intervals2 cannot be None")
 
     if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
-        raise NotImplementedError(
-            "2D gintervals_neighbors is not yet implemented in PyMisha "
-            "(tracked under Group K of the 2026-05-15 parity roadmap)."
+        if not (_is_2d_intervals_df(intervals1) and _is_2d_intervals_df(intervals2)):
+            raise ValueError("Cannot intermix 1D and 2D intervals")
+        if maxneighbors < 1:
+            raise ValueError("maxneighbors must be >= 1")
+        if mindist1 > maxdist1 or mindist2 > maxdist2:
+            raise ValueError("mindist exceeds maxdist")
+        # R returns NULL when an upper bound is negative.
+        if maxdist1 < 0 or maxdist2 < 0 or len(intervals1) == 0:
+            return None
+        df = _neighbors_2d(
+            intervals1, intervals2, int(maxneighbors),
+            float(mindist1), float(maxdist1), float(mindist2), float(maxdist2),
+            na_if_notfound,
         )
+        if intervals_set_out is not None:
+            if df is not None and len(df) > 0:
+                gintervals_save(df, intervals_set_out)
+            return None
+        return df
 
     if mindist1 != -1e9 or maxdist1 != 1e9 or mindist2 != -1e9 or maxdist2 != 1e9:
         # R behaviour: for 1D input these are accepted but unused; we mirror
@@ -4494,9 +4730,18 @@ def giterator_intervals(
                 from .extract import gextract
 
                 if intervals is None:
-                    intervals = gintervals_2d_all()
+                    # R's ALLGENOME used as the scope for a 2D iterator covers
+                    # all chrom pairs (full mode), so a bare 2D-track iterator
+                    # visits every rectangle of the track - not just the
+                    # intra-chromosomal (diagonal) ones.
+                    intervals = gintervals_2d_all(mode="full")
                 elif isinstance(intervals, str):
-                    intervals = gintervals_load(intervals)
+                    # The scope may be an interval-set name *or* a 2D track name
+                    # (its rectangles); _maybe_load_intervals_set handles both,
+                    # whereas gintervals_load only knows interval sets.
+                    from .extract import _maybe_load_intervals_set
+
+                    intervals = _maybe_load_intervals_set(intervals)
 
                 if intervals is None or len(intervals) == 0:
                     return None
@@ -4532,6 +4777,37 @@ def giterator_intervals(
 
     if len(intervals) == 0:
         return None
+
+    # A 2D interval-set name used as the iterator (e.g. "test.bigintervs_2d_5")
+    # is loaded to its rectangles so the DataFrame branch below routes it through
+    # the scalable intersect, matching R's intervals 2D iterator.  (2D *track*
+    # iterators are handled by the TrackRects path above.)
+    if isinstance(itr, str) and gintervals_exists(itr):
+        from .extract import _maybe_load_intervals_set
+
+        _loaded_itr = _maybe_load_intervals_set(itr)
+        if isinstance(_loaded_itr, _pandas.DataFrame) and _is_2d_intervals_df(_loaded_itr):
+            itr = _loaded_itr
+
+    # 2D intervals DataFrame as iterator: the iteration cells are the clipped
+    # intersections of the iterator rects with the 2D scope (R's
+    # TrackExpressionIntervals2DIterator builds a quadtree over the scope and
+    # walks the iterator rects).  Coordinates only - no track values.
+    if (
+        isinstance(itr, _pandas.DataFrame)
+        and _is_2d_intervals_df(itr)
+        and isinstance(intervals, _pandas.DataFrame)
+        and _is_2d_intervals_df(intervals)
+    ):
+        units = _intersect_2d_rects(itr, intervals)
+        if len(units) == 0:
+            return None
+        units = _sort_2d_intervals(units).reset_index(drop=True)
+        units["intervalID"] = _numpy.arange(len(units), dtype=int)
+        if intervals_set_out is not None:
+            gintervals_save(units, intervals_set_out)
+            return None
+        return units
 
     # Handle DataFrame-as-iterator
     intervals, itr, _itr_id_map = _preprocess_intervals_iterator(intervals, itr)

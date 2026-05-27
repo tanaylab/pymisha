@@ -1324,6 +1324,80 @@ def _gextract_2d(
 
     band = _validate_band(band)
 
+    # A 2D interval-set name used as the iterator (not a track) is loaded to its
+    # rectangles so the DataFrame branch below routes it through the scalable
+    # intersect (R's intervals 2D iterator).  2D *track* iterators keep the
+    # TrackRects path further down.
+    if isinstance(iterator, str):
+        from .tracks import gtrack_exists
+
+        if not gtrack_exists(iterator):
+            from .intervals import gintervals_exists
+
+            if gintervals_exists(iterator):
+                _loaded_iter = _maybe_load_intervals_set(iterator)
+                if isinstance(_loaded_iter, pd.DataFrame) and _is_2d_intervals(_loaded_iter):
+                    iterator = _loaded_iter
+
+    # ── 2D intervals DataFrame iterator (K_INTERVALS over iterator ∩ scope) ─
+    # R's TrackExpressionIntervals2DIterator builds a quadtree over the scope and
+    # walks the iterator rects, evaluating the expression on each clipped
+    # intersection.  Mirror that: units = iterator ∩ scope, then run the
+    # K_INTERVALS scanner (one value per unit rect).  A whole-genome scope clips
+    # each iterator rect to itself, so the general intersect also covers it.
+    if (
+        iterator is not None
+        and isinstance(iterator, pd.DataFrame)
+        and _is_2d_intervals(iterator)
+    ):
+        from ._iterator_policy import IntervalsPolicy
+        from .intervals import _intersect_2d_rects
+
+        def _remap_scope_ids(df: pd.DataFrame | None, b_idx: Any) -> pd.DataFrame | None:
+            # The scanner stamps intervalID = position of each unit in the units
+            # list it was handed (one row per unit, in order).  Re-stamp it as the
+            # 1-based index of the *scope* interval the unit came from, matching
+            # R's TrackExpressionIntervals2DIterator (and letting gintervals_summary
+            # group per scope interval).
+            if (
+                df is not None
+                and len(df) > 0
+                and "intervalID" in df.columns
+                and len(df) == len(b_idx)
+            ):
+                pos = df["intervalID"].to_numpy()
+                df = df.copy()
+                df["intervalID"] = b_idx[pos] + 1
+            return df
+
+        resolved = _resolve_exprs_for_scanner(exprs)
+        if resolved is not None:
+            units, b_idx = _intersect_2d_rects(iterator, intervals, return_b_index=True)
+            if len(units) == 0:
+                return None
+            return _remap_scope_ids(
+                _gextract_2d_via_scanner(
+                    exprs, units, IntervalsPolicy(),
+                    colnames=colnames, band=band, resolved_vars=resolved,
+                ),
+                b_idx,
+            )
+        compound = _resolve_2d_compound_for_scanner(exprs)
+        if compound is not None:
+            units, b_idx = _intersect_2d_rects(iterator, intervals, return_b_index=True)
+            if len(units) == 0:
+                return None
+            eval_specs, var_specs = compound
+            return _remap_scope_ids(
+                _gextract_2d_compound_via_scanner(
+                    exprs, units, IntervalsPolicy(),
+                    colnames=colnames, band=band,
+                    eval_specs=eval_specs, var_specs=var_specs,
+                ),
+                b_idx,
+            )
+        # vtracks / non-routable expression: fall through to the legacy path.
+
     # ── FixedRect via C++ scanner (new in v0.1.75) ────────────────────────
     # A tuple/list of two positive integers means FixedRect binning.
     # Route through pm_extract_2d_scanner when expressions are bare physical
