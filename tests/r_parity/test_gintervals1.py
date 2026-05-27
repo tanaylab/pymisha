@@ -54,7 +54,7 @@ _CASES = {
     "gintervals.chrom_sizes.1": (lambda: pm.gintervals_chrom_sizes("bigintervs1d"), None),
     "gintervals.chrom_sizes.2": (lambda: pm.gintervals_chrom_sizes("bigintervs2d"), None),
     "gintervals.chrom_sizes.3": (lambda: pm.gintervals_chrom_sizes("test.tss"), None),
-    "gintervals.chrom_sizes.4": (lambda: pm.gintervals_chrom_sizes("test.array"), GAP_ARRAY),
+    "gintervals.chrom_sizes.4": (lambda: pm.gintervals_chrom_sizes("test.array"), None),
     "gintervals.chrom_sizes.5": (lambda: pm.gintervals_chrom_sizes("test.sparse"), None),
     "gintervals.chrom_sizes.6": (lambda: pm.gintervals_chrom_sizes("test.rects"), None),
     "gintervals.diff.1": (lambda: pm.gintervals_diff(_scr("test.fixedbin > 0.2", _i1([1, 2], 0, -1)), _scr("test.fixedbin > 0.4", _i1([1, 2], 0, -1))), None),

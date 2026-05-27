@@ -36,7 +36,6 @@ def test_gextract_sparse():
     )
 
 
-@pytest.mark.xfail(reason="array-track gextract not supported (use gtrack_array_extract)", strict=True)
 def test_gextract_array():
     assert_matches_baseline(
         pm.gextract("test.array", _screen_intervs()), "gextract.array"
@@ -76,7 +75,6 @@ def test_gextract_allgenome_sparse():
     )
 
 
-@pytest.mark.xfail(reason="array-track gextract not supported", strict=True)
 def test_gextract_allgenome_array():
     assert_matches_baseline(
         pm.gextract("test.array", pm.gintervals_all()), "gextract.allgenome.array"

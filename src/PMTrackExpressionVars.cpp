@@ -197,9 +197,11 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
         // "cannot implicitly determine iterator policy"). Any other type
         // mismatch (e.g. 1D vs 2D, arrays) remains unsupported.
         const bool a_scalar_1d = track_type == GenomeTrack::FIXED_BIN ||
-                                 track_type == GenomeTrack::SPARSE;
+                                 track_type == GenomeTrack::SPARSE ||
+                                 track_type == GenomeTrack::ARRAYS;
         const bool b_scalar_1d = m_common_track_type == GenomeTrack::FIXED_BIN ||
-                                 m_common_track_type == GenomeTrack::SPARSE;
+                                 m_common_track_type == GenomeTrack::SPARSE ||
+                                 m_common_track_type == GenomeTrack::ARRAYS;
         if (a_scalar_1d && b_scalar_1d) {
             // Keep m_common_track_type as the first track's type so any later
             // genuinely-incompatible track (2D/array) still trips this guard;
@@ -243,11 +245,11 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
     } else if (track_type == GenomeTrack::SPARSE) {
         var.track = std::make_unique<GenomeTrackSparse>();
     } else if (track_type == GenomeTrack::ARRAYS) {
-        TGLError("gextract / scanner does not support array tracks yet. "
-                 "Use gtrack_array_extract('%s', ...) to read the per-column "
-                 "values, or gtrack_array_get_colnames() to inspect the "
-                 "column names.",
-                 track_name.c_str());
+        // Array tracks reduce each bin's columns to a scalar (default: avg over
+        // all columns) which is then aggregated over the iterator interval, just
+        // like a sparse track. A column slice / reduction can be configured via
+        // a vtrack (gvtrack.array.slice); a bare array name uses the default.
+        var.track = std::make_unique<GenomeTrackArray>();
     } else {
         TGLError("Track type '%s' not yet supported for track: %s",
                  GenomeTrack::TYPE_NAMES[track_type], track_name.c_str());
@@ -446,6 +448,38 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
 
             sparse->read_interval(interval);
             var.values[idx] = sparse->last_avg();
+            continue;
+        }
+
+        if (var.track_type == GenomeTrack::ARRAYS) {
+            GenomeTrackArray *array = static_cast<GenomeTrackArray *>(var.track.get());
+
+            if (var.cur_chromid != interval.chromid) {
+                std::string chrom_file = GenomeTrack::find_existing_1d_filename(
+                    g_pmdb->chromkey(), var.track_path, interval.chromid);
+                std::string full_path = var.track_path + "/" + chrom_file;
+                // Indexed tracks have no per-chrom file (data is in track.dat via
+                // track.idx); init_read reads through the index. Only gate on the
+                // per-chrom file for the per-chromosome layout.
+                const bool indexed =
+                    access((var.track_path + "/track.idx").c_str(), F_OK) == 0;
+                if (!indexed && access(full_path.c_str(), F_OK) != 0) {
+                    var.cur_chromid = interval.chromid;
+                    var.cur_chromid_valid = false;
+                } else {
+                    array->init_read(full_path.c_str(), interval.chromid);
+                    var.cur_chromid = interval.chromid;
+                    var.cur_chromid_valid = true;
+                }
+            }
+
+            if (!var.cur_chromid_valid) {
+                var.values[idx] = std::nan("");
+                continue;
+            }
+
+            array->read_interval(interval);
+            var.values[idx] = array->last_avg();
             continue;
         }
 
@@ -803,6 +837,10 @@ void PMTrackExpressionVars::setup_value_based_vtrack(VTrackVar &vvar, PyObject *
         vvar.src_track = std::make_unique<GenomeTrackFixedBin>();
     } else if (vvar.src_track_type == GenomeTrack::SPARSE) {
         vvar.src_track = std::make_unique<GenomeTrackSparse>();
+    } else if (vvar.src_track_type == GenomeTrack::ARRAYS) {
+        auto array = std::make_unique<GenomeTrackArray>();
+        configure_array_slice(*array, spec);
+        vvar.src_track = std::move(array);
     } else {
         TGLError("Track type not supported for value-based vtrack '%s': source track '%s'",
                  vvar.name.c_str(), vvar.src_track_name.c_str());
@@ -827,6 +865,42 @@ void PMTrackExpressionVars::setup_value_based_vtrack(VTrackVar &vvar, PyObject *
 
     vvar.src_cur_chromid = -1;
     vvar.src_cur_chromid_valid = false;
+}
+
+// ---- configure_array_slice: apply gvtrack.array.slice config to an array track ----
+
+void PMTrackExpressionVars::configure_array_slice(GenomeTrackArray &track, PyObject *spec)
+{
+    // 0-based column indices; empty -> reduce over every column (R parity).
+    std::vector<uint32_t> slice;
+    PyObject *py_slice = vt_dict_get(spec, "slice");
+    if (py_slice && py_slice != Py_None && PySequence_Check(py_slice)) {
+        Py_ssize_t n = PySequence_Size(py_slice);
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            PMPY item(PySequence_GetItem(py_slice, i), true);
+            if (!item) { PyErr_Clear(); continue; }
+            int64_t col = vt_obj_to_int64(item, -1);
+            if (col >= 0)
+                slice.push_back((uint32_t)col);
+        }
+    }
+
+    // Slice reduction function (column reduction within a bin), default avg.
+    std::string sfunc = vt_obj_to_string(vt_dict_get(spec, "slice_func"), "avg");
+    GenomeTrackArray::SliceFunctions func = GenomeTrackArray::S_AVG;
+    for (int i = 0; i < GenomeTrackArray::NUM_S_FUNCS; ++i) {
+        if (sfunc == GenomeTrackArray::SLICE_FUNCTION_NAMES[i]) {
+            func = (GenomeTrackArray::SliceFunctions)i;
+            break;
+        }
+    }
+
+    if (func == GenomeTrackArray::S_QUANTILE) {
+        double pct = vt_obj_to_double(vt_dict_get(spec, "slice_percentile"), 0.5);
+        track.set_slice_quantile(pct, 10000, 1000, 1000, slice);
+    } else {
+        track.set_slice_function(func, slice);
+    }
 }
 
 // ---- eval_value_based_vtrack: compute value for a single shifted interval ----
@@ -861,6 +935,9 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
                 vvar.sp_scan_idx = 0;
                 vvar.sp_last_start = std::numeric_limits<int64_t>::min();
                 vvar.sp_scan_ready = false;
+            } else if (vvar.src_track_type == GenomeTrack::ARRAYS) {
+                auto *ar = static_cast<GenomeTrackArray *>(vvar.src_track.get());
+                ar->init_read(full_path.c_str(), eval.chromid);
             }
             vvar.src_cur_chromid = eval.chromid;
             vvar.src_cur_chromid_valid = true;

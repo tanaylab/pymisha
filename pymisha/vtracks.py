@@ -2165,9 +2165,6 @@ def gvtrack_array_slice(
     """
     _shared._checkroot()
 
-    if params is not None:
-        raise NotImplementedError("array_slice params not yet supported")
-
     # Vtrack must already exist.
     if vtrack not in _shared._VTRACKS:
         raise ValueError(f"gvtrack_array_slice: no such vtrack '{vtrack}'")
@@ -2198,11 +2195,32 @@ def gvtrack_array_slice(
 
     from ._array_track import ARRAY_REDUCE_FUNCS
 
+    # "quantile" is supported via the C++ scanner (StreamPercentiler), in
+    # addition to the reducers the pure-Python path implements.
+    _ALLOWED_SLICE_FUNCS = ARRAY_REDUCE_FUNCS | {"quantile"}
     func_lc = func.lower()
-    if func_lc not in ARRAY_REDUCE_FUNCS:
+    if func_lc not in _ALLOWED_SLICE_FUNCS:
         raise ValueError(
             f"gvtrack_array_slice: func must be one of "
-            f"{sorted(ARRAY_REDUCE_FUNCS)!r}, got {func!r}"
+            f"{sorted(_ALLOWED_SLICE_FUNCS)!r}, got {func!r}"
+        )
+
+    # quantile requires a percentile in params; other reducers take no params.
+    if func_lc == "quantile":
+        pval = params[0] if isinstance(params, (list, tuple)) else params
+        if pval is None:
+            raise ValueError(
+                "gvtrack_array_slice: func='quantile' requires params=<percentile in [0,1]>"
+            )
+        pval = float(pval)
+        if not (0.0 <= pval <= 1.0):
+            raise ValueError(
+                f"gvtrack_array_slice: quantile percentile must be in [0, 1], got {pval}"
+            )
+        params = pval
+    elif params is not None:
+        raise ValueError(
+            f"gvtrack_array_slice: params is only used with func='quantile', got func={func!r}"
         )
 
     # Resolve slice to a list of 0-based int indices (or None = all columns)
@@ -2246,4 +2264,5 @@ def gvtrack_array_slice(
         "src": src,
         "slice_cols": slice_cols,  # None = all columns
         "func": func_lc,
+        "params": params,  # percentile for func="quantile", else None
     }

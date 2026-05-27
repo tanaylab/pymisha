@@ -218,6 +218,10 @@ _CPP_VALUE_FUNCS = {
     "sample.pos.relative",
 }
 
+# Column-reduction functions supported by an array-slice virtual track in C++
+# (GenomeTrackArray::SliceFunctions). "stdev" is R's spelling of "stddev".
+_CPP_ARRAY_SLICE_FUNCS = {"avg", "min", "max", "sum", "stddev", "stdev", "quantile"}
+
 
 def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
     """Check whether all listed vtracks can be evaluated in the C++ scanner.
@@ -232,9 +236,15 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
             return False
-        # Array-slice vtracks must go through Python
+        # Array-slice vtracks evaluate in C++: the source array track is read by
+        # the scanner with the configured column slice + reduction.
         if cfg.get("kind") == "array_slice":
-            return False
+            if not isinstance(cfg.get("src"), str):
+                return False
+            sfunc = str(cfg.get("func", "avg")).lower()
+            if sfunc not in _CPP_ARRAY_SLICE_FUNCS:
+                return False
+            continue
         # Filter vtracks must go through Python
         filt = cfg.get("filter")
         if filt is not None and not (isinstance(filt, _pandas.DataFrame) and len(filt) == 0):
@@ -257,22 +267,28 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
     return True
 
 
-def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | None:
-    """Infer the implicit iterator (bin size) from value-based vtrack sources.
+def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | str | None:
+    """Infer the implicit iterator from value-based vtrack sources.
 
     R determines the implicit iterator of a virtual-track expression from the
     vtrack's *source* track. For value-based vtracks over dense 1D tracks this
-    is the source track's native bin size. Returns that bin size when every
-    listed vtrack is a (non-array-slice, unfiltered) value vtrack over a dense
-    1D track sharing a single bin size, otherwise ``None`` (leaving the caller's
-    existing behavior unchanged for sparse/array/2D/sequence sources).
+    is the source track's native bin size; for an array source it is the array
+    track itself (iterate its bins). Returns:
+
+    - an ``int`` bin size when every vtrack is a value vtrack over a dense 1D
+      track sharing one bin size,
+    - the source track **name** (``str``) when a single array-source vtrack
+      (value or ``array_slice``) drives the expression - the caller resolves it
+      to the array's bins,
+    - ``None`` otherwise (sparse / 2D / sequence / mixed sources unchanged).
     """
     from .tracks import gtrack_exists, gtrack_info
 
     bin_sizes: set[int] = set()
+    array_srcs: set[str] = set()
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
-        if cfg is None or cfg.get("kind") == "array_slice":
+        if cfg is None:
             return None
         src = cfg.get("src")
         if not isinstance(src, str) or not gtrack_exists(src):
@@ -280,10 +296,19 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | No
         info = gtrack_info(src)
         if int(info.get("dimensions", 1) or 1) != 1:
             return None
+        if info.get("type") == "array":
+            array_srcs.add(src)
+            continue
         bs = info.get("bin_size") or info.get("bin.size")
         if bs is None:
-            return None  # sparse / array source: native iterator deferred
+            return None  # sparse source: native iterator deferred
         bin_sizes.add(int(float(bs)))
+    # An array source iterates its own bins; only resolvable when it is the
+    # sole source (a single array track name).
+    if array_srcs:
+        if len(array_srcs) == 1 and not bin_sizes:
+            return array_srcs.pop()
+        return None
     if len(bin_sizes) == 1:
         return bin_sizes.pop()
     return None
@@ -299,6 +324,33 @@ def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[st
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
+            continue
+        # Array-slice vtracks: the configured column reduction is the *slice*
+        # function (applied within each bin); the inter-bin aggregation is a
+        # plain avg (the default array iterator emits one bin per interval, so
+        # avg returns that bin's sliced value). Translate to the C++ spec keys
+        # read by configure_array_slice().
+        if cfg.get("kind") == "array_slice":
+            slice_cols = cfg.get("slice_cols")
+            if slice_cols is not None:
+                # R sorts + de-duplicates the column indices (the C++ slice
+                # lookup also assumes ascending order).
+                slice_cols = sorted({int(c) for c in slice_cols})
+            sfunc = str(cfg.get("func", "avg")).lower()
+            if sfunc == "stdev":
+                sfunc = "stddev"
+            spec = {
+                "src": cfg.get("src"),
+                "func": "avg",
+                "slice": slice_cols,
+                "slice_func": sfunc,
+            }
+            params = cfg.get("params")
+            if params is not None:
+                spec["slice_percentile"] = float(
+                    params[0] if isinstance(params, (list, tuple)) else params
+                )
+            result[name] = spec
             continue
         spec = dict(cfg)
         # Ensure pssm is a numpy array
@@ -2405,6 +2457,13 @@ def gextract(
         _inferred_it = _infer_iterator_from_vtracks(used_vtracks)
         if _inferred_it is not None:
             iterator = _inferred_it
+            # An array source resolves to its track name; expand it to the array
+            # bins (one iterator interval per bin) via the same path a string
+            # track iterator uses, and refresh the intervalID remap.
+            if isinstance(iterator, str):
+                intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(
+                    intervals, iterator
+                )
 
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars

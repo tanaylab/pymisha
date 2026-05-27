@@ -204,6 +204,10 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
             m_expr_vars.get_common_track_type() == GenomeTrack::SPARSE) {
             return std::make_unique<PMSparseIterator>(intervals, m_expr_vars.first_track_path());
         }
+        if (m_expr_vars.has_common_track_type() &&
+            m_expr_vars.get_common_track_type() == GenomeTrack::ARRAYS) {
+            return std::make_unique<PMArrayIterator>(intervals, m_expr_vars.first_track_path());
+        }
 
         int64_t bin_size = m_expr_vars.get_bin_size();
         if (bin_size > 0) {

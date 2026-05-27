@@ -125,14 +125,17 @@ class TestGtrackArrayExtract:
         assert df["col1"].isna().any()
 
 
-class TestGextractOnArrayTrackPointsToHelper:
-    """The C++ scanner doesn't yet integrate array tracks; the error
-    must direct the user to gtrack_array_extract."""
+class TestGextractOnArrayTrackScanner:
+    """The C++ scanner reads array tracks directly: each iterator bin is the
+    average of the array's per-column values aggregated over that bin."""
 
-    def test_helpful_error(self):
+    def test_bare_array_reads(self):
         ivs = pm.gintervals("1", 0, 5000)
-        with pytest.raises(Exception, match="gtrack_array_extract"):
-            pm.gextract("array_track", intervals=ivs, iterator=200)
+        result = pm.gextract("array_track", intervals=ivs, iterator=200)
+        assert result is not None and len(result) > 0
+        assert "array_track" in result.columns
+        # At least one bin carries data.
+        assert result["array_track"].notna().any()
 
 
 class TestArrayTrackHelperExports:

@@ -310,3 +310,136 @@ void PMSparseIterator::next()
         m_isend = true;
     }
 }
+
+
+// ========================= PMArrayIterator =========================
+// Mirrors PMSparseIterator exactly; the only difference is the reader type
+// (GenomeTrackArray) supplying bin coordinates via get_intervals().
+
+PMArrayIterator::PMArrayIterator(const std::vector<GInterval> &intervals, const std::string &track_dir)
+    : m_track_dir(track_dir)
+{
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    const size_t num_chroms = chromkey.get_num_chroms();
+
+    std::vector<std::vector<ScopeEntry>> tmp(num_chroms);
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        const GInterval &interval = intervals[i];
+        if (interval.chromid >= 0 && (size_t)interval.chromid < num_chroms) {
+            tmp[interval.chromid].push_back({interval, i + 1});
+        }
+    }
+
+    for (size_t chromid = 0; chromid < num_chroms; ++chromid) {
+        if (!tmp[chromid].empty()) {
+            m_chrom_order.push_back((int)chromid);
+            m_scope_by_chrom.push_back(std::move(tmp[chromid]));
+        }
+    }
+}
+
+size_t PMArrayIterator::find_first_overlap(const std::vector<GInterval> &intervals, int64_t start) const
+{
+    size_t left = 0;
+    size_t right = intervals.size();
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (intervals[mid].end <= start)
+            left = mid + 1;
+        else
+            right = mid;
+    }
+    return left;
+}
+
+bool PMArrayIterator::load_chrom(size_t chrom_order_idx)
+{
+    const std::string idx_path = m_track_dir + "/track.idx";
+    const bool indexed = access(idx_path.c_str(), F_OK) == 0;
+
+    while (chrom_order_idx < m_chrom_order.size()) {
+        int chromid = m_chrom_order[chrom_order_idx];
+        std::string chrom_file = GenomeTrack::find_existing_1d_filename(
+            g_pmdb->chromkey(), m_track_dir, chromid);
+        std::string full_path = m_track_dir + "/" + chrom_file;
+
+        if (indexed || access(full_path.c_str(), F_OK) == 0) {
+            m_cur_track.init_read(full_path.c_str(), chromid);
+            m_cur_track_intervals = &m_cur_track.get_intervals();
+            if (!m_cur_track_intervals->empty()) {
+                m_cur_chrom_order_idx = chrom_order_idx;
+                m_cur_scope_idx = 0;
+                m_cur_track_idx = 0;
+                return true;
+            }
+        }
+        ++chrom_order_idx;
+    }
+    return false;
+}
+
+bool PMArrayIterator::find_next_overlap()
+{
+    while (m_cur_chrom_order_idx < m_chrom_order.size()) {
+        int chromid = m_chrom_order[m_cur_chrom_order_idx];
+        const auto &scope_entries = m_scope_by_chrom[m_cur_chrom_order_idx];
+        const auto &track_ivs = *m_cur_track_intervals;
+
+        while (m_cur_scope_idx < scope_entries.size()) {
+            const GInterval &scope_iv = scope_entries[m_cur_scope_idx].interval;
+            uint64_t scope_id = scope_entries[m_cur_scope_idx].scope_id;
+
+            if (m_cur_track_idx == 0)
+                m_cur_track_idx = find_first_overlap(track_ivs, scope_iv.start);
+
+            while (m_cur_track_idx < track_ivs.size()) {
+                const GInterval &track_iv = track_ivs[m_cur_track_idx];
+                if (track_iv.start >= scope_iv.end)
+                    break;
+
+                int64_t overlap_start = std::max(scope_iv.start, track_iv.start);
+                int64_t overlap_end = std::min(scope_iv.end, track_iv.end);
+                if (overlap_start < overlap_end) {
+                    m_cur_overlap = GInterval(chromid, overlap_start, overlap_end);
+                    m_cur_scope_id = scope_id;
+                    ++m_cur_track_idx;
+                    return true;
+                }
+                ++m_cur_track_idx;
+            }
+
+            ++m_cur_scope_idx;
+            m_cur_track_idx = 0;
+        }
+
+        size_t next_chrom = m_cur_chrom_order_idx + 1;
+        if (!load_chrom(next_chrom))
+            return false;
+    }
+    return false;
+}
+
+void PMArrayIterator::begin()
+{
+    m_total_emitted = 0;
+    m_cur_chrom_order_idx = 0;
+
+    if (m_chrom_order.empty()) {
+        m_isend = true;
+        return;
+    }
+    if (!load_chrom(0)) {
+        m_isend = true;
+        return;
+    }
+    m_isend = !find_next_overlap();
+}
+
+void PMArrayIterator::next()
+{
+    if (m_isend) return;
+
+    ++m_total_emitted;
+    if (!find_next_overlap())
+        m_isend = true;
+}

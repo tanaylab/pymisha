@@ -31,7 +31,7 @@ _CASES = {
     "gtrack.smooth.fixedbin_LINEAR_RAMP": (lambda n: _smooth_extract(n, "test.fixedbin", "LINEAR_RAMP"), None),
     "gtrack.smooth.fixedbin_MEAN": (lambda n: _smooth_extract(n, "test.fixedbin", "MEAN"), None),
     "gtrack.smooth.sparse_LINEAR_RAMP": (lambda n: _smooth_extract(n, "test.sparse", "LINEAR_RAMP", 1000), None),
-    "gtrack.smooth.array_LINEAR_RAMP": (lambda n: _smooth_extract(n, "test.array", "LINEAR_RAMP", 1000), GAP_ARRAY),
+    "gtrack.smooth.array_LINEAR_RAMP": (lambda n: _smooth_extract(n, "test.array", "LINEAR_RAMP", 1000), None),
 }
 
 

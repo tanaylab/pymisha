@@ -39,7 +39,6 @@ def test_gscreen_1d_sparse():
     assert_matches_baseline(pm.gextract("test.sparse", i1, iterator=i2), "gextract.gscreen.1d.sparse")
 
 
-@pytest.mark.xfail(reason=GAP_ARRAY, strict=True)
 def test_gscreen_1d_array():
     i1, i2 = _screen_1d()
     assert_matches_baseline(pm.gextract("test.array", i1, iterator=i2), "gextract.gscreen.1d.array")

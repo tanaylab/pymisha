@@ -50,7 +50,7 @@ _CASES = {
     # iterator = "test.sparse" (sparse output)
     "gtrack.create.3": (lambda n: _create_extract(n, "test.fixedbin+1", _iv12(), "test.sparse"), None),
     # iterator = "test.array" -> array track (unreadable)
-    "gtrack.create.4": (lambda n: _create_extract(n, "test.fixedbin+1", _iv12(), "test.array"), GAP_ARRAY),
+    "gtrack.create.4": (lambda n: _create_extract(n, "test.fixedbin+1", _iv12(), "test.array"), None),
     # "test.rects+10": 2D track creation from an expression
     "gtrack.create.5": (
         lambda n: _create_extract(n, "test.rects+10", pm.gintervals_2d([2, 3], chroms2=[2, 4])),
@@ -68,7 +68,7 @@ _CASES = {
         lambda n: _create_extract(
             n, "test.fixedbin+1", _iv12(), pm.giterator_intervals("test.array", pm.gintervals([1, 3, 4]))
         ),
-        GAP_ARRAY,
+        None,
     ),
     # "test.rects+10" with a 2D-intervals iterator
     "gtrack.create.8": (

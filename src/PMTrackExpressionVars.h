@@ -19,6 +19,7 @@
 #include "GenomeTrack.h"
 #include "GenomeTrackFixedBin.h"
 #include "GenomeTrackSparse.h"
+#include "GenomeTrackArray.h"
 #include "GenomeSeqScorer.h"
 
 class PMTrackExpressionVars {
@@ -171,6 +172,11 @@ private:
 
     // Set up value-based vtrack from physical track source
     void setup_value_based_vtrack(VTrackVar &vvar, PyObject *spec, const std::string &func);
+
+    // Apply an array track's column slice + reduction from the vtrack spec
+    // (gvtrack.array.slice). No-op when the spec carries no slice keys, leaving
+    // the default avg-over-all-columns reduction.
+    void configure_array_slice(GenomeTrackArray &track, PyObject *spec);
 
     // Evaluate a value-based vtrack for a single interval
     double eval_value_based_vtrack(VTrackVar &vvar, const GInterval &interval);

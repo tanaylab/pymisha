@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.0 (2026-05-27)
+
+- **Array tracks now work in the track-expression scanner.** A `array` track can be used directly in a track expression (`gextract("my.array", ...)`, `gextract("2 * my.array + 17", ...)`), mixed with dense/sparse tracks under an explicit iterator, as the iterator itself (`iterator="my.array"`, one bin per row), and as the source of a value-based virtual track (`gvtrack_create("v", "my.array", "min")`). Each bin's columns are reduced to a scalar (default: average over all columns) which is then aggregated over the iterator interval, matching R. Previously any array track in an expression or as an iterator raised "scanner does not support array tracks".
+- **`gvtrack_array_slice` virtual tracks now evaluate through the fast C++ scanner and support a column quantile.** Selecting a column subset and reduction (`gvtrack_array_slice("v", ["col1", "col3"], func="max")`) is now computed in C++ and, with no explicit iterator, iterates the array's native bins (one value per bin), matching R exactly - including R's float32 standard-deviation accumulation. `func="quantile"` with `params=<percentile>` is now accepted (previously raised `NotImplementedError`).
+
 ## v0.5.2 (2026-05-27)
 
 - **`giterator_intervals` now accepts a numeric 2D iterator.** `giterator_intervals(expr, scope, iterator=(width, height), band=...)` over a 2D scope enumerates the fixed-size grid cells (clipped to the scope and the optional diagonal `band`), matching R's `giterator.intervals(expr, scope, iterator=c(width, height))`. Previously a two-element numeric iterator over a 2D scope raised "intervals must have 'chrom', 'start', and 'end' columns".

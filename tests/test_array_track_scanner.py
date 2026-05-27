@@ -122,15 +122,20 @@ class TestGextractArraySlice:
     """gextract routes array_slice vtracks through Python aggregation."""
 
     def test_avg_all_cols(self):
-        """All columns, avg: result is finite for non-empty intervals."""
+        """All columns, avg: with no explicit iterator the array's own bins
+        drive iteration (one row per bin, R parity), each holding the per-bin
+        column average."""
         pm.gvtrack_create("v_avg", src="array_track")
         pm.gvtrack_array_slice("v_avg", func="avg")
         ivs = _ivs("1", 0, 5000)
         result = pm.gextract("v_avg", intervals=ivs)
         assert result is not None
-        assert len(result) == 1
+        assert len(result) >= 1
         assert "v_avg" in result.columns
-        assert not pd.isna(result["v_avg"].iloc[0])
+        # First bin [0,50): columns 0,2,4,6,8 -> avg 4.0
+        first = result.sort_values(["chrom", "start", "end"]).iloc[0]
+        assert int(first["start"]) == 0
+        np.testing.assert_allclose(float(first["v_avg"]), 4.0, rtol=1e-5)
 
     def test_min_all_cols(self):
         pm.gvtrack_create("v_min", src="array_track")
@@ -207,7 +212,9 @@ class TestGextractArraySlice:
             assert pd.isna(val) or np.isfinite(val)
 
     def test_multi_interval_query(self):
-        """Multiple input intervals each get their own output row."""
+        """Each emitted row carries the intervalID of the scope interval whose
+        region it falls in (the default iterator is the array's bins, so there
+        may be several rows per scope interval)."""
         pm.gvtrack_create("v_avg", src="array_track")
         pm.gvtrack_array_slice("v_avg", func="avg")
         ivs = pd.DataFrame({
@@ -217,7 +224,9 @@ class TestGextractArraySlice:
         })
         result = pm.gextract("v_avg", intervals=ivs)
         assert result is not None
-        assert len(result) == 3
+        assert len(result) >= 1
+        # intervalIDs are a subset of the three scope intervals (1-based).
+        assert set(result["intervalID"]).issubset({1, 2, 3})
 
     def test_with_explicit_iterator(self):
         """Array-slice vtrack works with an explicit bin-size iterator."""
@@ -245,17 +254,49 @@ class TestGextractArraySlice:
 
 
 # ---------------------------------------------------------------------------
-# T5a: Bare array track in gextract still errors with helpful message
+# T5a: Bare array track in gextract reads via the C++ scanner
 # ---------------------------------------------------------------------------
 
-class TestBareArrayTrackError:
-    """gextract('array_track') without a vtrack still errors, pointing
-    to gtrack_array_extract (unchanged from before Spec B)."""
+class TestBareArrayTrackScanner:
+    """gextract('array_track') reads the array directly through the scanner:
+    each bin's columns are averaged (default reduction), matching the per-bin
+    average of gtrack_array_extract."""
 
-    def test_helpful_error_message(self):
-        ivs = _ivs("1", 0, 5000)
-        with pytest.raises(Exception, match="gtrack_array_extract"):
-            pm.gextract("array_track", intervals=ivs, iterator=200)
+    def test_bare_array_default_iterator(self):
+        ivs = _ivs("1", 0, 50000)
+        scanned = pm.gextract("array_track", intervals=ivs)
+        assert scanned is not None and len(scanned) > 0
+        assert "array_track" in scanned.columns
+        # Cross-check the per-bin value against the column average reported by
+        # the independent array-extract reader.
+        ext = pm.gtrack_array_extract("array_track", intervals=ivs)
+        cols = [c for c in ext.columns if c.startswith("col")]
+        ext = ext.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+        scn = scanned.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+        assert len(scn) == len(ext)
+        manual = np.nanmean(ext[cols].to_numpy(dtype=float), axis=1)
+        np.testing.assert_allclose(
+            scn["array_track"].to_numpy(dtype=float), manual, rtol=1e-5, equal_nan=True
+        )
+
+    def test_bare_array_in_expression(self):
+        ivs = _ivs("1", 0, 50000)
+        base = pm.gextract("array_track", intervals=ivs)
+        expr = pm.gextract("2 * array_track + 17", intervals=ivs)
+        base = base.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+        expr = expr.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+        np.testing.assert_allclose(
+            expr["2 * array_track + 17"].to_numpy(dtype=float),
+            2 * base["array_track"].to_numpy(dtype=float) + 17,
+            rtol=1e-5, equal_nan=True,
+        )
+
+    def test_array_as_iterator(self):
+        """iterator='array_track' emits one row per array bin overlapping scope."""
+        ivs = _ivs("1", 0, 50000)
+        bins = pm.gextract("array_track", intervals=ivs)
+        via_iter = pm.gextract("array_track", intervals=ivs, iterator="array_track")
+        assert len(via_iter) == len(bins)
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +388,22 @@ class TestGvtrackArraySliceErrors:
         with pytest.raises(ValueError, match="not an array track"):
             pm.gvtrack_array_slice("v1")
 
-    def test_params_raises(self):
-        """params argument is reserved; must raise NotImplementedError."""
+    def test_params_with_non_quantile_raises(self):
+        """params is only meaningful for func='quantile'; otherwise rejected."""
         pm.gvtrack_create("v1", src="array_track")
-        with pytest.raises(NotImplementedError):
-            pm.gvtrack_array_slice("v1", slice=0, params="something")
+        with pytest.raises(ValueError, match="quantile"):
+            pm.gvtrack_array_slice("v1", slice=[0], func="avg", params=0.4)
+
+    def test_quantile_requires_params(self):
+        """func='quantile' without params raises."""
+        pm.gvtrack_create("v1", src="array_track")
+        with pytest.raises(ValueError, match="quantile"):
+            pm.gvtrack_array_slice("v1", slice=[0], func="quantile")
+
+    def test_quantile_with_params_accepted(self):
+        """func='quantile' with a valid percentile configures the vtrack."""
+        pm.gvtrack_create("v1", src="array_track")
+        pm.gvtrack_array_slice("v1", slice=[0, 1, 2], func="quantile", params=0.4)
+        info = pm.gvtrack_info("v1")
+        assert info["func"] == "quantile"
+        assert info["params"] == 0.4
