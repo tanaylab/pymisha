@@ -1469,6 +1469,18 @@ def _gextract_2d(
         else:
             twod_vtracks.add(vt_name)
 
+    # A 1D vtrack with a dim projection over an explicit 2D iterator iterates
+    # the iterator's cells, not the raw scope. The scanner branches above
+    # could not route it (1D-source vtrack), so enumerate the iterator cells
+    # here and use them as the iteration units; _compute_vtrack_values then
+    # projects each cell onto the vtrack's dimension (R parity).
+    if iterator is not None and dim_vtracks:
+        from .intervals import _enumerate_2d_iterator_intervals
+
+        _units = _enumerate_2d_iterator_intervals(iterator, intervals, band)
+        if _units is not None:
+            intervals = _units
+
     vtrack_to_track = {}
     vtrack_shifts = {}
     vtrack_funcs = {}

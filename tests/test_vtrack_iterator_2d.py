@@ -1,6 +1,7 @@
 """Tests for gvtrack_iterator_2d."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -158,3 +159,73 @@ class TestGvtrackIterator2dExtraction:
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
         with pytest.raises(ValueError, match="does not support 1D iterator shifts"):
             pm.gextract("vt_1d", intervals)
+
+
+class TestDimProjectionOver2DIterator:
+    """A 1D vtrack with a dim projection, extracted over a 2D iterator.
+
+    R parity (test-vtrack.R): gvtrack.iterator(v, dim=1/2) projects the 2D
+    iterator interval onto one axis and evaluates the 1D vtrack there. The
+    iterator (a 2D track) defines the iteration units - one row per iterator
+    rect, NOT one row per scope interval.
+    """
+
+    def _scope(self):
+        # rects_track has data on chrom1='1' (x chrom2 '1' and '2').
+        return pm.gintervals_2d("1", 0, 500_000, "1", 0, 500_000)
+
+    def test_iterates_over_iterator_rects_not_scope(self):
+        """The 2D iterator is applied: many rows (one per rect), not 1 (scope)."""
+        pm.gvtrack_create("vd1", "dense_track")
+        pm.gvtrack_iterator("vd1", dim=1)
+        scope = self._scope()
+        rects = pm.gextract("rects_track", scope, iterator="rects_track")
+        result = pm.gextract("vd1", scope, iterator="rects_track")
+        assert result is not None
+        # One row per iterator rect (the scope is a single interval).
+        assert len(result) == len(rects) > 1
+        assert {"chrom1", "start1", "end1", "chrom2", "start2", "end2"} <= set(result.columns)
+
+    def test_dim1_value_equals_dense_avg_over_projection(self):
+        """dim=1: each value is dense_track's avg over the rect's [start1,end1]."""
+        pm.gvtrack_create("vd1", "dense_track")
+        pm.gvtrack_iterator("vd1", dim=1)
+        scope = self._scope()
+        rects = pm.gextract("rects_track", scope, iterator="rects_track")
+        rects = rects.sort_values("intervalID").reset_index(drop=True)
+        result = pm.gextract("vd1", scope, iterator="rects_track")
+
+        # Independent reference: dense avg over the dim-1 projection of each rect.
+        proj = pd.DataFrame({
+            "chrom": rects["chrom1"].values,
+            "start": rects["start1"].astype(int).values,
+            "end": rects["end1"].astype(int).values,
+        })
+        pm.gvtrack_create("vavg_ref", "dense_track", func="avg")
+        ref = pm.gextract("vavg_ref", proj, iterator=proj).sort_values("intervalID").reset_index(drop=True)
+
+        got = result.sort_values(["chrom1", "start1", "end1", "chrom2", "start2", "end2"]).reset_index(drop=True)
+        exp = rects[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+        exp["v"] = ref["vavg_ref"].values
+        exp = exp.sort_values(["chrom1", "start1", "end1", "chrom2", "start2", "end2"]).reset_index(drop=True)
+        np.testing.assert_allclose(
+            got["vd1"].to_numpy(dtype=float),
+            exp["v"].to_numpy(dtype=float),
+            rtol=1e-6, equal_nan=True,
+        )
+
+    def test_dim1_and_dim2_differ(self):
+        """Projecting onto axis 1 vs axis 2 generally yields different values."""
+        scope = self._scope()
+        pm.gvtrack_create("vp1", "dense_track")
+        pm.gvtrack_iterator("vp1", dim=1)
+        r1 = pm.gextract("vp1", scope, iterator="rects_track")
+        pm.gvtrack_rm("vp1")
+        pm.gvtrack_create("vp2", "dense_track")
+        pm.gvtrack_iterator("vp2", dim=2)
+        r2 = pm.gextract("vp2", scope, iterator="rects_track")
+        # Same number of rows, but the projected values are not all identical.
+        assert len(r1) == len(r2)
+        a = r1.sort_values(["start1", "start2"])["vp1"].to_numpy(dtype=float)
+        b = r2.sort_values(["start1", "start2"])["vp2"].to_numpy(dtype=float)
+        assert not np.allclose(a, b, equal_nan=True)

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2 (2026-05-27)
+
+- **`giterator_intervals` now accepts a numeric 2D iterator.** `giterator_intervals(expr, scope, iterator=(width, height), band=...)` over a 2D scope enumerates the fixed-size grid cells (clipped to the scope and the optional diagonal `band`), matching R's `giterator.intervals(expr, scope, iterator=c(width, height))`. Previously a two-element numeric iterator over a 2D scope raised "intervals must have 'chrom', 'start', and 'end' columns".
+- **A dim-projected 1D virtual track now honors a 2D iterator.** `gextract("v", scope_2d, iterator="rects_track")` for a 1D vtrack with `gvtrack_iterator(dim=1/2)` now iterates the iterator's 2D cells - projecting each onto the chosen axis and evaluating the vtrack there (one row per iterator cell), matching R. Previously the iterator was ignored and the vtrack was evaluated once per 2D scope interval.
+
 ## v0.5.1 (2026-05-27)
 
 - **`gtrack_create` can now build a 2D track from a 2D track expression.** `gtrack_create("t", desc, "rects_track + 10")` (and with a 2D-intervals `iterator`) evaluates the expression over the source track's rectangles and writes a 2D RECTS/POINTS track, matching R's `gtrack.create` on a 2D expression. Previously the 1D scanner could not iterate a rectangles track and no usable track was produced.

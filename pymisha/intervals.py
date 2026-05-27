@@ -4222,6 +4222,143 @@ def _enumerate_cartesian_grid_cells(
     return result
 
 
+def _run_2d_iterator_coords(
+    policy_dict: dict[str, Any],
+    scope_df: pd.DataFrame,
+    band: tuple[int, int] | tuple[float, float] | None,
+    intervals_set_out: str | None,
+) -> pd.DataFrame | None:
+    """Enumerate a 2D iterator policy's cells over a 2D scope (coords only).
+
+    Runs the C++ 2D scanner (``pm_extract_2d_scanner``) with an empty var list
+    so it emits only the iterator cell coordinates, then maps chromids back to
+    names. ``policy_dict`` is any policy the scanner accepts (``fixed_rect``,
+    ``track_rects``, ``cartesian_grid``, ``intervals``).
+    """
+    from .extract import _validate_band
+
+    # chrom name <-> chromid (gintervals_all order == the C++ chromkey order).
+    allg = gintervals_all()
+    chrom2id = {str(c): i for i, c in enumerate(allg["chrom"].tolist())}
+    id2chrom = {i: c for c, i in chrom2id.items()}
+
+    def _chromids(names: Any) -> _numpy.ndarray:
+        return _numpy.array([chrom2id[str(c)] for c in names], dtype=_numpy.int32)
+
+    empty_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    if len(scope_df) == 0:
+        if intervals_set_out is not None:
+            return None
+        return _pandas.DataFrame(columns=empty_cols)
+
+    s = scope_df.copy()
+    s["chrom1"] = _normalize_chroms(s["chrom1"].astype(str).tolist())
+    s["chrom2"] = _normalize_chroms(s["chrom2"].astype(str).tolist())
+    scope_dict = {
+        "chrom1": _chromids(s["chrom1"]),
+        "start1": s["start1"].to_numpy(_numpy.int64),
+        "end1": s["end1"].to_numpy(_numpy.int64),
+        "chrom2": _chromids(s["chrom2"]),
+        "start2": s["start2"].to_numpy(_numpy.int64),
+        "end2": s["end2"].to_numpy(_numpy.int64),
+    }
+
+    band_t = _validate_band(band)
+    band_arg = None if band_t is None else (int(band_t[0]), int(band_t[1]))
+
+    out = _pymisha.pm_extract_2d_scanner(policy_dict, scope_dict, [], [], band_arg)
+
+    result = _pandas.DataFrame(
+        {
+            "chrom1": [id2chrom[i] for i in out["_chrom1"]],
+            "start1": out["_start1"],
+            "end1": out["_end1"],
+            "chrom2": [id2chrom[i] for i in out["_chrom2"]],
+            "start2": out["_start2"],
+            "end2": out["_end2"],
+        }
+    )
+
+    if intervals_set_out is not None:
+        if len(result) == 0:
+            raise ValueError("Cannot save empty intervals")
+        gintervals_save(result, intervals_set_out)
+        return None
+    return result
+
+
+def _enumerate_2d_fixedrect_cells(
+    iterator: tuple[Any, Any] | list,
+    intervals: pd.DataFrame | str | None,
+    band: tuple[int, int] | tuple[float, float] | None,
+    intervals_set_out: str | None,
+) -> pd.DataFrame | None:
+    """Enumerate the cells of a fixed-size 2D iterator over a 2D scope.
+
+    Mirrors R's ``giterator.intervals(expr, scope, iterator = c(width, height))``:
+    subdivides each scope rectangle into a fixed ``width x height`` grid, clips
+    cells at the scope boundaries, applies the optional diagonal ``band``, and
+    returns the cell coordinates (no track values). Delegates to the same C++
+    FixedRect iterator the 2D scanner uses, run with an empty var list so it
+    emits coordinates only.
+    """
+    width = int(float(iterator[0]))
+    height = int(float(iterator[1]))
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "A 2D fixed-bin iterator requires two positive bin sizes"
+        )
+
+    scope_df = _resolve_2d_scope(intervals)
+    return _run_2d_iterator_coords(
+        {"kind": "fixed_rect", "width": width, "height": height},
+        scope_df, band, intervals_set_out,
+    )
+
+
+def _enumerate_2d_iterator_intervals(
+    iterator: Any,
+    intervals: pd.DataFrame | str | None,
+    band: tuple[int, int] | tuple[float, float] | None,
+) -> pd.DataFrame | None:
+    """Enumerate the iteration cells of a 2D iterator over a 2D scope (coords only).
+
+    Returns the 2D-interval coordinates an explicit 2D iterator would visit:
+      * a numeric ``(width, height)`` tuple -> a fixed-rect grid,
+      * a 2D rectangles/points track name -> the track's rects within the scope,
+      * a :class:`CartesianGridSpec` -> the cartesian grid cells.
+    Returns ``None`` for any iterator that is not a recognised 2D iterator
+    (the caller then keeps its existing behaviour).
+    """
+    from ._iterator_policy import CartesianGridSpec
+    from .tracks import gtrack_exists, gtrack_info
+
+    if isinstance(iterator, CartesianGridSpec):
+        return _enumerate_cartesian_grid_cells(iterator, intervals, band, None)
+
+    if (
+        isinstance(iterator, (tuple, list))
+        and len(iterator) == 2
+        and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in iterator
+        )
+    ):
+        return _enumerate_2d_fixedrect_cells(iterator, intervals, band, None)
+
+    if (
+        isinstance(iterator, str)
+        and gtrack_exists(iterator)
+        and int(gtrack_info(iterator).get("dimensions", 1) or 1) == 2
+    ):
+        scope_df = _resolve_2d_scope(intervals)
+        return _run_2d_iterator_coords(
+            {"kind": "track_rects", "track_name": iterator},
+            scope_df, band, None,
+        )
+
+    return None
+
+
 def giterator_intervals(
     expr: str | None = None,
     intervals: pd.DataFrame | str | None = None,
@@ -4307,6 +4444,20 @@ def giterator_intervals(
     from ._iterator_policy import CartesianGridSpec
     if isinstance(iterator, CartesianGridSpec):
         return _enumerate_cartesian_grid_cells(
+            iterator, intervals, band=band, intervals_set_out=intervals_set_out
+        )
+
+    # Numeric 2D iterator c(width, height): a fixed-rect grid over a 2D scope
+    # (R's giterator.intervals(expr, scope, iterator = c(width, height))). The
+    # expr only matters when the iterator is implicit, so it is ignored here.
+    if (
+        isinstance(iterator, (tuple, list))
+        and len(iterator) == 2
+        and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in iterator
+        )
+    ):
+        return _enumerate_2d_fixedrect_cells(
             iterator, intervals, band=band, intervals_set_out=intervals_set_out
         )
 

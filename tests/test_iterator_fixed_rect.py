@@ -486,6 +486,100 @@ def test_r_vtrack_fixedbin_quantile_2d_chroms1_6_1_5_raises():
 
 
 # ---------------------------------------------------------------------------
+# giterator_intervals with a numeric 2D iterator (FixedRect cell enumeration)
+# ---------------------------------------------------------------------------
+# R parity: giterator.intervals(expr, scope, iterator=c(width, height)) returns
+# the iterator cells (coordinates only, no track values) over a 2D scope.
+# Ports the structural intent of test-giterator.intervals.R cases 4 and 13.
+
+
+def _fixedrect_scope():
+    return pd.DataFrame({
+        "chrom1": ["1"], "start1": [0], "end1": [500_000],
+        "chrom2": ["1"], "start2": [0], "end2": [500_000],
+    })
+
+
+def test_giterator_intervals_2d_fixed_rect_grid():
+    """A numeric 2D iterator enumerates every grid cell (coords only).
+
+    5x5 = 25 cells over chr1 x chr1 [0,500k) x [0,500k); the returned set of
+    rectangles must equal the hand-built grid exactly.
+    """
+    result = pm.giterator_intervals(None, _fixedrect_scope(), iterator=(100_000, 100_000))
+    assert result is not None
+    # No value column -- only the 6 coordinate columns.
+    assert list(result.columns) == [
+        "chrom1", "start1", "end1", "chrom2", "start2", "end2"
+    ]
+
+    expected = []
+    for y in range(0, 500_000, 100_000):
+        for x in range(0, 500_000, 100_000):
+            expected.append(("1", x, x + 100_000, "1", y, y + 100_000))
+    exp = pd.DataFrame(expected, columns=result.columns)
+
+    key = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    got = result.sort_values(key).reset_index(drop=True)
+    exp = exp.sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(got, exp, check_dtype=False)
+
+
+def test_giterator_intervals_2d_fixed_rect_ignores_expr():
+    """The expr is ignored when the iterator is explicit: a 2D track name as
+    expr produces the same cells as expr=None (R parity)."""
+    key = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    none_expr = pm.giterator_intervals(
+        None, _fixedrect_scope(), iterator=(100_000, 100_000)
+    ).sort_values(key).reset_index(drop=True)
+    with_expr = pm.giterator_intervals(
+        "rects_track", _fixedrect_scope(), iterator=(100_000, 100_000)
+    ).sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(none_expr, with_expr, check_dtype=False)
+
+
+def test_giterator_intervals_2d_fixed_rect_non_square_multipair():
+    """Non-square bins over two chrom pairs: exact per-pair cell counts."""
+    scope = pd.DataFrame({
+        "chrom1": ["1", "1"], "start1": [0, 0], "end1": [300_000, 300_000],
+        "chrom2": ["1", "2"], "start2": [0, 0], "end2": [200_000, 200_000],
+    })
+    result = pm.giterator_intervals(None, scope, iterator=(100_000, 50_000))
+    # Each pair: 3 bins (dim1) x 4 bins (dim2) = 12 cells -> 24 total.
+    assert len(result) == 24
+    assert len(result[(result["chrom1"] == "1") & (result["chrom2"] == "1")]) == 12
+    assert len(result[(result["chrom1"] == "1") & (result["chrom2"] == "2")]) == 12
+
+
+def test_giterator_intervals_2d_fixed_rect_band():
+    """A diagonal band reduces the cell set; a band wider than the scope is a
+    no-op (returns the full grid)."""
+    full = pm.giterator_intervals(None, _fixedrect_scope(), iterator=(100_000, 100_000))
+
+    narrow = pm.giterator_intervals(
+        None, _fixedrect_scope(), iterator=(100_000, 100_000), band=(-100_000, 100_000)
+    )
+    assert 0 < len(narrow) < len(full)
+
+    wide = pm.giterator_intervals(
+        None, _fixedrect_scope(), iterator=(100_000, 100_000),
+        band=(-10_000_000, 10_000_000),
+    )
+    key = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    pd.testing.assert_frame_equal(
+        wide.sort_values(key).reset_index(drop=True),
+        full.sort_values(key).reset_index(drop=True),
+        check_dtype=False,
+    )
+
+
+def test_giterator_intervals_2d_fixed_rect_invalid_bin_raises():
+    """A non-positive bin size must raise ValueError."""
+    with pytest.raises(ValueError):
+        pm.giterator_intervals(None, _fixedrect_scope(), iterator=(0, 100_000))
+
+
+# ---------------------------------------------------------------------------
 # Multitask vs single-task equivalence
 # ---------------------------------------------------------------------------
 
