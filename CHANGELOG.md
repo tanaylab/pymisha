@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.1 (2026-05-28)
+
+- **2D `gextract` with a diagonal `band` now clips emitted rectangle coords to the band-intersected area.** Each contact rectangle returned by a 2D extract (raw track or scanner-driven aggregation over an intervals iterator) is now shrunk to the smallest bounding box containing its intersection with the band, matching R's `DiagonalBand::shrink2intersected` (so e.g. a 10kb-bin contact on the diagonal with `band=(-1024, 1024)` keeps its on-diagonal slice instead of returning the full bin). Previously pymisha returned the raw stored coords. Inter-chrom rectangles under an active band are now skipped, matching R.
+- **`weighted.sum` (and other 2D stats) over a near-diagonal band now agree with R.** The band-intersected area formula used a wrong corner (`y1` instead of `y2`) in the d1-triangle subtraction, over-reporting area by ~3x on contact bins that straddle the diagonal. Fixed to match R's `DiagonalBand::intersected_area`.
+- **2D `gextract` over a 2D-intervals scope/iterator now normalizes chromosome names (`chr1 ↔ 1`) before looking them up.** Previously the C++ scanner path used a raw chrom-name lookup, so passing a DataFrame whose `chrom1`/`chrom2` carried a `chr` prefix against a DB that stores chroms without it (or vice versa) produced `chromid=-1` and combined with a registered virtual track could crash with `std::bad_alloc`. The 1D `gextract` path already normalized; the 2D scanner path now does too.
+- **`gintervals_2d` recycles a length-1 axis against a length-N axis.** `gintervals_2d("chr1", starts, ends)` (axis2 omitted) now produces N rows of `(chr1, starts[i], ends[i]) × (chr1, 0, chrom_size)`, matching R's `data.frame`-style recycling. Previously this raised `ValueError("chroms1 and chroms2 must produce the same number of intervals")` when axis1 was a vector and axis2 fell back to chromosome-wide defaults. Equal-length 1D-vector arguments continue to pair positionally.
+
 ## v0.7.0 (2026-05-28)
 
 - **`gextract` now honors a 2D-intervals iterator (DataFrame or interval-set name).** `gextract("rects_track", scope_2d, iterator=other_2d_intervals)` (or `iterator="my_2d_set"`) iterates the rectangles of `iterator ∩ scope` and evaluates the expression on each (with `intervalID` attributing each row to its scope interval), matching R's 2D intervals iterator. Previously the 2D iterator was ignored and the whole scope was object-enumerated.

@@ -188,14 +188,12 @@ def test_real_k562_vtrack_weighted_sum(hg19_overlay, request):
     assert_matches_baseline(pm.gextract("v_k562_score", sc, band=(1e4, 5e5)), "real_k562_vtrack_weighted_sum.hic.1")
 
 
-def test_gextract_band_exclude_diag(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_BAND, strict=True))
+def test_gextract_band_exclude_diag(hg19_overlay):
     iv = pm.gintervals_2d("chr1", 5e5, 1e6, "chr1", 5e5, 1e6)
     assert_matches_baseline(pm.gextract("hic.test_basic", iv, band=(-2e6, -1024)), "gextract.band.exclude_diag.hic.1")
 
 
-def test_vtrack_band_filter(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_BAND, strict=True))
+def test_vtrack_band_filter(hg19_overlay):
     _clear()
     pm.gvtrack_create("v_test", "hic.test_basic", "weighted.sum")
     it = pm.gintervals_2d("chr1", 5e5, 1e6)
@@ -226,8 +224,7 @@ def test_vtrack_distance_dual(hg19_overlay, request):
     assert_matches_baseline(r, "vtrack.distance.dual.hic.1")
 
 
-def test_intra_vs_far_cis(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_intra_vs_far_cis(hg19_overlay):
     _clear()
     pm.gvtrack_create("v_test", "hic.test_basic", "weighted.sum")
     d = pm.gintervals_load("domains.test")
@@ -238,8 +235,7 @@ def test_intra_vs_far_cis(hg19_overlay, request):
     assert_matches_list_baseline({"intra": intra, "far_cis": far}, "intra_vs_far_cis.hic.1")
 
 
-def test_gscreen_2d_iterator2d(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_gscreen_2d_iterator2d(hg19_overlay):
     _clear()
     s1 = np.arange(5e5, 1e6 + 1, 1e5)
     s2 = np.arange(7e5, 1.2e6 + 1, 1e5)
@@ -254,17 +250,18 @@ def test_gscreen_2d_iterator2d(hg19_overlay, request):
     assert_matches_baseline(r, "gscreen.2d.iterator2d.1")
 
 
-def test_gscreen_multi_criteria(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_gscreen_multi_criteria(hg19_overlay):
     s = np.arange(5e5, 1e6 + 1, 5e4)
     e = s + 5e4
-    grid = pm.gintervals_2d("chr1", s, e, "chr1", s, e)
+    # R parity: ``gintervals.2d("chr1", starts, ends)`` defaults axis2 to
+    # ``(chroms1, 0, -1)`` (= full chr per row). The earlier port mistakenly
+    # passed all 6 axis args, building diagonal rects instead of full-chr rows.
+    grid = pm.gintervals_2d("chr1", s, e)
     r = pm.gscreen("hic.test_score > 40 & hic.test_basic > 0", grid, iterator=grid)
     assert_matches_baseline(r, "gscreen.multi_criteria.1")
 
 
-def test_marginal_diag_correct(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_BAND, strict=True))
+def test_marginal_diag_correct(hg19_overlay):
     _clear()
     iv1 = pm.giterator_intervals(intervals=pm.gintervals("chr1", 0, 5e5), iterator=5e4)
     it2d = pm.gintervals_2d(iv1["chrom"], iv1["start"], iv1["end"])
@@ -274,7 +271,6 @@ def test_marginal_diag_correct(hg19_overlay, request):
     assert_matches_list_baseline({"marginal": marg, "diagonal": diag}, "marginal.diag_correct.hic.1")
 
 
-@pytest.mark.xfail(reason=GAP_GCIS_DECAY, strict=True)
 def test_gcis_decay_basic(hg19_overlay):
     breaks = 2 ** np.arange(10, 20 + 1e-9, 0.5)
     r = pm.gcis_decay("hic.test_basic", breaks, pm.gintervals_all(), pm.gintervals_all(),

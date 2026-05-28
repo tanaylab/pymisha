@@ -14,8 +14,12 @@ PMTrackExpression2DIteratorPolicy::make_iterator(
 {
     switch (kind) {
     case K_INTERVALS:
-        // Existing path: ignore band (scanner applies filter); just walk scope.
-        return std::make_unique<PMTrackExpressionIntervals2DIterator>(scope);
+        // R parity: the iterator itself shrinks emitted rects to the band-
+        // intersected bounding box and skips inter-chrom rects under an active
+        // band (mirrors FixedRect's per-scope-rect shrink). Without this the
+        // scanner emits raw scope coords even when a diagonal band is applied,
+        // diverging from R on near-diagonal gextract / weighted.sum / marginal.
+        return std::make_unique<PMTrackExpressionIntervals2DIterator>(scope, band);
 
     case K_FIXED_RECT:
         return std::make_unique<PMTrackExpressionFixedRectIterator>(

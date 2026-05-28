@@ -1142,12 +1142,17 @@ def _gextract_2d_via_scanner(
             "height": int(policy.height),
         }
     elif isinstance(policy, CartesianGridSpec):
+        from .intervals import _normalize_chroms
+
         cmap = _chrom_id_map()
 
         def _df_to_intervals_dict(df: pd.DataFrame | None) -> dict[str, Any] | None:
             if df is None:
                 return None
-            chrom_strs = df["chrom"].astype(str).tolist()
+            # Normalize chr-prefix to match the DB's storage convention; see the
+            # rationale on the IntervalsPolicy / TrackRectsPolicy chrom mapping
+            # block below.
+            chrom_strs = _normalize_chroms(df["chrom"].astype(str).tolist())
             chromids = _numpy.array(
                 [cmap.get(c, -1) for c in chrom_strs], dtype=_numpy.int32
             )
@@ -1178,16 +1183,22 @@ def _gextract_2d_via_scanner(
         raise TypeError(f"Unsupported iterator policy: {type(policy)!r}")
 
     # Convert chrom name strings to chromid integers for the scope dict.
+    # ``_normalize_chroms`` first maps the input to the DB's storage convention
+    # (e.g. ``chr1 -> 1`` or vice versa), so callers passing the wrong prefix
+    # don't end up with ``chromid=-1`` -- which combined with a registered
+    # vtrack would crash the C++ scanner with ``std::bad_alloc``.
+    from .intervals import _normalize_chroms
+
     cmap = _chrom_id_map()
     chrom1_ids = (
-        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        _pandas.Series(_normalize_chroms(intervals["chrom1"].astype(str).tolist()))
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)
         .to_numpy()
     )
     chrom2_ids = (
-        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        _pandas.Series(_normalize_chroms(intervals["chrom2"].astype(str).tolist()))
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)

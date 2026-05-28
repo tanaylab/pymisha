@@ -387,12 +387,21 @@ void query_objects_node_band(const char *buf, size_t len,
                 if (obj->x1 < query.x2 && obj->x2 > query.x1 &&
                     obj->y1 < query.y2 && obj->y2 > query.y1 &&
                     band.do_intersect_rect(obj->x1, obj->y1, obj->x2, obj->y2)) {
+                    // R parity (StatQuadTree::intersect with band):
+                    //   r = obj.intersect(query); band.shrink2intersected(r);
+                    // emit the band-clipped coords, not the raw obj coords, so
+                    // downstream gextract rows reflect the band-intersected slice.
+                    Rectangle r{
+                        std::max(obj->x1, query.x1), std::max(obj->y1, query.y1),
+                        std::min(obj->x2, query.x2), std::min(obj->y2, query.y2),
+                    };
+                    band.shrink2intersected(r);
                     seen_ids.insert(obj->id);
                     result.ids.push_back(obj->id);
-                    result.x1s.push_back(obj->x1);
-                    result.y1s.push_back(obj->y1);
-                    result.x2s.push_back(obj->x2);
-                    result.y2s.push_back(obj->y2);
+                    result.x1s.push_back(r.x1);
+                    result.y1s.push_back(r.y1);
+                    result.x2s.push_back(r.x2);
+                    result.y2s.push_back(r.y2);
                     result.vals.push_back(obj->val);
                 }
             }

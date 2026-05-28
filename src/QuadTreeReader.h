@@ -162,12 +162,20 @@ struct DiagonalBand {
     }
 
     // Compute intersected area of (already shrinked) rectangle with band
+    //
+    // R parity (DiagonalBand::intersected_area in misha/src/DiagonalBand.h):
+    //   n = x1(y2) - x1 = (y2 + d1) - x1
+    // The triangle to subtract sits above the d1 diagonal; its width on the
+    // top edge (y = y2) is the distance from the rect's left edge to where the
+    // d1 line crosses y2 -- hence y2, not y1. Using y1 (the old pymisha
+    // formula) collapsed the subtraction on near-diagonal contact bins and
+    // over-reported weighted.sum by ~3x on the diagonal.
     int64_t intersected_area(const Rectangle &r) const {
         int64_t a = r.area();
 
         // subtract the area of the triangle above d1
         if (r.x1 - r.y2 + 1 < d1) {
-            int64_t n = r.y1 + d1 - r.x1;
+            int64_t n = (r.y2 + d1) - r.x1;
             a -= (n * n - n) >> 1;
         }
 

@@ -10,6 +10,7 @@
 
 #include <vector>
 #include "GInterval2D.h"
+#include "QuadTreeReader.h"
 
 // Base class for all 2D track expression iterators.
 class PMTrackExpression2DIterator {
@@ -37,9 +38,20 @@ public:
 
 // Iterator that emits each input 2D interval exactly once, in input order.
 // Counterpart to PMIntervalsIterator (1D).
+//
+// R parity (TrackExpressionIntervals2DIterator + DiagonalBand):
+//   - When a band is active and the input interval is on an *inter-chromosomal*
+//     pair, the interval is skipped entirely (matches FixedRect's parity at
+//     PMTrackExpressionFixedRectIterator.cpp:147-151).
+//   - When a band is active and the pair is same-chrom but the band doesn't
+//     intersect the rect at all, the interval is skipped.
+//   - Surviving same-chrom intervals are emitted with their rect *shrunk to
+//     the band-intersected bounding box* (DiagonalBand::shrink2intersected).
 class PMTrackExpressionIntervals2DIterator : public PMTrackExpression2DIterator {
 public:
-    PMTrackExpressionIntervals2DIterator(const std::vector<GInterval2D> &intervals);
+    PMTrackExpressionIntervals2DIterator(
+        const std::vector<GInterval2D> &intervals,
+        const quadtree::DiagonalBand *band = nullptr);
     virtual ~PMTrackExpressionIntervals2DIterator() {}
 
     virtual void begin() override;
@@ -47,7 +59,7 @@ public:
     virtual bool isend() const override { return m_isend; }
 
     virtual const GInterval2D &last_interval() const override {
-        return m_intervals[m_cur_idx];
+        return m_emit;
     }
 
     virtual uint64_t size() const override { return m_intervals.size(); }
@@ -55,9 +67,17 @@ public:
     virtual uint64_t original_interval_idx() const override { return m_cur_idx + 1; }
 
 private:
+    // Position m_cur_idx on the next interval (from m_scan_idx) that survives
+    // the band, applying shrink2intersected; sets m_isend when exhausted.
+    void advance_to_next_emit();
+
     std::vector<GInterval2D> m_intervals;
-    size_t                   m_cur_idx;
+    size_t                   m_cur_idx;     // index of the current emission
+    size_t                   m_scan_idx;    // next candidate to consider
     bool                     m_isend;
+    bool                     m_use_band;
+    quadtree::DiagonalBand   m_band;        // copy (safe under move-only sources)
+    GInterval2D              m_emit;        // current (possibly shrunk) emission
 };
 
 #endif /* PMTRACKEXPRESSION2DITERATOR_H_ */

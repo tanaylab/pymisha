@@ -526,6 +526,23 @@ def gintervals_2d(
     c1, s1, e1 = _make_1d_intervals(chroms1, starts1, ends1)
     c2, s2, e2 = _make_1d_intervals(chroms2, starts2, ends2)
 
+    # R parity: ``gintervals.2d`` builds the result with a ``data.frame(...)`` of
+    # both sides, which recycles a length-1 side against a length-N side. The
+    # common case is ``gintervals.2d(c, s, e)`` with no axis2 args -- chroms2
+    # defaults to chroms1 (length N), starts2/ends2 are scalars (length 1, =>
+    # the per-row chrom's full extent), and the result is N rows of
+    # ``(c[i], s[i], e[i]) x (c[i], 0, chrom_size[c[i]])``. Mirror that here:
+    # broadcast a length-1 axis against a longer axis. (We only broadcast the
+    # 1<->N case to keep accidental length-mismatches loud.)
+    if len(c1) == 1 and len(c2) > 1:
+        c1 = c1 * len(c2)
+        s1 = s1 * len(c2)
+        e1 = e1 * len(c2)
+    elif len(c2) == 1 and len(c1) > 1:
+        c2 = c2 * len(c1)
+        s2 = s2 * len(c1)
+        e2 = e2 * len(c1)
+
     if len(c1) != len(c2):
         raise ValueError("chroms1 and chroms2 must produce the same number of intervals")
 
