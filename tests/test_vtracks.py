@@ -1906,16 +1906,24 @@ class TestValueBasedVtracksPartialGaps:
         # [100-200] and [150-250] unified to [100-250] = 150/150 = 1.0
         np.testing.assert_allclose(result["vb_covign"].values, [1.0], atol=1e-6)
 
-    def test_value_based_distance_center_rejects_overlapping(self):
-        """distance.center rejects overlapping intervals (R line 441-449)."""
+    def test_value_based_distance_center_accepts_overlapping(self):
+        """distance.center accepts overlapping intervals (R misha 5.9.1).
+
+        Previously this rejected overlapping sources; R 5.9.1 made the bin
+        center inside several intervals resolve to the nearest center.
+        """
         src = pd.DataFrame({
             "chrom": ["chr1", "chr1", "chr1"],
             "start": [100, 150, 300],
             "end": [200, 250, 400],
-            "score": [10.0, 20.0, 30.0],
+            "score": [10.0, 20.0, 30.0],  # values ignored by distance.center
         })
-        with pytest.raises(Exception, match="overlapping|overlap"):
-            pm.gvtrack_create("vb_dc_ovlp", src, func="distance.center")
+        pm.gvtrack_create("vb_dc_ovlp", src, func="distance.center")
+        # Bin center 160 lies inside [100,200] (center 150) and [150,250]
+        # (center 200); nearest center is 150 -> |160-150| = 10.
+        q = pd.DataFrame({"chrom": ["chr1"], "start": [160], "end": [161]})
+        result = pm.gextract("vb_dc_ovlp", q, iterator=-1)
+        np.testing.assert_allclose(abs(result["vb_dc_ovlp"].values), [10.0], atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

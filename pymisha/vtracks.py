@@ -1615,7 +1615,10 @@ def gvtrack_create(
 
         prev_end = src_df.groupby("chrom")["end"].shift(1)
         has_overlaps = bool((src_df["start"] < prev_end).fillna(False).any())
-        if has_overlaps and (func_lc == "distance.center" or not is_interval_func):
+        # distance.center now accepts overlapping sources (a bin center inside
+        # several intervals resolves to the nearest center) - matching R misha
+        # 5.9.1. Value-bearing functions still reject overlaps.
+        if has_overlaps and not is_interval_func:
             raise ValueError("overlapping intervals in DataFrame source are not allowed for this function")
 
         src = src_df

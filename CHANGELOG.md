@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.0 (2026-05-29)
+
+- **`distance` / `distance.edge` / `distance.center` virtual tracks now return the true nearest source interval on overlapping or nested sources.** The previous scan could return a non-nearest interval, even a nonzero distance for a query that overlaps a source (e.g. against `rmsk`-style nested intervals). All three now use the same nearest-neighbor index as `gintervals_neighbors`, so `distance.edge` matches it exactly. `distance.center` also no longer errors when the source intervals overlap: a bin center inside several intervals resolves to the nearest center.
+- **`gdb_install_intervals` / `gdb_build_genome` now attach `name` and `geneName` columns to the installed `tss` / `exons` / `utr3` / `utr5` sets.** `name` is the transcript accession; `geneName` is the gene symbol (from the `gene_name` attribute, falling back to `gene_id`, blank when the source has neither). Overlapping features that unify to one interval concatenate their distinct symbols with `;`.
+- **Indexed dense tracks whose first chromosome has no data no longer report `bin_size = 0` or crash on read.** A packed/converted indexed track whose leading chrom has an empty index entry left the bin size uninitialized, so `gtrack_info` reported `bin_size = 0` and subsequent reads divided by zero. The bin size is now back-filled from the first non-empty chromosome.
+
 ## v0.7.1 (2026-05-28)
 
 - **2D `gextract` with a diagonal `band` now clips emitted rectangle coords to the band-intersected area.** Each contact rectangle returned by a 2D extract (raw track or scanner-driven aggregation over an intervals iterator) is now shrunk to the smallest bounding box containing its intersection with the band, matching R's `DiagonalBand::shrink2intersected` (so e.g. a 10kb-bin contact on the diagonal with `band=(-1024, 1024)` keeps its on-diagonal slice instead of returning the full bin). Previously pymisha returned the raw stored coords. Inter-chrom rectangles under an active band are now skipped, matching R.

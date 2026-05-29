@@ -76,7 +76,20 @@ def _install_genes(
     df["chrom"] = df["chrom"].map(translator)
     df = df[df["chrom"].notna()].reset_index(drop=True)
 
+    # Gene-name annotations (R misha 5.10.0): `name` = transcript accession,
+    # `geneName` = gene symbol. R's -geneNameAsName2 uses the gene_name
+    # attribute and falls back to gene_id when absent; we mirror that, leaving a
+    # blank when neither is present.
+    df["name"] = df["attributes"].map(lambda a: a.get("transcript_id", "") or "")
+    df["geneName"] = df["attributes"].map(
+        lambda a: a.get("gene_name") or a.get("gene_id") or ""
+    )
+
     installed: dict[str, int] = {}
+
+    def _join_distinct(series: pd.Series) -> str:
+        vals = sorted({str(v) for v in series if str(v) != ""})
+        return ";".join(vals)
 
     def _save(sub: pd.DataFrame, key: str) -> None:
         if key not in gene_sets:
@@ -84,8 +97,14 @@ def _install_genes(
         if sub.empty:
             return
         name = f"{prefix}{gene_sets[key]}"
-        # Keep only misha-required columns; ensure ordering.
-        out = sub[["chrom", "start", "end"]].copy()
+        # Keep misha-required columns plus the gene-name annotations. Overlapping
+        # features that unify to one interval (e.g. two transcripts sharing a
+        # TSS) concatenate their distinct accessions / symbols with ";", matching
+        # R's gintervals.import_genes annots merge.
+        out = sub[["chrom", "start", "end", "name", "geneName"]].copy()
+        out = out.groupby(
+            ["chrom", "start", "end"], as_index=False, sort=False
+        ).agg({"name": _join_distinct, "geneName": _join_distinct})
         pm.gintervals_save(out, name)
         installed[name] = len(out)
 

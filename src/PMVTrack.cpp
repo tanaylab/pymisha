@@ -24,6 +24,8 @@
 #include "PWMLseEditDistanceScorer.h"
 #include "KmerCounter.h"
 #include "MaskedBpCounter.h"
+#include "SegmentFinder.h"
+#include "Segment.h"
 #include "pmutils.h"
 
 extern PyObject *s_pm_err;
@@ -703,11 +705,6 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
             std::vector<GInterval> eintervs;
 
-            if (func == "distance" || func == "distance.edge") {
-                eintervs = sintervs;
-                std::sort(eintervs.begin(), eintervs.end(), interval_cmp_end);
-            }
-
             if (func == "coverage") {
                 unify_overlaps(sintervs);
             }
@@ -738,10 +735,6 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             size_t s_scan_idx = 0;
             int64_t s_last_key = std::numeric_limits<int64_t>::min();
             int s_last_chrom = -1;
-            // Hybrid scan state for end-sorted source intervals
-            size_t e_scan_idx = 0;
-            int64_t e_last_key = std::numeric_limits<int64_t>::min();
-            int e_last_chrom = -1;
             // Hybrid scan state for neighbor.count expanded intervals (start-sorted)
             size_t nc_scan_idx = 0;
             int64_t nc_last_key = std::numeric_limits<int64_t>::min();
@@ -765,23 +758,6 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 return s_scan_idx;
             };
 
-            // Adaptive lower_bound on end-sorted eintervs array
-            auto adaptive_lb_end = [&](const GInterval &eval) -> size_t {
-                if (eval.chromid == e_last_chrom && eval.end >= e_last_key) {
-                    while (e_scan_idx < eintervs.size() &&
-                           interval_cmp_end(eintervs[e_scan_idx], eval)) {
-                        ++e_scan_idx;
-                    }
-                } else {
-                    e_scan_idx = (size_t)(std::lower_bound(
-                        eintervs.begin(), eintervs.end(), eval,
-                        interval_cmp_end) - eintervs.begin());
-                }
-                e_last_key = eval.end;
-                e_last_chrom = eval.chromid;
-                return e_scan_idx;
-            };
-
             // Adaptive lower_bound on neighbor.count's start-sorted expanded eintervs
             auto adaptive_lb_nc = [&](const GInterval &eval) -> size_t {
                 if (eval.chromid == nc_last_chrom && eval.start >= nc_last_key) {
@@ -799,6 +775,28 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 return nc_scan_idx;
             };
 
+            // Lazy per-chromosome nearest-neighbor index for distance /
+            // distance.edge / distance.center. The 4-candidate lower_bound
+            // heuristic that previously served these missed enclosing / nested
+            // sources, returning a non-nearest interval (even a nonzero distance
+            // for a query that overlaps a source). Routing through the same
+            // SegmentFinder/NNIterator that gintervals_neighbors uses makes the
+            // distance family agree with it exactly (R misha 5.9.1).
+            SegmentFinder<GInterval> finder;
+            SegmentFinder<GInterval>::NNIterator nn(&finder);
+            int finder_chromid = -1;
+            auto ensure_finder = [&](int chromid) {
+                if (finder_chromid == chromid) return;
+                finder_chromid = chromid;
+                finder.reset(0, (int64_t)chromkey.get_chrom_size(chromid));
+                // sintervs is sorted by (chromid, start, end): find this chrom's
+                // contiguous run via lower_bound and insert it.
+                GInterval lo_key(chromid, 0, 1, 0);
+                auto lo = std::lower_bound(sintervs.begin(), sintervs.end(), lo_key, interval_cmp_start);
+                for (auto it = lo; it != sintervs.end() && it->chromid == chromid; ++it)
+                    finder.insert(*it);
+            };
+
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
@@ -811,83 +809,48 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 }
 
                 if (func == "distance") {
+                    ensure_finder(eval.chromid);
                     int64_t coord = (eval.start + eval.end) / 2;
-                    double min_dist = std::numeric_limits<double>::max();
-                    size_t idx = adaptive_lb_start(eval);
-                    auto it = sintervs.begin() + idx;
-                    if (it != sintervs.end() && it->chromid == eval.chromid) {
-                        min_dist = it->dist2coord(coord, dist_margin);
-                    }
-                    if (it != sintervs.begin() && (it - 1)->chromid == eval.chromid) {
-                        double d = (it - 1)->dist2coord(coord, dist_margin);
-                        if (std::fabs(d) < std::fabs(min_dist)) min_dist = d;
-                    }
-
-                    if (min_dist == std::numeric_limits<double>::max()) {
+                    if (!nn.begin(Segment(coord, coord + 1))) {
                         set_nan(i);
                     } else {
-                        size_t idx2 = adaptive_lb_end(eval);
-                        auto it2 = eintervs.begin() + idx2;
-                        if (it2 != eintervs.end() && it2->chromid == eval.chromid) {
-                            double d = it2->dist2coord(coord, dist_margin);
-                            if (std::fabs(d) < std::fabs(min_dist)) min_dist = d;
-                        }
-                        if (it2 != eintervs.begin() && (it2 - 1)->chromid == eval.chromid) {
-                            double d = (it2 - 1)->dist2coord(coord, dist_margin);
-                            if (std::fabs(d) < std::fabs(min_dist)) min_dist = d;
-                        }
-                        out[i] = min_dist;
+                        // Nearest source to the bin center, measured at its edges
+                        // (dist2coord returns 0 / a normalized fraction inside).
+                        out[i] = nn->dist2coord(coord, dist_margin);
                     }
                     continue;
                 }
 
                 if (func == "distance.center") {
-                    // R locates the source interval containing the bin *center*
-                    // by lower_bound on the center coordinate (not the bin start).
-                    // Searching by eval.start misses the containing interval when
-                    // several source intervals begin within [eval.start, coord].
+                    ensure_finder(eval.chromid);
                     int64_t coord = (eval.start + eval.end) / 2;
-                    GInterval ceval = eval;
-                    ceval.start = coord;
-                    ceval.end = coord + 1;
-                    size_t idx = adaptive_lb_start(ceval);
-                    auto it = sintervs.begin() + idx;
-                    double dist = std::numeric_limits<double>::quiet_NaN();
-                    if (it != sintervs.end() && it->chromid == eval.chromid)
-                        dist = it->dist2center(coord);
-                    if (std::isnan(dist) && it != sintervs.begin() && (it - 1)->chromid == eval.chromid)
-                        dist = (it - 1)->dist2center(coord);
-                    out[i] = dist;
+                    double best = std::numeric_limits<double>::quiet_NaN();
+                    // distance.center is defined only when the bin center sits
+                    // inside a source interval. NNIterator yields candidates by
+                    // increasing proximity, so every interval containing the
+                    // point precedes the first one that doesn't; among the
+                    // containing intervals keep the nearest center. With
+                    // non-overlapping sources there is at most one such interval
+                    // (historical behavior); overlapping sources resolve to the
+                    // nearest center instead of erroring.
+                    for (bool ok = nn.begin(Segment(coord, coord + 1)); ok; ok = nn.next()) {
+                        const GInterval &iv = *nn;
+                        if (coord < iv.start || coord >= iv.end) break;
+                        double d = iv.dist2center(coord);
+                        if (std::isnan(best) || std::fabs(d) < std::fabs(best)) best = d;
+                    }
+                    out[i] = best;
                     continue;
                 }
 
                 if (func == "distance.edge") {
-                    int64_t best = std::numeric_limits<int64_t>::max();
-                    size_t idx = adaptive_lb_start(eval);
-                    auto it = sintervs.begin() + idx;
-                    if (it != sintervs.end() && it->chromid == eval.chromid) {
-                        int64_t d = eval.dist2interv(*it);
-                        if (llabs(d) < llabs(best) || best == std::numeric_limits<int64_t>::max())
-                            best = d;
-                    }
-                    if (it != sintervs.begin() && (it - 1)->chromid == eval.chromid) {
-                        int64_t d = eval.dist2interv(*(it - 1));
-                        if (llabs(d) < llabs(best)) best = d;
-                    }
-                    size_t idx2 = adaptive_lb_end(eval);
-                    auto it2 = eintervs.begin() + idx2;
-                    if (it2 != eintervs.end() && it2->chromid == eval.chromid) {
-                        int64_t d = eval.dist2interv(*it2);
-                        if (llabs(d) < llabs(best)) best = d;
-                    }
-                    if (it2 != eintervs.begin() && (it2 - 1)->chromid == eval.chromid) {
-                        int64_t d = eval.dist2interv(*(it2 - 1));
-                        if (llabs(d) < llabs(best)) best = d;
-                    }
-                    if (best == std::numeric_limits<int64_t>::max()) {
+                    ensure_finder(eval.chromid);
+                    if (!nn.begin(Segment(eval.start, eval.end))) {
                         set_nan(i);
                     } else {
-                        out[i] = (double)best;
+                        // Nearest source by edge-to-edge distance; the first
+                        // NN result is the closest, matching gintervals_neighbors.
+                        out[i] = (double)eval.dist2interv(*nn);
                     }
                     continue;
                 }

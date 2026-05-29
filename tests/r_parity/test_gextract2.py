@@ -115,7 +115,9 @@ _GITER_CASES = {
     "17": lambda: pm.gextract("test.generated_2d_5", "test.generated_2d_6", iterator="test.bigintervs_2d_5"),
     "18": lambda: pm.gextract("test.generated_2d_5", "test.generated_2d_6", iterator="test.generated_2d_5"),
 }
-_GITER_XFAIL = {"10", "11", "12", "13", "14", "16", "17"}
+# All 2D giterator_intervals cases now match R: the 2D track / interval-set /
+# DataFrame iterator parity shipped in v0.7.0 (these markers predate that work).
+_GITER_XFAIL: set[str] = set()
 
 
 @pytest.mark.parametrize("n", list(_GITER_CASES))

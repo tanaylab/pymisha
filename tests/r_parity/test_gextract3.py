@@ -38,7 +38,7 @@ _CASES = {
     "gextract.64": (lambda: pm.gextract("test.sparse", _i1([1, 2], 0, 1000000)), None),
     "gextract.63": (lambda: pm.gextract("test.array", _i1([1, 2], 0, 1000000)), None),
     "gextract.62": (lambda: pm.gextract("test.rects", _i2([2, 3], 10000000, 50000000, [2, 4], 30000000, 80000000)), None),
-    "gextract.59": (lambda: pm.gextract("test.rects_big_rects", _i2(list(range(1, 21))), band=(-1874356, 234560)), GAP_BAND_59),
+    "gextract.59": (lambda: pm.gextract("test.rects_big_rects", _i2(list(range(1, 21))), band=(-1874356, 234560)), None),
     "gextract.58": (lambda: pm.gextract("test.computed2d", _i2([6, 8], 10000000, 50000000, [1, 3], 30000000, 80000000)), GAP_COMPUTED),
     "gextract.55": (lambda: pm.gextract("test.computed2d", _i2(list(range(1, 21))), band=(-1874356, 234560)), GAP_COMPUTED),
     "gextract.54": (lambda: pm.gextract("2 * test.fixedbin + 17", _i1([1, 2], 0, 1000000)), None),
