@@ -298,7 +298,6 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
 
     bin_sizes: set[int] = set()
     array_srcs: set[str] = set()
-    twod_srcs: set[str] = set()
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
@@ -309,8 +308,16 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
         info = gtrack_info(src)
         dims = int(info.get("dimensions", 1) or 1)
         if dims == 2:
-            twod_srcs.add(src)
-            continue
+            # 2D-source vtracks intentionally leave the iterator unspecified:
+            # the legacy path produces one row per scope interval (the
+            # historical pymisha contract used by a large surface of local
+            # tests).  R's `gextract` over a no-iterator 2D vtrack does iterate
+            # the source's rects per-row for `weighted.sum`/`area` (see the
+            # K562 r_parity test, currently xfail), but inferring it here
+            # silently changed object/aggregation vtrack output shape for
+            # callers in the wild - too breaking without more R-parity tests
+            # to anchor the right behaviour per func.
+            return None
         if dims != 1:
             return None
         if info.get("type") == "array":
@@ -320,12 +327,6 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
         if bs is None:
             return None  # sparse source: native iterator deferred
         bin_sizes.add(int(float(bs)))
-    # A 2D source iterates its own rects; only resolvable when it is the sole
-    # source. (R's per-vtrack expression-level dispatch matches this.)
-    if twod_srcs:
-        if len(twod_srcs) == 1 and not bin_sizes and not array_srcs:
-            return twod_srcs.pop()
-        return None
     # An array source iterates its own bins; only resolvable when it is the
     # sole source (a single array track name).
     if array_srcs:

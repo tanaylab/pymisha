@@ -719,14 +719,16 @@ def _query_node(
         _visited.discard(key)
 
 
-def _read_file_header(filepath: str) -> tuple[str, int, mmap.mmap]:
+def _read_file_header(filepath: str) -> tuple[bool, int, mmap.mmap]:
     """Read a 2D track file header.
 
     Returns
     -------
-    tuple of (kind, num_objs, data_bytes)
-        kind : str
-            One of ``"RECTS"``, ``"POINTS"``, ``"COMPUTED"``.
+    tuple of (is_points, num_objs, data_bytes)
+        is_points : bool
+            ``True`` for the POINTS signature; ``False`` otherwise (RECTS
+            or COMPUTED). COMPUTED tracks share the 48-byte ``Obj`` layout
+            with RECTS, so the same per-rect unpacker is used downstream.
         num_objs : int
             Number of stored objects (after the optional Computer2D header).
         data_bytes : mmap.mmap
@@ -738,13 +740,13 @@ def _read_file_header(filepath: str) -> tuple[str, int, mmap.mmap]:
     try:
         signature = struct.unpack_from("<i", data, 0)[0]
         if signature == SIGNATURE_RECTS:
-            kind = "RECTS"
+            is_points = False
             payload_offset = 4
         elif signature == SIGNATURE_POINTS:
-            kind = "POINTS"
+            is_points = True
             payload_offset = 4
         elif signature == SIGNATURE_COMPUTED:
-            kind = "COMPUTED"
+            is_points = False
             from ._computer2d import skip_computer2d_header
 
             payload_offset = skip_computer2d_header(data, offset=4)
@@ -752,10 +754,29 @@ def _read_file_header(filepath: str) -> tuple[str, int, mmap.mmap]:
             raise ValueError(f"Unknown 2D track signature: {signature}")
 
         num_objs = struct.unpack_from("<Q", data, payload_offset)[0]
-        return kind, num_objs, data
+        return is_points, num_objs, data
     except Exception:
         data.close()
         raise
+
+
+def _file_track_kind(filepath: str) -> str:
+    """Return ``"RECTS"`` / ``"POINTS"`` / ``"COMPUTED"`` for a 2D track file.
+
+    Lightweight signature-only sniff (no payload parsing).
+    """
+    with open(filepath, "rb") as fh:
+        head = fh.read(4)
+    if len(head) < 4:
+        raise ValueError(f"Truncated 2D track file: {filepath}")
+    sig = struct.unpack_from("<i", head, 0)[0]
+    if sig == SIGNATURE_RECTS:
+        return "RECTS"
+    if sig == SIGNATURE_POINTS:
+        return "POINTS"
+    if sig == SIGNATURE_COMPUTED:
+        return "COMPUTED"
+    raise ValueError(f"Unknown 2D track signature: {sig}")
 
 
 def _payload_offset(data: bytes | mmap.mmap) -> int:
@@ -791,8 +812,7 @@ def read_2d_track_objects(filepath: str) -> tuple[bool, list[tuple[Any, ...]]]:
             For RECTS: (x1, y1, x2, y2, value)
             For POINTS: (x, y, value)
     """
-    kind, num_objs, data = _read_file_header(filepath)
-    is_points = kind == "POINTS"
+    is_points, num_objs, data = _read_file_header(filepath)
     try:
         if num_objs == 0:
             return is_points, []
@@ -1366,8 +1386,7 @@ def query_2d_track_objects(filepath: str, qx1: int, qy1: int, qx2: int, qy2: int
         For RECTS: (x1, y1, x2, y2, value)
         For POINTS: (x, y, value)
     """
-    kind, num_objs, data = _read_file_header(filepath)
-    is_points = kind == "POINTS"
+    is_points, num_objs, data = _read_file_header(filepath)
     try:
         if num_objs == 0:
             return []
@@ -1627,8 +1646,7 @@ def open_2d_pair(track_path: str, c1: str, c2: str) -> tuple[bool, int, bytes | 
     if filepath is None:
         return None
 
-    kind, num_objs, mmap_data = _read_file_header(filepath)
-    file_is_points = kind == "POINTS"
+    file_is_points, num_objs, mmap_data = _read_file_header(filepath)
     if num_objs == 0:
         root_chunk_fpos = 0
     else:

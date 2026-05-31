@@ -27,12 +27,23 @@ def test_read_file_header_recognises_computed():
     chunk = Path(R_TESTDB) / "tracks/test/computed2d.track/chr10-chr8"
     if not chunk.exists():
         pytest.skip(f"R test DB fixture not present at {chunk}")
-    kind, num_objs, data = _read_file_header(str(chunk))
+    is_points, num_objs, data = _read_file_header(str(chunk))
     try:
-        assert kind == "COMPUTED", kind
+        # COMPUTED tracks share the 48-byte Obj layout with RECTS, so the
+        # `_read_file_header` API surfaces them as ``is_points = False``.
+        assert is_points is False
         assert num_objs > 0
     finally:
         data.close()
+
+
+def test_file_track_kind_detects_computed():
+    from pymisha._quadtree import _file_track_kind
+
+    chunk = Path(R_TESTDB) / "tracks/test/computed2d.track/chr10-chr8"
+    if not chunk.exists():
+        pytest.skip(f"R test DB fixture not present at {chunk}")
+    assert _file_track_kind(str(chunk)) == "COMPUTED"
 
 
 # --------------------------------------------------------------------------- #

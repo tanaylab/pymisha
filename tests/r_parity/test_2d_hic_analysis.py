@@ -180,7 +180,14 @@ def test_band_intersect_pos_neg(hg19_overlay):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.xfail(reason=GAP_2D_ITER, strict=True)
 def test_real_k562_vtrack_weighted_sum(hg19_overlay):
+    # Re-deferred in v0.8.6: the v0.8.3 default-iterator-from-2D-source
+    # inference flipped this case but broke a large surface of local
+    # aggregation-vtrack tests that expected one-row-per-scope output.
+    # Routing the iterator inference per-func needs more R-parity tests to
+    # anchor the right shape; until then, this single flip is rolled back
+    # to keep the broader API stable.
     _clear()
     pm.gvtrack_create("v_k562_score", "hic.K562.ela_k562_score", func="weighted.sum")
     sc = pm.gintervals_2d("chr1", 0, 1e6, "chr1", 0, 1e6)

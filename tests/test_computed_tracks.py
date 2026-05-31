@@ -1,4 +1,10 @@
-"""Tests for COMPUTED track detection and informative error messages."""
+"""Tests for unsupported COMPUTED computer types - clear errors only.
+
+Since v0.8.4, COMPUTED tracks backed by ``CT2_AREA`` (=0) or ``CT2_TEST``
+(=3) read end-to-end; this file only exercises the still-rejected types
+``CT2_POTENTIAL`` (=1) and ``CT2_TECHNICAL`` (=2) which raise informative
+``NotImplementedError``s pointing the user at R misha.
+"""
 
 import os
 import shutil
@@ -15,6 +21,7 @@ TRACK_DIR = str(TEST_DB / "tracks")
 
 COMPUTED_TRACK_NAME = "test.computed_stub"
 COMPUTED_SIGNATURE = -11  # GenomeTrack::FORMAT_SIGNATURES[COMPUTED]
+CT2_POTENTIAL = 1  # PotentialComputer2D - not yet ported, raises NotImplementedError.
 
 
 def _track_path(name):
@@ -38,9 +45,13 @@ def _create_computed_track():
     # We add some zero padding so buffered reads don't fail.
     filepath = os.path.join(tdir, "1-1")
     with open(filepath, "wb") as f:
+        # Signature -11 + Computer2DType byte = 1 (CT2_POTENTIAL).
+        # Since v0.8.4, CT2_AREA (=0) / CT2_TEST (=3) are SUPPORTED so we
+        # need an unsupported computer type to keep the NotImplementedError
+        # path in scope.
         f.write(struct.pack("<i", COMPUTED_SIGNATURE))
-        # Pad with zeros - enough for get_type() to succeed without
-        # reading further into the file.
+        f.write(struct.pack("<i", CT2_POTENTIAL))
+        # Pad so buffered reads don't fail probing the file.
         f.write(b"\x00" * 256)
 
     _pymisha.pm_dbreload()

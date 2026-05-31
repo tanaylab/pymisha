@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.6 (2026-05-31)
+
+- **CI is green again on `main`.** Three patches needed since v0.8.3 left the suite red:
+  - **Reverted v0.8.3's "2D-source value vtrack iterator defaults to source rects".** That flip won one r_parity case (`test_real_k562_vtrack_weighted_sum`, now re-xfailed) but silently changed the output shape of every 2D-source vtrack (`area`, `weighted.sum`, `exists`, `size`, `first`, `last`, `sample`, `min`, `max`, `avg`) - too breaking with only a single r_parity test to anchor the right per-func behaviour. The pre-v0.8.3 contract is restored: `gextract("v", scope_2d)` over a 2D-source vtrack returns one row per scope interval with the aggregated value. Pass an explicit `iterator=` to opt in to per-rect iteration.
+  - **`_read_file_header` API reverted to returning `(is_points: bool, num_objs, data)`.** v0.8.4 widened it to `(kind: str, ...)` which broke external test callers that pass `is_points` straight through to `query_2d_track_opened` (the C++ binding does a truthy check). COMPUTED tracks share the 48-byte RectObj layout with RECTS, so `is_points = False` is the right answer there. A new lightweight `_file_track_kind(path)` helper sniffs the signature for callers that specifically need `"COMPUTED"`.
+  - **`test_computed_tracks.py` stub now writes `CT2_POTENTIAL`** (=1) instead of the all-zeros byte (which is `CT2_AREA` - supported since v0.8.4). The file's intent - "COMPUTED tracks with an unsupported computer must raise NotImplementedError" - is preserved.
+
 ## v0.8.5 (2026-05-31)
 
 - **COMPUTED 2D tracks now clip stored rects to the query and recompute the cached value when needed.** R's `Computed_val<T>::val(rect, band)` returns the cached `v` only when `rect` exactly matches the stored coords (and the band contains it); otherwise it recomputes via `Computer2D::compute(rect, band)`. Pymisha's 2D extract now clips each emitted stored rect to (query ∩ band) via the R-parity `DiagonalBand::shrink2intersected` and routes mismatching cases through `recompute_or_cached`, mirroring `update_stat`. `TestComputer2D` mod operator now uses C-style truncation (truncation toward zero, sign of dividend) - matters when band-shrinking produces negative coordinates. `DiagonalBand.do_contain` + `intersected_area` corrected to mirror R's source exactly. Flips r_parity gextract.50 (`2 * test.computed2d + 17`), gextract.55 (band query), gextract.58 (scope-clipping at chrom boundaries), gextract.43 (iterator=COMPUTED + multi-expression).

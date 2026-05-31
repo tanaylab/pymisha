@@ -601,8 +601,7 @@ def gcis_decay(
         csize = chrom_sizes[chrom]
 
         # Open file once, query all objects as numpy arrays
-        kind, num_objs, data = _read_file_header(filepath)
-        file_is_points = kind == "POINTS"
+        file_is_points, num_objs, data = _read_file_header(filepath)
         try:
             if num_objs == 0:
                 continue
