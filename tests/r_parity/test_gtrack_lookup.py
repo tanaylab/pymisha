@@ -71,7 +71,7 @@ def _lookup_2d(namer):
 _CASES = {
     "gtrack.lookup.default_binning": (lambda n: _lookup_1d(n, True), None),
     "gtrack.lookup.no_force_binning": (lambda n: _lookup_1d(n, False), None),
-    "gtrack.lookup.2D_intervals": (_lookup_2d, GAP_2D),
+    "gtrack.lookup.2D_intervals": (_lookup_2d, None),
 }
 
 

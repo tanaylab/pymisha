@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.1 (2026-05-31)
+
+- **2D tracks built with NaN-valued rectangles now retain the NaN rects, matching R.** `gtrack_lookup` with `force_binning=False` on a 2D source, and any other path constructing a 2D RECTS track from NaN-bearing values, previously silently dropped NaN rects so the resulting track was incomplete (an off-diagonal `gtrack_lookup` query returned `None`); they now write the NaN rects to disk, exclude them from per-bin stat aggregations (avg / min / max / sum / weighted.sum), and `gextract` returns all rects including NaN values. `gtrack_lookup` also now evaluates the 2D scope under `mode="full"` so off-diagonal chrompair queries return data.
+
 ## v0.8.0 (2026-05-29)
 
 - **`distance` / `distance.edge` / `distance.center` virtual tracks now return the true nearest source interval on overlapping or nested sources.** The previous scan could return a non-nearest interval, even a nonzero distance for a query that overlaps a source (e.g. against `rmsk`-style nested intervals). All three now use the same nearest-neighbor index as `gintervals_neighbors`, so `distance.edge` matches it exactly. `distance.center` also no longer errors when the source intervals overlap: a bin center inside several intervals resolves to the nearest center.

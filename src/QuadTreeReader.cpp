@@ -43,8 +43,14 @@ static inline const NodeBase *read_node_base(const char *buf, int64_t abs_offset
 
 // -------------------------------------------------------------------
 // Helper: update stat from a rectangle object intersection (no band)
+//
+// NaN-valued objects are stored on disk (R parity: gtrack.lookup with
+// force_binning=FALSE can produce NaN rects) but are skipped from stat
+// aggregates - avg/min/max/sum/weighted.sum exclude them, matching R
+// and the writer-side invariant in pymisha/_quadtree.py.
 // -------------------------------------------------------------------
 static inline void update_stat_rect(float val, int64_t inter_area, QueryStat &stat) {
+    if (std::isnan(val)) return;
     double dval = static_cast<double>(val);
     stat.occupied_area += inter_area;
     stat.weighted_sum += dval * inter_area;
@@ -56,6 +62,7 @@ static inline void update_stat_rect(float val, int64_t inter_area, QueryStat &st
 // Helper: update stat from a point object (no band)
 // -------------------------------------------------------------------
 static inline void update_stat_point(float val, QueryStat &stat) {
+    if (std::isnan(val)) return;
     double dval = static_cast<double>(val);
     stat.occupied_area += 1;
     stat.weighted_sum += dval;
@@ -332,10 +339,21 @@ void query_objects_node(const char *buf, size_t len,
             int64_t kid_abs = kid_chunk + kid_offset;
             const NodeBase *kid_nb = read_node_base(buf, kid_abs);
 
-            if (kid_nb->stat.occupied_area > 0 && kid_nb->arena.do_intersect(query)) {
-                query_objects_node(buf, len, kid_chunk, kid_offset,
-                                   is_points, query, seen_ids, result, depth + 1);
+            // Object queries must reach every spatially-overlapping subtree
+            // that holds objects, even subtrees with only NaN-valued rects
+            // (occupied_area == 0 after the writer excludes NaN from stats).
+            // Use num_objs > 0 as the "has any objects" signal for leaves
+            // (cheap, already serialized); internal kids always carry
+            // objects by writer invariant (a node only splits when a leaf
+            // overflows >= max_node_objs), so we recurse unconditionally
+            // when spatially relevant.
+            if (!kid_nb->arena.do_intersect(query)) continue;
+            if (kid_nb->is_leaf) {
+                const Leaf *kid_leaf = reinterpret_cast<const Leaf *>(buf + kid_abs);
+                if (kid_leaf->num_objs == 0) continue;
             }
+            query_objects_node(buf, len, kid_chunk, kid_offset,
+                               is_points, query, seen_ids, result, depth + 1);
         }
     }
 }
@@ -416,14 +434,19 @@ void query_objects_node_band(const char *buf, size_t len,
             int64_t kid_abs = kid_chunk + kid_offset;
             const NodeBase *kid_nb = read_node_base(buf, kid_abs);
 
-            if (kid_nb->stat.occupied_area > 0 && kid_nb->arena.do_intersect(query)) {
-                // Check if child arena intersects band at all
-                Rectangle intersection = kid_nb->arena.intersect(query);
-                if (band.do_intersect(intersection)) {
-                    query_objects_node_band(buf, len, kid_chunk, kid_offset,
-                                            is_points, query, band,
-                                            seen_ids, result, depth + 1);
-                }
+            // See query_objects_node: prune on num_objs (cheap, on disk)
+            // for leaves rather than occupied_area (which now excludes NaN).
+            if (!kid_nb->arena.do_intersect(query)) continue;
+            if (kid_nb->is_leaf) {
+                const Leaf *kid_leaf = reinterpret_cast<const Leaf *>(buf + kid_abs);
+                if (kid_leaf->num_objs == 0) continue;
+            }
+            // Check if child arena intersects band at all
+            Rectangle intersection = kid_nb->arena.intersect(query);
+            if (band.do_intersect(intersection)) {
+                query_objects_node_band(buf, len, kid_chunk, kid_offset,
+                                        is_points, query, band,
+                                        seen_ids, result, depth + 1);
             }
         }
     }

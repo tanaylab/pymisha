@@ -505,7 +505,13 @@ def gtrack_lookup(
         raise ValueError("Cannot mix 1D and 2D tracks in gtrack_lookup expressions/iterator")
 
     use_2d_scope = (band is not None) or (2 in dims)
-    scope_intervals = gintervals_2d_all() if use_2d_scope else gintervals_all()
+    # R parity: gtrack.lookup evaluates the 2D scope over all chrompairs
+    # (gtrack_bintransform in R C++ uses mode="full"); the default diagonal
+    # mode would omit off-diagonal cells entirely and return None for an
+    # off-diagonal query.
+    scope_intervals = (
+        gintervals_2d_all(mode="full") if use_2d_scope else gintervals_all()
+    )
 
     # Compute lookup values using glookup over the whole genome
     # iterator may be a str (track expression) which glookup handles via gextract

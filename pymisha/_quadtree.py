@@ -132,22 +132,27 @@ class QuadTree:
         self.objs: list[tuple[Any, ...]] = []  # list of (x1, y1, x2, y2, value) for rects or (x, y, value) for points
 
     def insert(self, obj: tuple[Any, ...]) -> None:
-        """Insert an object. For rects: (x1,y1,x2,y2,value). For points: (x,y,value)."""
+        """Insert an object. For rects: (x1,y1,x2,y2,value). For points: (x,y,value).
+
+        NaN-valued objects are stored in ``self.objs`` and spatially indexed
+        (so coordinate queries return them) but are excluded from per-node
+        stat aggregates (weighted_sum / min_val / max_val / occupied_area),
+        matching R: 2D tracks may contain NaN rects (e.g. from
+        ``gtrack.lookup`` with ``force_binning=False``), and stat queries
+        like 2D vtrack avg/min/max/sum/weighted.sum must skip them.
+        """
         if self.is_points:
             x, y, v = obj
-            if np.isnan(v):
-                return
             obj_rect = (x, y, x + 1, y + 1)
         else:
-            if np.isnan(obj[4]):
-                return
+            v = obj[4]
             obj_rect = (obj[0], obj[1], obj[2], obj[3])
         inter = _rect_intersect(obj_rect, self.root.arena)
         if inter is None:
             return
         obj_idx = len(self.objs)
         self.objs.append(obj)
-        self._insert(self.root, inter, 0, obj_idx, obj_rect)
+        self._insert(self.root, inter, 0, obj_idx, obj_rect, is_nan=bool(np.isnan(v)))
 
     def _get_value(self, obj_idx: int) -> float:
         if self.is_points:
@@ -167,14 +172,19 @@ class QuadTree:
         depth: int,
         obj_idx: int,
         obj_rect: tuple[Any, ...],
+        is_nan: bool = False,
     ) -> None:
-        # Update stats
-        area = _rect_area(intersection)
-        val = self._get_value(obj_idx)
-        node.stat["weighted_sum"] += val * area
-        node.stat["min_val"] = min(val, node.stat["min_val"])
-        node.stat["max_val"] = max(val, node.stat["max_val"])
-        node.stat["occupied_area"] += area
+        # Update stats only for finite values: NaN rects are spatially indexed
+        # but excluded from value aggregates (matching R). The invariant
+        # "node.stat aggregates contain only finite values" is preserved, so
+        # existing 2D-vtrack stat queries are unchanged on non-NaN tracks.
+        if not is_nan:
+            area = _rect_area(intersection)
+            val = self._get_value(obj_idx)
+            node.stat["weighted_sum"] += val * area
+            node.stat["min_val"] = min(val, node.stat["min_val"])
+            node.stat["max_val"] = max(val, node.stat["max_val"])
+            node.stat["occupied_area"] += area
 
         if node.is_leaf:
             arena = node.arena
@@ -193,7 +203,7 @@ class QuadTree:
             assert kid is not None
             inter = _rect_intersect(obj_rect, kid.arena)
             if inter is not None:
-                self._insert(kid, inter, depth + 1, obj_idx, obj_rect)
+                self._insert(kid, inter, depth + 1, obj_idx, obj_rect, is_nan=is_nan)
 
     def _split_leaf(self, node: _QuadNode, depth: int) -> None:
         """Convert a leaf to an internal node with 4 children."""
@@ -215,12 +225,15 @@ class QuadTree:
 
         for oi in old_indices:
             obj_rect = self._get_rect(oi)
+            # Preserve NaN-vs-finite status when re-inserting after a split
+            # so the new children's stat aggregates remain finite-only.
+            oi_is_nan = bool(np.isnan(self._get_value(oi)))
             for iquad in range(4):
                 kid = node.kids[iquad]
                 assert kid is not None
                 inter = _rect_intersect(obj_rect, kid.arena)
                 if inter is not None:
-                    self._insert(kid, inter, depth + 1, oi, obj_rect)
+                    self._insert(kid, inter, depth + 1, oi, obj_rect, is_nan=oi_is_nan)
 
     def query(self, qx1: int, qy1: int, qx2: int, qy2: int) -> list[int]:
         """Return indices of inserted objects that strictly overlap the query rect.
@@ -916,6 +929,12 @@ def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offs
             for obj in raw_objs:
                 if is_points:
                     _, ox, oy, val = obj
+                    # NaN-valued objects are stored on disk and returned by
+                    # spatial queries, but must be skipped from stat aggregates
+                    # (matching R: 2D tracks may contain NaN rects, and
+                    # avg/min/max/sum/weighted.sum skip them).
+                    if np.isnan(val):
+                        continue
                     # Point inside both query and arena?
                     if (eqx1 <= ox < eqx2 and eqy1 <= oy < eqy2):
                         stat[0] += 1           # occupied_area
@@ -926,6 +945,8 @@ def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offs
                             stat[3] = val      # max_val
                 else:
                     _, ox1, oy1, ox2, oy2, val = obj
+                    if np.isnan(val):
+                        continue  # NaN-rect: stored on disk, skipped from stats
                     # Intersection clamped to effective query (query ∩ arena)
                     inter = (max(0, min(eqx2, ox2) - max(eqx1, ox1))
                              * max(0, min(eqy2, oy2) - max(eqy1, oy1)))
@@ -1131,6 +1152,8 @@ def _query_2d_track_stats_with_band(data: bytes | mmap.mmap, is_points: bool, nu
 
     if is_points:
         for x, y, val in objs:
+            if np.isnan(val):
+                continue  # NaN-rect: spatially returned, excluded from stats
             if not (d1 <= (x - y) < d2):
                 continue
             occupied_area += 1
@@ -1141,6 +1164,8 @@ def _query_2d_track_stats_with_band(data: bytes | mmap.mmap, is_points: bool, nu
                 max_val = val
     else:
         for ox1, oy1, ox2, oy2, val in objs:
+            if np.isnan(val):
+                continue  # NaN-rect: spatially returned, excluded from stats
             if not ((ox2 - oy1 > d1) and (ox1 - oy2 + 1 < d2)):
                 continue
             inter = (max(0, min(qx2, ox2) - max(qx1, ox1))
