@@ -273,19 +273,21 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
     R determines the implicit iterator of a virtual-track expression from the
     vtrack's *source* track. For value-based vtracks over dense 1D tracks this
     is the source track's native bin size; for an array source it is the array
-    track itself (iterate its bins). Returns:
+    track itself (iterate its bins); for a 2D source it is the 2D track itself
+    (iterate its rects). Returns:
 
     - an ``int`` bin size when every vtrack is a value vtrack over a dense 1D
       track sharing one bin size,
-    - the source track **name** (``str``) when a single array-source vtrack
-      (value or ``array_slice``) drives the expression - the caller resolves it
-      to the array's bins,
-    - ``None`` otherwise (sparse / 2D / sequence / mixed sources unchanged).
+    - the source track **name** (``str``) when a single array-source or
+      2D-source vtrack drives the expression - the caller resolves it to the
+      array's bins / the 2D track's rects,
+    - ``None`` otherwise (sparse / sequence / mixed sources unchanged).
     """
     from .tracks import gtrack_exists, gtrack_info
 
     bin_sizes: set[int] = set()
     array_srcs: set[str] = set()
+    twod_srcs: set[str] = set()
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
@@ -294,7 +296,11 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
         if not isinstance(src, str) or not gtrack_exists(src):
             return None
         info = gtrack_info(src)
-        if int(info.get("dimensions", 1) or 1) != 1:
+        dims = int(info.get("dimensions", 1) or 1)
+        if dims == 2:
+            twod_srcs.add(src)
+            continue
+        if dims != 1:
             return None
         if info.get("type") == "array":
             array_srcs.add(src)
@@ -303,6 +309,12 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
         if bs is None:
             return None  # sparse source: native iterator deferred
         bin_sizes.add(int(float(bs)))
+    # A 2D source iterates its own rects; only resolvable when it is the sole
+    # source. (R's per-vtrack expression-level dispatch matches this.)
+    if twod_srcs:
+        if len(twod_srcs) == 1 and not bin_sizes and not array_srcs:
+            return twod_srcs.pop()
+        return None
     # An array source iterates its own bins; only resolvable when it is the
     # sole source (a single array track name).
     if array_srcs:
@@ -665,6 +677,16 @@ def _resolve_2d_vtrack_var(expr: str) -> tuple[str, str, object, int, int, int, 
         return None
     if int(info.get("dimensions", 1) or 1) != 2:
         return None  # 1D source track; can't use 2D scanner
+
+    # 1D iterator shifts (sshift/eshift, no axis suffix) are invalid on a
+    # 2D-source vtrack -- the legacy path rejects them with the same message;
+    # mirror that here so the scanner path also raises instead of silently
+    # ignoring the shifts.
+    if int(cfg.get("sshift", 0) or 0) != 0 or int(cfg.get("eshift", 0) or 0) != 0:
+        raise ValueError(
+            f"2D extraction for virtual track '{expr}' does not support "
+            "1D iterator shifts"
+        )
 
     params = cfg.get("params")
     sshift1 = int(cfg.get("sshift1", 0) or 0)
@@ -1335,6 +1357,31 @@ def _gextract_2d(
 
     band = _validate_band(band)
 
+    # R parity: a value-based 2D vtrack with no explicit iterator iterates its
+    # source 2D track's rects (the 2D analogue of the array-source default
+    # shipped in v0.6.0 via `_infer_iterator_from_vtracks`).  Resolve it to the
+    # source-track name before the TrackRects scanner branch picks it up.
+    if iterator is None:
+        _track_names_for_infer = _track_names_set()
+        _vtrack_names_for_infer = set(_shared._VTRACKS.keys())
+        _used_vtracks_for_infer: set[str] = set()
+        for _e in exprs:
+            _, _, _vt, _ = _parse_expr_vars(
+                _e, _track_names_for_infer, _vtrack_names_for_infer
+            )
+            _used_vtracks_for_infer.update(_vt)
+        if _used_vtracks_for_infer:
+            _inferred_iter = _infer_iterator_from_vtracks(_used_vtracks_for_infer)
+            if isinstance(_inferred_iter, str):
+                from .tracks import gtrack_exists
+                try:
+                    if gtrack_exists(_inferred_iter):
+                        _inf_info = gtrack_info(_inferred_iter)
+                        if int(_inf_info.get("dimensions", 1) or 1) == 2:
+                            iterator = _inferred_iter
+                except Exception:
+                    pass
+
     # A 2D interval-set name used as the iterator (not a track) is loaded to its
     # rectangles so the DataFrame branch below routes it through the scalable
     # intersect (R's intervals 2D iterator).  2D *track* iterators keep the
@@ -1611,6 +1658,24 @@ def _gextract_2d(
     # could not route it (1D-source vtrack), so enumerate the iterator cells
     # here and use them as the iteration units; _compute_vtrack_values then
     # projects each cell onto the vtrack's dimension (R parity).
+    #
+    # When no explicit iterator is given and a bare 2D track is also in the
+    # expression, R defaults the iterator to that 2D track's rects (the
+    # bare-track analogue of the value-based-vtrack default).  Default the
+    # iterator to the lone 2D source so each rect of the source drives a
+    # dim-projected vtrack evaluation, matching R.
+    if iterator is None and dim_vtracks and used_tracks:
+        _two_d_used = []
+        for _t in used_tracks:
+            try:
+                _info_t = gtrack_info(_t)
+            except Exception:
+                continue
+            if int(_info_t.get("dimensions", 1) or 1) == 2:
+                _two_d_used.append(_t)
+        if len(_two_d_used) == 1:
+            iterator = _two_d_used[0]
+
     if iterator is not None and dim_vtracks:
         from .intervals import _enumerate_2d_iterator_intervals
 

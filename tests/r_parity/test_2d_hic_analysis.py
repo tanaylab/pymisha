@@ -38,7 +38,7 @@ from .baseline import assert_matches_baseline, assert_matches_list_baseline
 GAP_2D_BAND = "2D band query near the diagonal returns a different contact set/coords than R"
 GAP_2D_ITER = "2D iterator semantics differ (default 2D iterator / gvtrack.iterator.2d shifts / 2D span)"
 GAP_BAND_GITER = "giterator_intervals has no band= argument"
-GAP_2D_NEIGHBORS = "2D gintervals_neighbors not implemented"
+GAP_NN_TIE = "equidistant 2D neighbors tie-break differs from R (priority_queue pop order not portable)"
 GAP_INSU_DOMS = "gtrack_2d_get_insu_doms not implemented"
 GAP_R_POSTPROC = "baseline is pure R post-processing (cut/table or rpois seed) not reproducible cross-impl"
 GAP_GCIS_DECAY = "gcis_decay over Hi-C differs from R (valued-source gcis_decay gap)"
@@ -180,8 +180,7 @@ def test_band_intersect_pos_neg(hg19_overlay):
 # --------------------------------------------------------------------------- #
 
 
-def test_real_k562_vtrack_weighted_sum(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_real_k562_vtrack_weighted_sum(hg19_overlay):
     _clear()
     pm.gvtrack_create("v_k562_score", "hic.K562.ela_k562_score", func="weighted.sum")
     sc = pm.gintervals_2d("chr1", 0, 1e6, "chr1", 0, 1e6)
@@ -202,17 +201,18 @@ def test_vtrack_band_filter(hg19_overlay):
     assert_matches_list_baseline({"full": full, "diag": diag}, "vtrack.band_filter.hic.1")
 
 
-def test_vtrack_max_iterator2d(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_vtrack_max_iterator2d(hg19_overlay):
+    # R parity: ``gintervals.2d("chr1", c(5e5,1e6), c(5e5+1,1e6+1))`` defaults
+    # axis2 to ``(chr1, 0, chrom_size)`` per the v0.7.1 recycling fix.
     _clear()
     pm.gvtrack_create("max_score", "hic.test_score", "max")
     pm.gvtrack_iterator_2d("max_score", sshift1=-5e4, eshift1=5e4, sshift2=-5e4, eshift2=5e4)
-    pts = pm.gintervals_2d("chr1", [5e5, 1e6], [5e5 + 1, 1e6 + 1], "chr1", [5e5, 1e6], [5e5 + 1, 1e6 + 1])
+    pts = pm.gintervals_2d("chr1", [5e5, 1e6], [5e5 + 1, 1e6 + 1])
     assert_matches_baseline(pm.gextract("max_score", pts, iterator=pts), "vtrack.max.iterator2d.hic.1")
 
 
-def test_vtrack_distance_dual(hg19_overlay, request):
-    request.node.add_marker(pytest.mark.xfail(reason=GAP_2D_ITER, strict=True))
+def test_vtrack_distance_dual(hg19_overlay):
+    # R is variadic on gextract expressions; pymisha takes a list of exprs.
     _clear()
     feats = pm.gintervals("chr1", [5e5, 1e6, 1.5e6], [5.1e5, 1.1e6, 1.6e6])
     pm.gvtrack_create("dist1", feats, "distance")
@@ -220,7 +220,7 @@ def test_vtrack_distance_dual(hg19_overlay, request):
     pm.gvtrack_iterator("dist1", dim=1)
     pm.gvtrack_iterator("dist2", dim=2)
     sc = pm.gintervals_2d("chr1", 0, 2e6, "chr1", 0, 2e6)
-    r = pm.gextract("dist1", "dist2", "hic.test_basic", sc, band=(-1e6, -1e4))
+    r = pm.gextract(["dist1", "dist2", "hic.test_basic"], sc, band=(-1e6, -1e4))
     assert_matches_baseline(r, "vtrack.distance.dual.hic.1")
 
 
@@ -300,10 +300,12 @@ def test_giterator_intervals_band(hg19_overlay):
             pm.gintervals_rm("test.band_set", force=True)
 
 
-@pytest.mark.xfail(reason=GAP_2D_NEIGHBORS, strict=True)
+@pytest.mark.xfail(reason=GAP_NN_TIE, strict=True)
 def test_gintervals_neighbors_2d(hg19_overlay):
-    # giterator_intervals(band=...) now works; the remaining blocker is 2D
-    # gintervals_neighbors (unimplemented), not GAP_BAND_GITER.
+    # giterator_intervals(band=...) and 2D `gintervals_neighbors` are both
+    # implemented; the residual diff is an equidistant tie-break artifact
+    # (~58 of 789 rows pick a different equidistant target on the grid-cell
+    # boundary). Both choices have ``dist1 == dist2 == 0``.
     pm.giterator_intervals("hic.test_basic", band=(-5e5, -1e4), intervals_set_out="test.neigh_set")
     try:
         s1 = np.arange(5e5, 1e6 + 1, 1e5)

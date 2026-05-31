@@ -2330,6 +2330,14 @@ def _neighbors_2d(
     """
     from ._quadtree import QuadTree
 
+    # R parity: callers can hand 2D inputs whose chrom names are mixed (one
+    # side carries a ``chr`` prefix the DB doesn't store, or vice versa).  The
+    # downstream per-chrom-pair grouping is a literal string compare, so
+    # normalise both sides first (mirrors `gintervals_neighbors` 1D behaviour
+    # via `_df2pymisha`'s implicit normalisation).
+    i1 = _normalize_interval_df(i1.copy())
+    i2 = _normalize_interval_df(i2.copy())
+
     np = _numpy
     _BIG = 1e9
     bounded = maxdist1 < _BIG and maxdist2 < _BIG

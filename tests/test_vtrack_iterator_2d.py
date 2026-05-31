@@ -68,15 +68,15 @@ class TestGvtrackIterator2dExtraction:
     def test_zero_shifts_same_as_direct(self):
         """Zero shifts should produce an aggregated result consistent with direct extraction.
 
-        With func='avg', the vtrack returns one row per query interval (aggregated),
-        while direct extraction returns one row per object.  Verify the aggregated
-        avg equals the area-weighted average computed from the per-object rows.
+        Explicit ``iterator=intervals`` keeps the one-row-per-scope-interval
+        semantics this test originally relied on (since v0.8.3 a 2D-source
+        vtrack with no iterator defaults to the source's rects, R parity).
         """
         pm.gvtrack_create("vt_zero", "rects_track", func="avg")
         pm.gvtrack_iterator_2d("vt_zero")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
         direct = pm.gextract("rects_track", intervals)
-        via_vt = pm.gextract("vt_zero", intervals)
+        via_vt = pm.gextract("vt_zero", intervals, iterator=intervals)
         assert direct is not None
         assert via_vt is not None
         # Aggregation produces one row per query interval
@@ -107,12 +107,15 @@ class TestGvtrackIterator2dExtraction:
         pm.gvtrack_iterator_2d("vt_manual")
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        via_auto = pm.gextract("vt_auto", intervals)
+        # Explicit iterator=intervals: one-row-per-scope-interval aggregation
+        # (the original test intent; the default-iterator path now expands to
+        # source rects, R parity).
+        via_auto = pm.gextract("vt_auto", intervals, iterator=intervals)
         # Manually shift intervals
         shifted_intervals = intervals.copy()
         shifted_intervals["start1"] = shifted_intervals["start1"] + 1000
         shifted_intervals["end1"] = shifted_intervals["end1"] + 1000
-        via_manual = pm.gextract("vt_manual", shifted_intervals)
+        via_manual = pm.gextract("vt_manual", shifted_intervals, iterator=shifted_intervals)
         if via_auto is not None and via_manual is not None:
             np.testing.assert_allclose(
                 via_auto["vt_auto"].to_numpy(dtype=float),
@@ -133,14 +136,16 @@ class TestGvtrackIterator2dExtraction:
         pm.gvtrack_iterator_2d("vt_base")
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        via_auto = pm.gextract("vt_auto", intervals)
+        # Explicit iterator=intervals: keep one-row-per-scope semantics (see
+        # test_shifts_equivalent_to_manual_shift for the rationale).
+        via_auto = pm.gextract("vt_auto", intervals, iterator=intervals)
         # Manually shift intervals
         shifted_intervals = intervals.copy()
         shifted_intervals["start1"] = shifted_intervals["start1"] + 500
         shifted_intervals["end1"] = shifted_intervals["end1"] + 500
         shifted_intervals["start2"] = shifted_intervals["start2"] - 500
         shifted_intervals["end2"] = shifted_intervals["end2"] - 500
-        via_manual = pm.gextract("vt_base", shifted_intervals)
+        via_manual = pm.gextract("vt_base", shifted_intervals, iterator=shifted_intervals)
         if via_auto is not None and via_manual is not None:
             np.testing.assert_allclose(
                 via_auto["vt_auto"].to_numpy(dtype=float),

@@ -96,10 +96,12 @@ def _coord_schema(df: pd.DataFrame) -> tuple[str, ...] | None:
 def _normalize_df(df: pd.DataFrame, coords: tuple[str, ...]) -> pd.DataFrame:
     df = df.copy()
     for c in df.columns:
-        if c in _CHROM_COLS:
+        if c in _CHROM_COLS or c.startswith("chrom"):
             # Normalize chrom naming: R baselines store 'chr1'; pymisha may return
             # '1' (per-chrom DB) or 'chr1' (indexed DB). Strip the prefix on both
-            # sides so the comparison is prefix-agnostic.
+            # sides so the comparison is prefix-agnostic.  Also covers R's
+            # ``make.unique``-suffixed chrom columns (``chrom11``, ``chrom21``)
+            # that arise when 2D ``gintervals_neighbors`` cbinds two 2D sets.
             df[c] = df[c].astype(str).str.replace(r"^chr", "", regex=True)
         elif c in _INT_COORD_COLS:
             df[c] = df[c].astype(np.int64)
