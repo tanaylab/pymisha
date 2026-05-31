@@ -25,6 +25,8 @@ The set-colnames case writes ``.colnames``; the overlay copies track *dotfiles*
 
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -85,9 +87,48 @@ def test_gtrack_array_extract_sampled_intervals(overlay_db):
     "baseline_id, slice_cols",
     [("gtrack_array_extract_tmpresfile", None), ("gtrack_array_extract_tmpresfile_cols", _COLS)],
 )
-@pytest.mark.xfail(reason=GAP_ARRAY_FILE_DUMP, strict=True)
 def test_gtrack_array_extract_tmpresfile(baseline_id, slice_cols, overlay_db):
-    assert_matches_baseline(pm.gtrack_array_extract("test.array", slice_cols, _iv12()), baseline_id)
+    """R's ``tmpresfile`` baseline is ``read.table(file, nrows=1000)``: row 0 is the
+    header read as data, every cell is a string, and there is no intervalID column.
+    Compare semantically: peel the header row, parse types, take the first 1000
+    pymisha rows after sorting, then compare values column-by-column.
+    """
+    from .baseline import load_baseline
+    base_raw = load_baseline(baseline_id)
+    # Row 0 carries the column names; remaining rows are the data dump.
+    header = list(base_raw.iloc[0])
+    base = base_raw.iloc[1:].copy().reset_index(drop=True)
+    base.columns = header
+
+    # Cast types: chrom -> str (already), start/end -> int, value cols -> float.
+    base["start"] = base["start"].astype(int)
+    base["end"] = base["end"].astype(int)
+    value_cols = [c for c in base.columns if c not in ("chrom", "start", "end")]
+    for c in value_cols:
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+
+    py = pm.gtrack_array_extract("test.array", slice_cols, _iv12())
+    # Match R's chrom strings ('chr1') against pymisha's possibly bare-name format.
+    py = py.copy()
+    py["chrom"] = py["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
+    base["chrom"] = base["chrom"].astype(str).str.replace(r"^chr", "", regex=True)
+
+    # Sort both, then truncate to the same row count R wrote.
+    sort_keys = ["chrom", "start", "end"]
+    py = py.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+    base = base.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+    n = len(base)
+    py = py.head(n).reset_index(drop=True)
+
+    assert (py["chrom"].to_numpy() == base["chrom"].to_numpy()).all(), "chrom mismatch"
+    assert (py["start"].to_numpy() == base["start"].to_numpy()).all(), "start mismatch"
+    assert (py["end"].to_numpy() == base["end"].to_numpy()).all(), "end mismatch"
+    for c in value_cols:
+        pv = py[c].to_numpy(dtype=float)
+        bv = base[c].to_numpy(dtype=float)
+        assert np.allclose(pv, bv, rtol=1e-5, atol=1e-5, equal_nan=True), (
+            f"value column {c!r} differs"
+        )
 
 
 @pytest.mark.xfail(reason=GAP_ARRAY_IMPORT, strict=True)

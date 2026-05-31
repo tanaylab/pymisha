@@ -1581,7 +1581,9 @@ def gpartition(
     if intervals_set_out is not None:
         from .intervals import gintervals_save
 
-        gintervals_save(out[["chrom", "start", "end"]], intervals_set_out)
+        # R parity: the saved set keeps the bin column, not just the geometry.
+        to_save = out.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
+        gintervals_save(to_save, intervals_set_out)
         return None
 
     return out

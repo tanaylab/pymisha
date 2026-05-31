@@ -17,6 +17,7 @@ from .baseline import assert_matches_baseline
 GAP_ARRAY = "array-track extract not supported"
 GAP_LOAD_TRACK = "gintervals_load does not accept a track name as the set"
 GAP_SETOUT = "intervals.set.out roundtrip (R DB read-only; saved-set canonicalization)"
+GAP_COMPUTED = "glookup over COMPUTED 2D Hi-C source (per-cell Computer2D follow-on, KICKOFF-9 A)"
 GAP_2D_ITER = "2D giterator/band-intersect parity not complete"
 GAP_DIFF_OVERLAP = "gintervals_diff on overlapping (non-canonic) rbind input differs"
 
@@ -66,15 +67,11 @@ _CASES = {
     "gintervals.load.3": (lambda: pm.gintervals_load("bigintervs1d", chrom=2), None),
     "gintervals.load.4": (lambda: pm.gintervals_load("bigintervs2d"), None),
     "gintervals.load.5": (lambda: pm.gintervals_load("bigintervs2d", chrom1=2, chrom2=2), None),
-    "gintervals.load.6": (lambda: pm.gintervals_load("test.rects", chrom1=1, chrom2=2), GAP_LOAD_TRACK),
-    "gintervals.load.7": (lambda: pm.gintervals_load("test.generated_1d_1", chrom=13), GAP_LOAD_TRACK),
-    "gintervals.load.8": (lambda: pm.gintervals_load("test.generated_1d_1", chrom=12), GAP_LOAD_TRACK),
-    "gintervals.load.9": (lambda: pm.gintervals_load("test.generated_2d_5", chrom1=1, chrom2=2), GAP_LOAD_TRACK),
-    "gintervals.load.10": (lambda: pm.gintervals_load("test.generated_2d_5", chrom1=1, chrom2=3), GAP_LOAD_TRACK),
-    "gintervals.1": (lambda: pm.gintervals_canonic(pm.gextract("test.fixedbin", _i1([1, 2]))[["chrom", "start", "end"]]), GAP_SETOUT),
-    "gintervals.2": (lambda: pm.gintervals_canonic(pm.gextract("test.rects", _i2([1, 2]))), GAP_SETOUT),
-    "gintervals.3": (lambda: None, GAP_SETOUT),
-    "gintervals.4": (lambda: None, GAP_SETOUT),
+    "gintervals.load.6": (lambda: pm.gintervals_load("test.rects", chrom1=1, chrom2=2), None),
+    "gintervals.load.7": (lambda: pm.gintervals_load("test.generated_1d_1", chrom=13), None),
+    "gintervals.load.8": (lambda: pm.gintervals_load("test.generated_1d_1", chrom=12), None),
+    "gintervals.load.9": (lambda: pm.gintervals_load("test.generated_2d_5", chrom1=1, chrom2=2), None),
+    "gintervals.load.10": (lambda: pm.gintervals_load("test.generated_2d_5", chrom1=1, chrom2=3), None),
     "gintervals.5": (lambda: _scr("2 * test.sparse+0.2 > 0.4"), None),
     "gintervals.6": (lambda: _scr("test.rects > 40"), None),
 }
@@ -86,3 +83,75 @@ def test_gintervals1(bid, request):
     if reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
     assert_matches_baseline(fn(), bid)
+
+
+# ----------------------------------------------------------------------------
+# intervals.set.out roundtrips (R writes the extraction result as a saved set,
+# then loads it back; pymisha's gextract / glookup now do the same). These need
+# the writable overlay because the R parity DB is read-only.
+# ----------------------------------------------------------------------------
+
+
+import numpy as np  # noqa: E402
+
+
+def test_gintervals_1_setout(overlay_db, track_namer):
+    """R: gextract(test.fixedbin, gintervals(c(1,2)), intervals.set.out=temp)."""
+    name = track_namer("test.tmptrack")
+    pm.gextract(
+        "test.fixedbin",
+        _i1([1, 2]),
+        intervals_set_out=name,
+        progress=False,
+    )
+    assert_matches_baseline(pm.gintervals_load(name), "gintervals.1")
+
+
+def test_gintervals_2_setout(overlay_db, track_namer):
+    """R: gextract(test.rects, gintervals.2d(c(1,2)), intervals.set.out=temp)."""
+    name = track_namer("test.tmptrack")
+    pm.gextract(
+        "test.rects",
+        _i2([1, 2]),
+        intervals_set_out=name,
+        progress=False,
+    )
+    assert_matches_baseline(pm.gintervals_load(name), "gintervals.2")
+
+
+def test_gintervals_3_setout(overlay_db, track_namer):
+    """R: glookup(m1, test.fixedbin, ..., test.sparse, ..., gintervals(c(1,2)), iterator='test.fixedbin', intervals.set.out=temp)."""
+    name = track_namer("test.tmptrack")
+    m1 = np.arange(1, 16).reshape(5, 3, order="F")  # R: matrix(1:15, nrow=5, ncol=3)
+    pm.glookup(
+        m1,
+        "test.fixedbin",
+        np.linspace(0.1, 0.2, 6),
+        "test.sparse",
+        np.linspace(0.25, 0.48, 4),
+        intervals=_i1([1, 2]),
+        iterator="test.fixedbin",
+        intervals_set_out=name,
+    )
+    assert_matches_baseline(pm.gintervals_load(name), "gintervals.3")
+
+
+def test_gintervals_4_setout(overlay_db, track_namer):
+    """R: glookup(m1, test.computed2d, ..., test.computed2d/2, ..., gintervals.2d(...), intervals.set.out=temp).
+
+    Routes through the Python glookup fallback (band/2D path), which honours
+    the COMPUTED 2D recompute fallback in ``_gextract_2d_single_python``.
+    """
+    name = track_namer("test.tmptrack")
+    m1 = np.arange(1, 16).reshape(5, 3, order="F")
+    pm.glookup(
+        m1,
+        "test.computed2d",
+        np.linspace(5_000_000, 10_000_000, 6),
+        "test.computed2d / 2",
+        np.linspace(0, 4_000_000, 4),
+        intervals=_i2(chroms1=[6, 5], chroms2=[8, 9]),
+        force_binning=False,
+        intervals_set_out=name,
+    )
+    assert_matches_baseline(pm.gintervals_load(name), "gintervals.4")

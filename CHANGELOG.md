@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.7 (2026-05-31)
+
+- **`intervals_set_out=` on `gextract` / `glookup` / `gpartition` now stores value columns alongside the geometry.** The saved interval set is the full extraction frame minus the bookkeeping `intervalID`, matching R's `C_gextract` writer. Previously pymisha sliced to `chrom`/`start`/`end` (and deduplicated for `gextract`), so the loaded set lost `dense_track`, `bin`, lookup `value`, etc. - a round-trip drop that R never did.
+- **`gintervals_load` now accepts a *track* name and returns its underlying geometry**, mirroring R's `.gintervals.load_file` track branch. 1D tracks yield per-bin `(chrom, start, end)`; 2D RECTS tracks yield per-rect `(chrom1, start1, end1, chrom2, start2, end2)`. `gintervals_intersect` / `_union` / `_diff` therefore now accept track names as either operand. Previously these calls raised "Intervals set does not exist".
+- **`gintervals_update` now supports 2D interval sets via `chrom1=` / `chrom2=`.** Previously the 2D arms of R's `gintervals.update` (bigintervs2d, multi-chrom-pair updates) had no Python equivalent.
+
 ## v0.8.6 (2026-05-31)
 
 - **CI is green again on `main`.** Three patches needed since v0.8.3 left the suite red:

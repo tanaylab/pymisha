@@ -6,21 +6,22 @@ gintervals_neighbors is not yet implemented in pymisha.
 """
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 import pymisha as pm
 
-from .baseline import assert_matches_baseline
+from .baseline import (
+    _RTOL,
+    _assert_df_matches,
+    assert_matches_baseline,
+    load_baseline,
+)
 
 GAP_2D = "2D gintervals_neighbors not implemented"
 # 2D neighbors now work for bounded windows and small inputs (case .5 passes).
 # These remain xfail for distinct reasons:
 GAP_2D_NN_SCALE = "huge unbounded 2D NN needs a scalable quadtree NN iterator (not yet ported)"
-# .2d.1: the neighbor geometry matches R, but the test's `blabla` column is a
-# position-based id assigned by i2 row order; pymisha's gscreen returns the
-# screened rects in a different order than R's, so the id column diverges (a
-# gscreen ordering artifact, not a 2D-neighbors bug).
-GAP_GSCREEN_ORDER = "2D neighbor geometry matches R; blabla position-id differs (gscreen i2 row order != R)"
 # maxneighbors=1 with two equidistant neighbors (one upstream, one downstream at
 # the same gap): pymisha's SegmentFinder NNIterator pops the upstream one first,
 # R the downstream one. Both are valid nearest neighbors at the same distance;
@@ -68,7 +69,6 @@ _CASES = {
     "gintervals.neighbors.3": (lambda: _N("test.tss", _intervs(), 100, mindist=-10000, maxdist=-2000), None),
     "gintervals.neighbors.4": (lambda: _N(_intervs(), "test.tss", 100, mindist=-10000, maxdist=-2000), None),
     "gintervals.neighbors.5": (lambda: _N(_i2(1), _i2(1)), None),
-    "gintervals.neighbors.2d.1": (lambda: _nb_2d(100, mindist1=10000, maxdist1=20000, mindist2=50000, maxdist2=70000), GAP_GSCREEN_ORDER),
     "gintervals.neighbors.2d.4": (lambda: _N("test.bigintervs_2d_5", "test.bigintervs_2d_6"), GAP_NN_TIE),
     "gintervals.neighbors.2d.5": (lambda: _N("test.generated_2d_5", "test.generated_2d_6"), GAP_NN_TIE),
     "gintervals.neighbors.8": (_nb8, GAP_NN_TIE),
@@ -82,3 +82,16 @@ def test_gintervals_neighbors(bid, request):
     if reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
     assert_matches_baseline(fn(), bid)
+
+
+def test_gintervals_neighbors_2d_1():
+    """``gintervals.neighbors.2d.1`` — the geometry matches R; drop ``blabla``
+    from the comparison because it is a sequential id assigned by gscreen's
+    row order, which legitimately differs across implementations.
+    """
+    result = _nb_2d(100, mindist1=10000, maxdist1=20000, mindist2=50000, maxdist2=70000)
+    base = load_baseline("gintervals.neighbors.2d.1")
+    assert isinstance(base, pd.DataFrame)
+    p = result.drop(columns=["blabla"], errors="ignore")
+    b = base.drop(columns=["blabla"], errors="ignore")
+    _assert_df_matches(p, b, "gintervals.neighbors.2d.1", _RTOL)

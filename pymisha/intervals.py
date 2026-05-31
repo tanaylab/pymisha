@@ -51,9 +51,17 @@ def _normalize_chroms(chroms: Any) -> Any:
 
 
 def _resolve_intervals(intervals: pd.DataFrame | str) -> pd.DataFrame | str:
-    """Transparently load a named interval set if *intervals* is a string."""
-    if isinstance(intervals, str) and gintervals_exists(intervals):
-        return gintervals_load(intervals)
+    """Transparently load a named interval set, or a track's geometry, by name.
+
+    R parity: `gintervals.intersect` / `.diff` / `.union` accept a *track* name
+    as well as an interval-set name.
+    """
+    if isinstance(intervals, str):
+        if gintervals_exists(intervals):
+            return gintervals_load(intervals)
+        from .tracks import gtrack_exists
+        if gtrack_exists(intervals):
+            return gintervals_load(intervals)
     return intervals
 
 
@@ -3346,6 +3354,69 @@ def _normalize_chrom_column(df: pd.DataFrame, col: str) -> None:
         df[col] = _pandas.Series(df[col])
 
 
+def _gintervals_load_track(
+    track: str,
+    chrom: str | None,
+    chrom1: str | None,
+    chrom2: str | None,
+) -> pd.DataFrame | None:
+    """Return a track's geometry as if it were a saved interval set.
+
+    Mirrors R's ``gtrack_intervals_load`` (called by ``.gintervals.load_file``
+    when ``intervals.set`` resolves to a track): a 1D track yields per-bin
+    ``(chrom, start, end)``; a 2D track yields per-rect
+    ``(chrom1, start1, end1, chrom2, start2, end2)``. Empty per-chrom queries
+    return an empty DataFrame with the right schema (not ``None``) - the R
+    baselines for empty chrom slices are zero-row data frames.
+    """
+    from . import _shared
+    from .extract import gextract
+
+    is_2d = _shared._GROOT is not None and _track_is_2d(track)
+
+    if chrom is not None and is_2d:
+        raise ValueError(
+            f"{track} is a 2D track. chrom1 / chrom2 parameters are for 2D intervals."
+        )
+    if (chrom1 is not None or chrom2 is not None) and not is_2d:
+        raise ValueError(
+            f"{track} is a 1D track. chrom parameter is for 1D intervals."
+        )
+
+    if is_2d:
+        if chrom1 is not None and chrom2 is not None:
+            scope = gintervals_2d(chroms1=chrom1, chroms2=chrom2)
+        else:
+            # No chrom filter (or only one side) - load the whole 2D scope and
+            # let gextract filter; matches R's bigset zeroline-by-chrom semantics.
+            scope = gintervals_2d_all(mode="full")
+    else:
+        scope = gintervals_all() if chrom is None else gintervals(chrom)
+
+    df = gextract(track, scope, progress=False)
+    if df is None:
+        if is_2d:
+            return _pandas.DataFrame(
+                columns=["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+            )
+        return _pandas.DataFrame(columns=["chrom", "start", "end"])
+
+    coord_cols = (
+        ["chrom1", "start1", "end1", "chrom2", "start2", "end2"] if is_2d else ["chrom", "start", "end"]
+    )
+    return df[coord_cols].reset_index(drop=True)
+
+
+def _track_is_2d(track: str) -> bool:
+    """True iff *track* is a 2D track (uses chrom1/chrom2 geometry)."""
+    from .tracks import gtrack_info
+    try:
+        info = gtrack_info(track)
+    except Exception:
+        return False
+    return info.get("dimensions") == 2
+
+
 def _normalize_interval_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or len(df) == 0:
         return df
@@ -3451,6 +3522,15 @@ def gintervals_load(
         if len(df) == 0:
             return None
         return df.reset_index(drop=True)
+
+    # R parity: if the name resolves to a *track* rather than an interval set,
+    # return the track's underlying geometry (R's `.gcall("gtrack_intervals_load", ...)`).
+    # Used for both sparse 1D tracks (sparse-set coords) and 2D RECTS tracks
+    # (per-rect coords). Aligned with R's precedence in `.gintervals.load_file`:
+    # tracks first, then interval sets.
+    from .tracks import gtrack_exists
+    if gtrack_exists(intervals_set) and not gintervals_exists(intervals_set):
+        return _gintervals_load_track(intervals_set, chrom, chrom1, chrom2)
 
     interv_path = _intervset_path(intervals_set)
 
@@ -3746,6 +3826,8 @@ def gintervals_update(
     intervals_set: str,
     intervals: pd.DataFrame | None,
     chrom: str | None = None,
+    chrom1: str | None = None,
+    chrom2: str | None = None,
 ) -> None:
     """
     Update intervals for a specific chromosome in an existing intervals set.
@@ -3759,8 +3841,10 @@ def gintervals_update(
         Name of the existing intervals set.
     intervals : DataFrame or None
         New intervals for the chromosome, or None to delete.
-    chrom : str
-        Chromosome to update. Required.
+    chrom : str, optional
+        Chromosome to update (1D intervals). Mutually exclusive with chrom1/chrom2.
+    chrom1, chrom2 : str, optional
+        Chromosome pair to update (2D intervals). Both required for 2D.
 
     Returns
     -------
@@ -3769,7 +3853,8 @@ def gintervals_update(
     Raises
     ------
     ValueError
-        If intervals set does not exist or chrom is not specified.
+        If intervals set does not exist, or no chrom/chrom1/chrom2 specified,
+        or wrong dimensionality (e.g. ``chrom`` on a 2D set).
 
     See Also
     --------
@@ -3789,35 +3874,57 @@ def gintervals_update(
     """
     _checkroot()
 
-    if chrom is None:
-        raise ValueError("Chromosome must be specified in chrom parameter")
+    if chrom is None and chrom1 is None and chrom2 is None:
+        raise ValueError(
+            "Chromosome must be specified in chrom (for 2D intervals: chrom1, chrom2) parameter"
+        )
+    if chrom is not None and (chrom1 is not None or chrom2 is not None):
+        raise ValueError("Cannot use chrom and chrom1/chrom2 in the same call")
 
     if not gintervals_exists(intervals_set):
         raise ValueError(f"Intervals set '{intervals_set}' does not exist")
 
-    # Normalize chrom
-    chrom = _normalize_chroms([str(chrom)])[0]
-
-    # Load existing intervals
+    # Load existing intervals to discover dimensionality.
     existing = gintervals_load(intervals_set)
-    if existing is None:
-        existing = _pandas.DataFrame(columns=["chrom", "start", "end"])
+    is_2d = existing is not None and {"chrom1", "chrom2"}.issubset(existing.columns)
 
-    # Remove intervals for the target chrom
-    mask = existing["chrom"] != chrom
-    kept = existing[mask].copy()
-
-    if intervals is not None:
-        # Normalize new intervals
-        new_df = intervals.copy()
-        if "chrom" in new_df.columns:
-            new_df["chrom"] = _normalize_chroms(new_df["chrom"].astype(str).tolist())
-
-        # Combine
-        if len(kept) > 0 and len(new_df) > 0:
-            kept = _pandas.concat([kept, new_df], ignore_index=True)
-        elif len(new_df) > 0:
-            kept = new_df
+    if is_2d:
+        if chrom1 is None or chrom2 is None:
+            raise ValueError("chrom1 and chrom2 parameters must be specified")
+        chrom1_n = _normalize_chroms([str(chrom1)])[0]
+        chrom2_n = _normalize_chroms([str(chrom2)])[0]
+        if existing is None:
+            existing = _pandas.DataFrame(
+                columns=["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+            )
+        mask = ~((existing["chrom1"] == chrom1_n) & (existing["chrom2"] == chrom2_n))
+        kept = existing[mask].copy()
+        if intervals is not None:
+            new_df = intervals.copy()
+            if "chrom1" in new_df.columns:
+                new_df["chrom1"] = _normalize_chroms(new_df["chrom1"].astype(str).tolist())
+            if "chrom2" in new_df.columns:
+                new_df["chrom2"] = _normalize_chroms(new_df["chrom2"].astype(str).tolist())
+            if len(kept) > 0 and len(new_df) > 0:
+                kept = _pandas.concat([kept, new_df], ignore_index=True)
+            elif len(new_df) > 0:
+                kept = new_df
+    else:
+        if chrom is None:
+            raise ValueError("chrom parameter is not specified")
+        chrom_n = _normalize_chroms([str(chrom)])[0]
+        if existing is None:
+            existing = _pandas.DataFrame(columns=["chrom", "start", "end"])
+        mask = existing["chrom"] != chrom_n
+        kept = existing[mask].copy()
+        if intervals is not None:
+            new_df = intervals.copy()
+            if "chrom" in new_df.columns:
+                new_df["chrom"] = _normalize_chroms(new_df["chrom"].astype(str).tolist())
+            if len(kept) > 0 and len(new_df) > 0:
+                kept = _pandas.concat([kept, new_df], ignore_index=True)
+            elif len(new_df) > 0:
+                kept = new_df
 
     if len(kept) == 0:
         raise ValueError("Cannot save empty intervals")

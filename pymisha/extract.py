@@ -2234,13 +2234,15 @@ def _apply_extract_output(
     df = _apply_intervals_join(df, input_intervals, intervals_join, is_2d=is_2d)
     assert df is not None  # _apply_intervals_join preserves non-None input
 
-    # -- intervals_set_out: save coordinate columns as a named interval set --
+    # -- intervals_set_out: save coords AND value columns as a named interval set --
+    # R parity: the C++ writer behind C_gextract stores the full extraction frame
+    # (minus the bookkeeping intervalID column), not a deduplicated coords-only
+    # slice. Several R baselines (gintervals.1/.2/.3) depend on this.
     if intervals_set_out is not None:
         from .intervals import gintervals_save
 
-        coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"] if is_2d else ["chrom", "start", "end"]
-        coords = df[coord_cols].drop_duplicates().reset_index(drop=True)
-        gintervals_save(coords, intervals_set_out)
+        to_save = df.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
+        gintervals_save(to_save, intervals_set_out)
 
     # -- file: write TSV and return None --
     if file is not None:

@@ -200,7 +200,8 @@ def glookup(
         if intervals_set_out is not None:
             from .intervals import gintervals_save
 
-            gintervals_save(df[["chrom", "start", "end"]], intervals_set_out)
+            to_save = df.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
+            gintervals_save(to_save, intervals_set_out)
             return None
         return df
 
@@ -220,7 +221,8 @@ def glookup(
     if result is not None and intervals_set_out is not None:
         from .intervals import gintervals_save
 
-        gintervals_save(result[["chrom", "start", "end"]], intervals_set_out)
+        to_save = result.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
+        gintervals_save(to_save, intervals_set_out)
         return None
     return result
 
