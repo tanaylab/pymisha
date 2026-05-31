@@ -21,7 +21,7 @@ def _i2(*a, **k):
 _CASES = {
     "gquantiles_fixedbin_result": (lambda: pm.gquantiles("test.fixedbin+0.2", percentiles=[0.5, 0.3, 0.2, 0.9], intervals=pm.gscreen("test.fixedbin > 0.2", _i1([1, 2], 0, -1))), None),
     "gquantiles_rects_result": (lambda: pm.gquantiles("test.rects", percentiles=[0.5, 0.3, 0.2, 0.9, 0.999], intervals=_i2(chroms1=[2, 3], chroms2=[2, 4])), None),
-    "gquantiles_computed2d_result": (lambda: pm.gquantiles("test.computed2d", percentiles=[0.5, 0.3, 0.2, 0.9, 0.999], intervals=_i2(chroms1=[6, 5], chroms2=[8, 9])), GAP_COMPUTED),
+    "gquantiles_computed2d_result": (lambda: pm.gquantiles("test.computed2d", percentiles=[0.5, 0.3, 0.2, 0.9, 0.999], intervals=_i2(chroms1=[6, 5], chroms2=[8, 9])), None),
     "gquantiles_fixedbin_no_intervals_result": (lambda: pm.gquantiles("test.fixedbin+0.2", percentiles=[0.5, 0.999]), None),
 }
 

@@ -52,14 +52,23 @@ def _resolve_exprs_for_scanner(exprs: list[str]) -> list[tuple[str, str, object,
     Returns a list of ``(physical_track, func, params, ss1, es1, ss2, es2)``
     tuples — one per expression — or ``None`` if any expression cannot be
     routed through the scanner (compound expression, unsupported vtrack,
-    1D vtrack, etc.).
+    1D vtrack, COMPUTED 2D track, etc.).
     """
+    from .tracks import gtrack_info
+
     track_names_now = _track_names_set()
     vtrack_names_now = set(_shared._VTRACKS.keys())
 
     resolved: list[tuple[str, str, object, int, int, int, int]] = []
     for expr in exprs:
         if expr in track_names_now and expr not in vtrack_names_now:
+            # COMPUTED 2D tracks need the Python read path (the C++ scanner
+            # has no Computer2D port yet).
+            try:
+                if gtrack_info(expr).get("type") == "computed":
+                    return None
+            except Exception:
+                return None
             # Bare physical track: default aggregation is "avg", no shifts.
             resolved.append((expr, "avg", None, 0, 0, 0, 0))
         else:
@@ -133,6 +142,8 @@ def _resolve_2d_compound_for_scanner(
                     return None
                 if int(info.get("dimensions", 1) or 1) != 2:
                     return None  # 1D bare-track ref in a 2D expression
+                if info.get("type") == "computed":
+                    return None  # C++ scanner has no Computer2D port yet
                 seen_vars[safe_name] = (orig_name, "avg", None, 0, 0, 0, 0)
             else:
                 return None  # unknown identifier; fall through
@@ -549,10 +560,23 @@ def _gextract_2d_single(
     Returns None if no objects intersect any interval.
     """
     from .intervals import _chrom_id_map
+    from .tracks import gtrack_info
 
     n = len(intervals)
     if n == 0:
         return None
+
+    # COMPUTED 2D tracks: the C++ pm_extract_2d has no Computer2D dispatcher
+    # port yet.  Read the per-rect cached value via the pure-Python path
+    # which uses _quadtree.open_2d_pair (signature -11 aware).  Per-rect
+    # recompute fallback (when a query doesn't exactly match a stored rect)
+    # is handled inside _gextract_2d_single_python via the same data
+    # structures that already read the cached `Computed_val.v`.
+    try:
+        if gtrack_info(track).get("type") == "computed":
+            return _gextract_2d_single_python(track, col_name, intervals, band)
+    except Exception:
+        pass
 
     cmap = _chrom_id_map()
     chrom1_ids = (
@@ -677,6 +701,8 @@ def _resolve_2d_vtrack_var(expr: str) -> tuple[str, str, object, int, int, int, 
         return None
     if int(info.get("dimensions", 1) or 1) != 2:
         return None  # 1D source track; can't use 2D scanner
+    if info.get("type") == "computed":
+        return None  # C++ scanner has no Computer2D port yet
 
     # 1D iterator shifts (sshift/eshift, no axis suffix) are invalid on a
     # 2D-source vtrack -- the legacy path rejects them with the same message;
@@ -1531,35 +1557,44 @@ def _gextract_2d(
                 else getattr(_iter_info, "type", None)
             )
 
-            if _iter_type not in ("rectangles", "points"):
+            if _iter_type not in ("rectangles", "points", "computed"):
                 raise ValueError(
                     f"Invalid iterator: {iterator!r} is a 1D track (type={_iter_type!r}). "
                     "A 2D rectangles or points track is required when using a track "
                     "name as iterator for 2D extraction."
                 )
 
+            # COMPUTED iterator: the C++ scanner can't see the Computer2D
+            # header.  Fall through to the legacy path so the iterator's
+            # rects are materialised via the Python reader.
+            _resolved_scanner_skip = _iter_type == "computed"
+
             # 2D rects/points track confirmed.
             # Route if all expressions are bare physical tracks or supported
             # reducing 2D vtracks; otherwise fall through to the legacy path.
-            resolved = _resolve_exprs_for_scanner(exprs)
-            if resolved is not None:
-                from ._iterator_policy import TrackRectsPolicy
+            # COMPUTED iterators bypass the scanner branches entirely (the
+            # scanner has no Computer2D port yet); the legacy path materializes
+            # the iterator's rects via the Python reader.
+            if not _resolved_scanner_skip:
+                resolved = _resolve_exprs_for_scanner(exprs)
+                if resolved is not None:
+                    from ._iterator_policy import TrackRectsPolicy
 
-                policy = TrackRectsPolicy(track_name=iterator)
-                return _gextract_2d_via_scanner(
-                    exprs, intervals, policy, colnames=colnames, band=band,
-                    resolved_vars=resolved,
-                )
-            compound = _resolve_2d_compound_for_scanner(exprs)
-            if compound is not None:
-                from ._iterator_policy import TrackRectsPolicy
+                    policy = TrackRectsPolicy(track_name=iterator)
+                    return _gextract_2d_via_scanner(
+                        exprs, intervals, policy, colnames=colnames, band=band,
+                        resolved_vars=resolved,
+                    )
+                compound = _resolve_2d_compound_for_scanner(exprs)
+                if compound is not None:
+                    from ._iterator_policy import TrackRectsPolicy
 
-                eval_specs, var_specs = compound
-                policy = TrackRectsPolicy(track_name=iterator)
-                return _gextract_2d_compound_via_scanner(
-                    exprs, intervals, policy, colnames=colnames, band=band,
-                    eval_specs=eval_specs, var_specs=var_specs,
-                )
+                    eval_specs, var_specs = compound
+                    policy = TrackRectsPolicy(track_name=iterator)
+                    return _gextract_2d_compound_via_scanner(
+                        exprs, intervals, policy, colnames=colnames, band=band,
+                        eval_specs=eval_specs, var_specs=var_specs,
+                    )
             # Unsupported vtracks or non-routable compound: fall through to
             # the legacy path which resolves vtracks via the original flow.
 

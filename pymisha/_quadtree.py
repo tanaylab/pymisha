@@ -28,9 +28,10 @@ try:
 except ImportError:
     _HAS_CPP_QUADTREE = False
 
-# Format signatures from GenomeTrack.cpp
+# Format signatures from GenomeTrack.cpp::FORMAT_SIGNATURES.
 SIGNATURE_RECTS = -9
 SIGNATURE_POINTS = -10
+SIGNATURE_COMPUTED = -11
 
 # Quad indices: NW=0, NE=1, SE=2, SW=3
 NW, NE, SE, SW = 0, 1, 2, 3
@@ -718,25 +719,59 @@ def _query_node(
         _visited.discard(key)
 
 
-def _read_file_header(filepath: str) -> tuple[bool, int, mmap.mmap]:
-    """Read a 2D track file header. Returns (is_points, num_objs, data_bytes)."""
+def _read_file_header(filepath: str) -> tuple[str, int, mmap.mmap]:
+    """Read a 2D track file header.
+
+    Returns
+    -------
+    tuple of (kind, num_objs, data_bytes)
+        kind : str
+            One of ``"RECTS"``, ``"POINTS"``, ``"COMPUTED"``.
+        num_objs : int
+            Number of stored objects (after the optional Computer2D header).
+        data_bytes : mmap.mmap
+            Memory-mapped file bytes (caller must ``close()`` it).
+    """
     with open(filepath, "rb") as f:
         data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
     try:
         signature = struct.unpack_from("<i", data, 0)[0]
         if signature == SIGNATURE_RECTS:
-            is_points = False
+            kind = "RECTS"
+            payload_offset = 4
         elif signature == SIGNATURE_POINTS:
-            is_points = True
+            kind = "POINTS"
+            payload_offset = 4
+        elif signature == SIGNATURE_COMPUTED:
+            kind = "COMPUTED"
+            from ._computer2d import skip_computer2d_header
+
+            payload_offset = skip_computer2d_header(data, offset=4)
         else:
             raise ValueError(f"Unknown 2D track signature: {signature}")
 
-        num_objs = struct.unpack_from("<Q", data, 4)[0]
-        return is_points, num_objs, data
+        num_objs = struct.unpack_from("<Q", data, payload_offset)[0]
+        return kind, num_objs, data
     except Exception:
         data.close()
         raise
+
+
+def _payload_offset(data: bytes | mmap.mmap) -> int:
+    """Return the byte offset where the StatQuadTreeCached payload begins.
+
+    For RECTS / POINTS this is 4 (just past the signature); for COMPUTED
+    it skips the Computer2D header so the offset lands on ``num_objs``.
+    """
+    signature = struct.unpack_from("<i", data, 0)[0]
+    if signature in (SIGNATURE_RECTS, SIGNATURE_POINTS):
+        return 4
+    if signature == SIGNATURE_COMPUTED:
+        from ._computer2d import skip_computer2d_header
+
+        return skip_computer2d_header(data, offset=4)
+    raise ValueError(f"Unknown 2D track signature: {signature}")
 
 
 def read_2d_track_objects(filepath: str) -> tuple[bool, list[tuple[Any, ...]]]:
@@ -756,12 +791,18 @@ def read_2d_track_objects(filepath: str) -> tuple[bool, list[tuple[Any, ...]]]:
             For RECTS: (x1, y1, x2, y2, value)
             For POINTS: (x, y, value)
     """
-    is_points, num_objs, data = _read_file_header(filepath)
+    kind, num_objs, data = _read_file_header(filepath)
+    is_points = kind == "POINTS"
     try:
         if num_objs == 0:
             return is_points, []
 
-        root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
+        # RECTS / POINTS: payload starts at byte 4 (signature only), so the
+        # root_chunk_fpos lives at byte 12 (= 4 sig + 8 num_objs).  For
+        # COMPUTED the Computer2D header pushes the payload forward;
+        # _payload_offset returns the byte position of num_objs there.
+        payload_offset = _payload_offset(data)
+        root_chunk_fpos = struct.unpack_from("<q", data, payload_offset + 8)[0]
         top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
 
         raw_objs = _collect_all_objects(data, root_chunk_fpos, top_node_offset, is_points)
@@ -826,8 +867,17 @@ def query_2d_track_opened(
     if num_objs == 0:
         return []
 
+    # The C++ fast path assumes the RECTS / POINTS file header layout
+    # (signature at 0, num_objs at 4, root_chunk_fpos at 12).  COMPUTED
+    # files have an extra Computer2D header in front (sig at 0, type byte
+    # at 4, then num_objs/root_chunk_fpos pushed forward); the C++ side
+    # has no Computer2D dispatcher port, so route COMPUTED through the
+    # pure-Python walker below (still mmap-fast for the test fixture).
+    _sig = struct.unpack_from("<i", data, 0)[0]
+    _is_computed = _sig == SIGNATURE_COMPUTED
+
     # C++ fast path
-    if _HAS_CPP_QUADTREE:
+    if _HAS_CPP_QUADTREE and not _is_computed:
         try:
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
@@ -1033,8 +1083,10 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
         return {"occupied_area": 0, "weighted_sum": 0.0,
                 "min_val": float("nan"), "max_val": float("nan")}
 
-    # C++ fast path
-    if _HAS_CPP_QUADTREE:
+    # C++ fast path — gated on RECTS / POINTS signature (the binding
+    # assumes the standard header layout and would seg-fault on COMPUTED).
+    _sig = struct.unpack_from("<i", data, 0)[0]
+    if _HAS_CPP_QUADTREE and _sig != SIGNATURE_COMPUTED:
         try:
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
@@ -1105,8 +1157,14 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
 
     rects_arr = np.ascontiguousarray(rects, dtype=np.int64).reshape(-1, 4)
 
-    # C++ fast path
-    if _HAS_CPP_QUADTREE:
+    # C++ fast path: gated on the file's signature being RECTS / POINTS
+    # (the C++ binding assumes the standard 12-byte header; COMPUTED has
+    # an extra Computer2D byte block that pushes num_objs / root_chunk
+    # forward and would seg-fault the binding).
+    _sig = struct.unpack_from("<i", data, 0)[0]
+    _is_computed = _sig == SIGNATURE_COMPUTED
+
+    if _HAS_CPP_QUADTREE and not _is_computed:
         try:
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
@@ -1238,8 +1296,9 @@ def query_2d_track_opened_arrays(
     if num_objs == 0:
         return _empty
 
-    # C++ fast path — already returns dict of numpy arrays
-    if _HAS_CPP_QUADTREE:
+    # C++ fast path — gated on RECTS / POINTS signature.
+    _sig = struct.unpack_from("<i", data, 0)[0]
+    if _HAS_CPP_QUADTREE and _sig != SIGNATURE_COMPUTED:
         try:
             has_band = 1 if band is not None else 0
             band_d1 = band[0] if band else 0
@@ -1307,12 +1366,14 @@ def query_2d_track_objects(filepath: str, qx1: int, qy1: int, qx2: int, qy2: int
         For RECTS: (x1, y1, x2, y2, value)
         For POINTS: (x, y, value)
     """
-    is_points, num_objs, data = _read_file_header(filepath)
+    kind, num_objs, data = _read_file_header(filepath)
+    is_points = kind == "POINTS"
     try:
         if num_objs == 0:
             return []
 
-        root_chunk_fpos = struct.unpack_from("<q", data, 12)[0]
+        payload_offset = _payload_offset(data)
+        root_chunk_fpos = struct.unpack_from("<q", data, payload_offset + 8)[0]
         return query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
                                      qx1, qy1, qx2, qy2)
     finally:
@@ -1450,16 +1511,26 @@ class IndexedTrack2DReader:
         signature = struct.unpack_from("<i", pair_data, 0)[0]
         if signature == SIGNATURE_RECTS:
             is_points = False
+            payload_offset = 4
         elif signature == SIGNATURE_POINTS:
             is_points = True
+            payload_offset = 4
+        elif signature == SIGNATURE_COMPUTED:
+            is_points = False
+            from ._computer2d import skip_computer2d_header
+
+            payload_offset = skip_computer2d_header(pair_data, offset=4)
         else:
             return None
 
-        num_objs = struct.unpack_from("<Q", pair_data, 4)[0]
+        if len(pair_data) < payload_offset + 8:
+            return None
+
+        num_objs = struct.unpack_from("<Q", pair_data, payload_offset)[0]
         if num_objs == 0:
             return (is_points, 0, pair_data, 0)
 
-        root_chunk_fpos = struct.unpack_from("<q", pair_data, 12)[0]
+        root_chunk_fpos = struct.unpack_from("<q", pair_data, payload_offset + 8)[0]
         return (is_points, num_objs, pair_data, root_chunk_fpos)
 
     def close(self) -> None:
@@ -1556,8 +1627,13 @@ def open_2d_pair(track_path: str, c1: str, c2: str) -> tuple[bool, int, bytes | 
     if filepath is None:
         return None
 
-    file_is_points, num_objs, mmap_data = _read_file_header(filepath)
-    root_chunk_fpos = 0 if num_objs == 0 else struct.unpack_from("<q", mmap_data, 12)[0]
+    kind, num_objs, mmap_data = _read_file_header(filepath)
+    file_is_points = kind == "POINTS"
+    if num_objs == 0:
+        root_chunk_fpos = 0
+    else:
+        payload_offset = _payload_offset(mmap_data)
+        root_chunk_fpos = struct.unpack_from("<q", mmap_data, payload_offset + 8)[0]
     return (file_is_points, num_objs, mmap_data, root_chunk_fpos, mmap_data.close)
 
 

@@ -601,13 +601,17 @@ def gcis_decay(
         csize = chrom_sizes[chrom]
 
         # Open file once, query all objects as numpy arrays
-        file_is_points, num_objs, data = _read_file_header(filepath)
+        kind, num_objs, data = _read_file_header(filepath)
+        file_is_points = kind == "POINTS"
         try:
             if num_objs == 0:
                 continue
             import struct as _struct
 
-            root_chunk_fpos = _struct.unpack_from("<q", data, 12)[0]
+            from ._quadtree import _payload_offset
+
+            payload_offset = _payload_offset(data)
+            root_chunk_fpos = _struct.unpack_from("<q", data, payload_offset + 8)[0]
             arrays = query_2d_track_opened_arrays(
                 data, file_is_points, num_objs, root_chunk_fpos,
                 0, 0, csize, csize, band=band,

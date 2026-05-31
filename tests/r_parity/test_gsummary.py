@@ -28,12 +28,12 @@ _CASES = {
     "gsummary_sparse": (lambda: pm.gsummary("test.sparse"), None),
     "gsummary_array": (lambda: pm.gsummary("test.array"), None),
     "gsummary_rects": (lambda: pm.gsummary("test.rects"), None),
-    "gsummary_computed2d": (lambda: pm.gsummary("test.computed2d"), GAP_COMPUTED),
+    "gsummary_computed2d": (lambda: pm.gsummary("test.computed2d"), None),
     "gsummary_fixedbin_gscreen_filtered": (lambda: pm.gsummary("test.fixedbin", _scr1d()), None),
     "gsummary_sparse_gscreen_filtered": (lambda: pm.gsummary("test.sparse", _scr1d()), None),
     "gsummary_array_gscreen_filtered": (lambda: pm.gsummary("test.array", _scr1d()), None),
     "gsummary_rects_gscreen_filtered": (lambda: pm.gsummary("test.rects", pm.gscreen("test.rects > 40", _i2(chroms1=[2, 3], chroms2=[2, 4]))), None),
-    "gsummary_computed2d_gscreen_filtered": (lambda: pm.gsummary("test.computed2d", pm.gscreen("test.computed2d > 4000000", _i2(chroms1=[6, 5], chroms2=[8, 9]))), GAP_COMPUTED),
+    "gsummary_computed2d_gscreen_filtered": (lambda: pm.gsummary("test.computed2d", pm.gscreen("test.computed2d > 4000000", _i2(chroms1=[6, 5], chroms2=[8, 9]))), None),
     "gsummary_generated_1d_limited_data_size": (lambda: pm.gsummary("test.generated_1d_1", "test.generated_1d_2"), None),
 }
 

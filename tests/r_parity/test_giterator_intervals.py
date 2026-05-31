@@ -36,7 +36,7 @@ _CASES = {
     "2": (lambda: _gi("test.fixedbin", _i1([2, 3])), None),
     "3": (lambda: _gi("test.fixedbin", _i1([2, 3]), iterator=120), None),
     "4": (lambda: _gi("test.rects", _i2([2, 3]), iterator=(100000, 200000)), None),
-    "5": (lambda: _gi("test.computed2d", _i2(chroms1=[6, 1, 5], chroms2=[8, 1, 9])), GAP_COMPUTED),
+    "5": (lambda: _gi("test.computed2d", _i2(chroms1=[6, 1, 5], chroms2=[8, 1, 9])), None),
     "7": (lambda: _gi(None, _i1([2, 3]), iterator=120), None),
     "8": (lambda: _gi(None, _ALL(), iterator="test.sparse"), None),
     "9": (lambda: _gi(None, _i1([2, 3]), iterator="test.sparse"), None),

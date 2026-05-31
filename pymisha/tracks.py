@@ -109,6 +109,11 @@ def _load_track_attributes(track_name: str) -> dict[str, str]:
 # dict.  Even one cached lookup beats pm_track_info (~18 ms on hg38).
 _COMPUTED_TRACK_CACHE: dict[str, bool] = {}
 
+# Per-track "computer type supported?" cache for COMPUTED tracks (CT2_AREA /
+# CT2_TEST -> True, CT2_POTENTIAL / CT2_TECHNICAL -> False).  Read once from
+# the first per-chrom-pair file's Computer2D header.
+_COMPUTED_TYPE_OK_CACHE: dict[str, bool] = {}
+
 # Cache of "this expr tuple has already been validated as clean" — keyed by
 # (frozenset(exprs), frozenset(vtrack_names)).  Avoids re-parsing the
 # expression and re-touching the track_names set on every gextract/gscreen
@@ -119,7 +124,66 @@ _CHECK_EXPRS_CACHE: set[tuple] = set()
 def _clear_computed_track_cache() -> None:
     """Drop the _check_computed_tracks caches.  Called on db reload/unload."""
     _COMPUTED_TRACK_CACHE.clear()
+    _COMPUTED_TYPE_OK_CACHE.clear()
     _CHECK_EXPRS_CACHE.clear()
+
+
+def _is_computed_track_supported(track: str) -> bool:
+    """Whether *track*'s embedded Computer2D type is one we can read.
+
+    Reads the first per-chrom-pair file (or any chunk of the indexed
+    track.dat) and inspects the Computer2D header byte at offset 4.
+    Returns True for ``CT2_AREA`` / ``CT2_TEST`` (the ones the framework
+    actually evaluates today), False otherwise.
+    """
+    cached = _COMPUTED_TYPE_OK_CACHE.get(track)
+    if cached is not None:
+        return cached
+    import glob
+    import os
+    import struct
+
+    from ._computer2d import _SUPPORTED_TYPES
+    from ._quadtree import SIGNATURE_COMPUTED
+
+    try:
+        path = _pymisha.pm_track_path(track)
+    except Exception:
+        _COMPUTED_TYPE_OK_CACHE[track] = False
+        return False
+
+    # Indexed track: read the leading bytes of the first per-chunk record
+    # in track.dat (each per-pair chunk starts with the signature header).
+    candidates: list[str] = []
+    indexed_dat = os.path.join(path, "track.dat")
+    if os.path.exists(indexed_dat):
+        candidates.append(indexed_dat)
+    else:
+        for entry in glob.glob(os.path.join(path, "*")):
+            base = os.path.basename(entry)
+            if base.startswith(".") or base.endswith(".idx"):
+                continue
+            if os.path.isfile(entry):
+                candidates.append(entry)
+    candidates.sort(key=os.path.getsize)
+    for cand in candidates:
+        try:
+            with open(cand, "rb") as fh:
+                head = fh.read(8)
+        except OSError:
+            continue
+        if len(head) < 8:
+            continue
+        sig = struct.unpack_from("<i", head, 0)[0]
+        if sig != SIGNATURE_COMPUTED:
+            continue
+        ct_type = struct.unpack_from("<i", head, 4)[0]
+        ok = ct_type in _SUPPORTED_TYPES
+        _COMPUTED_TYPE_OK_CACHE[track] = ok
+        return ok
+
+    _COMPUTED_TYPE_OK_CACHE[track] = False
+    return False
 
 
 def _check_computed_tracks(exprs: str | list[str]) -> None:
@@ -178,11 +242,15 @@ def _check_computed_tracks(exprs: str | list[str]) -> None:
                 continue
             cached = info.get("type") == "computed"
             _COMPUTED_TRACK_CACHE[tname] = cached
-        if cached:
+        # COMPUTED tracks backed by CT2_AREA / CT2_TEST are readable in pymisha
+        # now; CT2_POTENTIAL / CT2_TECHNICAL still need their C++ port
+        # (deferred).  Consult the on-disk Computer2D header to pick the
+        # right behaviour.
+        if cached and not _is_computed_track_supported(tname):
             raise NotImplementedError(
-                f"COMPUTED tracks (Hi-C normalization) are not yet supported "
-                f"in pymisha. Track '{tname}' is a COMPUTED track. "
-                f"Consider using R misha for this workflow."
+                f"COMPUTED track '{tname}' uses an unsupported Computer2D "
+                "type (PotentialComputer2D / TechnicalComputer2D not yet "
+                "ported). Consider using R misha for this workflow."
             )
 
     # All tracks clean — remember this expression set so the next call short-circuits.

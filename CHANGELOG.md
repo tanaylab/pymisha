@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.4 (2026-05-31)
+
+- **COMPUTED 2D tracks backed by `AreaComputer2D` / `TestComputer2D` are now readable.** `gextract`, `gsummary`, `gquantiles`, and related routines used to raise `NotImplementedError` on any track of type `"computed"`; pymisha now parses the COMPUTED file format (signature -11), dispatches the embedded Computer2D header (`CT2_AREA` / `CT2_TEST`), and reads the StatQuadTreeCached payload via the existing RECTS machinery (Computed_val<float> on-disk layout matches RectObj). Aggregation-only paths (`gsummary`, `gquantiles`, scope-level `gscreen`) consume cached node stats and return R-parity values for these tracks. `PotentialComputer2D` / `TechnicalComputer2D` (Hi-C normalisation) and the per-rect compute-on-mismatch fallback (used when an iterator emits clipped or grid-binned rects whose coords don't exactly match a stored rect) remain deferred.
+
 ## v0.8.3 (2026-05-31)
 
 - **A value-based 2D vtrack with no explicit iterator now iterates the source 2D track's rects.** `pm.gvtrack_create("v", "hic.track", "weighted.sum"); pm.gextract("v", scope_2d)` (no `iterator=`) used to fall through to one-row-per-scope-interval aggregation; it now defaults the iterator to the source 2D track's rectangles (one row per source rect in the scope), matching R's per-vtrack default iterator. Pass `iterator=scope_2d` to keep the prior one-row-per-scope-interval behavior. 1D iterator shifts (`gvtrack_iterator(sshift=, eshift=)`) set on a 2D-source vtrack are now rejected by the scanner path too (the legacy path already rejected them).
