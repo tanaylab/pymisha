@@ -487,13 +487,36 @@ def _gextract_2d_single_python(
     """Pure-Python reference implementation of 2D bare-track extract.
 
     Kept for parity tests against the C++ fast path. Not used in production.
+
+    COMPUTED tracks (R's ``GenomeTrackComputed``) hit a different per-rect
+    emit path: each stored ``Computed_val<float>`` is clipped to the
+    intersection of the query rect and (if present) the band, then the
+    cached value is *recomputed* via the Computer2D mirroring R's
+    ``Computed_val::val(rect, [band])``.  Pymisha emits the clipped coords
+    and the recomputed value to match R.
     """
-    from ._quadtree import open_2d_pair, query_2d_track_opened
+    from ._computer2d import (
+        DiagonalBand as _DBand,
+    )
+    from ._computer2d import (
+        Rectangle as _Rect,
+    )
+    from ._computer2d import (
+        load_computer_from_header,
+        recompute_or_cached,
+    )
+    from ._quadtree import (
+        SIGNATURE_COMPUTED,
+        open_2d_pair,
+        query_2d_track_opened,
+    )
     from .tracks import gtrack_info
 
     track_path = _pymisha.pm_track_path(track)
     info = gtrack_info(track)
     is_points = info.get("type") == "points"
+    is_computed = info.get("type") == "computed"
+    band_obj = _DBand(int(band[0]), int(band[1])) if band is not None else None
 
     # Group intervals by (chrom1, chrom2) to open each file only once.
     chrom_pair_intervals = _group_intervals_by_chrom_pair(intervals)
@@ -508,6 +531,14 @@ def _gextract_2d_single_python(
         try:
             if num_objs == 0:
                 continue
+
+            # COMPUTED: parse the Computer2D header once per chrom-pair so the
+            # per-rect recompute can call computer.compute(clipped_rect, band).
+            computer = None
+            if is_computed:
+                import struct as _struct
+                if _struct.unpack_from("<i", data, 0)[0] == SIGNATURE_COMPUTED:
+                    computer = load_computer_from_header(data)
 
             for interval_idx, s1, e1, s2, e2 in interval_list:
                 objs = query_2d_track_opened(
@@ -527,7 +558,28 @@ def _gextract_2d_single_python(
                         rows.append((c1, ox, ox + 1, c2, oy, oy + 1, float(val), interval_idx))
                     else:
                         ox1, oy1, ox2, oy2, val = obj
-                        rows.append((c1, ox1, ox2, c2, oy1, oy2, float(val), interval_idx))
+                        if computer is not None:
+                            # Clip the stored rect to the query rect, then to
+                            # the diagonal band (R's shrink2intersected); recompute
+                            # via the Computer2D mirroring R's val(rect, band).
+                            cx1 = max(int(ox1), int(s1))
+                            cy1 = max(int(oy1), int(s2))
+                            cx2 = min(int(ox2), int(e1))
+                            cy2 = min(int(oy2), int(e2))
+                            query_rect = _Rect(cx1, cy1, cx2, cy2)
+                            if band_obj is not None and band_obj.active:
+                                query_rect = band_obj.shrink2intersected(query_rect)
+                            stored_rect = _Rect(int(ox1), int(oy1), int(ox2), int(oy2))
+                            new_val = recompute_or_cached(
+                                stored_rect, float(val), query_rect, computer, band_obj,
+                            )
+                            rows.append(
+                                (c1, query_rect.x1, query_rect.x2,
+                                 c2, query_rect.y1, query_rect.y2,
+                                 float(new_val), interval_idx)
+                            )
+                        else:
+                            rows.append((c1, ox1, ox2, c2, oy1, oy2, float(val), interval_idx))
         finally:
             close_fn()
 

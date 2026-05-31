@@ -89,34 +89,62 @@ class DiagonalBand:
         return self.d1 != 0 or self.d2 != 0
 
     def do_intersect(self, r: Rectangle) -> bool:
+        # R: rect.x2 - rect.y1 > d1 && rect.x1 - rect.y2 + 1 < d2
         return (r.x2 - r.y1 > self.d1) and (r.x1 - r.y2 + 1 < self.d2)
 
     def do_contain(self, r: Rectangle) -> bool:
-        # Every point in the rect lies inside [d1, d2) on the (x-y) axis.
-        # The rect's (x-y) range is [x1 - (y2 - 1), (x2 - 1) - y1].
-        return (r.x1 - (r.y2 - 1) >= self.d1) and ((r.x2 - 1) - r.y1 < self.d2)
+        # R: rect.x1 - rect.y2 + 1 >= d1 && rect.x2 - rect.y1 <= d2
+        return (r.x1 - r.y2 + 1 >= self.d1) and (r.x2 - r.y1 <= self.d2)
+
+    # R's diagonal-band parameterisation helpers (DiagonalBand.h:30-33).
+    def x1_at(self, y1: int) -> int:
+        return y1 + self.d1
+
+    def y1_at(self, x1: int) -> int:
+        return x1 - self.d1
+
+    def x2_at(self, y2: int) -> int:
+        return y2 + self.d2
+
+    def y2_at(self, x2: int) -> int:
+        return x2 - self.d2
+
+    def shrink2intersected(self, r: Rectangle) -> Rectangle:
+        """Return the minimal rect bounding the original ∩ band.
+
+        Mirrors R's ``DiagonalBand::shrink2intersected`` (in-place there;
+        we return a new Rectangle for immutability).
+        """
+        x1, y1, x2, y2 = r.x1, r.y1, r.x2, r.y2
+        if x1 - y1 < self.d1:
+            x1 = self.x1_at(y1)
+        elif x1 - y1 > self.d2:
+            y1 = self.y2_at(x1)
+
+        if x2 - y2 < self.d1:
+            y2 = self.y1_at(x2)
+        elif x2 - y2 > self.d2:
+            x2 = self.x2_at(y2)
+        return Rectangle(x1, y1, x2, y2)
 
 
 def intersected_area(r: Rectangle, band: DiagonalBand) -> int:
     """Area of ``r`` falling inside the half-open band ``[d1, d2)``.
 
-    Mirrors R's ``DiagonalBand::intersected_area`` (axis-aligned rect ∩
-    diagonal strip = full rect minus the two corner triangles outside the
-    band).
+    Mirrors R's ``DiagonalBand::intersected_area`` (which assumes ``r`` is
+    already shrunk to its band-intersection bounding box, then subtracts
+    the two off-band corner triangles).
     """
-    if not band.do_intersect(r):
-        return 0
-    if band.do_contain(r):
-        return r.area
-    rect_d_lo = r.x1 - (r.y2 - 1)  # min (x - y) over the rect's points
-    rect_d_hi = (r.x2 - 1) - r.y1  # max (x - y) over the rect's points
-    # Triangle of cells with (x - y) < d1.
-    below = max(0, band.d1 - rect_d_lo)
-    below_area = (below * (below + 1)) // 2
-    # Triangle of cells with (x - y) >= d2.
-    above = max(0, rect_d_hi - (band.d2 - 1))
-    above_area = (above * (above + 1)) // 2
-    return r.area - below_area - above_area
+    area = r.area
+    # Subtract the triangle above d1 (cells with x - y < d1).
+    if r.x1 - r.y2 + 1 < band.d1:
+        n = band.x1_at(r.y2) - r.x1
+        area -= (n * n - n) >> 1
+    # Subtract the triangle below d2 (cells with x - y > d2 - 1).
+    if r.x2 - r.y1 > band.d2:
+        n = r.x2 - band.x2_at(r.y1)
+        area -= (n * n + n) >> 1
+    return area
 
 
 # --------------------------------------------------------------------------- #
@@ -150,14 +178,23 @@ class AreaComputer2D(Computer2D):
 class TestComputer2D(Computer2D):
     """``(x1+x2+y1+y2[+d1+d2]) % 10_000_000`` - R-side test fixture.
 
-    Mirrors R's ``TestComputer2D::compute``.
+    Mirrors R's ``TestComputer2D::compute`` exactly, including the C-style
+    ``%`` semantics (truncation toward zero, sign of the dividend - matters
+    when band-shrinking produces negative coordinates).
     """
+
+    _MOD = 10_000_000
 
     def compute(self, r: Rectangle, band: DiagonalBand | None = None) -> float:
         s = r.x1 + r.x2 + r.y1 + r.y2
         if band is not None and band.active:
             s += band.d1 + band.d2
-        return float(s % 10_000_000)
+        # C-style integer mod (truncation toward zero, sign of dividend):
+        # ``s - trunc(s / mod) * mod``.  Python ``//`` floor-divides, so
+        # negate-and-negate to get truncation for negatives.
+        if s >= 0:
+            return float(s - (s // self._MOD) * self._MOD)
+        return float(s - (-(-s // self._MOD)) * self._MOD)
 
 
 def create_computer2d(ct_type: int) -> Computer2D:
@@ -180,3 +217,44 @@ def create_computer2d(ct_type: int) -> Computer2D:
             "CT2_TECHNICAL (TechnicalComputer2D) not yet ported"
         )
     raise ValueError(f"Unknown Computer2DType: {ct_type}")
+
+
+def load_computer_from_header(data: Any) -> Computer2D:
+    """Construct the Computer2D instance encoded in a COMPUTED 2D track header.
+
+    Verifies the leading signature is -11 and dispatches the next 4 bytes
+    through :func:`create_computer2d`.  CT2_AREA / CT2_TEST have no extra
+    per-instance state so this is just signature + type-byte parsing.
+    """
+    sig = struct.unpack_from("<i", data, 0)[0]
+    if sig != -11:
+        raise ValueError(f"Expected COMPUTED signature -11, got {sig}")
+    ct_type = read_computer2d_type(data, offset=4)
+    return create_computer2d(ct_type)
+
+
+def recompute_or_cached(
+    stored: Rectangle,
+    cached_v: float,
+    query: Rectangle,
+    computer: Computer2D,
+    band: DiagonalBand | None,
+) -> float:
+    """Mirror R's ``Computed_val<T>::val(rect[, band])``.
+
+    Returns the cached value when ``stored == query`` (and the band, if any,
+    fully contains the rect); otherwise calls ``computer.compute(query, band)``.
+    """
+    coords_match = (
+        stored.x1 == query.x1
+        and stored.x2 == query.x2
+        and stored.y1 == query.y1
+        and stored.y2 == query.y2
+    )
+    if band is None or not band.active:
+        if coords_match:
+            return cached_v
+        return computer.compute(query)
+    if coords_match and band.do_contain(query):
+        return cached_v
+    return computer.compute(query, band)

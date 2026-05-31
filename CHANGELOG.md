@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.5 (2026-05-31)
+
+- **COMPUTED 2D tracks now clip stored rects to the query and recompute the cached value when needed.** R's `Computed_val<T>::val(rect, band)` returns the cached `v` only when `rect` exactly matches the stored coords (and the band contains it); otherwise it recomputes via `Computer2D::compute(rect, band)`. Pymisha's 2D extract now clips each emitted stored rect to (query ∩ band) via the R-parity `DiagonalBand::shrink2intersected` and routes mismatching cases through `recompute_or_cached`, mirroring `update_stat`. `TestComputer2D` mod operator now uses C-style truncation (truncation toward zero, sign of dividend) - matters when band-shrinking produces negative coordinates. `DiagonalBand.do_contain` + `intersected_area` corrected to mirror R's source exactly. Flips r_parity gextract.50 (`2 * test.computed2d + 17`), gextract.55 (band query), gextract.58 (scope-clipping at chrom boundaries), gextract.43 (iterator=COMPUTED + multi-expression).
+
 ## v0.8.4 (2026-05-31)
 
 - **COMPUTED 2D tracks backed by `AreaComputer2D` / `TestComputer2D` are now readable.** `gextract`, `gsummary`, `gquantiles`, and related routines used to raise `NotImplementedError` on any track of type `"computed"`; pymisha now parses the COMPUTED file format (signature -11), dispatches the embedded Computer2D header (`CT2_AREA` / `CT2_TEST`), and reads the StatQuadTreeCached payload via the existing RECTS machinery (Computed_val<float> on-disk layout matches RectObj). Aggregation-only paths (`gsummary`, `gquantiles`, scope-level `gscreen`) consume cached node stats and return R-parity values for these tracks. `PotentialComputer2D` / `TechnicalComputer2D` (Hi-C normalisation) and the per-rect compute-on-mismatch fallback (used when an iterator emits clipped or grid-binned rects whose coords don't exactly match a stored rect) remain deferred.
