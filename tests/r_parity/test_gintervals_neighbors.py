@@ -69,10 +69,10 @@ _CASES = {
     "gintervals.neighbors.4": (lambda: _N(_intervs(), "test.tss", 100, mindist=-10000, maxdist=-2000), None),
     "gintervals.neighbors.5": (lambda: _N(_i2(1), _i2(1)), None),
     "gintervals.neighbors.2d.1": (lambda: _nb_2d(100, mindist1=10000, maxdist1=20000, mindist2=50000, maxdist2=70000), GAP_GSCREEN_ORDER),
-    "gintervals.neighbors.2d.4": (lambda: _N("test.bigintervs_2d_5", "test.bigintervs_2d_6"), GAP_2D_NN_SCALE),
-    "gintervals.neighbors.2d.5": (lambda: _N("test.generated_2d_5", "test.generated_2d_6"), GAP_2D_NN_SCALE),
+    "gintervals.neighbors.2d.4": (lambda: _N("test.bigintervs_2d_5", "test.bigintervs_2d_6"), GAP_NN_TIE),
+    "gintervals.neighbors.2d.5": (lambda: _N("test.generated_2d_5", "test.generated_2d_6"), GAP_NN_TIE),
     "gintervals.neighbors.8": (_nb8, GAP_NN_TIE),
-    "gintervals.neighbors.9": (_nb_2d, GAP_2D_NN_SCALE),
+    "gintervals.neighbors.9": (_nb_2d, GAP_NN_TIE),
 }
 
 

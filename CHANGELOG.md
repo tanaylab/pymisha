@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.2 (2026-05-31)
+
+- **`gintervals_neighbors` on 2D interval sets now handles large unbounded inputs.** A nearest-neighbor query without a `maxdist*` window on intervals beyond a few million rects previously raised `NotImplementedError`; it now runs an in-memory quadtree NN iterator in C++ (port of R misha's `StatQuadTree::NNIterator`), matching R's per-axis-unsigned-gap geometry. R's `priority_queue` tie-break order on equidistant `maxn=1` neighbors is not portable across STL implementations and is not replicated; query rows that hit such ties may pick a different (but equidistant) neighbor. 2D track names passed as `intervals1` / `intervals2` are now materialized via `gextract` over the 2D ALLGENOME(full) scope (R parity).
+
 ## v0.8.1 (2026-05-31)
 
 - **2D tracks built with NaN-valued rectangles now retain the NaN rects, matching R.** `gtrack_lookup` with `force_binning=False` on a 2D source, and any other path constructing a 2D RECTS track from NaN-bearing values, previously silently dropped NaN rects so the resulting track was incomplete (an off-diagonal `gtrack_lookup` query returned `None`); they now write the NaN rects to disk, exclude them from per-bin stat aggregations (avg / min / max / sum / weighted.sum), and `gextract` returns all rects including NaN values. `gtrack_lookup` also now evaluates the 2D scope under `mode="full"` so off-diagonal chrompair queries return data.

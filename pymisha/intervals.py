@@ -2179,6 +2179,130 @@ def gintervals_coverage_fraction(
 _NEIGHBORS_2D_BRUTE_LIMIT = 100_000_000
 
 
+def _neighbors_2d_via_cpp_nn(
+    i1: pd.DataFrame,
+    i2: pd.DataFrame,
+    maxneighbors: int,
+    mindist1: int,
+    maxdist1: int,
+    mindist2: int,
+    maxdist2: int,
+    na_if_notfound: bool,
+) -> pd.DataFrame | None:
+    """Unbounded / huge-input 2D NN: build a C++ MemQuadTree per chrom-pair
+    and call the NN iterator binding (R parity).
+
+    The bounded path uses _quadtree.QuadTree's expanded-rect query, which
+    is faster for tiny inputs.  This path scales to multi-million rect
+    inputs that would blow the brute-force budget; it is also correct
+    for bounded windows (we pass mindist/maxdist through and the NN
+    iterator early-breaks at the Manhattan cutoff).
+    """
+    np = _numpy
+
+    qx1 = i1["start1"].to_numpy(np.int64)
+    qy1 = i1["start2"].to_numpy(np.int64)
+    qx2 = i1["end1"].to_numpy(np.int64)
+    qy2 = i1["end2"].to_numpy(np.int64)
+    tx1 = i2["start1"].to_numpy(np.int64)
+    ty1 = i2["start2"].to_numpy(np.int64)
+    tx2 = i2["end1"].to_numpy(np.int64)
+    ty2 = i2["end2"].to_numpy(np.int64)
+
+    g1_idx = i1.groupby(["chrom1", "chrom2"], observed=True).indices
+    g2_idx = i2.groupby(["chrom1", "chrom2"], observed=True).indices
+
+    out_q: list[int] = []
+    out_t: list[int] = []
+    out_d1: list[float] = []
+    out_d2: list[float] = []
+
+    queries_with_any_match: set[int] = set()
+
+    for key, q_pos in g1_idx.items():
+        t_pos = g2_idx.get(key)
+        if t_pos is None or len(t_pos) == 0:
+            continue
+        q_pos_arr = np.asarray(q_pos, dtype=np.int64)
+        t_pos_arr = np.asarray(t_pos, dtype=np.int64)
+        res = _pymisha.pm_neighbors_2d(
+            qx1[q_pos_arr], qy1[q_pos_arr], qx2[q_pos_arr], qy2[q_pos_arr],
+            tx1[t_pos_arr], ty1[t_pos_arr], tx2[t_pos_arr], ty2[t_pos_arr],
+            int(maxneighbors),
+            int(mindist1), int(maxdist1),
+            int(mindist2), int(maxdist2),
+        )
+        if len(res["q_local_idx"]) == 0:
+            continue
+        q_local = res["q_local_idx"]
+        t_local = res["t_local_idx"]
+        d1_arr = res["dist1"]
+        d2_arr = res["dist2"]
+        q_global = q_pos_arr[q_local]
+        t_global = t_pos_arr[t_local]
+        for j in range(len(q_global)):
+            out_q.append(int(q_global[j]))
+            out_t.append(int(t_global[j]))
+            out_d1.append(float(d1_arr[j]))
+            out_d2.append(float(d2_arr[j]))
+            queries_with_any_match.add(int(q_global[j]))
+
+    # NA-if-notfound: every query in i1 that produced zero matches.
+    if na_if_notfound:
+        for j in range(len(i1)):
+            if j not in queries_with_any_match:
+                out_q.append(j)
+                out_t.append(-1)
+                out_d1.append(float("nan"))
+                out_d2.append(float("nan"))
+
+    if not out_q:
+        return None
+
+    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, id2).
+    order = sorted(
+        range(len(out_q)),
+        key=lambda i: (
+            out_q[i],
+            abs((out_d1[i] + out_d2[i]) if out_t[i] >= 0 else 0.0),
+            out_t[i],
+        ),
+    )
+    id1_arr = [out_q[i] for i in order]
+    id2_arr = [out_t[i] for i in order]
+    d1_arr = [out_d1[i] for i in order]
+    d2_arr = [out_d2[i] for i in order]
+
+    # Build the output mirroring the bounded path (same column-rename and
+    # final DataFrame shape).
+    left = i1.iloc[id1_arr].reset_index(drop=True)
+    used = set(i1.columns)
+    rename2: dict[str, str] = {}
+    for col in i2.columns:
+        new = col
+        while new in used:
+            new = new + "1"
+        rename2[col] = new
+        used.add(new)
+    # For NA rows, take the first i2 row as a template and overwrite to NA.
+    if i2.shape[0] > 0:
+        right = i2.iloc[[max(k, 0) for k in id2_arr]].reset_index(drop=True)
+        right.rename(columns=rename2, inplace=True)
+        for col in rename2.values():
+            mask = [k < 0 for k in id2_arr]
+            if any(mask):
+                if pd.api.types.is_numeric_dtype(right[col]):
+                    right.loc[mask, col] = float("nan")
+                else:
+                    right.loc[mask, col] = pd.NA
+    else:
+        right = pd.DataFrame()
+    res_df = pd.concat([left, right], axis=1)
+    res_df["dist1"] = d1_arr
+    res_df["dist2"] = d2_arr
+    return res_df
+
+
 def _neighbors_2d(
     i1: pd.DataFrame,
     i2: pd.DataFrame,
@@ -2230,20 +2354,16 @@ def _neighbors_2d(
     ty2 = i2["end2"].to_numpy(np.int64)
     g2_indices = i2.groupby(["chrom1", "chrom2"], observed=True).indices
 
-    # Brute-force budget guard for unbounded windows.
+    # Unbounded windows (and large bounded ones): use the C++ NN iterator
+    # per chrom-pair (Phase NN of KICKOFF-5 deferred backlog).
     if not bounded:
-        budget = 0
-        g1_indices = i1.groupby(["chrom1", "chrom2"], observed=True).indices
-        for key, q_pos in g1_indices.items():
-            t_pos = g2_indices.get(key)
-            if t_pos is not None:
-                budget += len(q_pos) * len(t_pos)
-        if budget > _NEIGHBORS_2D_BRUTE_LIMIT:
-            raise NotImplementedError(
-                "2D nearest-neighbor search over large unbounded interval sets "
-                "is not yet supported (needs a quadtree NN iterator); supply a "
-                "bounded maxdist1/maxdist2 window or use smaller inputs."
-            )
+        return _neighbors_2d_via_cpp_nn(
+            i1, i2,
+            int(maxneighbors),
+            int(mindist1), int(maxdist1),
+            int(mindist2), int(maxdist2),
+            na_if_notfound,
+        )
 
     pair_tree: dict[tuple, Any] = {}
 
@@ -2424,6 +2544,28 @@ def gintervals_neighbors(
     """
     intervals1 = _resolve_intervals(intervals1)
     intervals2 = _resolve_intervals(intervals2)
+    # 2D track names (e.g. "test.generated_2d_5"): _resolve_intervals only
+    # handles named intervals SETS; for 2D track names we materialize their
+    # rectangles via gextract over the 2D ALLGENOME(full) scope.  R parity:
+    # gintervals.neighbors(track_2d, ...) loads the track's rectangles.
+    def _resolve_2d_track_name(x):
+        if not isinstance(x, str):
+            return x
+        from .tracks import gtrack_exists, gtrack_info
+        if not gtrack_exists(x):
+            return x
+        info = gtrack_info(x)
+        if int(info.get("dimensions", 1) or 1) != 2:
+            return x
+        from .extract import gextract
+        scope = gintervals_2d_all(mode="full")
+        df = gextract(x, scope)
+        if df is None:
+            return x
+        return df[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+
+    intervals1 = _resolve_2d_track_name(intervals1)
+    intervals2 = _resolve_2d_track_name(intervals2)
     _checkroot()
 
     if intervals1 is None:

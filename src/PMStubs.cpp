@@ -15,6 +15,7 @@
 #include "BinFinder.h"
 #include "BinsManager.h"
 #include "QuadTreeReader.h"
+#include "MemQuadTree.h"
 #include "GInterval2D.h"
 #include "PMTrackExpression2DIterator.h"
 #include "PMTrackExpression2DIteratorPolicy.h"
@@ -7494,4 +7495,150 @@ PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args)
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return nullptr;
     }
+}
+
+// =====================================================================
+// pm_neighbors_2d — 2D NN iteration on one chrom-pair using MemQuadTree
+// (Phase NN of the KICKOFF-5 deferred backlog). The caller pre-groups
+// i1 / i2 by chrom-pair and invokes this per pair with int64 rect
+// arrays.  Returns a dict of 4 int64 ndarrays:
+//
+//   q_local_idx : index into the query arrays of the matched row
+//   t_local_idx : index into the target arrays of the matched row
+//   dist1, dist2: per-axis unsigned gaps
+//
+// Rows are appended in the order the NN iterator surfaces them (per
+// query, ascending Manhattan distance).  The Python wrapper re-sorts
+// and joins back to global indices.
+// =====================================================================
+
+static PyObject *_emit_neighbors_2d_result(
+        const std::vector<int64_t> &q_idx,
+        const std::vector<int64_t> &t_idx,
+        const std::vector<int64_t> &d1,
+        const std::vector<int64_t> &d2) {
+    npy_intp n = static_cast<npy_intp>(q_idx.size());
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+
+    auto build = [&](const std::vector<int64_t> &v, const char *key) -> bool {
+        PyObject *arr = PyArray_SimpleNew(1, &n, NPY_INT64);
+        if (!arr) return false;
+        if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr),
+                          v.data(), n * sizeof(int64_t));
+        PyDict_SetItemString(result, key, arr);
+        Py_DECREF(arr);
+        return true;
+    };
+
+    if (!build(q_idx, "q_local_idx") ||
+        !build(t_idx, "t_local_idx") ||
+        !build(d1,    "dist1") ||
+        !build(d2,    "dist2")) {
+        Py_DECREF(result);
+        return NULL;
+    }
+    return result;
+}
+
+PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
+    PyArrayObject *qx1_a, *qy1_a, *qx2_a, *qy2_a;
+    PyArrayObject *tx1_a, *ty1_a, *tx2_a, *ty2_a;
+    long long maxneighbors;
+    long long mindist1, maxdist1, mindist2, maxdist2;
+
+    if (!PyArg_ParseTuple(args, "OOOOOOOOLLLLL",
+                          &qx1_a, &qy1_a, &qx2_a, &qy2_a,
+                          &tx1_a, &ty1_a, &tx2_a, &ty2_a,
+                          &maxneighbors,
+                          &mindist1, &maxdist1, &mindist2, &maxdist2))
+        return NULL;
+
+    auto as_i64 = [](PyArrayObject *a) -> const int64_t * {
+        return static_cast<const int64_t *>(PyArray_DATA(a));
+    };
+    auto count = [](PyArrayObject *a) -> npy_intp { return PyArray_DIM(a, 0); };
+
+    npy_intp nq = count(qx1_a);
+    npy_intp nt = count(tx1_a);
+
+    if (nq == 0 || nt == 0) {
+        std::vector<int64_t> empty;
+        return _emit_neighbors_2d_result(empty, empty, empty, empty);
+    }
+
+    const int64_t *qx1 = as_i64(qx1_a), *qy1 = as_i64(qy1_a),
+                  *qx2 = as_i64(qx2_a), *qy2 = as_i64(qy2_a);
+    const int64_t *tx1 = as_i64(tx1_a), *ty1 = as_i64(ty1_a),
+                  *tx2 = as_i64(tx2_a), *ty2 = as_i64(ty2_a);
+
+    // Arena: bounding box of all i1 and i2 rects, plus a margin so all
+    // objects are strictly inside (R's quadtree treats arena as
+    // half-open).  +1 in each direction keeps insertions inside.
+    int64_t x_lo = qx1[0], y_lo = qy1[0], x_hi = qx2[0], y_hi = qy2[0];
+    for (npy_intp i = 0; i < nq; ++i) {
+        if (qx1[i] < x_lo) x_lo = qx1[i];
+        if (qy1[i] < y_lo) y_lo = qy1[i];
+        if (qx2[i] > x_hi) x_hi = qx2[i];
+        if (qy2[i] > y_hi) y_hi = qy2[i];
+    }
+    for (npy_intp i = 0; i < nt; ++i) {
+        if (tx1[i] < x_lo) x_lo = tx1[i];
+        if (ty1[i] < y_lo) y_lo = ty1[i];
+        if (tx2[i] > x_hi) x_hi = tx2[i];
+        if (ty2[i] > y_hi) y_hi = ty2[i];
+    }
+    x_hi += 1; y_hi += 1;
+
+    memqt::MemQuadTree tree;
+    tree.init(x_lo, y_lo, x_hi, y_hi);
+    for (npy_intp i = 0; i < nt; ++i) {
+        tree.insert(memqt::RectObj(
+            memqt::Rectangle(tx1[i], ty1[i], tx2[i], ty2[i]),
+            static_cast<int64_t>(i)));
+    }
+
+    std::vector<int64_t> out_q, out_t, out_d1, out_d2;
+    int64_t per_q = maxneighbors > 16 ? 16 : maxneighbors;
+    if (per_q < 1) per_q = 1;
+    out_q.reserve(nq * per_q);
+    out_t.reserve(nq * per_q);
+    out_d1.reserve(nq * per_q);
+    out_d2.reserve(nq * per_q);
+
+    // Manhattan cutoff: if both maxdists are finite, the iterator can
+    // stop once dist1 + dist2 exceeds the sum.  We treat "unbounded" as
+    // any maxdist >= 1e9 (the Python `_BIG` sentinel).
+    constexpr int64_t BIG = 1000000000LL;
+    int64_t cutoff = INT64_MAX;
+    if (maxdist1 < BIG && maxdist2 < BIG)
+        cutoff = maxdist1 + maxdist2;
+
+    for (npy_intp j = 0; j < nq; ++j) {
+        memqt::MemQuadTree::NNIterator it(&tree);
+        memqt::Rectangle qr(qx1[j], qy1[j], qx2[j], qy2[j]);
+        if (!it.begin(qr)) continue;
+        int kept = 0;
+        do {
+            const memqt::RectObj &t = *it;
+            int64_t d1 = 0;
+            if (t.rect.x1 >= qr.x2)      d1 = t.rect.x1 - qr.x2;
+            else if (qr.x1 >= t.rect.x2) d1 = qr.x1 - t.rect.x2;
+            int64_t d2 = 0;
+            if (t.rect.y1 >= qr.y2)      d2 = t.rect.y1 - qr.y2;
+            else if (qr.y1 >= t.rect.y2) d2 = qr.y1 - t.rect.y2;
+            int64_t M = d1 + d2;
+            if (M > cutoff) break;
+            if (d1 >= mindist1 && d1 <= maxdist1 &&
+                d2 >= mindist2 && d2 <= maxdist2) {
+                out_q.push_back(static_cast<int64_t>(j));
+                out_t.push_back(t.id);
+                out_d1.push_back(d1);
+                out_d2.push_back(d2);
+                if (++kept >= static_cast<int>(maxneighbors)) break;
+            }
+        } while (it.next());
+    }
+
+    return _emit_neighbors_2d_result(out_q, out_t, out_d1, out_d2);
 }
