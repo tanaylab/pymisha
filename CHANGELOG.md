@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.10 (2026-06-01)
+
+- **Documentation corrections (no code changes).** The R-parity guide and several capability notes were out of date. Fixed: COMPUTED 2D tracks are now documented as readable for `AreaComputer2D`/`TestComputer2D` (Hi-C `Potential`/`Technical` computers and creation remain unsupported); array tracks and the 2D iterator family work through the C++ scanner; array and 2D tracks support the indexed format; gene annotations install via `gdb_install_intervals`/`gdb_build_genome`. Removed stale "not implemented" notes for features that have shipped (`gvtrack.array.slice`, liftover, SAM import). Added a reproducibility note (NumPy vs R RNG; nearest-neighbor tie ordering).
+
 ## v0.8.9 (2026-06-01)
 
 - **Per-chromosome dense tracks whose first chromosome has no data no longer error in `gtrack_info` / `gtrack_copy`.** A per-chrom dense track may legitimately lack a file for the genome's first chromosome (an empty scaffold, or a partial track). `gtrack_info` probed that chromosome to read the bin size and failed with "No such file or directory"; since `gtrack_copy` reads the source's info, copying such a track also failed. It now reads the bin size from the first chromosome that actually has data. (Per-chromosome companion to the v0.8.0 indexed-track fix.)

@@ -115,10 +115,11 @@ Functions for creating, importing, modifying, and managing genomic tracks, inclu
 ## Array Tracks
 
 Multi-column per-position tracks. The PyMisha implementation reads and writes
-the on-disk format byte-compatibly with R misha. Note that `gextract` does
-not yet dispatch through the C++ scanner for ARRAYS tracks - use
-`gtrack_array_extract` to read array data; the scanner integration is
-tracked under Group K of the 2026-05-15 parity roadmap.
+the on-disk format byte-compatibly with R misha. Array tracks dispatch through
+the C++ track-expression scanner, so they work directly in expressions
+(`gextract("my.array", ...)`, `gextract("2 * my.array", ...)`), as an iterator,
+and as the source of value / slice virtual tracks. Use `gtrack_array_extract`
+to dump the full multi-column matrix.
 
 ::: pymisha.gtrack_array_create
     options:

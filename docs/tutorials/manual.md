@@ -408,7 +408,7 @@ info = pm.gtrack_info("my_track")
 print(info["format"])  # "indexed" or "per-chromosome"
 ```
 
-**Supported Track Types:** Dense (fixed-bin) and Sparse tracks (1D only) can use indexed format. 2D tracks and virtual tracks are not supported for indexed format.
+**Supported Track Types:** Dense (fixed-bin), sparse, array, and 2D tracks can all use the indexed format (`gtrack_convert_to_indexed`, `gtrack_2d_convert_to_indexed`); interval sets too (`gintervals_convert_to_indexed` / `gintervals_2d_convert_to_indexed`). Virtual tracks are computed on the fly rather than stored on disk, so the format does not apply to them.
 
 **Backward Compatibility:** The indexed format is fully transparent to all PyMisha functions. Both formats can coexist in the same database and are used identically in track expressions and analysis functions.
 

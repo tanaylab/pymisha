@@ -241,8 +241,15 @@ UCSC data URLs:
 
 ## Gene Annotations
 
-!!! warning "Gene import not yet supported"
-    The R misha `gdb.create()` function accepts `genes_file`, `annots_file`, and `annots_names` parameters to import UCSC gene annotations (e.g., knownGene) during database creation. These parameters are accepted by `pm.gdb_create()` for API compatibility but are **not yet implemented** in PyMisha. The UCSC URLs for gene annotation files are listed above for each genome for future use.
+!!! note "Installing gene annotations"
+    The `genes_file` / `annots_file` / `annots_names` parameters of
+    `pm.gdb_create()` are accepted for API compatibility but are **not** acted on
+    (no gene import happens at `gdb_create` time). Install gene annotations
+    instead with **`pm.gdb_install_intervals()`** (into an existing genome), or
+    build a genome together with its gene sets in one step via
+    **`pm.gdb_build_genome()`**. Both populate the `tss` / `exons` / `utr3` /
+    `utr5` interval sets, each carrying `name` (transcript accession) and
+    `geneName` (gene symbol) columns.
 
 ## Linked Databases
 
