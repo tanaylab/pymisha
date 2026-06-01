@@ -4689,6 +4689,79 @@ def gtrack_2d_import_contacts(
         raise
 
 
+def gtrack_2d_get_insu_doms(
+    insu_track: str,
+    thresh: float,
+    iterator: int | float = 500,
+) -> pd.DataFrame:
+    """Extract TAD-style domains from a 1D insulation track.
+
+    Domains are intervals where the insulation score is *missing* or
+    *above* ``thresh`` (lax/inside-domain bins; mirrors R misha's
+    ``gtrack.2d.get_insu_doms``).
+
+    Parameters
+    ----------
+    insu_track : str
+        Name of a 1D track of per-bin insulation values.
+    thresh : float
+        Threshold; bins with value > ``thresh`` (or ``NaN``) are kept.
+    iterator : int or float, default 500
+        Bin size passed to :func:`gscreen`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``chrom``, ``start``, ``end`` of the domain intervals.
+
+    See Also
+    --------
+    gtrack_2d_get_insu_borders : The complementary borders-of-domains
+        extraction.
+    gscreen : Underlying interval-screening engine.
+    """
+    from .extract import gscreen
+    # In pymisha track expressions, R's `is.na(x)` is `np.isnan(x)` (see
+    # tests/r_parity/test_db.py for the mapping convention).
+    expr = f"np.isnan({insu_track}) | {insu_track} > {thresh}"
+    return gscreen(expr, iterator=iterator)
+
+
+def gtrack_2d_get_insu_borders(
+    insu_track: str,
+    thresh: float,
+    iterator: int | float = 500,
+) -> pd.DataFrame:
+    """Extract TAD borders from a 1D insulation track.
+
+    Borders are intervals where the insulation score is *present* and
+    *below* ``thresh`` (strong-boundary bins; mirrors R misha's
+    ``gtrack.2d.get_insu_borders``).
+
+    Parameters
+    ----------
+    insu_track : str
+        Name of a 1D track of per-bin insulation values.
+    thresh : float
+        Threshold; bins with value < ``thresh`` (and not ``NaN``) are kept.
+    iterator : int or float, default 500
+        Bin size passed to :func:`gscreen`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``chrom``, ``start``, ``end`` of the border intervals.
+
+    See Also
+    --------
+    gtrack_2d_get_insu_doms : The complementary domains extraction.
+    gscreen : Underlying interval-screening engine.
+    """
+    from .extract import gscreen
+    expr = f"~np.isnan({insu_track}) & {insu_track} < {thresh}"
+    return gscreen(expr, iterator=iterator)
+
+
 # ---------------------------------------------------------------------------
 # Array tracks (R parity for gtrack.array.*)
 # ---------------------------------------------------------------------------
@@ -4799,6 +4872,86 @@ def gtrack_array_create(
     _pymisha.pm_dbreload()
 
 
+def gtrack_array_import(
+    track: str,
+    description: str,
+    *srcs: str,
+) -> None:
+    """Create an array track by merging one or more sources.
+
+    R parity for ``gtrack.array.import``. Each ``src`` is either an
+    existing array-track name or a path to a tab-separated file with
+    header ``chrom\\tstart\\tend\\t<col1>\\t<col2>...`` (the format
+    written by :func:`gtrack_array_extract` with ``file=``).
+
+    Sources are merged interval-wise. If two sources share an identical
+    ``(start, end)`` interval, their non-NaN cells are combined into a
+    single output row; identical column names across sources are treated
+    as a single output column (consistency-checked, error on mismatch).
+    Partial overlaps across sources raise an error.
+
+    Parameters
+    ----------
+    track : str
+        Name of the array track to create.
+    description : str
+        Description string written to the track's ``.attributes`` file.
+    *srcs : str
+        One or more source paths (TSV files) or existing array-track names.
+
+    Returns
+    -------
+    None
+
+    See Also
+    --------
+    gtrack_array_extract : Read array-track values (and write to TSV via ``file=``).
+    gtrack_array_create : Create an array track directly from a values matrix.
+    """
+    _checkroot()
+    _validate_track_name(track)
+    _ensure_track_absent(track)
+    if not srcs:
+        raise ValueError("gtrack_array_import: at least one source is required")
+
+    from ._array_track import (
+        _CSVSource,
+        _import_sources,
+        _TrackSource,
+        write_colnames,
+    )
+    from .intervals import gintervals_all
+
+    # Resolve each src to a CSV or track source. R: not-a-track -> CSV.
+    sources: list = []
+    for src in srcs:
+        if _track_exists(src):
+            sources.append(_TrackSource(src))
+        else:
+            sources.append(_CSVSource(src))
+
+    chrom_order = [str(c) for c in gintervals_all()["chrom"].tolist()]
+
+    # Atomic create: directory layout mirrors gtrack_array_create -- per-chrom
+    # binary files at <track_dir>/<chrom>, <track_dir>/.colnames, and an empty
+    # <track_dir>/vars/ subdir. No separate "signature" file; the array-track
+    # reader detects the layout.
+    with _atomic_track_create(track) as track_dir:
+        track_dir.mkdir(parents=True, exist_ok=True)
+        (track_dir / "vars").mkdir(exist_ok=True)
+        colnames = _import_sources(track_dir, sources, chrom_order)
+        write_colnames(track_dir, colnames)
+
+    _pymisha.pm_dbreload()
+    created_by = (
+        f'gtrack_array_import("{track}", description, src = c("'
+        + '", "'.join(srcs)
+        + '"))'
+    )
+    _set_created_attrs(track, description, created_by)
+    _pymisha.pm_dbreload()
+
+
 def gtrack_array_get_colnames(track: str) -> list[str]:
     """Return the column names of an ``array`` track.
 
@@ -4843,7 +4996,8 @@ def gtrack_array_extract(
     track: str,
     slice: list[str] | list[int] | None = None,
     intervals: pd.DataFrame | str | None = None,
-) -> pd.DataFrame:
+    file: str | None = None,
+) -> pd.DataFrame | None:
     """Extract per-position array values from an ``array`` track.
 
     R parity for ``gtrack.array.extract``. Returns a DataFrame with
@@ -4861,6 +5015,15 @@ def gtrack_array_extract(
         all columns.
     intervals : DataFrame, optional
         Query intervals (``chrom, start, end``). Defaults to all genome.
+    file : str, optional
+        If given, write the result as a tab-separated table to this path
+        and return ``None`` (R parity for ``gtrack.array.extract(file=)``).
+        The output is the same format consumed by ``gtrack_array_import``.
+
+    Returns
+    -------
+    DataFrame or None
+        The extracted DataFrame, or ``None`` when ``file=`` is given.
     """
     _checkroot()
     if not _track_exists(track):
@@ -4915,4 +5078,11 @@ def gtrack_array_extract(
     from .intervals import gintervals_all
     chrom_order = gintervals_all()["chrom"].astype(str).tolist()
 
-    return extract_array(track_path, intervals, slice_idx, colnames, chrom_order=chrom_order)
+    df = extract_array(track_path, intervals, slice_idx, colnames, chrom_order=chrom_order)
+    if file is not None:
+        # R parity: gtrack.array.extract(file=) writes only the genomic + value
+        # columns; intervalID is an in-memory-only attribute (see the
+        # GAP_ARRAY_FILE_DUMP note in tests/r_parity/test_gtrack_array.py).
+        df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
+        return None
+    return df

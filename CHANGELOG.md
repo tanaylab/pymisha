@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.8 (2026-06-01)
+
+- **`gtrack_2d_get_insu_doms` and `gtrack_2d_get_insu_borders`**: thin `gscreen` wrappers that extract TAD-style domains / borders from a 1D insulation track. R parity for the same-named test-helper idioms in misha (now public API in pymisha).
+- **`gtrack_array_import(track, description, *srcs)`**: create an array track by merging one or more sources. Each source is either an existing array-track name or a tab-separated file with header `chrom\tstart\tend\t<col1>...`. Sources sharing an identical interval merge cell-wise; sources sharing a column name chain through a consistency check; partial overlaps raise. R parity for `gtrack.array.import`.
+- **`gtrack_array_extract` gains `file=` parameter**: writes the result as a tab-separated table without the `intervalID` bookkeeping column, mirroring R's behaviour. The TSV is consumable by `gtrack_array_import`.
+- **`gextract(file=)` no longer writes the `intervalID` column** (R parity). The in-memory `DataFrame` is unchanged; only the on-disk TSV is affected.
+
 ## v0.8.7 (2026-05-31)
 
 - **`intervals_set_out=` on `gextract` / `glookup` / `gpartition` now stores value columns alongside the geometry.** The saved interval set is the full extraction frame minus the bookkeeping `intervalID`, matching R's `C_gextract` writer. Previously pymisha sliced to `chrom`/`start`/`end` (and deduplicated for `gextract`), so the loaded set lost `dense_track`, `bin`, lookup `value`, etc. - a round-trip drop that R never did.

@@ -407,3 +407,18 @@ class TestGvtrackArraySliceErrors:
         info = pm.gvtrack_info("v1")
         assert info["func"] == "quantile"
         assert info["params"] == 0.4
+
+
+# ---------------------------------------------------------------------------
+# gtrack_array_extract: file= TSV dump (R parity)
+# ---------------------------------------------------------------------------
+
+def test_gtrack_array_extract_file_roundtrip(tmp_path):
+    out = tmp_path / "extract.tsv"
+    rc = pm.gtrack_array_extract("array_track", None, file=str(out))
+    assert rc is None
+    assert out.exists()
+    text = out.read_text().splitlines()
+    assert len(text) > 1
+    header = text[0].split("\t")
+    assert header[:3] == ["chrom", "start", "end"]

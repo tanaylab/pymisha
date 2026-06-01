@@ -17,7 +17,6 @@ Open gaps marked ``xfail(strict=True)``:
   there is no ``intervalID``. That raw text dump isn't a faithful target for the
   typed DataFrame the pandas API returns (the underlying data is already covered
   by the cases above).
-* ``GAP_ARRAY_IMPORT`` -- ``gtrack.array.import`` has no pymisha equivalent.
 
 The set-colnames case writes ``.colnames``; the overlay copies track *dotfiles*
 (see overlay.py) so this never touches the shared source DB.
@@ -34,7 +33,6 @@ import pymisha as pm
 from .baseline import assert_matches_baseline
 
 GAP_ARRAY_FILE_DUMP = "tmpresfile baseline is a read.table dump of file output (header-as-data, stringified, no intervalID)"
-GAP_ARRAY_IMPORT = "gtrack.array.import not implemented in pymisha"
 
 _COLS = ["col1", "col3", "col5"]
 
@@ -131,6 +129,32 @@ def test_gtrack_array_extract_tmpresfile(baseline_id, slice_cols, overlay_db):
         )
 
 
-@pytest.mark.xfail(reason=GAP_ARRAY_IMPORT, strict=True)
 def test_gtrack_array_import_extract(overlay_db):
-    assert hasattr(pm, "gtrack_array_import"), "gtrack_array_import not implemented"
+    import contextlib
+    import tempfile
+    from pathlib import Path
+
+    from .baseline import assert_matches_list_baseline
+
+    files = [Path(tempfile.mkstemp(suffix=".tsv")[1]) for _ in range(3)]
+    f1, f2, f3 = files
+    try:
+        pm.gextract("test.sparse", pm.gintervals([1, 2]), file=str(f1))
+        pm.gtrack_array_extract(
+            "test.array", ["col2", "col3", "col4"], pm.gintervals([1, 2]), file=str(f2),
+        )
+        pm.gtrack_array_extract(
+            "test.array", ["col1", "col3"], pm.gintervals([1, 2]), file=str(f3),
+        )
+        pm.gtrack_array_import("test_track1", "", str(f1), str(f2))
+        r1 = pm.gtrack_array_extract("test_track1", None, pm.gintervals_all())
+        pm.gtrack_array_import("test_track2", "", "test_track1", str(f3))
+        r2 = pm.gtrack_array_extract("test_track2", None, pm.gintervals_all())
+        assert_matches_list_baseline({"r1": r1, "r2": r2}, "gtrack_array_import_extract")
+    finally:
+        for f in files:
+            f.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            pm.gtrack_rm("test_track1", force=True)
+        with contextlib.suppress(Exception):
+            pm.gtrack_rm("test_track2", force=True)

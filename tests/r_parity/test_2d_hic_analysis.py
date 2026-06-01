@@ -18,7 +18,6 @@ The remaining cases ``xfail(strict)`` / ``skip`` on distinct gaps:
   iterator span.
 * ``GAP_BAND_GITER`` -- ``giterator_intervals`` has no ``band=`` argument (also
   blocks the 2D ``gintervals.neighbors`` case that builds its set that way).
-* ``GAP_INSU_DOMS`` -- ``gtrack.2d.get_insu_doms`` is not implemented.
 * ``GAP_R_POSTPROC`` -- the baseline is pure R post-processing
   (``cut``/``table``; or ``rpois`` with an R seed) not reproducible cross-impl.
 * ``GAP_GCIS_DECAY`` -- ``gcis_decay`` over Hi-C differs (same family as the
@@ -39,7 +38,6 @@ GAP_2D_BAND = "2D band query near the diagonal returns a different contact set/c
 GAP_2D_ITER = "2D iterator semantics differ (default 2D iterator / gvtrack.iterator.2d shifts / 2D span)"
 GAP_BAND_GITER = "giterator_intervals has no band= argument"
 GAP_NN_TIE = "equidistant 2D neighbors tie-break differs from R (priority_queue pop order not portable)"
-GAP_INSU_DOMS = "gtrack_2d_get_insu_doms not implemented"
 GAP_R_POSTPROC = "baseline is pure R post-processing (cut/table or rpois seed) not reproducible cross-impl"
 GAP_GCIS_DECAY = "gcis_decay over Hi-C differs from R (valued-source gcis_decay gap)"
 
@@ -346,9 +344,10 @@ def test_spatial_max_grid(hg19_overlay):
     assert_matches_baseline(pm.gextract(vtracks, pts, iterator=pts), "spatial_max_grid.hic.1")
 
 
-@pytest.mark.skip(reason=GAP_INSU_DOMS)
-def test_get_insu_doms():
-    pass
+def test_get_insu_doms(hg19_overlay):
+    domains = pm.gtrack_2d_get_insu_doms("insulation.test", thresh=-3.0)
+    filtered = domains[domains["end"] - domains["start"] > 5e4].reset_index(drop=True)
+    assert_matches_baseline(filtered, "get_insu_doms.1")
 
 
 @pytest.mark.skip(reason=GAP_R_POSTPROC)

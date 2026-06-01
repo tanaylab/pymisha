@@ -43,7 +43,13 @@ class TestGextractFileOutput1D:
         assert result is None
 
     def test_file_content_matches_dataframe(self, tmp_path):
-        """TSV file content must match the DataFrame that would have been returned."""
+        """TSV file content matches the in-memory DataFrame's value columns.
+
+        R parity: ``gextract(file=)`` writes only the iterator coordinate
+        columns + expression columns -- no ``intervalID`` (see
+        ``GenomeTrackExtract.cpp`` in R misha). The in-memory DataFrame
+        still carries ``intervalID``.
+        """
         out = tmp_path / "out.tsv"
         intervals = pm.gintervals("1", 0, 2000)
 
@@ -55,7 +61,8 @@ class TestGextractFileOutput1D:
         )
         df_from_file = pd.read_csv(out, sep="\t")
 
-        assert list(df_expected.columns) == list(df_from_file.columns)
+        expected_cols = [c for c in df_expected.columns if c != "intervalID"]
+        assert list(df_from_file.columns) == expected_cols
         assert len(df_expected) == len(df_from_file)
         np.testing.assert_array_almost_equal(
             df_expected["dense_track"].values,
@@ -181,7 +188,11 @@ class TestGextractFileOutput2D:
         assert len(df) > 0
 
     def test_2d_file_content_matches_dataframe(self, tmp_path):
-        """TSV file content for 2D extraction matches DataFrame result."""
+        """TSV file content for 2D extraction matches the DataFrame value columns.
+
+        R parity: ``gextract(file=)`` omits ``intervalID`` (see
+        ``GenomeTrackExtract.cpp`` in R misha).
+        """
         out = tmp_path / "out2d.tsv"
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
 
@@ -189,7 +200,8 @@ class TestGextractFileOutput2D:
         pm.gextract("rects_track", intervals, file=str(out), progress=False)
         df_from_file = pd.read_csv(out, sep="\t")
 
-        assert list(df_expected.columns) == list(df_from_file.columns)
+        expected_cols = [c for c in df_expected.columns if c != "intervalID"]
+        assert list(df_from_file.columns) == expected_cols
         assert len(df_expected) == len(df_from_file)
 
 

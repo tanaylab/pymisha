@@ -2246,7 +2246,10 @@ def _apply_extract_output(
 
     # -- file: write TSV and return None --
     if file is not None:
-        df.to_csv(file, sep="\t", index=False)
+        # R parity: gextract(file=) writes only the iterator coordinate columns
+        # and the expression columns (no intervalID; see R
+        # GenomeTrackExtract.cpp).
+        df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
         return None
 
     return df

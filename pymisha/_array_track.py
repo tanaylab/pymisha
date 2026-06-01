@@ -510,3 +510,325 @@ def reduce_array_extract(
             out[idx] = float(_numpy.std(finite, ddof=1)) if finite.size > 1 else _numpy.nan
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-source array-track import (R parity for garrays_import)
+# ---------------------------------------------------------------------------
+
+class _CSVSource:
+    """Per-chromosome streaming reader for a tab-separated array-import source.
+
+    Mirrors R misha's ``GenomeArraysCsv``: header line is
+    ``chrom\\tstart\\tend\\t<col1>\\t<col2>...``; data rows are values
+    (empty cell = NaN). Within each chromosome, intervals must not
+    overlap (caller enforces this on read).
+    """
+
+    def __init__(self, path) -> None:
+        self._path = Path(path)
+        if not self._path.is_file():
+            raise FileNotFoundError(
+                f"gtrack_array_import: source file not found: {self._path}"
+            )
+        df = _pd.read_csv(self._path, sep="\t", dtype={"chrom": str})
+        cols = list(df.columns)
+        required = ["chrom", "start", "end"]
+        if cols[:3] != required:
+            raise ValueError(
+                f"File {self._path}: invalid format (header must start with "
+                f"chrom\\tstart\\tend; got {cols[:3]!r})"
+            )
+        self.colnames: list[str] = cols[3:]
+        self._by_chrom: dict[str, _pd.DataFrame] = {
+            str(c): g.reset_index(drop=True) for c, g in df.groupby("chrom", sort=False)
+        }
+
+    @property
+    def src(self) -> str:
+        return str(self._path)
+
+    @property
+    def src_typename(self) -> str:
+        return "file"
+
+    def chroms(self) -> list[str]:
+        return list(self._by_chrom.keys())
+
+    def read_chrom(self, chrom: str):
+        """Return ``(intervals_arr, vals_arr)`` for ``chrom``.
+
+        ``intervals_arr`` is a sorted ``(n, 2)`` int64 array of
+        ``(start, end)``. ``vals_arr`` is a parallel
+        ``(n, len(colnames))`` float32 array with NaN for empty cells.
+        Raises ``ValueError`` on overlapping intervals.
+        """
+        sub = self._by_chrom.get(str(chrom))
+        if sub is None or len(sub) == 0:
+            return (
+                _numpy.empty((0, 2), dtype=_numpy.int64),
+                _numpy.empty((0, len(self.colnames)), dtype=_numpy.float32),
+            )
+        starts = sub["start"].to_numpy(dtype=_numpy.int64)
+        ends = sub["end"].to_numpy(dtype=_numpy.int64)
+        if (ends <= starts).any():
+            bad = int(_numpy.where(ends <= starts)[0][0])
+            raise ValueError(
+                f"File {self._path}, row {bad}: start coordinate exceeds or "
+                f"equals the end coordinate"
+            )
+        order = _numpy.argsort(starts, kind="mergesort")
+        starts, ends = starts[order], ends[order]
+        if len(starts) > 1 and (starts[1:] < ends[:-1]).any():
+            bad = int(_numpy.where(starts[1:] < ends[:-1])[0][0])
+            raise ValueError(
+                f"File {self._path}: intervals at rows {bad} and {bad + 1} "
+                f"overlap"
+            )
+        sub_sorted = sub.iloc[order].reset_index(drop=True)
+        vals = sub_sorted[self.colnames].to_numpy(dtype=_numpy.float32)
+        intervals = _numpy.stack([starts, ends], axis=1)
+        return intervals, vals
+
+
+class _TrackSource:
+    """Array-track source for ``_import_sources``.
+
+    Reads colnames + per-chrom intervals + value matrix via the existing
+    ``extract_array`` reader. Mirrors R's ``Source`` (track arm) in
+    ``GenomeTrackArrayImport.cpp``.
+    """
+
+    def __init__(self, track: str) -> None:
+        # Lazy imports avoid circular load (tracks <-> _array_track).
+        from . import _pymisha
+        from .tracks import _track_exists, gtrack_info
+
+        if not _track_exists(track):
+            raise ValueError(
+                f"gtrack_array_import: source track '{track}' does not exist"
+            )
+        info = gtrack_info(track)
+        if info.get("type") != "array":
+            raise ValueError(
+                f"Track {track}: only array tracks can be used as a source"
+            )
+        self._track = track
+        self._track_dir = Path(_pymisha.pm_track_path(track))
+        self.colnames: list[str] = read_colnames(self._track_dir)
+
+    @property
+    def src(self) -> str:
+        return self._track
+
+    @property
+    def src_typename(self) -> str:
+        return "track"
+
+    def chroms(self) -> list[str]:
+        from .intervals import gintervals_all
+        return [str(c) for c in gintervals_all()["chrom"].tolist()]
+
+    def read_chrom(self, chrom: str):
+        from .intervals import gintervals_all
+
+        all_iv = gintervals_all()
+        row = all_iv[all_iv["chrom"].astype(str) == str(chrom)]
+        if row.empty:
+            return (
+                _numpy.empty((0, 2), dtype=_numpy.int64),
+                _numpy.empty((0, len(self.colnames)), dtype=_numpy.float32),
+            )
+        query = row[["chrom", "start", "end"]].reset_index(drop=True)
+        df = extract_array(self._track_dir, query, None, self.colnames)
+        if df.empty:
+            return (
+                _numpy.empty((0, 2), dtype=_numpy.int64),
+                _numpy.empty((0, len(self.colnames)), dtype=_numpy.float32),
+            )
+        df = df.sort_values(["start", "end"], kind="mergesort").reset_index(drop=True)
+        starts = df["start"].to_numpy(dtype=_numpy.int64)
+        ends = df["end"].to_numpy(dtype=_numpy.int64)
+        vals = df[self.colnames].to_numpy(dtype=_numpy.float32)
+        return _numpy.stack([starts, ends], axis=1), vals
+
+
+def _import_sources(
+    track_dir,
+    sources: list,
+    chrom_order: list[str],
+) -> list[str]:
+    """Multi-source streaming merge into per-chrom array-track files.
+
+    Implements the merge logic of R misha's ``garrays_import``:
+
+    * Build a dependency chain across sources by column-name match.
+      Source ``i``'s column ``c`` is *dependent* on the latest earlier
+      source ``j<i`` that exports ``c``; the chain head owns the unique
+      output array index, tail nodes share it.
+    * Per chromosome, stream all sources; pick the source whose next
+      interval has the smallest start. Sources sharing an identical
+      ``(start, end)`` interval contribute their non-NaN cells; tails of
+      a chain are checked for value consistency against an ancestor that
+      contributed the same interval and otherwise skipped.
+    * Partial overlap across sources raises ``ValueError`` with R's
+      wording.
+
+    Returns the unified colnames list (chain heads, in source order).
+    """
+    if not sources:
+        return []
+
+    # 1. Build the parent map: for each (source_i, slice1), point to the
+    #    latest j<i and slice2 in j with the same column name.
+    parents: dict[tuple[int, int], tuple[int, int]] = {}
+    for i, src in enumerate(sources):
+        for slice1, c in enumerate(src.colnames):
+            for j in range(i - 1, -1, -1):
+                other = sources[j].colnames
+                if c in other:
+                    slice2 = other.index(c)
+                    parents[(i, slice1)] = (j, slice2)
+                    break
+
+    def chain_head(i: int, slice1: int) -> tuple[int, int]:
+        cur = (i, slice1)
+        while cur in parents:
+            cur = parents[cur]
+        return cur
+
+    # 2. Assign each chain head a unique output column index.
+    output_idx: dict[tuple[int, int], int] = {}
+    colnames_out: list[str] = []
+    for i, src in enumerate(sources):
+        for slice1, c in enumerate(src.colnames):
+            if (i, slice1) not in parents:
+                output_idx[(i, slice1)] = len(colnames_out)
+                colnames_out.append(c)
+
+    # 3. Per-chromosome streaming merge.
+    Path(track_dir).mkdir(parents=True, exist_ok=True)
+    block_dtype = _numpy.dtype([("val", "<f4"), ("idx", "<u4")])
+
+    for chrom in chrom_order:
+        src_data = [src.read_chrom(chrom) for src in sources]
+        if all(len(d[0]) == 0 for d in src_data):
+            continue
+
+        idx_ptr = [0] * len(sources)
+        merged_starts: list[int] = []
+        merged_ends: list[int] = []
+        merged_blocks: list[_numpy.ndarray] = []
+
+        # Per-source last-shared interval + values (used for chain consistency
+        # checks; mirrors R's Source::m_last_interval / m_vals).
+        last_iv: dict[int, tuple[int, int]] = {}
+        last_vals: dict[int, _numpy.ndarray] = {}
+
+        while True:
+            pick = -1
+            for i in range(len(sources)):
+                ivs, _ = src_data[i]
+                if idx_ptr[i] >= len(ivs):
+                    continue
+                if pick < 0 or ivs[idx_ptr[i], 0] < src_data[pick][0][idx_ptr[pick], 0]:
+                    pick = i
+            if pick < 0:
+                break
+
+            pick_start = int(src_data[pick][0][idx_ptr[pick], 0])
+            pick_end = int(src_data[pick][0][idx_ptr[pick], 1])
+
+            cells: list[tuple[int, float]] = []
+
+            for i in range(len(sources)):
+                ivs, vals_arr = src_data[i]
+                if idx_ptr[i] >= len(ivs):
+                    continue
+                s_i = int(ivs[idx_ptr[i], 0])
+                e_i = int(ivs[idx_ptr[i], 1])
+
+                if (s_i, e_i) == (pick_start, pick_end):
+                    row = vals_arr[idx_ptr[i]]
+                    last_iv[i] = (s_i, e_i)
+                    last_vals[i] = row
+                    for slice1, v in enumerate(row):
+                        if _numpy.isnan(v):
+                            continue
+                        # Walk up the dependency chain. If any ancestor also
+                        # contributed at this interval, compare values; equal
+                        # -> dependent write (skip), differ -> R verror.
+                        cur_i, cur_s = i, slice1
+                        wrote_by_chain = False
+                        while (cur_i, cur_s) in parents:
+                            par_i, par_s = parents[(cur_i, cur_s)]
+                            if (
+                                par_i in last_iv
+                                and last_iv[par_i] == (s_i, e_i)
+                                and not _numpy.isnan(last_vals[par_i][par_s])
+                            ):
+                                pv = float(last_vals[par_i][par_s])
+                                if pv != float(v):
+                                    raise ValueError(
+                                        f"Non matching values ({pv:g} and "
+                                        f"{float(v):g}) in column "
+                                        f"{sources[i].colnames[slice1]!r}, "
+                                        f"interval ({chrom}, {s_i}, {e_i}) "
+                                        f"contained in a "
+                                        f"{sources[par_i].src_typename} "
+                                        f"{sources[par_i].src} and a "
+                                        f"{sources[i].src_typename} "
+                                        f"{sources[i].src}"
+                                    )
+                                wrote_by_chain = True
+                                break
+                            cur_i, cur_s = par_i, par_s
+                        if wrote_by_chain:
+                            continue
+                        head = chain_head(i, slice1)
+                        cells.append((output_idx[head], float(v)))
+                elif s_i < pick_end and e_i > pick_start:
+                    raise ValueError(
+                        f"Interval ({chrom}, {pick_start}, {pick_end}) "
+                        f"contained in a {sources[pick].src_typename} "
+                        f"{sources[pick].src} overlaps interval "
+                        f"({chrom}, {s_i}, {e_i}) contained in a "
+                        f"{sources[i].src_typename} {sources[i].src}"
+                    )
+                # disjoint: leave its pointer alone, advance pick below.
+
+            # Build sparse block (dedup by output column idx).
+            if cells:
+                idx_to_val: dict[int, float] = {}
+                for oi, v in cells:
+                    idx_to_val.setdefault(oi, v)
+                if idx_to_val:
+                    block = _numpy.zeros(len(idx_to_val), dtype=block_dtype)
+                    block["idx"] = _numpy.array(sorted(idx_to_val.keys()), dtype=_numpy.uint32)
+                    block["val"] = _numpy.array(
+                        [idx_to_val[k] for k in block["idx"].tolist()],
+                        dtype=_numpy.float32,
+                    )
+                    merged_starts.append(pick_start)
+                    merged_ends.append(pick_end)
+                    merged_blocks.append(block)
+
+            # Advance every source whose current interval == picked.
+            for i in range(len(sources)):
+                ivs = src_data[i][0]
+                if idx_ptr[i] < len(ivs):
+                    s_i = int(ivs[idx_ptr[i], 0])
+                    e_i = int(ivs[idx_ptr[i], 1])
+                    if (s_i, e_i) == (pick_start, pick_end):
+                        idx_ptr[i] += 1
+
+        if merged_starts:
+            filepath = Path(track_dir) / str(chrom)
+            write_chrom_file(
+                filepath,
+                _numpy.array(merged_starts, dtype=_numpy.int64),
+                _numpy.array(merged_ends, dtype=_numpy.int64),
+                merged_blocks,
+            )
+
+    return colnames_out
