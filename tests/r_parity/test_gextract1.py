@@ -42,8 +42,9 @@ def test_gextract_array():
     )
 
 
-@pytest.mark.xfail(reason="2D gscreen on rects + COMPUTED Hi-C tracks not supported", strict=True)
 def test_gextract_computed2d_1():
+    # 2D gscreen on a rects track + COMPUTED Hi-C extract now match R (the
+    # COMPUTED read path shipped in v0.8.4/v0.8.5; gscreen-on-rects works).
     intervs = pm.gscreen("test.rects > 9")
     assert_matches_baseline(
         pm.gextract("test.computed2d", intervs), "gextract.computed2d.1"

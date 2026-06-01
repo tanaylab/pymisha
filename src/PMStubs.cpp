@@ -2767,21 +2767,30 @@ PyObject *pm_track_info(PyObject *self, PyObject *args)
         PMPY py_format(PyUnicode_FromString(is_indexed ? "indexed" : "per-chromosome"), true);
         PyDict_SetItemString(result, "format", py_format);
 
-        // For dense tracks, get bin size
+        // For dense tracks, get bin size (invariant across chromosomes).
         if (track_type == GenomeTrack::FIXED_BIN) {
-            // Find first chromosome file and read bin size from it
             for (uint64_t chromid = 0; chromid < chromkey.get_num_chroms(); ++chromid) {
                 std::string chrom_file = GenomeTrack::find_existing_1d_filename(
                     chromkey, track_path, chromid);
-                if (!chrom_file.empty()) {
-                    std::string full_path = track_path + "/" + chrom_file;
-                    GenomeTrackFixedBin track;
-                    track.init_read(full_path.c_str(), chromid);
-                    int64_t bin_size = track.get_bin_size();
-                    PMPY py_binsize(PyLong_FromLongLong(bin_size), true);
-                    PyDict_SetItemString(result, "bin_size", py_binsize);
-                    break;
-                }
+                if (chrom_file.empty())
+                    continue;
+                std::string full_path = track_path + "/" + chrom_file;
+                // For per-chrom tracks, find_existing_1d_filename returns the
+                // canonical base name even when no file exists for that chrom
+                // (a legitimately empty leading scaffold, or a partial track).
+                // Probing it with init_read would error "No such file or
+                // directory". Skip to the first chrom that actually has a file.
+                // Indexed tracks have no per-chrom files and read bin_size from
+                // track.dat via the index inside init_read (which back-fills an
+                // empty leading chrom), so probe the first chrom directly.
+                if (!is_indexed && access(full_path.c_str(), F_OK) != 0)
+                    continue;
+                GenomeTrackFixedBin track;
+                track.init_read(full_path.c_str(), chromid);
+                int64_t bin_size = track.get_bin_size();
+                PMPY py_binsize(PyLong_FromLongLong(bin_size), true);
+                PyDict_SetItemString(result, "bin_size", py_binsize);
+                break;
             }
         }
 

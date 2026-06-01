@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.9 (2026-06-01)
+
+- **Per-chromosome dense tracks whose first chromosome has no data no longer error in `gtrack_info` / `gtrack_copy`.** A per-chrom dense track may legitimately lack a file for the genome's first chromosome (an empty scaffold, or a partial track). `gtrack_info` probed that chromosome to read the bin size and failed with "No such file or directory"; since `gtrack_copy` reads the source's info, copying such a track also failed. It now reads the bin size from the first chromosome that actually has data. (Per-chromosome companion to the v0.8.0 indexed-track fix.)
+
 ## v0.8.8 (2026-06-01)
 
 - **`gtrack_2d_get_insu_doms` and `gtrack_2d_get_insu_borders`**: thin `gscreen` wrappers that extract TAD-style domains / borders from a 1D insulation track. R parity for the same-named test-helper idioms in misha (now public API in pymisha).
