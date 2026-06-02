@@ -1911,6 +1911,62 @@ static bool calc_quantiles(StreamPercentiler<double> &sp, std::vector<Percentile
 {
     bool estimated_results = false;
 
+    // Fast path (port of R GenomeTrackQuantiles.cpp): the entire stream fits the
+    // reservoir, so sp.samples() holds every non-NaN value with no sub-sampling.
+    // Select the needed order statistics with nth_element-on-suffix (O(k*N)) and
+    // interpolate, instead of the O(N log N) std::sort that get_percentile runs
+    // on first call. Output is identical (same (N-1)*pct linear interpolation,
+    // and all results are exact so the monotonicity repair below is a no-op).
+    if (sp.stream_size() && sp.stream_size() <= sp.max_rnd_sampling_buf_size()) {
+        std::vector<double> &samples = sp.samples_mutable();
+        const uint64_t N = samples.size();
+
+        std::vector<uint64_t> targets;
+        targets.reserve(percentiles.size() * 2);
+        for (const auto &p : percentiles) {
+            double pct = std::max(0.0, std::min(1.0, p.percentile));
+            double idx = (double)(N - 1) * pct;
+            targets.push_back((uint64_t)std::floor(idx));
+            targets.push_back((uint64_t)std::ceil(idx));
+        }
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+
+        std::vector<double> values_at_targets(targets.size());
+        const size_t log2N = (N <= 2) ? 1 : (size_t)std::ceil(std::log2((double)N));
+        const size_t crossover = std::max<size_t>(64, 2 * log2N);
+
+        if (targets.size() <= crossover) {
+            // Ascending walk: each nth_element partitions only the unconsumed
+            // suffix [prev_end, end); samples[0..prev_end) are already the
+            // globally smallest, so samples[r] becomes the global r-th smallest.
+            uint64_t prev_end = 0;
+            for (size_t t = 0; t < targets.size(); ++t) {
+                uint64_t r = targets[t];
+                std::nth_element(samples.begin() + prev_end, samples.begin() + r, samples.end());
+                values_at_targets[t] = samples[r];
+                prev_end = r + 1;
+            }
+        } else {
+            std::sort(samples.begin(), samples.end());
+            for (size_t t = 0; t < targets.size(); ++t)
+                values_at_targets[t] = samples[targets[t]];
+        }
+
+        for (auto &p : percentiles) {
+            double pct = std::max(0.0, std::min(1.0, p.percentile));
+            double idx = (double)(N - 1) * pct;
+            uint64_t i1 = (uint64_t)std::floor(idx);
+            uint64_t i2 = (uint64_t)std::ceil(idx);
+            double w = idx - (double)i1;
+            size_t pos1 = std::lower_bound(targets.begin(), targets.end(), i1) - targets.begin();
+            size_t pos2 = std::lower_bound(targets.begin(), targets.end(), i2) - targets.begin();
+            quantiles[p.index] = values_at_targets[pos1] * (1.0 - w) + values_at_targets[pos2] * w;
+            p.estimation = false;
+        }
+        return false;
+    }
+
     if (sp.stream_size()) {
         for (auto &p : percentiles) {
             bool estimated = false;
@@ -2219,7 +2275,11 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             StreamPercentiler<double> sp;
             std::vector<double> empty_low;
             std::vector<double> empty_high;
-            sp.init_with_swap(total_stream_size, merged_samples, empty_low, empty_high);
+            // Skip the O(N log N) sort of the merged reservoir: calc_quantiles
+            // selects the needed order statistics with nth_element (exact path)
+            // and falls back to a lazy sort inside get_percentile only for the
+            // sub-sampling (approximate) case.
+            sp.init_with_swap(total_stream_size, merged_samples, empty_low, empty_high, /*do_sort=*/false);
 
             bool estimated = calc_quantiles(sp, percentiles, quantiles);
             if (estimated || min_sampling_rate < 1.0) {

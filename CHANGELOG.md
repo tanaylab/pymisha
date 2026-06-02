@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8.12 (2026-06-03)
+
+Performance (all results unchanged):
+
+- **`gquantiles` / `gintervals_quantiles` are faster when the data fits in memory.** Percentiles are selected with `nth_element` over the reservoir instead of a full sort (~3x for typical percentile counts), and the multitasked path no longer re-sorts the merged reservoir on the parent.
+- **Multi-chromosome `gextract` parallelizes by balanced base-pair ranges.** Large extracts (e.g. genome-wide over `gintervals_all()`) split the scope into bp-balanced chunks across workers - splitting a single large chromosome when needed - instead of one chunk per chromosome bounded by the largest chromosome. ~4x on a 3-large-chromosome extract with 6 processes (more on cold cache).
+- **Multiple dense virtual tracks over the same source are read once.** When several virtual tracks share the same source track and `gvtrack_iterator` shift, the source is read once per output bin and shared across them instead of re-read per vtrack. ~1.7x when extracting 8 such vtracks together.
+
 ## v0.8.11 (2026-06-02)
 
 - **Windowed virtual-track reductions over dense tracks are now incremental (R 5.10.2 parity).** A `sum`/`avg`/`nearest`/`lse`/`exists`/`size` virtual track with a sliding window (`gvtrack.iterator(sshift=, eshift=)`) scanned bin-by-bin now maintains a running window instead of recomputing the reduction from scratch at every step. The motif-energy workload (windowed `lse` reduced by `gquantiles`/`gscreen`) is ~8x faster on a 1000-bin window (hg38); results are unchanged. Set `PYMISHA_DISABLE_SLIDING_REDUCER=1` to force the legacy per-bin recompute.

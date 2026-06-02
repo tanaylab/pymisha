@@ -72,6 +72,15 @@ public:
         int src_cur_chromid{-1};
         bool src_cur_chromid_valid{false};
 
+        // Vtrack-instance dedup: when several dense (FIXED_BIN) vtracks share the
+        // same source track + sshift/eshift, only the first ("primary") owns a
+        // reader (with the union of all their funcs registered) and does the
+        // read_interval; "followers" set this to the primary's index and just
+        // extract their own last_<func>() from the primary's reader.
+        // -1 = primary or standalone. Relies on set_vars evaluating vvars in
+        // registration order (primary before its followers) per interval.
+        int shared_primary_idx{-1};
+
         // Sparse fast-reduce state
         const std::vector<GInterval> *sp_intervals_ptr{nullptr};
         const std::vector<float> *sp_vals_ptr{nullptr};
@@ -146,6 +155,7 @@ private:
     std::vector<VTrackVar> m_vtrack_vars;
     std::unordered_map<std::string, size_t> m_var_map;  // track_name -> index in m_track_vars
     std::unordered_map<std::string, size_t> m_vtrack_var_map;  // vtrack_name -> index in m_vtrack_vars
+    std::unordered_map<std::string, size_t> m_value_vtrack_groups;  // dense (src+sshift+eshift) -> primary vvar index
     std::unordered_map<std::string, std::string> m_varname_to_track;  // var_name -> track_name (for collision detection)
     int64_t m_bin_size;  // Uniform bin size (0 if mixed)
     GenomeTrack::Type m_common_track_type{GenomeTrack::NUM_TYPES};
@@ -180,6 +190,15 @@ private:
 
     // Evaluate a value-based vtrack for a single interval
     double eval_value_based_vtrack(VTrackVar &vvar, const GInterval &interval);
+
+    // Register the reducer(s) a value-based func needs on a 1D reader.
+    static void register_value_funcs(GenomeTrack1D *t, const std::string &func,
+                                     GenomeTrack::Type type);
+
+    // Extract a dense reader's already-computed last_<func>() value (used by a
+    // dedup follower, whose primary already did the read for this interval).
+    static double extract_dense_last(GenomeTrack1D *t, const std::string &func,
+                                     int64_t eval_start, double param);
 
     // Apply shift to interval, clamping to chromosome bounds
     static bool apply_shift(const GInterval &in, int64_t sshift, int64_t eshift,

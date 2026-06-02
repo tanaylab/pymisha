@@ -658,6 +658,36 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
     } else if (py_src && py_src != Py_None && PyUnicode_Check(py_src)) {
         // Physical track source — value-based vtrack
         setup_value_based_vtrack(vvar, spec, func);
+
+        // Vtrack-instance dedup (dense only): if another dense vtrack already
+        // reads the same source track with the same sshift/eshift, share its
+        // reader instead of reading the source again. The primary owns the
+        // reader (union of all funcs registered); this follower extracts its own
+        // last_<func>() after the primary's read (set_vars evaluates vvars in
+        // registration order, so the primary runs first for each interval).
+        // Plain "min"/"max" are excluded: they are computed only on the generic
+        // read path (not mask-gated) and register no func bit, so a reader whose
+        // other funcs are all sliding-compatible would take the sliding fast path
+        // (which leaves min/max NaN). Such vtracks stay standalone.
+        if (vvar.src_track_type == GenomeTrack::FIXED_BIN &&
+            vvar.func != "min" && vvar.func != "max") {
+            std::string key = vvar.src_track_name + "\x1f" +
+                              std::to_string(vvar.sshift) + "\x1f" +
+                              std::to_string(vvar.eshift);
+            auto git = m_value_vtrack_groups.find(key);
+            if (git != m_value_vtrack_groups.end()) {
+                size_t primary_idx = git->second;
+                GenomeTrack1D *pt = dynamic_cast<GenomeTrack1D *>(
+                    m_vtrack_vars[primary_idx].src_track.get());
+                if (pt) {
+                    register_value_funcs(pt, vvar.func, GenomeTrack::FIXED_BIN);
+                    vvar.shared_primary_idx = (int)primary_idx;
+                    vvar.src_track.reset();  // follower reads via the primary
+                }
+            } else {
+                m_value_vtrack_groups[key] = m_vtrack_vars.size() - 1;
+            }
+        }
     } else {
         // Interval-based or DataFrame source — delegate to pm_vtrack_compute
         // This should not happen on the C++ path (Python filters these out)
@@ -848,32 +878,86 @@ void PMTrackExpressionVars::setup_value_based_vtrack(VTrackVar &vvar, PyObject *
 
     // Register special functions on 1D tracks
     GenomeTrack1D *track1d = dynamic_cast<GenomeTrack1D *>(vvar.src_track.get());
-    if (track1d) {
-        if (func == "stddev" || func == "std") track1d->register_function(GenomeTrack1D::STDDEV);
-        if (func == "quantile") track1d->register_quantile(10000, 1000, 1000);
-        if (func == "exists") track1d->register_function(GenomeTrack1D::EXISTS);
-        if (func == "size") track1d->register_function(GenomeTrack1D::SIZE);
-        if (func == "sample") track1d->register_function(GenomeTrack1D::SAMPLE);
-        if (func == "sample.pos.abs" || func == "sample.pos.relative") track1d->register_function(GenomeTrack1D::SAMPLE_POS);
-        if (func == "first") track1d->register_function(GenomeTrack1D::FIRST);
-        if (func == "first.pos.abs" || func == "first.pos.relative") track1d->register_function(GenomeTrack1D::FIRST_POS);
-        if (func == "last") track1d->register_function(GenomeTrack1D::LAST);
-        if (func == "last.pos.abs" || func == "last.pos.relative") track1d->register_function(GenomeTrack1D::LAST_POS);
-        if (func == "max.pos.abs" || func == "max.pos.relative") track1d->register_function(GenomeTrack1D::MAX_POS);
-        if (func == "min.pos.abs" || func == "min.pos.relative") track1d->register_function(GenomeTrack1D::MIN_POS);
-        // Register the primary reducer on dense tracks so read_interval takes the
-        // incremental sliding-window fast path (overlapping sshift/eshift windows).
-        // Dense-only: the sliding machinery lives in GenomeTrackFixedBin.
-        if (vvar.src_track_type == GenomeTrack::FIXED_BIN) {
-            if (func == "avg" || func == "mean") track1d->register_function(GenomeTrack1D::AVG);
-            if (func == "sum") track1d->register_function(GenomeTrack1D::SUM);
-            if (func == "nearest") track1d->register_function(GenomeTrack1D::NEAREST);
-            if (func == "lse") track1d->register_function(GenomeTrack1D::LSE);
-        }
-    }
+    if (track1d)
+        register_value_funcs(track1d, func, vvar.src_track_type);
 
     vvar.src_cur_chromid = -1;
     vvar.src_cur_chromid_valid = false;
+}
+
+// ---- register_value_funcs: register the reducer(s) a func needs on a 1D reader ----
+// Shared by setup_value_based_vtrack and the vtrack-instance dedup (which unions
+// a follower's func onto the primary's reader). avg/sum/min/max are computed
+// unconditionally by read_interval; only the "extras" below are gated by the mask.
+void PMTrackExpressionVars::register_value_funcs(GenomeTrack1D *t, const std::string &func,
+                                                 GenomeTrack::Type type)
+{
+    if (func == "stddev" || func == "std") t->register_function(GenomeTrack1D::STDDEV);
+    if (func == "quantile") t->register_quantile(10000, 1000, 1000);
+    if (func == "exists") t->register_function(GenomeTrack1D::EXISTS);
+    if (func == "size") t->register_function(GenomeTrack1D::SIZE);
+    if (func == "sample") t->register_function(GenomeTrack1D::SAMPLE);
+    if (func == "sample.pos.abs" || func == "sample.pos.relative") t->register_function(GenomeTrack1D::SAMPLE_POS);
+    if (func == "first") t->register_function(GenomeTrack1D::FIRST);
+    if (func == "first.pos.abs" || func == "first.pos.relative") t->register_function(GenomeTrack1D::FIRST_POS);
+    if (func == "last") t->register_function(GenomeTrack1D::LAST);
+    if (func == "last.pos.abs" || func == "last.pos.relative") t->register_function(GenomeTrack1D::LAST_POS);
+    if (func == "max.pos.abs" || func == "max.pos.relative") t->register_function(GenomeTrack1D::MAX_POS);
+    if (func == "min.pos.abs" || func == "min.pos.relative") t->register_function(GenomeTrack1D::MIN_POS);
+    // Register the primary reducer on dense tracks so read_interval takes the
+    // incremental sliding-window fast path (overlapping sshift/eshift windows).
+    // Dense-only: the sliding machinery lives in GenomeTrackFixedBin.
+    if (type == GenomeTrack::FIXED_BIN) {
+        if (func == "avg" || func == "mean") t->register_function(GenomeTrack1D::AVG);
+        if (func == "sum") t->register_function(GenomeTrack1D::SUM);
+        if (func == "nearest") t->register_function(GenomeTrack1D::NEAREST);
+        if (func == "lse") t->register_function(GenomeTrack1D::LSE);
+    }
+}
+
+// ---- extract_dense_last: read an already-computed last_<func>() from a dense reader ----
+double PMTrackExpressionVars::extract_dense_last(GenomeTrack1D *t, const std::string &func,
+                                                 int64_t eval_start, double param)
+{
+    if (func == "avg" || func == "mean") return t->last_avg();
+    if (func == "sum") return t->last_sum();
+    if (func == "lse") return t->last_lse();
+    if (func == "min") return t->last_min();
+    if (func == "max") return t->last_max();
+    if (func == "stddev" || func == "std") return t->last_stddev();
+    if (func == "quantile") return t->last_quantile(param);
+    if (func == "exists") return t->last_exists();
+    if (func == "size") return t->last_size();
+    if (func == "first") return t->last_first();
+    if (func == "last") return t->last_last();
+    if (func == "sample") return t->last_sample();
+    if (func == "nearest") return t->last_nearest();
+    if (func == "first.pos.abs") return t->last_first_pos();
+    if (func == "first.pos.relative") {
+        double pos = t->last_first_pos();
+        return std::isnan(pos) ? pos : pos - eval_start;
+    }
+    if (func == "last.pos.abs") return t->last_last_pos();
+    if (func == "last.pos.relative") {
+        double pos = t->last_last_pos();
+        return std::isnan(pos) ? pos : pos - eval_start;
+    }
+    if (func == "max.pos.abs") return t->last_max_pos();
+    if (func == "max.pos.relative") {
+        double pos = t->last_max_pos();
+        return std::isnan(pos) ? pos : pos - eval_start;
+    }
+    if (func == "min.pos.abs") return t->last_min_pos();
+    if (func == "min.pos.relative") {
+        double pos = t->last_min_pos();
+        return std::isnan(pos) ? pos : pos - eval_start;
+    }
+    if (func == "sample.pos.abs") return t->last_sample_pos();
+    if (func == "sample.pos.relative") {
+        double pos = t->last_sample_pos();
+        return std::isnan(pos) ? pos : pos - eval_start;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 // ---- configure_array_slice: apply gvtrack.array.slice config to an array track ----
@@ -916,6 +1000,17 @@ void PMTrackExpressionVars::configure_array_slice(GenomeTrackArray &track, PyObj
 
 double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GInterval &eval)
 {
+    // Dedup follower: the primary (same dense source + shift) already loaded the
+    // chromosome and ran read_interval for this exact interval earlier in the
+    // set_vars loop, so just extract our own last_<func>() from its reader.
+    if (vvar.shared_primary_idx >= 0) {
+        GenomeTrack1D *pt = dynamic_cast<GenomeTrack1D *>(
+            m_vtrack_vars[vvar.shared_primary_idx].src_track.get());
+        if (pt)
+            return extract_dense_last(pt, vvar.func, eval.start, vvar.param);
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
     const std::string &func = vvar.func;
     const GenomeChromKey &chromkey = g_pmdb->chromkey();
 

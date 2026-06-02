@@ -39,7 +39,10 @@ public:
 	StreamPercentiler(uint64_t rnd_sampling_buf_size, uint64_t lowest_vals_buf_size = 0, uint64_t highest_vals_buf_size = 0, bool do_reserve = false);
 
 	void init(uint64_t rnd_sampling_buf_size, uint64_t lowest_vals_buf_size = 0, uint64_t highest_vals_buf_size = 0, bool do_reserve = false);
-	void init_with_swap(uint64_t stream_size, vector<T> &samples, vector<T> &lowest_vals, vector<T> &highest_vals);
+	// do_sort=false leaves the reservoir unsorted and the stream unsealed, so a
+	// caller that selects order statistics itself (nth_element fast path) avoids
+	// the O(N log N) sort; get_percentile() still sorts lazily on first use.
+	void init_with_swap(uint64_t stream_size, vector<T> &samples, vector<T> &lowest_vals, vector<T> &highest_vals, bool do_sort = true);
 
 	void reset();
 
@@ -49,6 +52,9 @@ public:
 	uint64_t highest_vals_buf_size() const { return m_extreme_vals_buf_size[HIGHEST]; }
 
 	const vector<T> &samples() const { return m_stream_sampler.samples(); }
+	// Mutable access to the reservoir, for the nth_element percentile fast path
+	// (caller may partition/sort in place when the whole stream fits memory).
+	vector<T> &samples_mutable() { return m_stream_sampler.samples(); }
 	const vector<T> &lowest_vals() const { return m_extreme_vals[LOWEST]; }
 	const vector<T> &highest_vals() const { return m_extreme_vals[HIGHEST]; }
 
@@ -99,11 +105,13 @@ void StreamPercentiler<T>::init(uint64_t rnd_sampling_buf_size, uint64_t lowest_
 }
 
 template <class T>
-void StreamPercentiler<T>::init_with_swap(uint64_t stream_size, vector<T> &samples, vector<T> &lowest_vals, vector<T> &highest_vals)
+void StreamPercentiler<T>::init_with_swap(uint64_t stream_size, vector<T> &samples, vector<T> &lowest_vals, vector<T> &highest_vals, bool do_sort)
 {
-	sort(samples.begin(), samples.end());
-	sort(lowest_vals.begin(), lowest_vals.end());
-	sort(highest_vals.begin(), highest_vals.end());
+	if (do_sort) {
+		sort(samples.begin(), samples.end());
+		sort(lowest_vals.begin(), lowest_vals.end());
+		sort(highest_vals.begin(), highest_vals.end());
+	}
 
 	m_stream_sampler.init_with_swap(stream_size, samples);
 	m_extreme_vals_buf_size[LOWEST] = lowest_vals.size();
@@ -111,7 +119,9 @@ void StreamPercentiler<T>::init_with_swap(uint64_t stream_size, vector<T> &sampl
 	m_heaps_activated = !lowest_vals.empty() || !highest_vals.empty();
 	m_extreme_vals[LOWEST].swap(lowest_vals);
 	m_extreme_vals[HIGHEST].swap(highest_vals);
-	m_stream_sealed = true;
+	// When unsorted, leave the stream unsealed so get_percentile() sorts lazily
+	// for the sub-sampling (estimated) path; the exact path uses nth_element.
+	m_stream_sealed = do_sort;
 }
 
 template <class T>

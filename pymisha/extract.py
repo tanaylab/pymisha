@@ -2439,57 +2439,112 @@ def _parallel_extract(
     config: dict[str, Any],
     vtracks_dict: dict[str, dict[str, Any]] | None = None,
 ) -> pd.DataFrame | None:
-    """Split intervals by chromosome and extract in parallel.
+    """Split the scope into bp-balanced range chunks and extract in parallel.
 
-    Returns a merged DataFrame with globally consistent intervalIDs that
-    match what a serial extraction over the same *intervals* would produce,
-    or ``None`` to signal the caller to use the normal serial path.
+    Each worker handles a contiguous run of (possibly range-split) sub-intervals
+    spanning roughly equal base-pairs, so a single huge interval (e.g. a whole
+    chromosome in ALLGENOME) is spread across workers instead of bounding wall
+    time on one kid. For a fixed-bin (int) iterator, splits are aligned to bin
+    boundaries so the emitted genome-aligned bins are byte-identical to a serial
+    extraction; for other iterator types intervals are kept whole (a mid-interval
+    split could change which iterator intervals are emitted at the boundary).
+
+    Returns a merged DataFrame with intervalIDs remapped to the original scope
+    rows (matching a serial extraction over *intervals*), or ``None`` to signal
+    the caller to fall back to the serial path.
     """
     import multiprocessing
 
     max_procs = int(config.get("max_processes", 1))
     if max_procs < 2:
-        return None  # signal caller to use normal path
+        return None
 
-    # Group intervals by chromosome
-    chroms = intervals["chrom"].unique()
-    if len(chroms) < 2:
-        return None  # not worth parallelizing a single chromosome
+    chrom_col = intervals["chrom"].to_numpy()
+    start_col = intervals["start"].to_numpy()
+    end_col = intervals["end"].to_numpy()
+    total_bp = int(_numpy.maximum(end_col - start_col, 0).sum())
+    if total_bp <= 0:
+        return None
 
-    n_workers = min(max_procs, len(chroms))
-    # Suppress progress in workers (parent handles it)
+    bin_size = (
+        int(iterator)
+        if isinstance(iterator, (int, _numpy.integer)) and int(iterator) > 0
+        else None
+    )
+
+    # ceil(total_bp / max_procs): target bp per worker.
+    target_bp = max(1, -(-total_bp // max_procs))
+
+    # Tile the scope into sub-intervals in original row order, each tagged with
+    # its parent (original) row index.
+    subs: list[tuple[Any, int, int, int]] = []
+    for i in range(len(chrom_col)):
+        c = chrom_col[i]
+        s = int(start_col[i])
+        e = int(end_col[i])
+        if e <= s or bin_size is None or (e - s) <= target_bp:
+            subs.append((c, s, e, i))
+            continue
+        # Split [s, e) into bin-aligned pieces of ~target_bp.
+        step = max(bin_size, (target_bp // bin_size) * bin_size)
+        cur = s
+        while cur < e:
+            nxt = cur + step
+            if nxt < e:
+                nxt = (nxt // bin_size) * bin_size  # align down to a bin boundary
+                if nxt <= cur:
+                    nxt = cur + step
+            else:
+                nxt = e
+            subs.append((c, cur, min(nxt, e), i))
+            cur = nxt
+
+    if len(subs) < 2:
+        return None
+
+    # Partition the ordered sub-intervals into <= max_procs contiguous,
+    # bp-balanced runs (preserves original order on concatenation).
+    n_workers = min(max_procs, len(subs))
+    runs: list[list[tuple[Any, int, int, int]]] = [[] for _ in range(n_workers)]
+    run_bp = [0] * n_workers
+    w = 0
+    for sub in subs:
+        runs[w].append(sub)
+        run_bp[w] += max(0, sub[2] - sub[1])
+        if run_bp[w] >= target_bp and w < n_workers - 1:
+            w += 1
+    runs = [r for r in runs if r]
+
+    if len(runs) < 2:
+        return None  # everything landed in one run -> serial is just as fast
+
     worker_config = dict(config)
     worker_config["progress"] = False
 
-    # Build per-chromosome chunks, tracking original interval indices so we
-    # can remap intervalID after the parallel extraction.
-    chunks = []
-    original_indices = []  # list of arrays: original 0-based positions
-    for chrom in sorted(chroms):
-        mask = intervals["chrom"] == chrom
-        chunk = intervals[mask]
-        orig_idx = _numpy.where(mask)[0]  # 0-based positions in parent
-        chunks.append(chunk.to_dict(orient="list"))
-        original_indices.append(orig_idx)
-
-    worker_args = [(chunk_dict, exprs, iterator, worker_config, vtracks_dict) for chunk_dict in chunks]
+    worker_args = []
+    run_parent_maps = []
+    for r in runs:
+        chunk_dict = {
+            "chrom": [x[0] for x in r],
+            "start": [x[1] for x in r],
+            "end": [x[2] for x in r],
+        }
+        worker_args.append((chunk_dict, exprs, iterator, worker_config, vtracks_dict))
+        run_parent_maps.append(_numpy.array([x[3] for x in r], dtype=_numpy.int64))
 
     ctx = multiprocessing.get_context("fork")
-    with ctx.Pool(processes=n_workers) as pool:
+    with ctx.Pool(processes=len(worker_args)) as pool:
         results = pool.map(_worker_extract_chunk, worker_args)
 
-    # Collect and concatenate non-None results, remapping intervalID
     dfs = []
-    for df, orig_idx in zip(results, original_indices, strict=False):
+    for df, parent_map in zip(results, run_parent_maps, strict=False):
         if df is not None and len(df) > 0:
             if "intervalID" in df.columns:
-                # C++ intervalID is 1-based within the chunk.
-                # Remap: chunk_local_id -> original_global_id (1-based).
+                # C++ intervalID is 1-based within the run -> the run's k-th
+                # sub-interval -> its parent row -> original global 1-based id.
                 local_ids = df["intervalID"].to_numpy()
-                # local_ids are 1-based; orig_idx is 0-based
-                global_ids = orig_idx[local_ids - 1] + 1
                 df = df.copy()
-                df["intervalID"] = global_ids
+                df["intervalID"] = parent_map[local_ids - 1] + 1
             dfs.append(df)
     if not dfs:
         return _pandas.DataFrame()
