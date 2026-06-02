@@ -1063,13 +1063,26 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         if (func == "max.pos.abs" || func == "max.pos.relative") track1d->register_function(GenomeTrack1D::MAX_POS);
         if (func == "min.pos.abs" || func == "min.pos.relative") track1d->register_function(GenomeTrack1D::MIN_POS);
 
+        // Register the primary reducer on dense tracks so read_interval can take
+        // the incremental sliding-window fast path (classify_fast_path_mode).
+        // Dense-only: the sliding machinery lives in GenomeTrackFixedBin; sparse
+        // keeps its existing scan path.
+        if (fixed_bin) {
+            if (func == "avg" || func == "mean") track1d->register_function(GenomeTrack1D::AVG);
+            if (func == "sum") track1d->register_function(GenomeTrack1D::SUM);
+            if (func == "nearest") track1d->register_function(GenomeTrack1D::NEAREST);
+            if (func == "lse") track1d->register_function(GenomeTrack1D::LSE);
+        }
+
         const bool sparse_fast_reduce =
             sparse &&
             (func == "avg" || func == "mean" || func == "sum" ||
              func == "min" || func == "max" || func == "size" || func == "exists");
 
-        // LSE (log-sum-exp) for physical tracks: read raw values and compute directly
-        if (func == "lse") {
+        // LSE for sparse tracks: collect per-interval values and reduce directly.
+        // Dense LSE falls through to the generic read_interval loop below, where
+        // the registered LSE reducer takes the incremental sliding-window path.
+        if (func == "lse" && sparse) {
             int cur_chromid = -1;
             bool cur_chromid_valid = false;
             // Hybrid scan state for sparse LSE
@@ -1308,6 +1321,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 out[i] = track1d->last_avg();
             } else if (func == "sum") {
                 out[i] = track1d->last_sum();
+            } else if (func == "lse") {
+                out[i] = track1d->last_lse();
             } else if (func == "min") {
                 out[i] = track1d->last_min();
             } else if (func == "max") {

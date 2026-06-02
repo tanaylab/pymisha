@@ -11,13 +11,14 @@ this port:
 * **Fixed:** ``global.percentile.min`` / ``.max`` now map each per-bin value
   through R's frozen ``vars/pv.percentiles`` binned table (instead of an exact
   empirical CDF), matching R bit-for-bit. The ``global.percentile`` (avg) variant
-  remains off (``GAP_GLOBAL_PCT_AVG``).
+  now matches R too: the sliding-window reducer accumulates the windowed mean in
+  double precision (Kahan), removing the ~1 float32 ULP discrepancy that used to
+  flip values landing exactly on a quantile break.
 
 Open gaps marked ``xfail(strict=True)``:
 
 * ``GAP_ARRAY`` -- array-track extraction / ``gvtrack.array.slice`` extraction.
 * ``GAP_COMPUTED`` -- COMPUTED 2D Hi-C tracks (``test.computed2d``).
-* ``GAP_GLOBAL_PCT_AVG`` -- global.percentile (avg) per-bin value vs R (float32 ULP).
 * ``GAP_VTRACK_ITER`` -- default iterator not inferred from a value-based
   vtrack's source track (+ ``gvtrack.iterator`` shifts).
 * ``GAP_2D_ITER`` -- a 1D vtrack ``dim``-projected over a 2D iterator.
@@ -38,12 +39,11 @@ from .baseline import assert_matches_baseline, load_baseline
 
 GAP_ARRAY = "array-track gextract / gvtrack.array.slice extraction not supported"
 GAP_COMPUTED = "COMPUTED 2D Hi-C tracks (test.computed2d) not supported"
-# global.percentile.min/.max now read R's frozen vars/pv.percentiles binned table
-# (exact native per-bin values -> exact bin). The AVG variant remains off: the
-# weighted/averaged per-bin value differs from R by ~1 float32 ULP, so values
-# that land exactly on a break (the breaks are the track's float32 quantiles)
-# flip to an adjacent bin. Matching needs bit-exact AVG float32 accumulation order.
-GAP_GLOBAL_PCT_AVG = "global.percentile (avg) per-bin value differs from R by ~1 float32 ULP at break boundaries"
+# global.percentile.min/.max read R's frozen vars/pv.percentiles binned table
+# (exact native per-bin values -> exact bin). The AVG variant now matches R as
+# well: the sliding-window reducer accumulates the windowed mean in double
+# precision (Kahan), so values no longer differ by ~1 float32 ULP at quantile
+# break boundaries.
 GAP_VTRACK_ITER = "default iterator not inferred from value-based vtrack source (+ gvtrack.iterator shifts)"
 GAP_2D_ITER = "1D vtrack dim-projection over a 2D iterator differs from R"
 GAP_STDDEV = "stddev one-pass numerical cancellation vs R two-pass (tiny diffs)"
@@ -191,7 +191,7 @@ _CASES: dict[str, tuple] = {
     "vtrack.array_sum": (_value("test.array", "sum", 10000), None),
     "vtrack.fixedbin_quantile": (_two_quantile(233), None),
     "vtrack.fixedbin.quantile_extraction_1": (_two_quantile(10000), None),
-    "vtrack.fixedbin.global_percentile_extraction": (_value("test.fixedbin", "global.percentile", 233), GAP_GLOBAL_PCT_AVG),
+    "vtrack.fixedbin.global_percentile_extraction": (_value("test.fixedbin", "global.percentile", 233), None),
     "vtrack.fixedbin.global_percentile_max_extraction": (_value("test.fixedbin", "global.percentile.max", 233), None),
     "vtrack.fixedbin.result": (_value("test.fixedbin", "global.percentile.min", 233), None),
     "vtrack.fixedbin.gscreen.result": (_intervs_vtrack(None, 533), None),

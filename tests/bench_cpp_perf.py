@@ -137,6 +137,8 @@ def run_benchmarks():
     # 14. gtrack_import_mappedseq: C++ vs Python fallback on a 100k-read synthetic SAM.
     results.append(bench_import_mappedseq())
 
+    results.append(bench_sliding_reducer())
+
     return results
 
 
@@ -642,6 +644,47 @@ def bench_import_mappedseq(n_reads: int = 100_000) -> dict:
         "sparse_speedup": round(speedup_sparse, 3),
         "median_s": round(t_cpp_dense, 6),
         "std_s": 0.0,
+    }
+
+
+def bench_sliding_reducer() -> dict:
+    """Windowed-lse vtrack: incremental sliding window vs from-scratch recompute.
+
+    Times a func="lse" vtrack with a 1000-bin (sshift/eshift) window scanned
+    bin-by-bin over chrom 1 of the test DB, reduced by gextract. The sliding path
+    pops/pushes the step bins per advance; PYMISHA_DISABLE_SLIDING_REDUCER forces
+    the legacy per-bin recompute, so we can report the head-to-head speedup.
+    """
+    pm.gdb_init(TESTDB)
+    pm.CONFIG["progress"] = False
+    pm.CONFIG["multitasking"] = False
+    pm.gvtrack_clear()
+    pm.gvtrack_create("bench_slide_vt", "dense_track", func="lse")
+    pm.gvtrack_iterator("bench_slide_vt", sshift=-25000, eshift=25000)
+    iv = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [500000]})
+
+    def _run():
+        pm.gextract("bench_slide_vt", intervals=iv, iterator=50)
+
+    os.environ.pop("PYMISHA_DISABLE_SLIDING_REDUCER", None)
+    slide = bench(_run, "sliding_lse_window1000")
+    os.environ["PYMISHA_DISABLE_SLIDING_REDUCER"] = "1"
+    try:
+        recompute = bench(_run, "recompute_lse_window1000")
+    finally:
+        os.environ.pop("PYMISHA_DISABLE_SLIDING_REDUCER", None)
+    pm.gvtrack_rm("bench_slide_vt")
+
+    speedup = (recompute["median_s"] / slide["median_s"]
+               if slide["median_s"] > 0 else float("inf"))
+    return {
+        "label": "sliding_lse_vtrack_window1000",
+        "name": "windowed lse vtrack (1000-bin window, chrom 1)",
+        "slide_seconds": slide["median_s"],
+        "recompute_seconds": recompute["median_s"],
+        "speedup": round(speedup, 3),
+        "median_s": slide["median_s"],
+        "std_s": slide["std_s"],
     }
 
 

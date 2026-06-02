@@ -861,6 +861,15 @@ void PMTrackExpressionVars::setup_value_based_vtrack(VTrackVar &vvar, PyObject *
         if (func == "last.pos.abs" || func == "last.pos.relative") track1d->register_function(GenomeTrack1D::LAST_POS);
         if (func == "max.pos.abs" || func == "max.pos.relative") track1d->register_function(GenomeTrack1D::MAX_POS);
         if (func == "min.pos.abs" || func == "min.pos.relative") track1d->register_function(GenomeTrack1D::MIN_POS);
+        // Register the primary reducer on dense tracks so read_interval takes the
+        // incremental sliding-window fast path (overlapping sshift/eshift windows).
+        // Dense-only: the sliding machinery lives in GenomeTrackFixedBin.
+        if (vvar.src_track_type == GenomeTrack::FIXED_BIN) {
+            if (func == "avg" || func == "mean") track1d->register_function(GenomeTrack1D::AVG);
+            if (func == "sum") track1d->register_function(GenomeTrack1D::SUM);
+            if (func == "nearest") track1d->register_function(GenomeTrack1D::NEAREST);
+            if (func == "lse") track1d->register_function(GenomeTrack1D::LSE);
+        }
     }
 
     vvar.src_cur_chromid = -1;
@@ -1028,6 +1037,9 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
 
     if (func == "avg" || func == "mean") return track1d->last_avg();
     if (func == "sum") return track1d->last_sum();
+    // Dense LSE uses the sliding reducer (registered above); sparse LSE falls
+    // through to the dedicated collect-and-reduce branch below.
+    if (func == "lse" && fixed_bin) return track1d->last_lse();
     if (func == "min") return track1d->last_min();
     if (func == "max") return track1d->last_max();
     if (func == "stddev" || func == "std") return track1d->last_stddev();

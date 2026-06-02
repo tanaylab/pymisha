@@ -13,9 +13,11 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <deque>
 
 #include "GenomeTrack1D.h"
 #include "MmapFile.h"
+#include "utils/RunningLogSumExp.h"
 
 // !!!!!!!!! IN CASE OF ERROR THIS CLASS THROWS TGLException  !!!!!!!!!!!!!!!!
 
@@ -52,6 +54,48 @@ protected:
 	int64_t   m_cached_bin_idx{-1};
 	float     m_cached_bin_val{numeric_limits<float>::quiet_NaN()};
 	bool      m_cache_valid{false};
+
+	// ---- incremental sliding-window reducer state (R misha mode-1 port) ----
+	// A reader slides only when it registered a non-empty subset of these funcs
+	// and nothing else (and no quantile). pymisha computes avg/sum/min/max
+	// unconditionally, so callers must explicitly register their reducer to opt
+	// into sliding; readers that register nothing keep the compute-everything
+	// path unchanged. See classify_fast_path_mode().
+	static constexpr uint32_t SLIDING_COMPATIBLE_MASK =
+		(1u << AVG) | (1u << NEAREST) | (1u << SUM) |
+		(1u << LSE) | (1u << EXISTS) | (1u << SIZE);
+
+	int       m_fast_path_mode{0};   // 0=unclassified, 1=sliding reducers, -1=generic
+	RunningLogSumExp m_running_lse;
+	std::deque<float> m_lse_window_bins;   // raw window values incl. NaN placeholders
+	int64_t   m_lse_prev_sbin{-1};
+	int64_t   m_lse_prev_ebin{-1};
+	double    m_sliding_sum{0.0};
+	double    m_sliding_sum_comp{0.0};     // Kahan compensation
+	int64_t   m_sliding_num_vs{0};         // count of non-NaN values in window
+	bool      m_lse_sliding_valid{false};
+	bool      m_running_lse_initialized{false};
+
+	void classify_fast_path_mode();
+	void read_interval_reducers_only(const GInterval &interval);
+
+	inline void kahan_add_to_sliding_sum(double value) {
+		double y = value - m_sliding_sum_comp;
+		double t = m_sliding_sum + y;
+		m_sliding_sum_comp = (t - m_sliding_sum) - y;
+		m_sliding_sum = t;
+	}
+	inline void kahan_sub_from_sliding_sum(double value) { kahan_add_to_sliding_sum(-value); }
+	inline void reset_sliding_state() {
+		m_fast_path_mode = 0;
+		m_running_lse.clear();
+		m_lse_window_bins.clear();
+		m_lse_prev_sbin = m_lse_prev_ebin = -1;
+		m_sliding_sum = m_sliding_sum_comp = 0.0;
+		m_sliding_num_vs = 0;
+		m_lse_sliding_valid = false;
+		m_running_lse_initialized = false;
+	}
 
 	// Reusable scratch buffers for multi-bin path (avoids per-call allocation)
 	std::vector<float> m_scratch_bin_vals;

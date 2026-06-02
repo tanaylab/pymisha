@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.8.11 (2026-06-02)
+
+- **Windowed virtual-track reductions over dense tracks are now incremental (R 5.10.2 parity).** A `sum`/`avg`/`nearest`/`lse`/`exists`/`size` virtual track with a sliding window (`gvtrack.iterator(sshift=, eshift=)`) scanned bin-by-bin now maintains a running window instead of recomputing the reduction from scratch at every step. The motif-energy workload (windowed `lse` reduced by `gquantiles`/`gscreen`) is ~8x faster on a 1000-bin window (hg38); results are unchanged. Set `PYMISHA_DISABLE_SLIDING_REDUCER=1` to force the legacy per-bin recompute.
+- **`global.percentile` virtual tracks now match R bit-for-bit** - the windowed mean no longer differs from R by ~1 float32 ULP at quantile-break boundaries.
+- **`exists` / `size` virtual tracks over a single all-NaN dense bin now return 0** (matching R) instead of 1.
+
 ## v0.8.10 (2026-06-01)
 
 - **Documentation corrections (no code changes).** The R-parity guide and several capability notes were out of date. Fixed: COMPUTED 2D tracks are now documented as readable for `AreaComputer2D`/`TestComputer2D` (Hi-C `Potential`/`Technical` computers and creation remain unsupported); array tracks and the 2D iterator family work through the C++ scanner; array and 2D tracks support the indexed format; gene annotations install via `gdb_install_intervals`/`gdb_build_genome`. Removed stale "not implemented" notes for features that have shipped (`gvtrack.array.slice`, liftover, SAM import). Added a reproducibility note (NumPy vs R RNG; nearest-neighbor tie ordering).

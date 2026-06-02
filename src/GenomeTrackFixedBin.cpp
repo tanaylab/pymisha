@@ -5,12 +5,248 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <cstdlib>
+
 #include "TGLException.h"
 #include "GenomeTrackFixedBin.h"
 #include "TrackIndex.h"
 
+void GenomeTrackFixedBin::classify_fast_path_mode()
+{
+	// Escape hatch: force the generic recompute path (benchmarking + safety toggle).
+	if (std::getenv("PYMISHA_DISABLE_SLIDING_REDUCER")) {
+		m_fast_path_mode = -1;
+		return;
+	}
+	// pymisha computes avg/sum/min/max unconditionally and only registers
+	// "extras", so - unlike R, which registers every function - we can only
+	// slide when the caller explicitly registered a non-empty subset of the
+	// sliding-compatible reducers and nothing else (and no quantile). Readers
+	// that register nothing (the common compute-everything case) keep the
+	// existing recompute path untouched.
+	if (!m_use_quantile && m_func_mask != 0 &&
+	    (m_func_mask & ~SLIDING_COMPATIBLE_MASK) == 0)
+		m_fast_path_mode = 1;
+	else
+		m_fast_path_mode = -1;
+}
+
+// Incremental sliding-window reducer (port of R misha
+// GenomeTrackFixedBin::read_interval_reducers_only). Maintains a Kahan-
+// compensated running sum, a non-NaN count, and a RunningLogSumExp across
+// consecutive monotone bin windows: when the query advances by `step` bins
+// (<= the window width) it pops `step` bins off the front and pushes `step`
+// off the back instead of recomputing the whole window. avg/nearest are
+// derived from the running sum/count (R derives these in its generic path; we
+// unify them here so a single avg/sum/lse/exists/size vtrack all slide).
+void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
+{
+	const bool need_lse = has_function(LSE);
+	if (!need_lse)
+		m_running_lse_initialized = false;
+
+	// Publish from the running window state (multi-bin window).
+	auto assign_from_state = [&]() {
+		if (m_sliding_num_vs > 0) {
+			m_last_sum = (float)m_sliding_sum;
+			m_last_avg = m_last_nearest = (float)(m_sliding_sum / (double)m_sliding_num_vs);
+			m_last_exists = 1;
+			if (need_lse)
+				m_last_lse = m_running_lse.window.empty()
+					? numeric_limits<float>::quiet_NaN()
+					: (float)m_running_lse.value();
+		} else {
+			m_last_sum = m_last_avg = m_last_nearest = numeric_limits<float>::quiet_NaN();
+			m_last_exists = 0;
+			if (need_lse)
+				m_last_lse = numeric_limits<float>::quiet_NaN();
+		}
+		m_last_size = (float)m_sliding_num_vs;
+		m_last_min = m_last_max = m_last_stddev = numeric_limits<float>::quiet_NaN();
+	};
+
+	// Publish for a single-bin read. exists/size are non-NaN-aware (matches R:
+	// a single NaN bin has exists=0, size=0), unlike the legacy single-bin
+	// recompute path which reported 1 for an in-range NaN bin.
+	auto assign_single_value = [&](bool have_value, float v) {
+		bool has_num = have_value && !std::isnan(v);
+		m_last_sum = has_num ? v : numeric_limits<float>::quiet_NaN();
+		m_last_avg = m_last_nearest = has_num ? v : numeric_limits<float>::quiet_NaN();
+		m_last_exists = has_num ? 1 : 0;
+		m_last_size = has_num ? 1 : 0;
+		if (need_lse)
+			m_last_lse = has_num ? v : numeric_limits<float>::quiet_NaN();
+		m_last_min = m_last_max = m_last_stddev = numeric_limits<float>::quiet_NaN();
+	};
+
+	// Common case: iterator advances exactly one dense bin.
+	if (interval.start == m_cur_coord && interval.end == m_cur_coord + m_bin_size) {
+		float v = numeric_limits<float>::quiet_NaN();
+		bool have_value = read_next_bin(v);
+		if (have_value) {
+			m_cached_bin_idx = (int64_t)(interval.start / m_bin_size);
+			m_cached_bin_val = v;
+			m_cache_valid = true;
+		}
+		assign_single_value(have_value, v);
+		m_lse_sliding_valid = false;
+		m_sliding_sum = 0;
+		m_sliding_sum_comp = 0;
+		m_sliding_num_vs = 0;
+		m_running_lse_initialized = false;
+		return;
+	}
+
+	int64_t sbin = (int64_t)(interval.start / m_bin_size);
+	int64_t ebin = (int64_t)ceil(interval.end / (double)m_bin_size);
+
+	if (ebin == sbin + 1) {
+		float v = numeric_limits<float>::quiet_NaN();
+		bool have_value = false;
+
+		if (m_cache_valid && m_cached_bin_idx == sbin) {
+			v = m_cached_bin_val;
+			m_cur_coord = (sbin + 1) * m_bin_size;
+			have_value = true;
+		} else {
+			if (m_cur_coord != sbin * m_bin_size)
+				goto_bin(sbin);
+			if (read_next_bin(v)) {
+				have_value = true;
+				m_cached_bin_idx = sbin;
+				m_cached_bin_val = v;
+				m_cache_valid = true;
+			}
+		}
+
+		assign_single_value(have_value, v);
+		m_lse_sliding_valid = false;
+		m_sliding_sum = 0;
+		m_sliding_sum_comp = 0;
+		m_sliding_num_vs = 0;
+		m_running_lse_initialized = false;
+		return;
+	}
+
+	const int64_t window_size = ebin - sbin;
+
+	// Sliding reducers update when the window shifts forward by <= its width.
+	if (m_lse_sliding_valid && window_size > 0 && (!need_lse || m_running_lse_initialized)) {
+		int64_t step = sbin - m_lse_prev_sbin;
+		int64_t prev_window = m_lse_prev_ebin - m_lse_prev_sbin;
+		if (step > 0 && step <= prev_window && window_size == prev_window &&
+			(int64_t)m_lse_window_bins.size() == prev_window) {
+			int64_t appended = 0;
+
+			if (step == 1) {
+				float new_val = numeric_limits<float>::quiet_NaN();
+				if (m_cur_coord != m_lse_prev_ebin * m_bin_size)
+					goto_bin(m_lse_prev_ebin);
+				if (read_next_bin(new_val) && !m_lse_window_bins.empty()) {
+					float old_val = m_lse_window_bins.front();
+					m_lse_window_bins.pop_front();
+					if (!std::isnan(old_val)) {
+						kahan_sub_from_sliding_sum(old_val);
+						--m_sliding_num_vs;
+						if (need_lse)
+							m_running_lse.pop_front();
+					}
+
+					m_lse_window_bins.push_back(new_val);
+					if (!std::isnan(new_val)) {
+						kahan_add_to_sliding_sum(new_val);
+						++m_sliding_num_vs;
+						if (need_lse)
+							m_running_lse.push(new_val);
+					}
+					appended = 1;
+				}
+			} else {
+				m_scratch_bin_vals.clear();
+				appended = read_bins_bulk(m_lse_prev_ebin, step, m_scratch_bin_vals);
+				auto &new_vals = m_scratch_bin_vals;
+				if (appended == step) {
+					for (int64_t i = 0; i < step && !m_lse_window_bins.empty(); ++i) {
+						float old_val = m_lse_window_bins.front();
+						m_lse_window_bins.pop_front();
+						if (!std::isnan(old_val)) {
+							kahan_sub_from_sliding_sum(old_val);
+							--m_sliding_num_vs;
+							if (need_lse)
+								m_running_lse.pop_front();
+						}
+					}
+
+					for (int64_t i = 0; i < step; ++i) {
+						float new_val = new_vals[i];
+						m_lse_window_bins.push_back(new_val);
+						if (!std::isnan(new_val)) {
+							kahan_add_to_sliding_sum(new_val);
+							++m_sliding_num_vs;
+							if (need_lse)
+								m_running_lse.push(new_val);
+						}
+					}
+				}
+			}
+
+			if (appended == step) {
+				assign_from_state();
+				m_lse_prev_sbin = sbin;
+				m_lse_prev_ebin = ebin;
+				m_lse_sliding_valid = true;
+				m_cached_bin_idx = ebin - 1;
+				m_cached_bin_val = m_lse_window_bins.back();
+				m_cache_valid = true;
+				return;
+			}
+		}
+	}
+
+	// Fallback: full window read + reseed of the sliding state.
+	m_scratch_bin_vals.clear();
+	int64_t bins_read = read_bins_bulk(sbin, window_size, m_scratch_bin_vals);
+	auto &bin_vals = m_scratch_bin_vals;
+
+	if (need_lse)
+		m_running_lse.clear();
+	m_sliding_sum = 0;
+	m_sliding_sum_comp = 0;
+	m_sliding_num_vs = 0;
+	m_lse_window_bins.clear();
+	for (int64_t i = 0; i < bins_read; ++i) {
+		float v = bin_vals[i];
+		m_lse_window_bins.push_back(v);
+		if (!std::isnan(v)) {
+			kahan_add_to_sliding_sum(v);
+			++m_sliding_num_vs;
+			if (need_lse)
+				m_running_lse.push(v);
+		}
+	}
+	m_running_lse_initialized = need_lse;
+
+	if (bins_read > 0) {
+		m_cached_bin_idx = sbin + bins_read - 1;
+		m_cached_bin_val = bin_vals[bins_read - 1];
+		m_cache_valid = true;
+	}
+
+	assign_from_state();
+	m_lse_prev_sbin = sbin;
+	m_lse_prev_ebin = ebin;
+	m_lse_sliding_valid = bins_read == window_size && window_size > 0;
+}
+
 void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 {
+	if (m_fast_path_mode == 0)
+		classify_fast_path_mode();
+	if (m_fast_path_mode == 1) {
+		read_interval_reducers_only(interval);
+		return;
+	}
+
 	if (m_use_quantile)
 		m_sp.reset();
 
@@ -42,6 +278,8 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 
 			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
+			if (has_function(LSE))
+				m_last_lse = m_last_avg;  // lse of a single value == the value
 			if (has_function(MAX_POS))
 				m_last_max_pos = interval.start;
 			if (has_function(MIN_POS))
@@ -66,6 +304,8 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 				m_sp.add(m_last_avg, s_rnd_func);
 		} else {
 			m_last_min = m_last_max = m_last_nearest = m_last_avg = m_last_stddev = m_last_sum = numeric_limits<float>::quiet_NaN();
+			if (has_function(LSE))
+				m_last_lse = numeric_limits<float>::quiet_NaN();
 			if (has_function(MAX_POS))
 				m_last_max_pos = numeric_limits<double>::quiet_NaN();
 			if (has_function(MIN_POS))
@@ -107,6 +347,8 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		if (have_value) {
 			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
+			if (has_function(LSE))
+				m_last_lse = m_last_avg;  // lse of a single value == the value
 			double overlap_start = std::max(static_cast<double>(sbin * m_bin_size), static_cast<double>(interval.start));
 			if (has_function(MAX_POS))
 				m_last_max_pos = overlap_start;
@@ -132,6 +374,8 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 				m_sp.add(m_last_avg, s_rnd_func);
 		} else {
 			m_last_min = m_last_max = m_last_nearest = m_last_avg = m_last_stddev = m_last_sum = numeric_limits<float>::quiet_NaN();
+			if (has_function(LSE))
+				m_last_lse = numeric_limits<float>::quiet_NaN();
 			if (has_function(MAX_POS))
 				m_last_max_pos = numeric_limits<double>::quiet_NaN();
 			if (has_function(MIN_POS))
@@ -274,6 +518,31 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		if (has_function(STDDEV))
 			m_last_stddev = num_vs > 1 ? sqrt(stddev_m2 / static_cast<double>(num_vs - 1))
 			                           : numeric_limits<float>::quiet_NaN();
+
+		// LSE on the generic fallback path. Normal operation slides LSE in
+		// read_interval_reducers_only; this keeps PYMISHA_DISABLE_SLIDING_REDUCER
+		// (and any future mode -1 LSE reader) correct, matching R's generic path.
+		// inf was already coerced to NaN by read_bins_bulk, so a non-empty window
+		// has a finite max.
+		if (has_function(LSE)) {
+			if (num_vs > 0) {
+				double m = -numeric_limits<double>::infinity();
+				for (int64_t i = 0; i < bins_read; ++i) {
+					float v = m_scratch_bin_vals[i];
+					if (!std::isnan(v) && (double)v > m)
+						m = (double)v;
+				}
+				double sum_exp = 0.0;
+				for (int64_t i = 0; i < bins_read; ++i) {
+					float v = m_scratch_bin_vals[i];
+					if (!std::isnan(v))
+						sum_exp += std::exp((double)v - m);
+				}
+				m_last_lse = (float)(m + std::log(sum_exp));
+			} else {
+				m_last_lse = numeric_limits<float>::quiet_NaN();
+			}
+		}
 	}
 }
 
@@ -355,6 +624,7 @@ void GenomeTrackFixedBin::init_read(const char *filename, const char *mode, int 
 	m_cached_bin_idx = -1;
 	m_cached_bin_val = numeric_limits<float>::quiet_NaN();
 	m_cache_valid = false;
+	reset_sliding_state();
 
 	// Check for indexed format FIRST.
 	// E.1.4: get_track_index() already caches loaded indexes and returns
