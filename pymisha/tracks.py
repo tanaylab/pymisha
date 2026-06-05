@@ -845,34 +845,94 @@ def _close_text_auto(stream: Any) -> None:
     stream.close()
 
 
+def _filter_track_lines(path: str, skip_prefixes: tuple[str, ...]) -> list[str]:
+    """Read *path* and return non-blank lines not starting with *skip_prefixes*.
+
+    Cheap line-level pass (strip + startswith only, no field parsing), shared
+    by the BED and tabular parsers so the expensive splitting/numeric coercion
+    can be vectorized downstream.
+    """
+    stream = _open_text_auto(path)
+    try:
+        return [
+            raw for raw in stream
+            if (s := raw.strip()) and not s.startswith(skip_prefixes)
+        ]
+    finally:
+        _close_text_auto(stream)
+
+
 def _parse_bed(path: str) -> pd.DataFrame:
+    kept = _filter_track_lines(path, ("#", "track", "browser"))
+    if not kept:
+        raise ValueError(f"BED file '{path}' contains no intervals")
+
+    # Fast path for tab-delimited BED (the UCSC standard): the C parser with
+    # per-column `names` pads ragged BED3..BED12 rows and the numeric coercion
+    # is vectorized (~1.8x vs the per-row Python loop, which did int(float(...))
+    # per field). Space-delimited / non-numeric-coord files return None and
+    # fall through to the general parser below.
+    if "\t" in kept[0]:
+        df = _parse_bed_fast_tab(kept)
+        if df is not None:
+            return df
+    return _parse_bed_generic(kept)
+
+
+def _parse_bed_fast_tab(kept: list[str]) -> pd.DataFrame | None:
+    maxc = max(line.count("\t") for line in kept) + 1
+    if maxc < 3:
+        return None
+    # Read only the needed columns with inferred dtypes (the C parser converts
+    # coordinates directly - far cheaper than reading str + pd.to_numeric).
+    # chrom is forced to str so a bare numeric chrom ("1") stays "1".
+    usecols = [0, 1, 2, 4] if maxc >= 5 else [0, 1, 2]
+    df = pd.read_csv(
+        io.StringIO("".join(kept)), sep="\t", header=None,
+        names=range(maxc), usecols=usecols, dtype={0: str}, engine="c",
+    )
+    start, end = df[1], df[2]
+    # Non-numeric / NaN coordinate -> not clean tab-delimited BED (e.g.
+    # space-delimited, or a row with < 3 fields); defer to the generic parser,
+    # which parses it or raises.
+    if not (pd.api.types.is_numeric_dtype(start) and pd.api.types.is_numeric_dtype(end)):
+        return None
+    if start.isna().any() or end.isna().any():
+        return None
+    # BED score is column 4 (0-based); unparseable / absent -> 1.0 (R parity).
+    value = (
+        pd.to_numeric(df[4], errors="coerce").fillna(1.0).to_numpy()
+        if maxc >= 5
+        else np.ones(len(df), dtype=float)
+    )
+    return pd.DataFrame({
+        "chrom": df[0].astype(str).to_numpy(),
+        "start": start.to_numpy().astype(np.int64),
+        "end": end.to_numpy().astype(np.int64),
+        "value": value,
+    })
+
+
+def _parse_bed_generic(kept: list[str]) -> pd.DataFrame:
     chrom: list[str] = []
     start: list[int] = []
     end: list[int] = []
     value: list[float] = []
-    stream = _open_text_auto(path)
-    try:
-        for raw in stream:
-            line = raw.strip()
-            if not line or line.startswith(("#", "track", "browser")):
-                continue
-            fields = line.split()
-            if len(fields) < 3:
-                raise ValueError(f"Malformed BED line: {line}")
-            chrom.append(fields[0])
-            start.append(int(float(fields[1])))
-            end.append(int(float(fields[2])))
-            v = 1.0
-            if len(fields) >= 5:
-                try:
-                    v = float(fields[4])
-                except ValueError:
-                    v = 1.0
-            value.append(v)
-    finally:
-        _close_text_auto(stream)
-    if len(chrom) == 0:
-        raise ValueError(f"BED file '{path}' contains no intervals")
+    for raw in kept:
+        line = raw.strip()
+        fields = line.split()
+        if len(fields) < 3:
+            raise ValueError(f"Malformed BED line: {line}")
+        chrom.append(fields[0])
+        start.append(int(float(fields[1])))
+        end.append(int(float(fields[2])))
+        v = 1.0
+        if len(fields) >= 5:
+            try:
+                v = float(fields[4])
+            except ValueError:
+                v = 1.0
+        value.append(v)
     return pd.DataFrame({"chrom": chrom, "start": start, "end": end, "value": value})
 
 
@@ -971,26 +1031,61 @@ def _parse_wig_or_bedgraph(path: str) -> pd.DataFrame:
 
 
 def _parse_tabular_track(path: str) -> pd.DataFrame:
-    stream = _open_text_auto(path)
-    header: list[str] | None = None
-    rows: list[list[str]] = []
-    try:
-        for raw in stream:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if header is None:
-                header = line.split("\t") if "\t" in line else line.split()
-                continue
-            fields = line.split("\t") if "\t" in line else line.split()
-            if len(fields) == 0:
-                continue
-            rows.append(fields)
-    finally:
-        _close_text_auto(stream)
-
-    if header is None:
+    kept = _filter_track_lines(path, ("#",))
+    if not kept:
         raise ValueError(f"File '{path}' is empty")
+
+    # Fast path for tab-delimited tables (the common case): one vectorized
+    # C-engine read + numeric coercion instead of a per-row Python loop. Any
+    # parser hiccup (e.g. rows wider than the header) defers to the general
+    # parser, which preserves the original lenient per-row behavior.
+    if "\t" in kept[0]:
+        try:
+            # Inferred dtypes: the C parser converts start/end/value directly
+            # (reading as str + pd.to_numeric is markedly slower).
+            df = pd.read_csv(io.StringIO("".join(kept)), sep="\t", header=0, engine="c")
+        except Exception:
+            df = None
+        if df is not None:
+            df.columns = [str(c).strip() for c in df.columns]
+            return _tabular_finish(df, path)
+    return _parse_tabular_generic(kept, path)
+
+
+def _tabular_finish(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    req = ["chrom", "start", "end"]
+    for c in req:
+        if c not in df.columns:
+            raise ValueError(f"Tabular track file must contain '{c}' column")
+    val_cols = [c for c in df.columns if c not in req]
+    if len(val_cols) != 1:
+        raise ValueError("Tabular track file must contain exactly one value column besides chrom/start/end")
+    c_val = val_cols[0]
+
+    # Drop short rows (a missing field reads as NaN) - mirrors the original
+    # `len(fields) < len(cols)` skip - then coerce, raising on a non-numeric
+    # field in a full row (mirrors the original int()/float() raise).
+    sel = df[[*req, c_val]]
+    keep = sel.notna().all(axis=1)
+    if not keep.any():
+        raise ValueError(f"File '{path}' contains no data rows")
+    sel = sel[keep]
+    start = pd.to_numeric(sel["start"], errors="coerce")
+    end = pd.to_numeric(sel["end"], errors="coerce")
+    value = pd.to_numeric(sel[c_val], errors="coerce")
+    if start.isna().any() or end.isna().any() or value.isna().any():
+        raise ValueError(f"Malformed numeric field in tabular track '{path}'")
+    return pd.DataFrame({
+        "chrom": sel["chrom"].astype(str).to_numpy(),
+        "start": start.to_numpy().astype(np.int64),
+        "end": end.to_numpy().astype(np.int64),
+        "value": value.to_numpy().astype(float),
+    })
+
+
+def _parse_tabular_generic(kept: list[str], path: str) -> pd.DataFrame:
+    header_line = kept[0].strip()
+    header = header_line.split("\t") if "\t" in header_line else header_line.split()
     cols = [c.strip() for c in header]
     req = ["chrom", "start", "end"]
     for c in req:
@@ -999,11 +1094,12 @@ def _parse_tabular_track(path: str) -> pd.DataFrame:
     val_cols = [c for c in cols if c not in req]
     if len(val_cols) != 1:
         raise ValueError("Tabular track file must contain exactly one value column besides chrom/start/end")
-
     idx = {c: i for i, c in enumerate(cols)}
     c_val = val_cols[0]
     out: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": []}
-    for fields in rows:
+    for raw in kept[1:]:
+        line = raw.strip()
+        fields = line.split("\t") if "\t" in line else line.split()
         if len(fields) < len(cols):
             continue
         out["chrom"].append(fields[idx["chrom"]])

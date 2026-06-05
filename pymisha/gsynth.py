@@ -1932,6 +1932,12 @@ def gsynth_score(
 
     # Build log-probability arrays from the model CDFs.
     log_p_list, bin_is_sparse = _build_log_p_from_cdf(model.model_data["cdf"])
+    # Stack the per-bin tables (each (4^k, 4)) into one (num_bins, 4^k, 4) array
+    # so the hot per-bp lookup below is a single vectorized gather rather than a
+    # Python loop over every scored base pair.
+    log_p_arr = (
+        _numpy.stack(log_p_list) if log_p_list else _numpy.empty((0, 0, 0), dtype=_numpy.float64)
+    )
 
     # Extend each interval upstream by iter_size for stratum extraction so
     # the first k bp of every interval get bin info from the prior iter
@@ -2189,11 +2195,11 @@ def gsynth_score(
                     bin_arr = stratum_bin[valid_idx].astype(int)
                     cidx = ctx_idx[valid_idx].astype(int)
                     bidx = base_idx[valid_idx].astype(int)
-                    raw = _numpy.empty(valid_idx.shape[0], dtype=_numpy.float64)
-                    for i, (bb, cc, ba) in enumerate(
-                        zip(bin_arr, cidx, bidx, strict=True)
-                    ):
-                        raw[i] = log_p_list[bb][cc, ba]
+                    # Vectorized gather of log P(base | context, bin) for every
+                    # scored bp at once (was a per-bp Python loop). Indices are
+                    # all in-bounds here: `normal` already excludes invalid
+                    # stratum / N-context / N-base / no-context positions.
+                    raw = log_p_arr[bin_arr, cidx, bidx]
                     nan_pos = _numpy.isnan(raw)
                     if nan_pos.any():
                         bad_pos = valid_idx[nan_pos]

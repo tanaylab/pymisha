@@ -1640,58 +1640,48 @@ def gintervals_force_range(
         )
     )
 
-    def _force_axis(chrom_vals, starts, ends):
-        out_chrom = []
-        out_start = []
-        out_end = []
+    def _force_axis(chrom_series, start_series, end_series):
+        """Vectorized clamp of one axis to chromosome boundaries.
+
+        Returns ``(chrom_arr, start_arr, end_arr, keep_mask)`` as numpy arrays;
+        ``keep_mask`` is False for rows whose chrom is unknown or that collapse
+        to an empty interval after clamping. Mirrors R's vectorized
+        ``pmax``/``pmin`` fast path instead of looping per row.
+        """
+        chrom_vals = chrom_series.astype(str).tolist()
         with _contextlib.suppress(Exception):
             chrom_vals = _normalize_chroms(chrom_vals)
+        chrom_arr = _numpy.asarray(chrom_vals, dtype=object)
 
-        for chrom, start, end in zip(chrom_vals, starts, ends, strict=False):
-            if chrom not in chrom_sizes:
-                out_chrom.append(None)
-                out_start.append(None)
-                out_end.append(None)
-                continue
-            chrom_size = chrom_sizes[chrom]
-            start = max(0, int(start))
-            end = min(chrom_size, int(end))
-            if start < end:
-                out_chrom.append(chrom)
-                out_start.append(start)
-                out_end.append(end)
-            else:
-                out_chrom.append(None)
-                out_start.append(None)
-                out_end.append(None)
-        return out_chrom, out_start, out_end
+        sizes = pd.Series(chrom_arr).map(chrom_sizes)
+        in_db = sizes.notna().to_numpy()
+        sizes_i = sizes.fillna(0).to_numpy().astype(_numpy.int64)
+
+        # int() truncates toward zero; float64 -> int64 cast matches it and is
+        # exact for genomic coordinates (< 2^53).
+        starts_i = _numpy.asarray(start_series, dtype=_numpy.float64).astype(_numpy.int64)
+        ends_i = _numpy.asarray(end_series, dtype=_numpy.float64).astype(_numpy.int64)
+        start_c = _numpy.maximum(0, starts_i)
+        end_c = _numpy.minimum(sizes_i, ends_i)
+        keep = in_db & (start_c < end_c)
+        return chrom_arr, start_c, end_c, keep
 
     # 2D intervals
     if {"chrom1", "start1", "end1", "chrom2", "start2", "end2"}.issubset(intervals.columns):
-        c1, s1, e1 = _force_axis(
-            intervals["chrom1"].astype(str).tolist(),
-            intervals["start1"].tolist(),
-            intervals["end1"].tolist(),
-        )
-        c2, s2, e2 = _force_axis(
-            intervals["chrom2"].astype(str).tolist(),
-            intervals["start2"].tolist(),
-            intervals["end2"].tolist(),
-        )
+        c1, s1, e1, k1 = _force_axis(intervals["chrom1"], intervals["start1"], intervals["end1"])
+        c2, s2, e2, k2 = _force_axis(intervals["chrom2"], intervals["start2"], intervals["end2"])
 
-        keep = [
-            i for i in range(len(c1))
-            if c1[i] is not None and c2[i] is not None
-        ]
-        if not keep:
+        keep = k1 & k2
+        if not keep.any():
             return None
-        result = intervals.iloc[keep].copy()
-        result["chrom1"] = [c1[i] for i in keep]
-        result["start1"] = [s1[i] for i in keep]
-        result["end1"] = [e1[i] for i in keep]
-        result["chrom2"] = [c2[i] for i in keep]
-        result["start2"] = [s2[i] for i in keep]
-        result["end2"] = [e2[i] for i in keep]
+        idx = _numpy.flatnonzero(keep)
+        result = intervals.iloc[idx].copy()
+        result["chrom1"] = c1[idx]
+        result["start1"] = s1[idx]
+        result["end1"] = e1[idx]
+        result["chrom2"] = c2[idx]
+        result["start2"] = s2[idx]
+        result["end2"] = e2[idx]
         result = result.reset_index(drop=True)
         if intervals_set_out is not None:
             gintervals_save(result, intervals_set_out)
@@ -1699,18 +1689,16 @@ def gintervals_force_range(
         return result
 
     # 1D intervals
-    chrom_vals, starts, ends = _force_axis(
-        intervals["chrom"].astype(str).tolist(),
-        intervals["start"].tolist(),
-        intervals["end"].tolist(),
+    chrom_arr, start_c, end_c, keep = _force_axis(
+        intervals["chrom"], intervals["start"], intervals["end"]
     )
-    keep = [i for i in range(len(chrom_vals)) if chrom_vals[i] is not None]
-    if not keep:
+    if not keep.any():
         return None
-    result = intervals.iloc[keep].copy()
-    result["chrom"] = [chrom_vals[i] for i in keep]
-    result["start"] = [starts[i] for i in keep]
-    result["end"] = [ends[i] for i in keep]
+    idx = _numpy.flatnonzero(keep)
+    result = intervals.iloc[idx].copy()
+    result["chrom"] = chrom_arr[idx]
+    result["start"] = start_c[idx]
+    result["end"] = end_c[idx]
     result = result.reset_index(drop=True)
     if intervals_set_out is not None:
         gintervals_save(result, intervals_set_out)
@@ -3228,10 +3216,30 @@ def gintervals_chrom_sizes(intervals: pd.DataFrame | str) -> pd.DataFrame:
 
 
 def _read_serialized_dataframe(payload: bytes) -> pd.DataFrame:
-    with tempfile.NamedTemporaryFile(suffix=".rds") as tmp:
-        tmp.write(payload)
-        tmp.flush()
-        return _decode_r_obj_to_bytes(tmp.name)
+    """Decode an in-memory R-serialized shard payload into a DataFrame.
+
+    Reads directly from the bytes (mirroring ``_r_serialize.read``'s gzip
+    sniff) instead of round-tripping through a temp file - the latter cost a
+    create/write/flush/reopen per chromosome shard, which is expensive on the
+    NFS-backed trackdb.
+    """
+    import gzip
+    import io as _io
+
+    from ._r_serialize import read_stream as _r_read_stream
+
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    obj = _r_read_stream(_io.BytesIO(payload))
+    if isinstance(obj, pd.DataFrame):
+        return obj
+    if isinstance(obj, dict):
+        first = next(iter(obj.values()))
+        if isinstance(first, pd.DataFrame):
+            return first
+    raise ValueError(
+        f"expected a data.frame in serialized shard, got {type(obj).__name__}"
+    )
 
 
 def _load_serialized_dataframe(path: str | Path) -> pd.DataFrame:
@@ -5641,16 +5649,19 @@ def gintervals_normalize(
     new_starts = _numpy.floor(centers - half).astype(_numpy.int64)
     new_ends = new_starts + size
 
-    # Clamp to chromosome boundaries
-    for i in range(n_intervals):
-        chrom = str(chroms[i])
-        chrom_sz = chrom_sizes.get(chrom, 0)
-        if new_starts[i] < 0:
-            new_starts[i] = 0
-            new_ends[i] = min(size[i], chrom_sz)
-        if new_ends[i] > chrom_sz:
-            new_ends[i] = chrom_sz
-            new_starts[i] = max(0, chrom_sz - size[i])
+    # Clamp to chromosome boundaries (vectorized; preserves the original
+    # sequential low-then-high clamp order so the high clamp sees the
+    # already-low-clamped ends).
+    chrom_sz = (
+        _pandas.Series(chroms).astype(str).map(chrom_sizes).fillna(0)
+        .to_numpy().astype(_numpy.int64)
+    )
+    low = new_starts < 0
+    new_ends = _numpy.where(low, _numpy.minimum(size, chrom_sz), new_ends)
+    new_starts = _numpy.where(low, 0, new_starts)
+    high = new_ends > chrom_sz
+    new_starts = _numpy.where(high, _numpy.maximum(0, chrom_sz - size), new_starts)
+    new_ends = _numpy.where(high, chrom_sz, new_ends)
 
     # Build result preserving extra columns
     result = _pandas.DataFrame({

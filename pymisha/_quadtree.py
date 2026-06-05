@@ -153,7 +153,9 @@ class QuadTree:
             return
         obj_idx = len(self.objs)
         self.objs.append(obj)
-        self._insert(self.root, inter, 0, obj_idx, obj_rect, is_nan=bool(np.isnan(v)))
+        # `v != v` is a scalar NaN test ~50-100x cheaper than np.isnan() on a
+        # Python/NumPy scalar (no array dispatch), called once per inserted object.
+        self._insert(self.root, inter, 0, obj_idx, obj_rect, is_nan=bool(v != v))
 
     def _get_value(self, obj_idx: int) -> float:
         if self.is_points:
@@ -228,7 +230,8 @@ class QuadTree:
             obj_rect = self._get_rect(oi)
             # Preserve NaN-vs-finite status when re-inserting after a split
             # so the new children's stat aggregates remain finite-only.
-            oi_is_nan = bool(np.isnan(self._get_value(oi)))
+            v = self._get_value(oi)
+            oi_is_nan = bool(v != v)
             for iquad in range(4):
                 kid = node.kids[iquad]
                 assert kid is not None

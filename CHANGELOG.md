@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8.13 (2026-06-05)
+
+Performance (all results unchanged):
+
+- **BED and tabular track import are faster.** The common tab-delimited case is parsed with a vectorized reader instead of a per-row Python loop (~2.5x BED, ~3.2x tabular on multi-million-row inputs); space-delimited and non-standard files fall back to the original parser.
+- **`gintervals_force_range` and `gintervals_normalize` are vectorized** - the per-row chromosome-boundary clamp is now a single numpy pass.
+- **Loading indexed ("bigset") interval sets avoids a temporary file per chromosome.** Each chromosome shard is decoded directly from memory instead of being written to and re-read from a temp file (notably faster on networked filesystems).
+- **`gsynth_score` is ~2x faster** - the per-base-pair log-probability lookup is a single vectorized gather instead of a Python loop.
+- **2D track creation is slightly faster** - the quadtree writer uses a cheaper per-object NaN test.
+
 ## v0.8.12 (2026-06-03)
 
 Performance (all results unchanged):

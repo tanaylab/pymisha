@@ -29,7 +29,7 @@ jobs:
           - python: "3.10"
             numpy: "2.1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_branch }}
 
@@ -134,7 +134,7 @@ jobs:
             --force \
             "${PACKAGES[@]}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: conda-pkg-${{ matrix.os }}-py${{ matrix.python }}-np${{ matrix.numpy }}
           path: |
