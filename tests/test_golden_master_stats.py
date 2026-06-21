@@ -20,7 +20,8 @@ if shutil.which("R") is None:
     pytest.skip("R not available; skipping golden-master tests", allow_module_level=True)
 
 # Path to test database
-TESTDB = "tests/testdb/trackdb/test"
+from _dbpath import TESTDB_ROOT
+TESTDB = str(TESTDB_ROOT)
 
 
 def run_r_code(code):

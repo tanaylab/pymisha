@@ -15,7 +15,6 @@ from . import _shared
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
-    _bound_colname,
     _checkroot,
     _chunk_slices,
     _config_no_mt,
@@ -2831,7 +2830,7 @@ def gextract(
             raise RuntimeError("Failed to extract physical track values for mixed expression")
         base_df = _remap_interval_ids(base_df, _itr_id_map)
         for tname in track_exprs:
-            col = tname if tname in base_df.columns else _bound_colname(tname, 40)
+            col = tname
             if col not in base_df.columns:
                 raise KeyError(f"Track column not found for '{tname}'")
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
@@ -2876,8 +2875,15 @@ def gextract(
     chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
     compiled = []
     result_cols = []
+    # Match the C++ PMDataFrame dedup: when two expressions (or user-supplied
+    # colnames) resolve to the same name, append '_' until unique so each keeps
+    # its own column instead of silently overwriting an earlier one.
+    used_colnames = {"chrom", "start", "end"}
     for i, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in enumerate(parsed):
-        colname = colnames[i] if colnames is not None else _bound_colname(orig_expr, 40)
+        colname = colnames[i] if colnames is not None else orig_expr
+        while colname in used_colnames:
+            colname += "_"
+        used_colnames.add(colname)
         allowed_names = {
             "np",
             "numpy",
@@ -3122,7 +3128,7 @@ def gscreen(
         if base_df is None:
             raise RuntimeError("Failed to extract physical track values for mixed expression")
         for tname in track_exprs:
-            col = tname if tname in base_df.columns else _bound_colname(tname, 40)
+            col = tname
             if col not in base_df.columns:
                 raise KeyError(f"Track column not found for '{tname}'")
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)

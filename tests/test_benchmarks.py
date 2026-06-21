@@ -17,14 +17,14 @@ import time
 from dataclasses import dataclass, field
 
 # Path to test database (use absolute path for consistency with conftest)
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 import pymisha as pm
 
-TESTDB = str(Path(__file__).resolve().parent / "testdb" / "trackdb" / "test")
+from _dbpath import TESTDB_ROOT
+TESTDB = str(TESTDB_ROOT)
 
 # Large database for more reliable benchmarks - R misha test databases
 # These have proper chromosome sizes and enough data for reliable timing

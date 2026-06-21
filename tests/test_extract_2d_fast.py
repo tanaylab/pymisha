@@ -22,9 +22,8 @@ import pymisha as pm
 from pymisha._quadtree import clear_indexed_2d_cache, write_2d_track_file
 from pymisha.extract import _gextract_2d_single, _gextract_2d_single_python
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
+from _dbpath import TESTDB_ROOT
+TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
 def _track_dir(name: str) -> str:

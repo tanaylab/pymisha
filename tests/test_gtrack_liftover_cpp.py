@@ -11,7 +11,8 @@ import pytest
 import _pymisha
 import pymisha as pm
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 EMPTY_CHAIN = {
     "chrom":     np.array([], dtype=object),
@@ -169,7 +170,7 @@ class TestPmLiftoverTrackEndToEnd:
                 "", "mean", True, -1, 0,
             )
         finally:
-            pm.gdb_init(str(pm._GROOT) if hasattr(pm, "_GROOT") else "tests/testdb/trackdb/test")
+            pm.gdb_init(str(pm._GROOT) if hasattr(pm, "_GROOT") else str(TESTDB_ROOT))
         # FIXED_BIN preservation
         assert result["track_type"] == "dense"
         assert int(result["bin_size"]) == 100

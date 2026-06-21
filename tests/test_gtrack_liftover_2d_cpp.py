@@ -1,7 +1,6 @@
 """Cross-validation tests for pm_liftover_track_2d (G1.P3.D)."""
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
@@ -13,7 +12,8 @@ import pytest
 import pymisha as pm
 from pymisha._quadtree import read_2d_track_objects, write_2d_track_file
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 EMPTY_CHAIN = {

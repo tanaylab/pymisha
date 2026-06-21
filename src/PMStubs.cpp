@@ -1173,11 +1173,9 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
             verror("Expressions must be a string or list of strings");
         }
 
-        // Use bounded expression strings as column names
-        std::vector<std::string> colnames;
-        for (const auto &expr : exprs) {
-            colnames.push_back(get_bound_colname(expr.c_str()));
-        }
+        // Column names are the (full) expression strings. Duplicate/colliding
+        // names are de-duplicated downstream in _pymisha2df.
+        std::vector<std::string> colnames = exprs;
 
         // Convert intervals
         std::vector<GInterval> intervals;

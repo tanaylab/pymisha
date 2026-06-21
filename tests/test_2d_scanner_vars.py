@@ -31,9 +31,8 @@ import pytest
 
 from pymisha._quadtree import write_2d_track_file
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
+from _dbpath import TESTDB_ROOT
+TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
 def _track_dir(name: str) -> str:

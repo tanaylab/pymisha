@@ -1,4 +1,3 @@
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -6,7 +5,8 @@ import pytest
 
 import pymisha as pm
 
-SEQ_CHR1 = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test" / "seq" / "chr1.seq"
+from _dbpath import TESTDB_ROOT
+SEQ_CHR1 = TESTDB_ROOT / "seq" / "chr1.seq"
 
 
 def _read_seq():

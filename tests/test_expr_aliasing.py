@@ -7,7 +7,8 @@ import pandas as pd
 import pymisha as pm
 from pymisha.expr import _expr_safe_name, _parse_expr_vars
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 def _copy_db(tmp_path: Path) -> Path:

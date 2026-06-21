@@ -15,7 +15,8 @@ import pymisha as pm
 _has_R = shutil.which("R") is not None
 
 # Path to test database
-TESTDB = "tests/testdb/trackdb/test"
+from _dbpath import TESTDB_ROOT
+TESTDB = str(TESTDB_ROOT)
 
 
 class TestGtrackLsBasic:

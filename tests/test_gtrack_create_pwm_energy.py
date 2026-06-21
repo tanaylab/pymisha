@@ -2,7 +2,6 @@
 
 import contextlib
 import shutil
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,7 +9,8 @@ import pytest
 import pymisha as pm
 from pymisha.tracks import _load_pssm_from_db
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 # ---------------------------------------------------------------------------

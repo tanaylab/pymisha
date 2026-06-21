@@ -21,7 +21,8 @@ import pytest
 import pymisha as pm
 from pymisha import _pymisha
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 def _write_per_chrom_db(root: Path, chrom_rows):

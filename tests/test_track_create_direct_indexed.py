@@ -10,7 +10,6 @@ what the legacy per-chrom + gtrack_convert_to_indexed pipeline produces
 on the same input.
 """
 
-import filecmp
 import shutil
 from pathlib import Path
 
@@ -20,7 +19,8 @@ import pytest
 
 import pymisha as pm
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 def _copy_db(tmp_path: Path, name: str = "test") -> Path:

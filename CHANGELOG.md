@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.14 (2026-06-21)
+
+- **`gextract` no longer truncates column names to 40 characters.** Auto-generated column names now use the full expression (e.g. the complete track name) instead of `<first 37 chars>...`. Long track names that previously collapsed to the same truncated column - silently dropping one - are now kept distinct. Pass `colnames=` to set names explicitly.
+
 ## v0.8.13 (2026-06-05)
 
 Performance (all results unchanged):

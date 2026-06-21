@@ -1,7 +1,6 @@
 """Tests for liftover chain workflow: load_chain, as_chain, liftover."""
 
 import os
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,7 +8,8 @@ import pytest
 
 import pymisha as pm
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 CHAIN_FILE = str(TEST_DB / "data" / "test.chain")
 
 

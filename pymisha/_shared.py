@@ -261,9 +261,16 @@ def _pymisha2df(arg):
     colnames = arg[0]
     numrows = -1
     data = {}
+    # Dedup colliding column names (C++ PMDataFrame convention: append '_').
+    # Two expressions can resolve to the same name (e.g. the same track listed
+    # twice); without this they would silently overwrite each other in this dict.
+    seen: set = set()
 
     for i in range(colnames.size):
         colname = colnames[i]
+        while colname in seen:
+            colname += "_"
+        seen.add(colname)
         col = arg[i + 1]
         if isinstance(col, _numpy.ndarray):
             if numrows != -1 and col.size != numrows:
@@ -626,12 +633,6 @@ def _chunk_slices(n, chunk_size):
     if chunk_size is None or chunk_size <= 0 or chunk_size >= n:
         return [(0, n)]
     return [(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
-
-
-def _bound_colname(expr: str, maxlen: int = 40) -> str:
-    if len(expr) > maxlen:
-        return expr[: maxlen - 3] + '...'
-    return expr
 
 
 def _gwd_prefix():

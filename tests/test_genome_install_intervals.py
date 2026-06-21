@@ -24,7 +24,8 @@ RMSK_BYTES = (FIXTURES / "sample_rmsk.out").read_bytes()
 CGI_BYTES = (FIXTURES / "sample_cgi.txt").read_bytes()
 CYTO_BYTES = (FIXTURES / "sample_cytoband.txt").read_bytes()
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 @pytest.fixture

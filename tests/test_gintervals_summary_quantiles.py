@@ -2,7 +2,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,7 +11,8 @@ import pymisha as pm
 
 _has_R = shutil.which("R") is not None
 
-TESTDB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TESTDB = TESTDB_ROOT
 
 
 def _run_r_table(r_code):

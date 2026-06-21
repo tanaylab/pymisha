@@ -9,12 +9,9 @@ import _pymisha
 
 from pymisha._quadtree import write_2d_track_file
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
-TEST_DB = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test"
-)
+from _dbpath import TESTDB_ROOT
+TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
+TEST_DB = str(TESTDB_ROOT)
 
 
 def _track_dir_cgi(name: str) -> str:

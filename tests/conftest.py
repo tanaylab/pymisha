@@ -1,12 +1,12 @@
 import os
 import shutil
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 import _pymisha
 import pymisha as pm
+from pymisha import _shared
 from pymisha._quadtree import write_2d_track_file
 
 
@@ -19,7 +19,8 @@ def pytest_collection_modifyitems(config, items):
         if "benchmark" in item.keywords:
             item.add_marker(skip_bench)
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 os.environ.setdefault("PYMISHA_EXAMPLES_DB", str(TEST_DB))
 
 _TRACK_DIR = str(TEST_DB / "tracks")
@@ -30,6 +31,49 @@ def _init_db():
     pm.gdb_init(str(TEST_DB))
     yield
     pm.gdb_unload()
+
+
+def _restore_groot(prev):
+    if _shared._GROOT == prev:
+        return
+    if prev is None:
+        pm.gdb_unload()
+    else:
+        pm.gdb_init(prev)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_db_state_module():
+    """Undo GROOT changes made at *module* scope - e.g. a module-scoped
+    ``gdb_init_examples`` fixture with no teardown - so they can't leak into the
+    next test file on the same xdist worker. Snapshots before the module's own
+    fixtures run (parent-conftest autouse fixtures init first) and restores
+    after, so r_parity's package-scoped DB is preserved.
+    """
+    prev_groot = _shared._GROOT
+    yield
+    _restore_groot(prev_groot)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_db_state():
+    """Keep cross-test global state from leaking between tests on the same
+    process (matters under xdist, where each worker is a long-lived process).
+
+    1. Drop the cached ``pm_track_names`` result so a test sees tracks created
+       by its own fixtures. Many fixtures write a track file directly and call
+       ``_pymisha.pm_dbreload()`` (C++) without clearing the Python-side cache,
+       which only ``gdb_init``/``gtrack_create`` normally do.
+    2. Restore GROOT to whatever it was before the test, so a test that calls
+       ``gdb_init_examples`` / ``gdb_init`` to another DB can't leak its root
+       into the next test. Restoring (rather than forcing the test DB) keeps
+       module/package-scoped DBs - incl. the r_parity suite - working.
+    """
+    prev_groot = _shared._GROOT
+    _shared._clear_track_names_cache()
+    yield
+    _shared._clear_track_names_cache()
+    _restore_groot(prev_groot)
 
 
 def extract_values(expr, intervals, iterator=None):

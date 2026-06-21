@@ -12,7 +12,6 @@ from . import _shared
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
-    _bound_colname,
     _checkroot,
     _chunk_slices,
     _config_no_mt,
@@ -389,7 +388,7 @@ def _gdist_vtrack_streaming(
 
         track_arrays = {}
         for tname in track_exprs:
-            col = tname if tname in base_df.columns else _bound_colname(tname, 40)
+            col = tname
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
@@ -554,7 +553,7 @@ def _gsummary_vtrack_streaming(
 
         track_arrays = {}
         for tname in track_exprs:
-            col = tname if tname in base_df.columns else _bound_colname(tname, 40)
+            col = tname
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
@@ -756,7 +755,7 @@ def _gquantiles_vtrack_streaming(
 
         track_arrays = {}
         for tname in track_exprs:
-            col = tname if tname in base_df.columns else _bound_colname(tname, 40)
+            col = tname
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
@@ -905,7 +904,7 @@ def _extract_values_direct(
     if df is None or len(df) == 0:
         return _numpy.array([], dtype=float)
 
-    col = expr if expr in df.columns else _bound_colname(expr, 40)
+    col = expr
     return _numpy.asarray(df[col].to_numpy(dtype=float, copy=False))
 
 

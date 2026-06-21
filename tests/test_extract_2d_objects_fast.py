@@ -26,9 +26,8 @@ from pymisha.extract import (
     _gextract_2d_vtrack_objects_python,
 )
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
+from _dbpath import TESTDB_ROOT
+TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
 def _track_dir(name: str) -> str:

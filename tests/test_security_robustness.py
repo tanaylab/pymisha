@@ -12,7 +12,8 @@ import pymisha.intervals as intervals_mod
 import pymisha.liftover as liftover_mod
 from pymisha.tracks import _validate_track_name
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 def _copy_db(tmp_path: Path) -> Path:

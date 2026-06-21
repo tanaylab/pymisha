@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 DENSE_TRACK = TEST_DB / "tracks" / "dense_track.track"
 SPARSE_TRACK = TEST_DB / "tracks" / "sparse_track.track"
 

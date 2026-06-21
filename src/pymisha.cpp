@@ -658,15 +658,3 @@ void vdebug(const char *fmt, ...)
     }
 }
 
-string get_bound_colname(const char *str, unsigned maxlen)
-{
-    string colname;
-
-    maxlen = max(maxlen, 4u);
-    if (strlen(str) > maxlen) {
-        colname.assign(str, maxlen - 3);
-        colname += "...";
-    } else
-        colname = str;
-    return colname;
-}

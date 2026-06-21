@@ -1,7 +1,6 @@
 """Tests for gdb_convert_to_indexed and gdb_create_linked."""
 
 import contextlib
-from pathlib import Path
 
 import pytest
 
@@ -358,7 +357,8 @@ def test_gdb_create_linked_validation(tmp_path):
 # (ported from R test-gtrack-format-conversion.R)
 # ===========================================================================
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 @pytest.fixture

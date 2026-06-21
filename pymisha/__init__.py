@@ -19,7 +19,6 @@ from . import _shared
 from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
 from ._shared import (  # noqa: F401 — imported for _PMLOCALS C++ bridge
     CONFIG,
-    _bound_colname,
     _checkroot,
     _chunk_slices,
     _df2pymisha,

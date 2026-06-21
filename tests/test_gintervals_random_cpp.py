@@ -17,7 +17,8 @@ import pandas as pd
 import pymisha as pm
 from pymisha._shared import _df2pymisha
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 def _restore_test_db() -> None:

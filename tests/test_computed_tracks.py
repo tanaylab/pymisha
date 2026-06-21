@@ -9,14 +9,14 @@ Since v0.8.4, COMPUTED tracks backed by ``CT2_AREA`` (=0) or ``CT2_TEST``
 import os
 import shutil
 import struct
-from pathlib import Path
 
 import pytest
 
 import pymisha as pm
 import _pymisha
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 TRACK_DIR = str(TEST_DB / "tracks")
 
 COMPUTED_TRACK_NAME = "test.computed_stub"

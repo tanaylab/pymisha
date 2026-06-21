@@ -20,7 +20,8 @@ if shutil.which("R") is None:
 
 
 # Path to test database
-TESTDB = "tests/testdb/trackdb/test"
+from _dbpath import TESTDB_ROOT
+TESTDB = str(TESTDB_ROOT)
 
 
 def run_r_code(code):

@@ -14,7 +14,8 @@ import pymisha as pm
 if shutil.which("R") is None:
     pytest.skip("R not available; skipping golden-master tests", allow_module_level=True)
 
-TESTDB = "tests/testdb/trackdb/test"
+from _dbpath import TESTDB_ROOT
+TESTDB = str(TESTDB_ROOT)
 
 def run_r_code(code):
     with tempfile.NamedTemporaryFile(mode='w', suffix='.R', delete=False) as f:

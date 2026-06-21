@@ -13,9 +13,8 @@ import pytest
 
 import pymisha as pm
 
-TRACK_DIR = os.path.join(
-    os.path.dirname(__file__), "testdb", "trackdb", "test", "tracks"
-)
+from _dbpath import TESTDB_ROOT
+TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
 def _track_dir(name):
@@ -48,7 +47,7 @@ def _reference_gcis_decay_slow(track, breaks, src, domain, include_lowest=False,
         _unify_overlaps_per_chrom,
         _val2bin_vec,
     )
-    from pymisha.extract import _find_2d_track_file, _obj_in_band, _validate_band
+    from pymisha.extract import _find_2d_track_file, _validate_band
     from pymisha.intervals import _normalize_chroms
     from pymisha.tracks import gtrack_info
 

@@ -50,8 +50,6 @@ void vdebug(const char *fmt, ...);
 
 inline bool is_py_var_char(char c) { return isalnum(c) || c == '_' || c == '.'; }
 
-string get_bound_colname(const char *str, unsigned maxlen = 40);
-
 template<typename T> void pack_data(void *&ptr, const T &data, size_t n) {
         size_t size = sizeof(data) * n;
         memcpy(ptr, &data, size);

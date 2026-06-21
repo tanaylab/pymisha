@@ -3,7 +3,6 @@
 import contextlib
 import shutil
 import tarfile
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -14,7 +13,8 @@ from pymisha import _shared
 from pymisha import db_attrs as db_attrs_mod
 from pymisha.tracks import _load_track_attributes, _save_track_attributes
 
-TEST_DB = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
+from _dbpath import TESTDB_ROOT
+TEST_DB = TESTDB_ROOT
 
 
 @pytest.fixture(autouse=True)
