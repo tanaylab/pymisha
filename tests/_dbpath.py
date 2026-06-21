@@ -28,7 +28,9 @@ def _resolve() -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(_CANONICAL, dst)
         atexit.register(shutil.rmtree, dst.parent, ignore_errors=True)
-    return dst
+    # Resolve symlinks (on macOS gettempdir() is /var/... -> /private/var/...);
+    # misha returns realpaths, so tests comparing against this path must match.
+    return dst.resolve()
 
 
 TESTDB_ROOT = _resolve()
