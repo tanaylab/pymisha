@@ -3,8 +3,6 @@
 import os
 from pathlib import Path
 
-import pytest
-
 import pymisha as pm
 
 
@@ -65,3 +63,30 @@ class TestGdatasetExamplePath:
         load_result = pm.gdataset_load(result)
         assert load_result["tracks"] >= 1
         pm.gdataset_unload(result)
+
+
+class TestScanIntervalsRobustness:
+    """_scan_intervals must ignore misha `.trash.*` removal-targets.
+
+    Regression: it used Path.rglob, which descended into `.trash.*.track`
+    dirs and statted entries that a concurrent track removal was unlinking,
+    raising FileNotFoundError mid-scan (flaky under xdist).
+    """
+
+    def test_skips_trash_and_finds_all_set_types(self, tmp_path):
+        from pymisha.dataset import _scan_intervals
+
+        tracks = tmp_path / "tracks"
+        tracks.mkdir()
+        (tracks / "myset.interv").write_text("x")          # small set (file)
+        (tracks / "sub").mkdir()
+        (tracks / "sub" / "nested.interv").write_text("x")  # nested set
+        big = tracks / "big.interv"
+        big.mkdir()
+        (big / "chr1").write_text("x")                      # bigset (dir)
+        (tracks / "t.track").mkdir()                         # a track, not a set
+        trash = tracks / ".trash.t.track.999.abc"           # removal-target
+        trash.mkdir()
+        (trash / "x.interv").write_text("x")                # must NOT be found
+
+        assert _scan_intervals(str(tmp_path)) == {"myset", "sub.nested", "big"}

@@ -2918,6 +2918,8 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
         from . import _shared
         assert _shared._GROOT is not None
 
+        from .dataset import _scan_intervals
+
         roots: list[str] = []
         if _shared._UROOT:
             roots.append(_shared._UROOT)
@@ -2926,14 +2928,7 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
 
         seen: set[str] = set()
         for root in roots:
-            tracks_dir = Path(root) / "tracks"
-            if not tracks_dir.exists():
-                continue
-            for suffix in (".interv", ".interv2d"):
-                for interv_file in tracks_dir.rglob(f"*{suffix}"):
-                    rel_path = interv_file.relative_to(tracks_dir)
-                    name = str(rel_path)[:-len(suffix)].replace("/", ".").replace("\\", ".")
-                    seen.add(name)
+            seen |= _scan_intervals(root)  # robust walk; skips `.trash.*`
         interval_set_names = list(seen)
 
     interval_sets: list[str] = sorted(set(interval_set_names))

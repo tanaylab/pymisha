@@ -77,11 +77,20 @@ def _scan_intervals(root: str) -> set[str]:
         return set()
 
     names: set[str] = set()
-    for suffix in (".interv", ".interv2d"):
-        for path in tracks_dir.rglob(f"*{suffix}"):
-            rel = path.relative_to(tracks_dir)
-            name = str(rel)[:-len(suffix)].replace("/", ".").replace("\\", ".")
-            names.add(name)
+    suffixes = (".interv", ".interv2d")
+    # os.walk (not rglob): it ignores scandir errors, so a misha `.trash.*`
+    # removal-target that vanishes mid-walk doesn't raise FileNotFoundError.
+    # Prune dotted dirs (incl. `.trash.*`) and don't descend into set dirs.
+    for cur_dir, dirs, files in os.walk(tracks_dir):
+        rel_dir = Path(cur_dir).relative_to(tracks_dir)
+        # An interval set is either a `.interv` file (small) or dir (bigset).
+        for entry in dirs + files:
+            for suffix in suffixes:
+                if entry.endswith(suffix):
+                    name = str(rel_dir / entry)[:-len(suffix)].replace("/", ".").replace("\\", ".")
+                    names.add(name)
+                    break
+        dirs[:] = [d for d in dirs if not d.startswith(".") and not d.endswith(suffixes)]
     return names
 
 

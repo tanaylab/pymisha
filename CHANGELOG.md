@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.18 (2026-06-23)
+
+- **Listing interval sets no longer errors when a track is being removed concurrently.** `gintervals_ls` and dataset loading skip misha's transient `.trash.*` removal directories instead of failing with `FileNotFoundError` if one is unlinked mid-scan.
+
 ## v0.8.16 (2026-06-23)
 
 - **`gintervals_quantiles` no longer collapses nearby percentile columns.** Percentile column names now use the shortest decimal that round-trips the value, so close percentiles (e.g. `0.123456789` and `0.1234567891`) keep distinct columns instead of both rounding to `0.123457` and silently dropping one. Common percentiles are unchanged (`0.5`, `0.95`, ...).
