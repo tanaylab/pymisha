@@ -20,12 +20,17 @@ import pytest
 
 import pymisha as pm
 
+from _dbpath import TESTDB_ROOT
+
 from .baseline import R_SNAPSHOT_DIR, R_TESTDB
 from .overlay import build_overlay
 
-# Small test DB used by the rest of the suite (restored on teardown so r_parity
-# tests don't leave GROOT pointing at R's DB for unrelated tests).
-_SMALL_TEST_DB = Path(__file__).resolve().parents[1] / "testdb" / "trackdb" / "test"
+# Small test DB restored on teardown so r_parity tests don't leave GROOT
+# pointing at R's DB for unrelated tests on the same xdist worker. Must be the
+# per-worker copy (TESTDB_ROOT), NOT the canonical git-tracked tree - otherwise
+# later modules on this worker would read/write the shared canonical DB and
+# race other workers' gdb_init_examples copies.
+_SMALL_TEST_DB = TESTDB_ROOT
 
 _DB_AVAILABLE = os.path.isdir(R_TESTDB) and os.path.isdir(R_SNAPSHOT_DIR)
 _SKIP_REASON = (

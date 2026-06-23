@@ -909,10 +909,35 @@ def _extract_values_direct(
 
 
 def _format_percentile(value: float) -> str:
+    """Shortest decimal string that round-trips ``value``.
+
+    A fixed ``%g`` (6 significant digits) collapsed nearby percentiles to the
+    same column name (e.g. 0.123456789 and 0.1234567891 both -> "0.123457"),
+    silently dropping a column. Grow precision until the string parses back to
+    the same float. Mirrors the C++ ``format_percentile`` in PMStubs.cpp.
+    """
     try:
-        return f"{float(value):g}"
+        v = float(value)
     except Exception:
         return str(value)
+    for prec in range(1, 18):
+        s = f"{v:.{prec}g}"
+        if float(s) == v:
+            return s
+    return f"{v:.17g}"
+
+
+def _percentile_colnames(pcts) -> list[str]:
+    """Per-percentile column names, deduped with '_' (C++ PMDataFrame convention)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for p in pcts:
+        name = _format_percentile(p)
+        while name in seen:
+            name += "_"
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 def _gsummary_from_values(values: np.ndarray) -> pd.Series:
@@ -1407,6 +1432,8 @@ def gintervals_quantiles(
     if _numpy.any((pct < 0) | (pct > 1)):
         raise ValueError("percentiles must be within [0, 1]")
 
+    pct_names = _percentile_colnames(pct)
+
     # As in gintervals_summary: a DataFrame/interval-set iterator was intersected
     # into per-bin pieces; R reports one row per SCOPE interval. Route through the
     # extract path on the ORIGINAL scope + iterator (gextract maps intervalID back
@@ -1423,8 +1450,8 @@ def gintervals_quantiles(
             result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
         if result is None:
             out = intervals[_interval_coord_cols(intervals)].copy()
-            for p in pct:
-                out[_format_percentile(p)] = _numpy.nan
+            for name in pct_names:
+                out[name] = _numpy.nan
             out = out.reset_index(drop=True)
         else:
             out = _pymisha2df(result)
@@ -1432,8 +1459,8 @@ def gintervals_quantiles(
         result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress, progress_desc=progress_desc)
         if result is None or len(result) == 0:
             out = intervals[_interval_coord_cols(intervals)].copy()
-            for p in pct:
-                out[_format_percentile(p)] = _numpy.nan
+            for name in pct_names:
+                out[name] = _numpy.nan
             out = out.reset_index(drop=True)
         else:
             data_cols = [c for c in result.columns if c not in _INTERVAL_META_COLS]
@@ -1467,11 +1494,12 @@ def gintervals_quantiles(
             q_df = q_df.reindex(all_ids)
 
             out = intervals[_interval_coord_cols(intervals)].copy()
-            for p in pct:
+            for i, p in enumerate(pct):
+                name = pct_names[i]
                 if p in q_df.columns:
-                    out[_format_percentile(p)] = q_df[p].values
+                    out[name] = q_df[p].values
                 else:
-                    out[_format_percentile(p)] = _numpy.nan
+                    out[name] = _numpy.nan
             out = out.reset_index(drop=True)
 
     if intervals_set_out is not None:

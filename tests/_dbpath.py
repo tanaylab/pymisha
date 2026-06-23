@@ -19,23 +19,37 @@ from pathlib import Path
 _CANONICAL = Path(__file__).resolve().parent / "testdb" / "trackdb" / "test"
 
 
-def _resolve() -> Path:
-    worker = os.environ.get("PYTEST_XDIST_WORKER")  # e.g. "gw0"; unset when serial
-    if not worker:
-        return _CANONICAL
-    dst = Path(tempfile.gettempdir()) / f"pymisha_testdb_{os.getpid()}_{worker}" / "test"
+def _worker_copy(prefix: str) -> Path:
+    """A per-worker copy of the canonical DB under a unique temp dir.
+
+    Resolve symlinks (on macOS gettempdir() is /var/... -> /private/var/...);
+    misha returns realpaths, so tests comparing against this path must match.
+    """
+    worker = os.environ["PYTEST_XDIST_WORKER"]  # e.g. "gw0"
+    dst = Path(tempfile.gettempdir()) / f"{prefix}_{os.getpid()}_{worker}" / "test"
     if not dst.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(_CANONICAL, dst)
         atexit.register(shutil.rmtree, dst.parent, ignore_errors=True)
-    # Resolve symlinks (on macOS gettempdir() is /var/... -> /private/var/...);
-    # misha returns realpaths, so tests comparing against this path must match.
     return dst.resolve()
 
 
-TESTDB_ROOT = _resolve()
+def _resolve() -> Path:
+    if not os.environ.get("PYTEST_XDIST_WORKER"):  # unset when serial
+        return _CANONICAL
+    return _worker_copy("pymisha_testdb")
 
-# gdb_init_examples() copies PYMISHA_EXAMPLES_DB into a throwaway temp DB; point
-# it at the pristine canonical tree (never mutated during a run) so the copy
-# can't race with a worker's own track churn (transient .trash.* files).
-os.environ["PYMISHA_EXAMPLES_DB"] = str(_CANONICAL)
+
+def _resolve_examples() -> Path:
+    # gdb_init_examples()/gdb_examples_path() must NOT point at the canonical
+    # (git-tracked) tree under xdist: several tests gdb_init onto the examples DB
+    # and then write tracks, which would mutate the shared tree AND race with
+    # another worker's gdb_init_examples copytree (file vanishes mid-copy ->
+    # "No such file or directory"). Give each worker its own pristine copy.
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        return _CANONICAL
+    return _worker_copy("pymisha_examples")
+
+
+TESTDB_ROOT = _resolve()
+os.environ["PYMISHA_EXAMPLES_DB"] = str(_resolve_examples())

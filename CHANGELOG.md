@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.16 (2026-06-23)
+
+- **`gintervals_quantiles` no longer collapses nearby percentile columns.** Percentile column names now use the shortest decimal that round-trips the value, so close percentiles (e.g. `0.123456789` and `0.1234567891`) keep distinct columns instead of both rounding to `0.123457` and silently dropping one. Common percentiles are unchanged (`0.5`, `0.95`, ...).
+
 ## v0.8.14 (2026-06-21)
 
 - **`gextract` no longer truncates column names to 40 characters.** Auto-generated column names now use the full expression (e.g. the complete track name) instead of `<first 37 chars>...`. Long track names that previously collapsed to the same truncated column - silently dropping one - are now kept distinct. Pass `colnames=` to set names explicitly.

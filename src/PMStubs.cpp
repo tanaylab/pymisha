@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -2463,6 +2464,21 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
     }
 }
 
+// Shortest decimal string that round-trips `v`, so nearby percentiles don't
+// collapse to the same column name the way a fixed "%g" (6 sig digits) would
+// (e.g. 0.123456789 and 0.1234567891 both -> "0.123457"). PMDataFrame::init_col
+// dedups any genuine duplicates by appending '_'.
+static std::string format_percentile(double v)
+{
+    char buf[64];
+    for (int prec = 1; prec <= 17; ++prec) {
+        std::snprintf(buf, sizeof(buf), "%.*g", prec, v);
+        if (std::strtod(buf, nullptr) == v)
+            return buf;
+    }
+    return buf;
+}
+
 // Compute quantiles per interval (streaming)
 PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
 {
@@ -2615,9 +2631,7 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
         std::vector<std::string> colnames;
         colnames.reserve(n);
         for (Py_ssize_t i = 0; i < n; ++i) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%g", pct_values[i]);
-            colnames.emplace_back(buf);
+            colnames.emplace_back(format_percentile(pct_values[i]));
             df.init_col(3 + i, colnames.back().c_str(), PMDataFrame::DOUBLE);
         }
 
