@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.8.19 (2026-07-02)
+
+Ports recent R misha correctness fixes (5.11.2-5.11.10):
+
+- **`gtrack_liftover` aggregation fixes.** Lifted dense-track values change for chains whose blocks are not aligned to the target bin grid (i.e. most real liftovers):
+  - A lifted contribution spanning a target-bin boundary is no longer dropped from the next bin when an overlapping chain shares its interval (previously gave spurious `NaN`s or wrong aggregates).
+  - Distinct source bins of the same chain that map into one target bin are now aggregated (`max`/`sum`/`mean`/`count`) instead of collapsing to the first bin's value.
+  - With `na_rm=True`, a chain mapping both a finite and a `NaN` source bin into one locus keeps its finite value instead of being discarded wholesale.
+- **2D `gtrack_liftover` aggregates overlapping mapped rectangles** into disjoint cells (honoring `multi_target_agg`/`na_rm`/`min_n`), instead of inserting overlapping objects that corrupted read-back and double-counted.
+- **`pwm.edit_distance*` virtual tracks no longer read out of bounds for motifs longer than 64 bp.**
+- **`gintervals_annotate` fills `na_value`** for query intervals with no neighbor in range (previously left as `NaN` when other queries in the same call matched).
+- **`gsetroot` leaves the current database loaded** when the target's `chrom_sizes.txt` is missing or malformed, instead of unloading the session on the failed call.
+- **`gintervals_mark_overlaps` returns correct groups for input not sorted by (chrom, start)** - it previously scrambled groups, joining an isolated interval to a cluster and isolating a real cluster member.
+- Strand-autocorrelation coverage for a read near a contig end is clamped to the last bin (R-parity).
+
 ## v0.8.18 (2026-06-23)
 
 - **Listing interval sets no longer errors when a track is being removed concurrently.** `gintervals_ls` and dataset loading skip misha's transient `.trash.*` removal directories instead of failing with `FileNotFoundError` if one is unlinked mid-scan.

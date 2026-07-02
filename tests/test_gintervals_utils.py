@@ -36,6 +36,25 @@ class TestGsetroot:
         with pytest.raises(Exception):
             pm.gsetroot("/nonexistent/path")
 
+    def test_failed_gsetroot_leaves_current_db_intact(self, tmp_path):
+        """A gsetroot that fails on a missing chrom_sizes.txt must not unload the
+        currently-loaded database (R M11 - validation now runs before the wipe)."""
+        pm.gdb_init(str(TEST_DB))
+        before = pm.gtrack_ls()
+        assert len(before) > 0
+
+        # A directory that looks like a DB (tracks/ + seq/) but has no chrom_sizes.txt.
+        bad = tmp_path / "baddb"
+        (bad / "tracks").mkdir(parents=True)
+        (bad / "seq").mkdir()
+
+        with pytest.raises(FileNotFoundError):
+            pm.gsetroot(str(bad))
+
+        # Session must be unchanged - the previous DB is still loaded and usable.
+        after = pm.gtrack_ls()
+        assert list(after) == list(before)
+
 
 # ---------------------------------------------------------------------------
 # giterator_intervals
@@ -270,6 +289,23 @@ class TestGintervalsMarkOverlaps:
         groups = result["overlap_group"].values
         assert groups[0] != groups[1]
 
+    def test_unsorted_input_correct_groups(self):
+        """Groups are correct even when the input is not sorted by (chrom, start).
+
+        Regression: the wrapper used to re-permute the (already original-indexed)
+        canonic mapping into sorted order, scrambling groups on unsorted input -
+        an isolated interval was joined to a cluster and a cluster member isolated.
+        """
+        intervs = pd.DataFrame({
+            "chrom": ["chr1", "chr1", "chr1", "chr1"],
+            "start": [11000, 100, 10000, 10500],
+            "end":   [12000, 200, 13000, 10600],
+        })
+        groups = pm.gintervals_mark_overlaps(intervs)["overlap_group"].values
+        # Rows 0,2,3 all overlap 10000-13000; row 1 (100-200) is isolated.
+        assert groups[0] == groups[2] == groups[3]
+        assert groups[1] != groups[0]
+
 
 # ---------------------------------------------------------------------------
 # gintervals_annotate
@@ -293,6 +329,22 @@ class TestGintervalsAnnotate:
         assert "score" in result.columns
         assert "dist" in result.columns
         assert len(result) == 2
+
+    def test_no_neighbor_in_range_fills_na_value(self):
+        """A query with no neighbor within the distance window gets na_value, not
+        NaN, even when another query in the same call did match (R M9 - the
+        per-row not-found case was previously left as NaN)."""
+        # Query A (5000-5050) is ~350bp from the annotation; query B (5450-5480)
+        # sits inside it. With a +/-80bp window only B has a neighbor in range.
+        intervs = pm.gintervals("chr1", [5000, 5450], [5050, 5480])
+        ann = pm.gintervals("chr1", [5400], [5500])
+        ann["remark"] = ["hit"]
+        result = pm.gintervals_annotate(
+            intervs, ann, na_value="none", mindist=-80, maxdist=80,
+        )
+        result = result.sort_values("start").reset_index(drop=True)
+        assert result["remark"].iloc[0] == "none"  # query A: no neighbor in range
+        assert result["remark"].iloc[1] == "hit"   # query B: neighbor in range
 
     def test_select_columns(self):
         """Only selected annotation columns are included."""

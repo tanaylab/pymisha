@@ -469,10 +469,45 @@ class TestAggregatePerBinPython:
         )
         assert np.isnan(result.iloc[0]["value"])
 
+    def test_na_rm_keeps_finite_piece_of_chain_with_nan(self):
+        """na_rm=True: a chain mapping both a finite and a NaN source bin into one
+        target bin keeps its finite value instead of being dropped wholesale by an
+        is_na carried over the whole chain (R 5.11.5)."""
+        from pymisha.liftover import _aggregate_per_bin_python
+
+        df = self._make_lifted_df([
+            ("chr1", 0, 100, float("nan"), 1),  # same chain_id ...
+            ("chr1", 0, 100, 5.0, 1),           # ... finite piece must survive
+        ])
+        result = _aggregate_per_bin_python(
+            df, bin_size=100,
+            tgt_chrom_sizes={"chr1": 100},
+            agg_name="mean",
+            na_rm=True,
+        )
+        np.testing.assert_allclose(result.iloc[0]["value"], 5.0, rtol=1e-9)
+
+    def test_distinct_keys_aggregated_not_collapsed(self):
+        """Two contributions with DIFFERENT keys in one bin are aggregated (max
+        keeps the larger). The 5.11.6 caller assigns a (chain_id, source-bin) key
+        so distinct source bins of one chain are not collapsed to the first's value."""
+        from pymisha.liftover import _aggregate_per_bin_python
+
+        df = self._make_lifted_df([
+            ("chr1", 0, 100, 5.0, 100),   # source bin A
+            ("chr1", 0, 100, 7.0, 101),   # source bin B (distinct key)
+        ])
+        result = _aggregate_per_bin_python(
+            df, bin_size=100,
+            tgt_chrom_sizes={"chr1": 100},
+            agg_name="max",
+        )
+        np.testing.assert_allclose(result.iloc[0]["value"], 7.0, rtol=1e-9)
+
     def test_partial_overlap_across_bin_boundary(self):
-        """A spanning interval that's the LAST in the list contributes to its
-        FIRST overlapping bin only (R behavior - the --iter step-back logic in
-        GTrackLiftover.cpp:719-751 fires only when a subsequent interval exists)."""
+        """A boundary-spanning interval contributes to EVERY bin it overlaps,
+        even when it is the only interval in the list (R 5.11.3 - the old cursor
+        over-advance dropped the spanning contribution from all but its first bin)."""
         from pymisha.liftover import _aggregate_per_bin_python
 
         # Interval [50, 150) overlaps bin [0,100) by 50bp and bin [100,200) by 50bp.
@@ -485,20 +520,19 @@ class TestAggregatePerBinPython:
             agg_name="mean",
         )
         r = result.sort_values("start").reset_index(drop=True)
-        # Bin [0, 100) gets val=8 (the interval's first overlap).
+        # Both overlapping bins get val=8 - the spanning interval contributes to each.
         np.testing.assert_allclose(r.iloc[0]["value"], 8.0, rtol=1e-9)
-        # Bin [100, 200) gets NaN - interval was consumed in bin 0; no subsequent
-        # interval triggers the --iter step-back. Matches R GTrackLiftover.cpp.
-        assert np.isnan(r.iloc[1]["value"])
+        np.testing.assert_allclose(r.iloc[1]["value"], 8.0, rtol=1e-9)
 
-    def test_step_back_when_subsequent_interval_triggers(self):
-        """A spanning interval contributes to multiple bins WHEN a subsequent
-        non-overlapping interval triggers R's --iter step-back. This is the
-        only path where a spanning interval can repeat across bins."""
+    def test_spanning_contributions_repeat_across_bins(self):
+        """Every interval contributes to every bin it overlaps, including when two
+        interleaved intervals each span a boundary (R 5.11.3 - the old cursor
+        over-advance dropped a boundary-spanning contribution from the next bin
+        whenever an overlapping sibling shared its interval)."""
         from pymisha.liftover import _aggregate_per_bin_python
 
         # Interval A: [50, 150) val=8 (spans bins 0 and 1).
-        # Interval B: [180, 220) val=9 (lies in bin 1).
+        # Interval B: [180, 220) val=9 (spans bins 1 and 2).
         df = self._make_lifted_df([
             ("chr1", 50, 150, 8.0, 1),
             ("chr1", 180, 220, 9.0, 2),
@@ -509,10 +543,9 @@ class TestAggregatePerBinPython:
             agg_name="mean",
         )
         r = result.sort_values("start").reset_index(drop=True)
-        # Bin [0, 100): only A contributes. mean = 8.
+        # Bin [0, 100): only A ([50,100)) contributes. mean = 8.
         np.testing.assert_allclose(r.iloc[0]["value"], 8.0, rtol=1e-9)
-        # Bin [100, 200): A (re-encountered via --iter) and B both contribute.
-        # mean = (8+9)/2 = 8.5.
+        # Bin [100, 200): A ([100,150)) and B ([180,200)) both contribute. mean = 8.5.
         np.testing.assert_allclose(r.iloc[1]["value"], 8.5, rtol=1e-9)
-        # Bin [200, 300): empty. NaN.
-        assert np.isnan(r.iloc[2]["value"])
+        # Bin [200, 300): B ([200,220)) contributes. mean = 9.
+        np.testing.assert_allclose(r.iloc[2]["value"], 9.0, rtol=1e-9)

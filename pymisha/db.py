@@ -324,6 +324,18 @@ def gsetroot(groot, subdir=None, rescan=False, **kwargs):
             "This does not appear to be a valid misha database."
         )
 
+    # Validate chrom_sizes.txt BEFORE gdb_init clears the current session, so a
+    # missing/malformed/empty file leaves the previously-loaded database intact
+    # instead of unloading it on a failed gsetroot. R M11.
+    chrom_sizes_path = p / "chrom_sizes.txt"
+    if not chrom_sizes_path.exists():
+        raise FileNotFoundError(
+            f"Database directory '{groot}' does not contain a chrom_sizes.txt file. "
+            "This does not appear to be a valid misha database."
+        )
+    if len(_read_chrom_sizes_rows(str(chrom_sizes_path))) == 0:
+        raise ValueError("chrom_sizes.txt file does not contain any chromosomes")
+
     gdb_init(str(p.resolve()))
 
     if subdir is not None:

@@ -154,10 +154,14 @@ PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args)
                                         forward[idx] = std::min(MAX_COV, forward[idx] + 1);
                                     }
                                 } else if (str[STRAND_COL] == "-" || str[STRAND_COL] == "R") {
+                                    // A minus-strand read is projected to its 3' end
+                                    // (coord + read length), which can land at/after
+                                    // chromsize for a read near the contig end; clamp to
+                                    // the last bin so the write stays in bounds (R-parity).
                                     int64_t idx = (coord + (int64_t)str[SEQ_COL].size()) / binsize;
-                                    if (idx >= 0 && idx < n_bins_cov) {
-                                        reverse[idx] = std::min(MAX_COV, reverse[idx] + 1);
-                                    }
+                                    if (idx >= n_bins_cov)
+                                        idx = n_bins_cov - 1;
+                                    reverse[idx] = std::min(MAX_COV, reverse[idx] + 1);
                                 }
                             }
                         }

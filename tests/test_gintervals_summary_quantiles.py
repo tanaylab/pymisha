@@ -186,3 +186,38 @@ def test_gintervals_quantiles_intervals_set_out_roundtrip():
             )
 
     pm.gintervals_rm(set_name, force=True)
+
+
+def test_non_multitask_large_scope_not_truncated():
+    """Non-multitask gintervals_quantiles over a >1000-interval scope must not
+    truncate to the first ~1000 intervals (defensive guard vs R misha #149 /
+    5.11.10; pymisha never had the estimate-after-scan-begin bug, but this locks
+    it in). Non-multitask must equal the multitask result over the same scope.
+    """
+    iv = pd.DataFrame({
+        "chrom": ["1"] * 2000,
+        "start": list(range(0, 400000, 200)),
+        "end": list(range(200, 400200, 200)),
+    })
+    pcts = [0.25, 0.5, 0.75]
+
+    saved = pm.CONFIG.get("multitasking")
+    try:
+        pm.CONFIG["multitasking"] = False
+        serial = pm.gintervals_quantiles("dense_track", pcts, iv)
+        pm.CONFIG["multitasking"] = True
+        parallel = pm.gintervals_quantiles("dense_track", pcts, iv)
+    finally:
+        if saved is None:
+            pm.CONFIG.pop("multitasking", None)
+        else:
+            pm.CONFIG["multitasking"] = saved
+
+    # Full scope returned (no truncation to the first ~1000 intervals).
+    assert len(serial) == 2000
+    val_cols = [c for c in serial.columns if c not in ("chrom", "start", "end")]
+    np.testing.assert_allclose(
+        serial[val_cols].to_numpy(dtype=float),
+        parallel[val_cols].to_numpy(dtype=float),
+        rtol=0, atol=0, equal_nan=True,
+    )

@@ -5697,3 +5697,24 @@ class TestVtrackLseDirectionBelowMaxEdits:
             assert max1 >= 0
         if not np.isnan(max5):
             assert max5 >= 0
+
+
+# ---------------------------------------------------------------------------
+# Long motifs (> 64 bp): the subs-only solvers must not read past the fixed
+# [64] PSSM lookup tables (R 5.11.9 H4 - tables are now sized to motif length).
+# ---------------------------------------------------------------------------
+class TestLongMotifNoOOB:
+    def test_70bp_motif_all_match_zero_edits(self):
+        pssm = np.tile([1.0, 0.0, 0.0, 0.0], (70, 1))  # every position wants A
+        result = pm.gseq_pwm_edits("A" * 70, pssm, score_thresh=-0.5,
+                                   prior=0, bidirect=False)
+        assert len(result) >= 1
+        assert set(result["n_edits"].unique()) == {0}
+
+    def test_70bp_motif_one_mismatch_one_edit(self):
+        pssm = np.tile([1.0, 0.0, 0.0, 0.0], (70, 1))
+        # Single mismatch past position 64 exercises the previously-OOB range.
+        result = pm.gseq_pwm_edits("A" * 69 + "T", pssm, score_thresh=-0.01,
+                                   prior=0, bidirect=False)
+        assert len(result) >= 1
+        assert set(result["n_edits"].unique()) == {1}

@@ -84,35 +84,39 @@ double aggregate_value_for_bin(
         return std::numeric_limits<double>::quiet_NaN();
     }
 
-    // Step 1: merge contributions sharing the same chain_id.
+    // Under na_rm = false, any NaN contribution makes the whole locus NaN
+    // (checked on the raw contributions, before the per-chain merge). R 5.11.5.
+    if (!na_rm) {
+        for (const auto &c : state) {
+            if (c.is_na) return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    // Step 1: merge contributions sharing the same chain key. NaN pieces are
+    // dropped FIRST (na_rm == true here) so a chain mapping both a finite and a
+    // NaN source bin into this locus keeps its finite value instead of being
+    // discarded wholesale by an is_na carried over the whole chain. R 5.11.5.
     std::vector<BinContribution> merged;
     merged.reserve(state.size());
     for (const auto &c : state) {
+        if (c.is_na) continue;  // na_rm == true here (na_rm == false already returned)
         bool found = false;
         for (auto &m : merged) {
             if (m.chain_id == c.chain_id) {
                 m.overlap_len += c.overlap_len;
                 m.start = std::min(m.start, c.start);
                 m.end   = std::max(m.end,   c.end);
-                m.is_na = m.is_na || c.is_na;
                 found = true;
                 break;
             }
         }
         if (!found) merged.push_back(c);
     }
-    const std::vector<BinContribution> &contribs = merged;
 
-    // Step 2: collect valid (non-NA) contribs; respect na_rm.
+    // Step 2: all merged contributions are non-NA.
     std::vector<const BinContribution *> valid;
-    valid.reserve(contribs.size());
-    for (const auto &c : contribs) {
-        if (c.is_na) {
-            if (!na_rm) return std::numeric_limits<double>::quiet_NaN();
-            continue;
-        }
-        valid.push_back(&c);
-    }
+    valid.reserve(merged.size());
+    for (const auto &c : merged) valid.push_back(&c);
 
     if (min_n_or_negative >= 0 && (int64_t)valid.size() < min_n_or_negative)
         return std::numeric_limits<double>::quiet_NaN();
@@ -464,27 +468,30 @@ void aggregate_per_bin_cpp(
         }
 
         const int64_t end_bin = (chrom_size + bin_size - 1) / bin_size;  // ceil
-        // iinterv_val cursor: mirrors R's GTrackLiftover.cpp iinterv_val.
-        // Advances monotonically across bins so we don't re-scan past intervals.
+        // Cursor advances monotonically: past intervals ending at or before the
+        // current bin start (sorted by start, those cannot overlap this or any
+        // later bin). Intervals ending after bin start may still overlap a later
+        // bin, so they are re-scanned each bin. R 5.11.3: the old `iinterv = iter`
+        // over-advanced past a boundary-spanning contribution whenever an
+        // overlapping sibling shared its interval, dropping it from the next bin.
         size_t iinterv = 0;
 
         for (int64_t bin = 0; bin < end_bin; ++bin) {
             const int64_t bs = bin * bin_size;
             const int64_t be = std::min<int64_t>((bin + 1) * bin_size, chrom_size);
 
-            // Collect contributions for this bin.
-            // Mirrors R: iter starts at iinterv_val, advances until past bin.
-            std::vector<BinContribution> state;
-            bool had_intersect = false;
-            size_t iter = iinterv;
+            // Advance the cursor past intervals that end at or before this bin start.
+            while (iinterv < idxs.size() && in_end[idxs[iinterv]] <= bs) ++iinterv;
 
-            for (; iter < idxs.size(); ++iter) {
+            // Collect every contribution overlapping [bs, be). Sorted by start, so
+            // stop as soon as an interval starts at or after the bin end.
+            std::vector<BinContribution> state;
+            for (size_t iter = iinterv; iter < idxs.size(); ++iter) {
                 const size_t i = idxs[iter];
+                if (in_start[i] >= be) break;
                 const int64_t ovl_s = std::max<int64_t>(bs, in_start[i]);
                 const int64_t ovl_e = std::min<int64_t>(be, in_end[i]);
                 if (ovl_s < ovl_e) {
-                    // Genuine overlap.
-                    had_intersect = true;
                     BinContribution c;
                     c.value      = in_value[i];
                     c.overlap_len = (double)(ovl_e - ovl_s);
@@ -493,20 +500,8 @@ void aggregate_per_bin_cpp(
                     c.is_na      = std::isnan(in_value[i]);
                     c.chain_id   = in_chain_id[i];
                     state.push_back(c);
-                } else if (in_end[i] > bs) {
-                    // interval ends after bin start but no genuine overlap:
-                    // if we already had an intersection and this interval
-                    // starts after bin end, back up one (like R's --iter + break).
-                    if (had_intersect && in_start[i] > be) {
-                        if (iter > iinterv) --iter;
-                    }
-                    break;
                 }
-                // else: interval is entirely before bs - advance iinterv.
-                if (!had_intersect && iter == iinterv) iinterv = iter + 1;
             }
-            // After inner loop, advance iinterv to iter (mirroring R's iinterv_val = iter).
-            if (iter > iinterv) iinterv = iter;
 
             const double v = aggregate_value_for_bin(
                 state, agg, na_rm, min_n_or_negative, nth_index);

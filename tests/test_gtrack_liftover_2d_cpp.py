@@ -67,6 +67,50 @@ def _result_to_sorted_rows(r):
     ))
 
 
+class TestAggregate2DRects:
+    """_aggregate_2d_rects turns possibly-overlapping mapped rects into disjoint
+    cells before insertion into the quadtree (R 5.11.8)."""
+
+    def _agg(self, x1, y1, x2, y2, v, agg="mean", na_rm=True, min_n=None, nth=0):
+        from pymisha.liftover import _aggregate_2d_rects
+        return sorted(_aggregate_2d_rects(
+            np.array(x1), np.array(y1), np.array(x2), np.array(y2),
+            np.array(v, dtype=float), agg, na_rm, min_n, nth))
+
+    def test_disjoint_rects_pass_through(self):
+        cells = self._agg([0, 20], [0, 20], [10, 30], [10, 30], [1.0, 2.0])
+        assert cells == [(0, 0, 10, 10, 1.0), (20, 20, 30, 30, 2.0)]
+
+    def test_fully_overlapping_rects_aggregated(self):
+        # Two identical rects -> one cell holding the aggregate (mean).
+        cells = self._agg([0, 0], [0, 0], [10, 10], [10, 10], [4.0, 8.0])
+        assert cells == [(0, 0, 10, 10, 6.0)]
+
+    def test_fully_overlapping_rects_max(self):
+        cells = self._agg([0, 0], [0, 0], [10, 10], [10, 10], [4.0, 8.0], agg="max")
+        assert cells == [(0, 0, 10, 10, 8.0)]
+
+    def test_partial_overlap_splits_into_disjoint_cells(self):
+        # A: x[0,10] y[0,30]=2 ; B: x[0,10] y[10,20]=6 (overlap in y[10,20]).
+        cells = self._agg([0, 0], [0, 10], [10, 10], [30, 20], [2.0, 6.0])
+        assert cells == [
+            (0, 0, 10, 10, 2.0),    # A only
+            (0, 10, 10, 20, 4.0),   # mean(A, B)
+            (0, 20, 10, 30, 2.0),   # A only
+        ]
+
+    def test_output_rects_are_disjoint(self):
+        # A random-ish overlap must never yield two cells sharing interior area.
+        cells = self._agg([0, 5], [0, 5], [10, 15], [10, 15], [1.0, 3.0])
+        for i in range(len(cells)):
+            for j in range(i + 1, len(cells)):
+                ax1, ay1, ax2, ay2, _ = cells[i]
+                bx1, by1, bx2, by2, _ = cells[j]
+                overlap_x = min(ax2, bx2) - max(ax1, bx1)
+                overlap_y = min(ay2, by2) - max(ay1, by1)
+                assert overlap_x <= 0 or overlap_y <= 0
+
+
 class TestPmLiftoverTrack2dSkeleton:
     def test_returns_empty_on_empty_source(self, tmp_path):
         r = _pymisha.pm_liftover_track_2d(str(tmp_path), EMPTY_CHAIN)

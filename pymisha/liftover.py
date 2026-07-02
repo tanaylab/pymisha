@@ -2355,30 +2355,34 @@ def _aggregate_value_for_bin(
     2. Apply na_rm / min_n filtering.
     3. Reduce via agg_name.
     """
-    # Step 1: merge contribs sharing chain_id.
+    # Under na_rm=False, any NaN contribution makes the whole locus NaN (checked
+    # on the raw contributions, before the per-chain merge). R 5.11.5.
+    if not na_rm:
+        for c in contribs:
+            if c["is_na"]:
+                return float("nan")
+
+    # Step 1: merge contribs sharing chain_id. NaN pieces are dropped FIRST
+    # (na_rm is True here) so a chain mapping both a finite and a NaN source bin
+    # into this locus keeps its finite value instead of being discarded wholesale
+    # by an is_na carried over the whole chain. R 5.11.5.
     merged: list[dict] = []
     for c in contribs:
+        if c["is_na"]:
+            continue  # na_rm is True here (na_rm=False already returned)
         found = False
         for mc in merged:
             if mc["chain_id"] == c["chain_id"]:
                 mc["overlap_len"] += c["overlap_len"]
                 mc["start"] = min(mc["start"], c["start"])
                 mc["end"] = max(mc["end"], c["end"])
-                mc["is_na"] = mc["is_na"] or c["is_na"]
                 found = True
                 break
         if not found:
             merged.append(dict(c))
-    used = merged if merged else contribs
 
-    # Step 2: na_rm / min_n.
-    valid = []
-    for c in used:
-        if c["is_na"]:
-            if not na_rm:
-                return float("nan")
-            continue
-        valid.append(c)
+    # Step 2: all merged contributions are non-NA.
+    valid = merged
 
     if min_n is not None and min_n >= 0 and len(valid) < min_n:
         return float("nan")
@@ -2462,27 +2466,33 @@ def _aggregate_per_bin_python(
             starts = ends = vals = cids = np.array([], dtype=np.int64)
 
         end_bin = (chrom_size + bin_size - 1) // bin_size
+        # Cursor advances monotonically past intervals ending at or before the
+        # bin start (sorted by start, those cannot overlap this or any later bin);
+        # intervals ending later are re-scanned each bin. R 5.11.3: the old
+        # `cursor = k` over-advanced past a boundary-spanning contribution whenever
+        # an overlapping sibling shared its interval, dropping it from the next bin.
         cursor = 0
+        n_iv = len(starts)
         for bin_idx in range(end_bin):
             bs = bin_idx * bin_size
             be = min((bin_idx + 1) * bin_size, chrom_size)
 
-            # R's exact iterator semantics from GTrackLiftover.cpp:719-751.
-            # cursor is saved between bins. Within a bin we walk forward;
-            # if the first non-overlapping interval that lies AT or AFTER the
-            # bin has a start beyond be AND at least one contribution was seen,
-            # we step back one so the last contributing interval is reconsidered
-            # for the next bin (the --iter step-back in the C++ code).
+            # Advance the cursor past intervals that end at or before this bin start.
+            while cursor < n_iv and int(ends[cursor]) <= bs:
+                cursor += 1
+
+            # Collect every contribution overlapping [bs, be). Sorted by start, so
+            # stop as soon as an interval starts at or after the bin end.
             contribs: list[dict] = []
             k = cursor
-            intersect = False
-            while k < len(starts):
+            while k < n_iv:
                 s_k = int(starts[k])
+                if s_k >= be:
+                    break
                 e_k = int(ends[k])
                 ovl_s = max(bs, s_k)
                 ovl_e = min(be, e_k)
                 if ovl_s < ovl_e:
-                    # Interval overlaps this bin — contribute and advance.
                     v = float(vals[k])
                     contribs.append({
                         "value": v,
@@ -2492,19 +2502,7 @@ def _aggregate_per_bin_python(
                         "is_na": bool(np.isnan(v)),
                         "chain_id": int(cids[k]),
                     })
-                    intersect = True
-                    k += 1
-                    continue
-                if e_k > bs:
-                    # No overlap, but interval is at or after this bin.
-                    # Step back one if we already had a contribution and the
-                    # interval starts strictly after be — mirrors --iter in R.
-                    if intersect and s_k > be:
-                        k -= 1
-                    break
-                # e_k <= bs: interval is entirely before this bin. Consume it.
                 k += 1
-            cursor = k
 
             v_out = _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
             out_rows.append((chrom, bs, be, v_out))
@@ -2751,13 +2749,16 @@ def gtrack_liftover(
     """
     # 2D source tracks route through the dedicated 2D path. Detection is by
     # quadtree file signature (R-parity: GTrackLiftover.cpp:843 dispatches on
-    # GenomeTrack::RECTS / POINTS). multi_target_agg / min_n / nth_index / na_rm
-    # are not used by the 2D path (R does no aggregation on the 2D side).
+    # GenomeTrack::RECTS / POINTS). multi_target_agg / na_rm / min_n / nth apply
+    # to the 2D path too: overlapping mapped rectangles are aggregated into
+    # disjoint cells before insertion (R 5.11.8).
     if _detect_source_track_2d(src_track_dir):
         return _gtrack_liftover_2d(
             track, description, src_track_dir, chain,
             src_overlap_policy=src_overlap_policy,
             tgt_overlap_policy=tgt_overlap_policy,
+            multi_target_agg=multi_target_agg,
+            params=params, na_rm=na_rm, min_n=min_n,
             min_score=min_score,
         )
 
@@ -3077,8 +3078,17 @@ def _gtrack_liftover_python(
 
         if bin_size is not None:
             tgt_chrom_sizes = _get_db_chrom_sizes()
+            # Dedup key = (chain_id, source-bin index) so that DIFFERENT source bins
+            # of the same chain landing in one target bin stay distinct and are
+            # aggregated, instead of being collapsed to the first bin's value.
+            # intervalID is the source-bin index. R 5.11.6.
+            dense_in = lifted[["chrom", "start", "end", "value", "chain_id"]].copy()
+            if "intervalID" in lifted.columns:
+                cid = lifted["chain_id"].to_numpy(dtype=np.int64)
+                iid = lifted["intervalID"].to_numpy(dtype=np.int64)
+                dense_in["chain_id"] = (cid << np.int64(32)) ^ iid
             per_bin = _aggregate_per_bin_python(
-                lifted[["chrom", "start", "end", "value", "chain_id"]],
+                dense_in,
                 bin_size,
                 tgt_chrom_sizes,
                 agg_name=multi_target_agg,
@@ -3142,6 +3152,89 @@ def _gtrack_liftover_python(
 # 2D source-track liftover (G1.P3.D)
 # ===================================================================
 
+def _aggregate_2d_rects(
+    x1: np.ndarray,
+    y1: np.ndarray,
+    x2: np.ndarray,
+    y2: np.ndarray,
+    v: np.ndarray,
+    agg_name: str,
+    na_rm: bool,
+    min_n: int | None,
+    nth_index: int,
+) -> list[tuple[int, int, int, int, float]]:
+    """Aggregate possibly-overlapping mapped rectangles into DISJOINT rects.
+
+    A StatQuadTree requires non-overlapping objects; disjoint source rects can
+    map onto overlapping target rects because the chain shifts x and y
+    independently, so the 2D path needs the same collect -> segment -> aggregate
+    treatment the 1D path has. Coordinate-compress the x/y boundaries into a grid
+    and, for every cell, aggregate the values of all rects covering it. Each
+    contribution gets a unique key so distinct sources are never folded together.
+    Port of R GTrackLiftover.cpp::aggregate_2d_rects (5.11.8).
+
+    ponytail: O(active rects per x-slab) per cell - ~O(N) for grid-aligned data
+    (Hi-C points / uniform bins, one cell per rect), O(N^2) worst case for
+    pathological nested/offset rects. Upgrade path if it ever bites: move to C++
+    (as R does) or decompose per overlap-cluster.
+    """
+    n = len(x1)
+    out: list[tuple[int, int, int, int, float]] = []
+    if n == 0:
+        return out
+
+    xs = np.unique(np.concatenate([x1, x2]))
+    ys = np.unique(np.concatenate([y1, y2]))
+    by_x1 = np.argsort(x1, kind="mergesort")
+    by_x2 = np.argsort(x2, kind="mergesort")
+
+    active: set[int] = set()
+    ia = 0
+    ir = 0
+    encounter = 0  # unique id per contribution -> reducer never merges them
+
+    for xi in range(len(xs) - 1):
+        xa = int(xs[xi])
+        xb = int(xs[xi + 1])
+
+        while ir < n and int(x2[by_x2[ir]]) <= xa:
+            active.discard(int(by_x2[ir]))
+            ir += 1
+        while ia < n and int(x1[by_x1[ia]]) <= xa:
+            active.add(int(by_x1[ia]))
+            ia += 1
+
+        if not active:
+            continue
+
+        # Per y-band aggregation over the rects active in this x-slab. Iterate the
+        # active rects in index order (mirrors R's std::set<size_t>) so the unique
+        # ids - and thus first/last/nth ordering - are deterministic.
+        band_contribs: dict[int, list] = {}
+        for ri in sorted(active):
+            b_lo = int(np.searchsorted(ys, y1[ri], side="left"))
+            b_hi = int(np.searchsorted(ys, y2[ri], side="left"))
+            val = float(v[ri])
+            is_na = bool(np.isnan(val))
+            for b in range(b_lo, b_hi):
+                band_contribs.setdefault(b, []).append({
+                    "value": val,
+                    "overlap_len": 1.0,
+                    "start": encounter,
+                    "end": encounter,
+                    "is_na": is_na,
+                    "chain_id": encounter,
+                })
+                encounter += 1
+
+        for b, contribs in band_contribs.items():
+            agg = _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
+            if not np.isnan(agg):
+                out.append((xa, int(ys[b]), xb, int(ys[b + 1]), agg))
+
+    return out
+
+
 def _gtrack_liftover_2d(
     track: str,
     description: str,
@@ -3150,12 +3243,18 @@ def _gtrack_liftover_2d(
     *,
     src_overlap_policy: str = "error",
     tgt_overlap_policy: str = "auto",
+    multi_target_agg: str = "mean",
+    params: dict[str, Any] | None = None,
+    na_rm: bool = True,
+    min_n: int | None = None,
     min_score: float | None = None,
 ) -> None:
     """Lift a 2D source track (RECTS or POINTS) to the current target DB.
 
     Routed to from ``gtrack_liftover`` whenever the source-track directory
     contains 2D quadtree files. Mirrors R ``GTrackLiftover.cpp:843-984``.
+    Overlapping mapped rectangles are aggregated into disjoint cells via
+    ``multi_target_agg`` before insertion (R 5.11.8).
     """
     from .tracks import (
         _load_track_attributes,
@@ -3195,27 +3294,77 @@ def _gtrack_liftover_2d(
         "score":     chain["score"].to_numpy(dtype=np.float64),
     }
 
+    if multi_target_agg not in _AGG_FUNCS:
+        raise ValueError(
+            f"Unsupported aggregation: {multi_target_agg}. "
+            f"Supported: {', '.join(sorted(_AGG_FUNCS))}"
+        )
+    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
+
     result = _pymisha.pm_liftover_track_2d(str(src_track_dir), chain_dict)
 
     created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
 
-    if len(result["chrom1"]) == 0:
-        # No target rectangles produced - create an empty track directory.
+    def _empty_track() -> None:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
         _pm_dbreload()
         _set_created_attrs(track, description, created_by)
+
+    if len(result["chrom1"]) == 0:
+        # No target rectangles produced - create an empty track directory.
+        _empty_track()
+        return
+
+    # Aggregate possibly-overlapping mapped rectangles into disjoint cells per
+    # target chrom-pair before insertion (the quadtree forbids overlapping
+    # objects; overlapping inserts corrupt read-back and double-count). R 5.11.8.
+    rects_df = pd.DataFrame({
+        "chrom1": result["chrom1"],
+        "chrom2": result["chrom2"],
+        "x1": np.asarray(result["x1"], dtype=np.int64),
+        "y1": np.asarray(result["y1"], dtype=np.int64),
+        "x2": np.asarray(result["x2"], dtype=np.int64),
+        "y2": np.asarray(result["y2"], dtype=np.int64),
+        "value": np.asarray(result["value"], dtype=np.float64),
+    })
+
+    out_c1: list = []
+    out_c2: list = []
+    out_x1: list = []
+    out_y1: list = []
+    out_x2: list = []
+    out_y2: list = []
+    out_v: list = []
+    for (c1, c2), grp in rects_df.groupby(["chrom1", "chrom2"], sort=False):
+        cells = _aggregate_2d_rects(
+            grp["x1"].to_numpy(), grp["y1"].to_numpy(),
+            grp["x2"].to_numpy(), grp["y2"].to_numpy(),
+            grp["value"].to_numpy(),
+            multi_target_agg, na_rm, min_n, nth_index,
+        )
+        for (cx1, cy1, cx2, cy2, cv) in cells:
+            out_c1.append(c1)
+            out_c2.append(c2)
+            out_x1.append(cx1)
+            out_y1.append(cy1)
+            out_x2.append(cx2)
+            out_y2.append(cy2)
+            out_v.append(cv)
+
+    if len(out_c1) == 0:
+        _empty_track()
         return
 
     target_df = pd.DataFrame({
-        "chrom1": result["chrom1"],
-        "start1": result["x1"],
-        "end1":   result["x2"],
-        "chrom2": result["chrom2"],
-        "start2": result["y1"],
-        "end2":   result["y2"],
+        "chrom1": out_c1,
+        "start1": out_x1,
+        "end1":   out_x2,
+        "chrom2": out_c2,
+        "start2": out_y1,
+        "end2":   out_y2,
     })
-    gtrack_2d_create(track, description, target_df, result["value"])
+    gtrack_2d_create(track, description, target_df, np.asarray(out_v, dtype=np.float64))
 
     attrs = _load_track_attributes(track)
     attrs["created.by"] = created_by

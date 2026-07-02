@@ -5271,18 +5271,11 @@ def gintervals_mark_overlaps(
         raise RuntimeError("gintervals_canonic did not return a mapping attribute")
 
     result = intervals.copy()
-    # mapping is indexed by sorted order; we need to map back to original order
-    # gintervals_canonic sorts by (chrom, start), so recreate that sort order
-    sort_idx = intervals[["chrom", "start"]].copy()
-    sort_idx["_orig_idx"] = _numpy.arange(len(intervals))
-    sort_idx = sort_idx.sort_values(["chrom", "start"]).reset_index(drop=True)
-
-    # mapping[i] corresponds to sorted interval i -> canonical interval index
-    # Distribute back to original order
-    group_ids = _numpy.empty(len(intervals), dtype=_numpy.int64)
-    group_ids[sort_idx["_orig_idx"].values] = mapping
-
-    result[group_col] = group_ids
+    # gintervals_canonic returns `mapping` already indexed by original input order
+    # (mapping[orig_idx] = canonical interval index), so it maps straight onto the
+    # original rows. The previous code re-permuted it into sorted order, which
+    # scrambled the groups whenever the input was not already sorted by (chrom, start).
+    result[group_col] = _numpy.asarray(mapping, dtype=_numpy.int64)
     return result
 
 
@@ -5523,6 +5516,17 @@ def gintervals_annotate(
     # Add distance column
     if dist_column is not None and "dist" in result.columns:
         output[dist_column] = result["dist"].values
+
+    # Per-row no-neighbor-in-range: query intervals that matched no neighbor got
+    # NA dist and NA annotation columns from gintervals_neighbors; fill na_value
+    # (the whole-empty and beyond-threshold cases are handled separately). R M9.
+    if "dist" in result.columns:
+        not_found = result["dist"].isna().to_numpy()
+        if not_found.any():
+            for out_name in ann_col_map:
+                if out_name in output.columns:
+                    fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
+                    output.loc[not_found, out_name] = fill
 
     # Apply distance threshold
     if max_dist < float("inf") and dist_column is not None and dist_column in output.columns:

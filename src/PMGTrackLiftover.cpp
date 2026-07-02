@@ -297,9 +297,17 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         std::vector<double>      out_value;
         if (src_type == "dense") {
             // FIXED_BIN preservation per R-parity.
+            // Dedup key = (chain id, source bin index). Pieces of the SAME source
+            // bin split by "agg" target segmentation share the key (counted once);
+            // DIFFERENT source bins of the same chain landing in one target bin stay
+            // distinct and are aggregated. Keying by chain_id alone collapsed them to
+            // the first bin's value (R 5.11.6, mirroring IntervalsLiftover's key).
+            std::vector<int64_t> agg_key(mapped.chain_id.size());
+            for (size_t k = 0; k < agg_key.size(); ++k)
+                agg_key[k] = (mapped.chain_id[k] << 32) ^ mapped.intervalID[k];
             aggregate_per_bin_cpp(
                 mapped.chrom, mapped.start, mapped.end, mapped.value,
-                mapped.chain_id,
+                agg_key,
                 tgt_sizes, src_bin_size,
                 agg, na_rm_int != 0, (int64_t)min_n_ll, (int64_t)nth_index_ll,
                 out_chrom, out_start, out_end, out_value);

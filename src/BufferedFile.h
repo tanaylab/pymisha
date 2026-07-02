@@ -124,13 +124,15 @@ inline void BufferedFile::init(unsigned bufsize) {
 inline int BufferedFile::getc()
 {
 	// is the new read already cached?
+	// Cast through unsigned char so a byte >= 0x80 is not sign-extended to a
+	// negative int that looks like EOF (-1), which truncated non-ASCII values.
 	if (m_virt_pos >= m_sbuf_pos && m_virt_pos + 1 <= m_ebuf_pos)
-		return m_buf[m_virt_pos++ - m_sbuf_pos];
+		return (unsigned char)m_buf[m_virt_pos++ - m_sbuf_pos];
 
 	char c;
 	if (!read(&c, 1))
 		return -1;
-	return c;
+	return (unsigned char)c;
 }
 
 inline uint64_t BufferedFile::read(void *ptr, uint64_t size)
