@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.20 (2026-07-02)
+
+- **`gintervals_annotate` restores neighbor rows with a stable sort.** With `maxneighbors > 1` and `tie_method="min.start"`/`"min.end"`, the per-query neighbor ordering is now preserved deterministically instead of relying on the platform's (non-stable) default sort.
+
 ## v0.8.19 (2026-07-02)
 
 Ports recent R misha correctness fixes (5.11.2-5.11.10):

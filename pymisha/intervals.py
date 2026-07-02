@@ -5536,10 +5536,12 @@ def gintervals_annotate(
                 fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
                 output.loc[beyond, out_name] = fill
 
-    # Restore original order
+    # Restore original order. Use a stable sort so that when maxneighbors > 1 the
+    # per-query neighbor ordering established above (by dist, then the min.start /
+    # min.end tie column) is preserved among rows sharing an _orig_order.
     if keep_order and "_orig_order" in result.columns:
         output["_orig_order"] = result["_orig_order"].values
-        output = output.sort_values("_orig_order").reset_index(drop=True)
+        output = output.sort_values("_orig_order", kind="stable").reset_index(drop=True)
         output = output.drop(columns=["_orig_order"])
     elif "_orig_order" in output.columns:
         output = output.drop(columns=["_orig_order"])
