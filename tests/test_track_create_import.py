@@ -48,6 +48,34 @@ def test_gtrack_create_sparse(tmp_path):
         pm.gdb_init(str(TEST_DB))
 
 
+def test_gtrack_create_sparse_value_column(tmp_path):
+    """values=None takes the values from the intervals' `value` column."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        # unsorted on purpose: the value column travels with its row
+        intervals = pd.DataFrame(
+            {
+                "chrom": ["chr2", "chr1", "chr1"],
+                "start": [10, 20, 0],
+                "end": [20, 30, 10],
+                "value": [3.0, 2.0, 1.0],
+            }
+        )
+        pm.gtrack_create_sparse("sparse_valcol", "sparse test", intervals)
+        out = pm.gextract("sparse_valcol", intervals[["chrom", "start", "end"]])
+        assert out is not None
+        out = out.sort_values(["chrom", "start"]).reset_index(drop=True)
+        np.testing.assert_allclose(out["sparse_valcol"].to_numpy(), np.array([1.0, 2.0, 3.0]))
+
+        with pytest.raises(ValueError, match='no "value" column'):
+            pm.gtrack_create_sparse(
+                "sparse_novalcol", "sparse test", intervals[["chrom", "start", "end"]]
+            )
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
 def test_gtrack_create_dense_overlap_and_defval(tmp_path):
     root = _copy_db(tmp_path)
     try:

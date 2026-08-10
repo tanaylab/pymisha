@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.21 (2026-08-10)
+
+Ports R misha 5.11.11-5.11.12:
+
+- **`gtrack_create_sparse` can take its values from a `value` column of `intervals`.** `values` is now optional; omitting it rules out a values/intervals row-order mismatch. Note that `gintervals()` returns its rows sorted, so a separately held value array must be reordered to match.
+- **PWM energy scoring treats `N`/`*` the same on both strands.** The reverse strand used `log(0.25)` where the forward strand used the PSSM column average; both now use the average. Genomic virtual-track scoring is unaffected (windows containing `N` are masked to `-inf` first).
+
 ## v0.8.20 (2026-07-02)
 
 - **`gintervals_annotate` restores neighbor rows with a stable sort.** With `maxneighbors > 1` and `tie_method="min.start"`/`"min.end"`, the per-query neighbor ordering is now preserved deterministically instead of relying on the platform's (non-stable) default sort.

@@ -1155,7 +1155,9 @@ def _ensure_track_absent(track: str) -> None:
         raise ValueError(f"Track '{track}' already exists")
 
 
-def gtrack_create_sparse(track: str, description: str, intervals: Intervals, values: Any) -> None:
+def gtrack_create_sparse(
+    track: str, description: str, intervals: Intervals, values: Any = None
+) -> None:
     """
     Create a Sparse track from intervals and values.
 
@@ -1164,6 +1166,13 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     chromosome. Chromosome names are normalized and filtered to those
     present in the current genome database. The description is stored
     as a track attribute.
+
+    *values* is matched to *intervals* row by row, in the order the intervals
+    are passed; *intervals* need not be sorted. Note however that
+    :func:`gintervals` returns its result sorted, so building *intervals* with
+    ``gintervals()`` while keeping *values* in the original order will bind
+    values to the wrong intervals. Keep the values in a ``value`` column of
+    *intervals* and omit *values* to make such a mismatch impossible.
 
     Parameters
     ----------
@@ -1175,9 +1184,11 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     intervals : pandas.DataFrame
         One-dimensional intervals with columns ``chrom``, ``start``,
         ``end``.
-    values : array-like of float
-        Numeric values, one per interval. Length must match the number
-        of rows in *intervals*.
+    values : array-like of float, optional
+        Numeric values, one per interval, in the same order as the rows
+        of *intervals*. Length must match the number of rows in
+        *intervals*. If ``None``, the ``value`` column of *intervals* is
+        used.
 
     Returns
     -------
@@ -1208,6 +1219,11 @@ def gtrack_create_sparse(track: str, description: str, intervals: Intervals, val
     """
     _checkroot()
     _validate_track_name(track)
+
+    if values is None:
+        if not isinstance(intervals, pd.DataFrame) or "value" not in intervals.columns:
+            raise ValueError('values is missing and intervals has no "value" column')
+        values = intervals["value"].to_numpy()
 
     data = _normalize_intervals_df(intervals)
     vals = np.asarray(values, dtype=np.float64)

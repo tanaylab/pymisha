@@ -342,7 +342,11 @@ def gintervals(
     -------
     DataFrame
         Sorted intervals with columns: chrom, start, end (and optionally
-        strand).
+        strand). The sort order is not the argument order: beware of
+        keeping per-interval data in a separate parallel array across a
+        ``gintervals()`` call, since the rows are reordered and the array
+        is not. Put such data in a column of the returned DataFrame
+        instead.
 
     See Also
     --------
