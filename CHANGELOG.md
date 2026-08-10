@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.22 (2026-08-10)
+
+- **Linux wheels are now built for glibc 2.28+ (`manylinux_2_28`, i.e. RHEL 8 / Ubuntu 20.04 and newer).** NumPy no longer ships `manylinux2014` wheels, so the old build image could not produce a v0.8.21 wheel. Older systems can still install from the source distribution.
+
 ## v0.8.21 (2026-08-10)
 
 Ports R misha 5.11.11-5.11.12:
