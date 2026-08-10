@@ -21,6 +21,7 @@ def gtrack_export_bedgraph(
     intervals: pd.DataFrame | None = None,
     iterator: int | None = None,
     name: str | None = None,
+    header: bool = True,
 ) -> None:
     """Export a track or track expression to bedGraph format.
 
@@ -46,6 +47,9 @@ def gtrack_export_bedgraph(
     name : str or None, optional
         Track name for the bedGraph header line. If ``None`` (default),
         uses the ``track`` parameter value.
+    header : bool, default True
+        Write the ``track type=bedGraph`` header line. Set to ``False``
+        for consumers that reject it (e.g. ``bedGraphToBigWig``).
 
     Returns
     -------
@@ -162,15 +166,14 @@ def gtrack_export_bedgraph(
 
     opener = gzip.open if use_gz else open
     with opener(file, "wt") as f:
-        # Write header
-        f.write(f'track type=bedGraph name="{name}"\n')
+        if header:
+            f.write(f'track type=bedGraph name="{name}"\n')
 
-        # Write data lines (tab-separated: chrom, start, end, value)
         if len(data) > 0:
-            for _, row in data.iterrows():
-                f.write(
-                    f"{row['chrom']}\t{int(row['start'])}\t{int(row['end'])}\t{row[value_col]}\n"
-                )
+            out = data[["chrom", "start", "end", value_col]].astype(
+                {"start": "int64", "end": "int64"}
+            )
+            out.to_csv(f, sep="\t", header=False, index=False)
 
 
 def gtrack_export_bigwig(
@@ -255,20 +258,11 @@ def gtrack_export_bigwig(
         ) as tmp_bg:
             tmp_bedgraph = tmp_bg.name
 
-        # Write the bedGraph data (we need to strip the header for conversion)
+        # bedGraphToBigWig rejects the track header, so never write it
         gtrack_export_bedgraph(
-            track, tmp_bedgraph, intervals=intervals, iterator=iterator
+            track, tmp_bedgraph, intervals=intervals, iterator=iterator,
+            header=False,
         )
-
-        # bedGraphToBigWig doesn't accept headers, so strip the first line
-        with open(tmp_bedgraph) as f:
-            lines = f.readlines()
-
-        with open(tmp_bedgraph, "w") as f:
-            # Skip the header line
-            for line in lines:
-                if not line.startswith("track "):
-                    f.write(line)
 
         # Write chrom.sizes
         with tempfile.NamedTemporaryFile(
@@ -278,8 +272,9 @@ def gtrack_export_bigwig(
 
         genome_intervals = gintervals_all()
         with open(tmp_chromsizes, "w") as f:
-            for _, row in genome_intervals.iterrows():
-                f.write(f"{row['chrom']}\t{int(row['end'])}\n")
+            genome_intervals[["chrom", "end"]].astype({"end": "int64"}).to_csv(
+                f, sep="\t", header=False, index=False
+            )
 
         # Run conversion
         result = subprocess.run(

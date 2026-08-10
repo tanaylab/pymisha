@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.0 (2026-08-10)
+
+- **Invalid interval coordinates now raise instead of crashing or returning wrong values.** A negative `start` previously read outside the mapped track file, killing the interpreter with a segfault - or, when the read stayed within the same memory page, silently returning values from the wrong position. `gextract`, `gsummary`, `gscreen`, `gquantiles`, `gdist`, `gpartition` and `gseq_extract` were all affected.
+- **Interval coordinates are validated as in R misha.** `start < 0`, `start >= end`, `end` past the end of the chromosome, and missing (`NaN`) coordinates each raise a specific error. **This is a behavior change:** coordinates past a chromosome end previously returned `NaN` rows (and `N`s from `gseq_extract`); they now raise. Use `gintervals_force_range` to clamp intervals first.
+- **`global.percentile` virtual tracks no longer return values computed from an older version of a track.** Recreating or modifying a track under the same name left the cached genome-wide reference in place, so every percentile could come back as `1`. Cached percentile tables and the indexed 2D track reader are now invalidated with the rest of the database state.
+- **Float and categorical interval columns are accepted.** `start`/`end` of any numeric dtype (`float64` from a CSV read with blanks, `int32`, nullable `Int64`) and a categorical `chrom` column now work instead of raising a conversion error.
+- **`gtrack_export_bedgraph` is ~12x faster** and takes a `header=` argument to omit the `track type=bedGraph` line. `gtrack_export_bigwig` no longer loads the whole intermediate bedGraph into memory.
+
 ## v0.8.22 (2026-08-10)
 
 - **Linux wheels are now built for glibc 2.28+ (`manylinux_2_28`, i.e. RHEL 8 / Ubuntu 20.04 and newer).** NumPy no longer ships `manylinux2014` wheels, so the old build image could not produce a v0.8.21 wheel. Older systems can still install from the source distribution.

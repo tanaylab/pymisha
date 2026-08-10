@@ -75,6 +75,68 @@ static int resolve_chrom_id(PyObject *chrom_val, const GenomeChromKey &chromkey)
     return -1;
 }
 
+// Bring the raw chrom / start / end columns into the shape the converters
+// below expect: a chrom sequence of strings and int64 coordinate arrays.
+void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end)
+{
+    // A categorical chrom column arrives from _df2pymisha as the 2-element
+    // list [categories, codes]. Materialize it with numpy fancy indexing.
+    if (PyList_Check((PyObject *)py_chrom) && PyList_Size((PyObject *)py_chrom) == 2) {
+        PyObject *cats = PyList_GetItem((PyObject *)py_chrom, 0);
+        PyObject *codes = PyList_GetItem((PyObject *)py_chrom, 1);
+        if (cats && codes && PyArray_Check(cats) && PyArray_Check(codes)) {
+            PyObject *expanded = PyObject_GetItem(cats, codes);
+            if (expanded)
+                py_chrom.assign(expanded, true);
+            else
+                PyErr_Clear();
+        }
+    }
+
+    // Coerce start/end to int64. Float coordinates are routine (a BED read
+    // with any blank field, or a non-matching merge, yields float64) and R
+    // misha accepts them. FORCECAST truncates toward zero like R's
+    // as.integer; a no-op incref when the array is already int64.
+    for (PMPY *col : {&py_start, &py_end}) {
+        PyObject *obj = (PyObject *)(*col);
+        if (!obj)
+            continue;
+        if (PyArray_Check(obj) && PyArray_TYPE((PyArrayObject *)obj) == NPY_INT64 &&
+            PyArray_NDIM((PyArrayObject *)obj) == 1 && PyArray_ISCARRAY_RO((PyArrayObject *)obj))
+            continue;
+        PyObject *casted = PyArray_FROM_OTF(obj, NPY_INT64,
+                                            NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
+        if (casted)
+            col->assign(casted, true);
+        else
+            PyErr_Clear();  // leave it to the caller's slow path
+    }
+}
+
+// R-parity: misha's IntervalConverter calls GInterval::verify() on every
+// converted interval. Without it a negative start reaches
+// GenomeTrackFixedBin::read_bins_bulk as a negative bin index and reads
+// before the mmap (segfault, or silent garbage when it stays in-page), and
+// coordinates past the end of a chromosome (a hg19 BED against an hg38 db)
+// come back as plausible-looking NaN rows instead of an error.
+void verify_interval_coords(const GenomeChromKey &chromkey, int chromid,
+                                   int64_t start, int64_t end) {
+    // NaN casts to INT64_MIN, which would otherwise be reported as a
+    // nonsensical negative coordinate.
+    if (start == INT64_MIN || end == INT64_MIN)
+        TGLError("Interval on chromosome %s has a missing (NaN) coordinate",
+                 chromkey.id2chrom(chromid).c_str());
+    if (start < 0)
+        TGLError("Interval (%s, %ld, %ld): start coordinate must be greater or equal than zero",
+                 chromkey.id2chrom(chromid).c_str(), (long)start, (long)end);
+    if (start >= end)
+        TGLError("Interval (%s, %ld, %ld): start coordinate must be lesser than end coordinate",
+                 chromkey.id2chrom(chromid).c_str(), (long)start, (long)end);
+    if ((uint64_t)end > chromkey.get_chrom_size(chromid))
+        TGLError("Interval (%s, %ld, %ld): end coordinate exceeds chromosome boundaries",
+                 chromkey.id2chrom(chromid).c_str(), (long)start, (long)end);
+}
+
 // Convert Python intervals (DataFrame or _df2pymisha list) to a C++
 // GInterval vector. Hot path: NPY_OBJECT chrom array of PyUnicode strings
 // plus NPY_INT64 start/end arrays. The cold paths (DataFrame attribute /
@@ -149,6 +211,8 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
         TGLError("intervals must have 'chrom', 'start', and 'end' columns");
     }
 
+    normalize_interval_columns(py_chrom, py_start, py_end);
+
     // Get length
     Py_ssize_t len = PyObject_Length(py_chrom);
     if (len < 0) {
@@ -205,6 +269,9 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
                 last_obj = obj;
                 last_id = id;
             }
+            if (start_data[i] < 0 || start_data[i] >= end_data[i] ||
+                (uint64_t)end_data[i] > chromkey.get_chrom_size(id))
+                verify_interval_coords(chromkey, id, start_data[i], end_data[i]);
             intervals.emplace_back(id, start_data[i], end_data[i]);
         }
         return;
@@ -244,6 +311,9 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
             TGLError("Invalid start/end values at index %ld", (long)i);
         }
 
+        if (start < 0 || start >= end ||
+            (uint64_t)end > chromkey.get_chrom_size(chromid))
+            verify_interval_coords(chromkey, chromid, start, end);
         intervals.emplace_back(chromid, start, end);
     }
 }
@@ -3088,6 +3158,8 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
         TGLError("intervals must have 'chrom', 'start', and 'end' columns");
     }
 
+    normalize_interval_columns(py_chrom, py_start, py_end);
+
     Py_ssize_t len = PyObject_Length(py_chrom);
     if (len < 0) {
         PyErr_Clear();
@@ -3164,6 +3236,10 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
             }
             PyErr_Clear();
         }
+
+        if (start < 0 || start >= end ||
+            (uint64_t)end > chromkey.get_chrom_size(chromid))
+            verify_interval_coords(chromkey, chromid, start, end);
 
         GInterval interval(chromid, start, end);
         interval.strand = strand;

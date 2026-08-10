@@ -624,11 +624,15 @@ def _gextract_2d_single(
     # recompute fallback (when a query doesn't exactly match a stored rect)
     # is handled inside _gextract_2d_single_python via the same data
     # structures that already read the cached `Computed_val.v`.
+    # Only the probe is guarded: `track` may be an expression rather than a
+    # track name.  The read itself must not be, or a genuine failure falls
+    # through to a C++ path that cannot serve COMPUTED tracks at all.
     try:
-        if gtrack_info(track).get("type") == "computed":
-            return _gextract_2d_single_python(track, col_name, intervals, band)
+        _is_computed = gtrack_info(track).get("type") == "computed"
     except Exception:
-        pass
+        _is_computed = False
+    if _is_computed:
+        return _gextract_2d_single_python(track, col_name, intervals, band)
 
     cmap = _chrom_id_map()
     chrom1_ids = (

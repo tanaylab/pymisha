@@ -558,7 +558,9 @@ double GenomeTrackFixedBin::last_min_pos() const
 
 int64_t GenomeTrackFixedBin::read_bins_bulk(int64_t start_bin, int64_t num_bins, std::vector<float> &vals)
 {
-	if (num_bins <= 0) {
+	if (num_bins <= 0 || start_bin < 0) {
+		// start_bin < 0 would memcpy before the mmap. Callers must verify
+		// interval coordinates; this is the backstop.
 		vals.clear();
 		return 0;
 	}

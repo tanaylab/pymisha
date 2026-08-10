@@ -30,6 +30,12 @@
 
 extern PyObject *s_pm_err;
 
+// Defined in PMStubs.cpp. Declared outside the anonymous namespace below so
+// they keep external linkage.
+extern void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end);
+extern void verify_interval_coords(const GenomeChromKey &chromkey, int chromid,
+                                   int64_t start, int64_t end);
+
 namespace {
 
 struct IntervalValue {
@@ -215,6 +221,8 @@ void convert_py_intervals_basic(PyObject *py_intervals, std::vector<GInterval> &
         TGLError("intervals must have 'chrom', 'start', and 'end' columns");
     }
 
+    normalize_interval_columns(py_chrom, py_start, py_end);
+
     Py_ssize_t len = PyObject_Length(py_chrom);
     if (len < 0) {
         PyErr_Clear();
@@ -270,6 +278,10 @@ void convert_py_intervals_basic(PyObject *py_intervals, std::vector<GInterval> &
             PyErr_Clear();
             TGLError("Invalid start/end values at index %ld", (long)i);
         }
+
+        if (start < 0 || start >= end ||
+            (uint64_t)end > chromkey.get_chrom_size(chromid))
+            verify_interval_coords(chromkey, chromid, start, end);
 
         intervals.emplace_back(chromid, start, end);
     }
@@ -334,6 +346,8 @@ void convert_py_intervals_with_values(PyObject *py_intervals,
         if (has_values) *has_values = true;
     }
 
+    normalize_interval_columns(py_chrom, py_start, py_end);
+
     Py_ssize_t len = PyObject_Length(py_chrom);
     if (len < 0) {
         PyErr_Clear();
@@ -383,6 +397,10 @@ void convert_py_intervals_with_values(PyObject *py_intervals,
             PyErr_Clear();
             TGLError("Invalid start/end values at index %ld", (long)i);
         }
+
+        if (start < 0 || start >= end ||
+            (uint64_t)end > chromkey.get_chrom_size(chromid))
+            verify_interval_coords(chromkey, chromid, start, end);
 
         char strand = 0;
         if (py_strand) {

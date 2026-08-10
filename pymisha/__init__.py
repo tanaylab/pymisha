@@ -237,6 +237,16 @@ def _pm_dbreload_with_invalidation(*args: Any, **kwargs: Any) -> Any:
     _shared._clear_track_names_cache()
     from .tracks import _clear_computed_track_cache
     _clear_computed_track_cache()
+    # Track *content* caches. A track rewritten under the same name (or a
+    # gtrack_rm + gtrack_create round trip) otherwise keeps serving values
+    # derived from the old data: global.percentile silently returns ranks
+    # against a stale reference, and the 2D reader keeps an mmap of the
+    # deleted track.dat.
+    from ._quadtree import clear_indexed_2d_cache
+    from .vtracks import _GLOBAL_PERCENTILE_CACHE, _PV_TABLE_CACHE
+    _GLOBAL_PERCENTILE_CACHE.clear()
+    _PV_TABLE_CACHE.clear()
+    clear_indexed_2d_cache()
     return result
 
 
