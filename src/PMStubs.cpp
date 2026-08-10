@@ -104,6 +104,30 @@ void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end)
         if (PyArray_Check(obj) && PyArray_TYPE((PyArrayObject *)obj) == NPY_INT64 &&
             PyArray_NDIM((PyArrayObject *)obj) == 1 && PyArray_ISCARRAY_RO((PyArrayObject *)obj))
             continue;
+
+        // Reject NaN *before* casting. Converting NaN to an integer is
+        // undefined behaviour and platform-dependent: x86-64 yields
+        // INT64_MIN, arm64 saturates to 0, so a missing coordinate would
+        // silently become position 0 on Apple silicon. Only float inputs can
+        // carry NaN, so the common int64 path pays nothing. (Object arrays
+        // fail the int64 cast outright and fall through to the slow path.)
+        if (PyArray_Check(obj) &&
+            PyTypeNum_ISFLOAT(PyArray_TYPE((PyArrayObject *)obj))) {
+            PMPY as_double(PyArray_FROM_OTF(obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY), true);
+            if (as_double) {
+                PyArrayObject *arr = (PyArrayObject *)(PyObject *)as_double;
+                const double *d = (const double *)PyArray_DATA(arr);
+                npy_intp count = PyArray_SIZE(arr);
+                for (npy_intp k = 0; k < count; ++k) {
+                    if (d[k] != d[k])
+                        TGLError("Interval coordinates contain a missing (NaN) value at index %ld",
+                                 (long)k);
+                }
+            } else {
+                PyErr_Clear();
+            }
+        }
+
         PyObject *casted = PyArray_FROM_OTF(obj, NPY_INT64,
                                             NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST);
         if (casted)

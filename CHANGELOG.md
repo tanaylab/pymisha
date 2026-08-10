@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.9.1 (2026-08-10)
+
+- **A missing (`NaN`) interval coordinate now raises on all platforms.** In v0.9.0 the check relied on how `NaN` converts to an integer, which is platform-dependent: on Apple silicon it did not fire and a `NaN` start was silently read as position `0`. Affects macOS arm64 users of v0.9.0 who passed interval coordinates containing `NaN`.
+
 ## v0.9.0 (2026-08-10)
 
 - **Invalid interval coordinates now raise instead of crashing or returning wrong values.** A negative `start` previously read outside the mapped track file, killing the interpreter with a segfault - or, when the read stayed within the same memory page, silently returning values from the wrong position. `gextract`, `gsummary`, `gscreen`, `gquantiles`, `gdist`, `gpartition` and `gseq_extract` were all affected.
