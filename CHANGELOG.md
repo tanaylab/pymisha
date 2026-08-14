@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.2 (2026-08-14)
+
+- **`gextract` over many tracks is no longer pinned to a single process when the iterator is a DataFrame.** Passing `iterator=<DataFrame>` disabled multitasking for the whole call, so extracting dozens of tracks ran serially. With the track data not already in the page cache this cost roughly 25x - a 56-track scan of one chromosome took ~90s where R misha took ~4s. Extractions with 8 or more expressions now split the expressions across workers, as they already did for other iterator types.
+- **`max_processes` now defaults to 70% of the machine's cores** (as R misha's `gmax.processes` does) instead of a flat 20, which left large machines idle. Worker counts are clamped to the actual core count, so smaller machines are unaffected. Set `pm.CONFIG["max_processes"]` to pin it.
+- **Parallel `gextract` no longer oversubscribes small machines.** The forked worker paths sized the pool from `max_processes` alone, ignoring how many cores were available - 56 expressions on a 4-core machine forked far more workers than cores.
+- **Repeating the same expression in one `gextract` no longer drops columns** when the call runs in parallel. Duplicate expressions are disambiguated by name (`expr`, `expr_`, ...) per worker, so two workers could return the same column name and silently overwrite each other.
+
 ## v0.9.1 (2026-08-10)
 
 - **A missing (`NaN`) interval coordinate now raises on all platforms.** In v0.9.0 the check relied on how `NaN` converts to an integer, which is platform-dependent: on Apple silicon it did not fire and a `NaN` start was silently read as position `0`. Affects macOS arm64 users of v0.9.0 who passed interval coordinates containing `NaN`.

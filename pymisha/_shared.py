@@ -10,6 +10,7 @@ Use PyMisha APIs from a single controlling thread or add external locking.
 from __future__ import annotations
 
 import contextlib as _contextlib
+import os as _os
 import sys as _sys
 from contextlib import contextmanager
 from typing import Any
@@ -33,7 +34,12 @@ CONFIG = {
     'multitasking_stdout': False,   # Debug output from children
     'multitasking_strategy': 'auto',  # 'auto' | 'tracks' | 'tiles' (R 5.6.18 parity)
     'min_processes': 4,             # Min workers for multitasking
-    'max_processes': 20,            # Max workers for multitasking
+    # Max workers for multitasking. 70% of cores, as R misha's gmax.processes
+    # auto-calculates it; the old flat 20 left large-core machines idle (a
+    # 56-track extraction ran ~1.5x slower at 20 workers than at 40). Both the
+    # C++ scanner and the Python fork paths clamp this to the actual core
+    # count, so a small machine is unaffected.
+    'max_processes': max(4, int((_os.cpu_count() or 1) * 0.7)),
     'max_data_size': 10000000,      # Max rows in memory
     # Workload floors for fork-based multitasking. Fork+IPC costs ~150ms on
     # this stack; below these floors serial is faster (measured 20-200x on
@@ -556,15 +562,22 @@ def _preprocess_intervals_iterator(intervals, iterator):
 
 
 @_contextlib.contextmanager
-def _config_no_mt(id_map):
+def _config_no_mt(id_map, keep=False):
     """Context manager that disables C++ multitasking when id_map is set.
 
     When a DataFrame iterator was preprocessed into a small set of
     intersected intervals, the C++ fork/FIFO multitasking overhead
     dominates the actual work.  The C++ side reads multitasking from
     the module-level ``CONFIG`` global, so we temporarily mutate it.
+
+    ``keep=True`` leaves multitasking enabled: the caller has already
+    established that the workload is big enough to fork (the
+    track-parallel gextract path).  Without this escape hatch a
+    DataFrame iterator forced *every* extraction serial, which on cold
+    NFS costs ~25x on many-track scans - one process servicing page
+    faults where R misha forks one kid per expression group.
     """
-    if id_map is None:
+    if id_map is None or keep:
         yield CONFIG
         return
     prev = CONFIG.get("multitasking")

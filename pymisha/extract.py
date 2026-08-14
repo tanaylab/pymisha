@@ -2306,6 +2306,39 @@ def _workload_too_small_for_fork(
     return False
 
 
+def _effective_max_procs(config: dict) -> int:
+    """Worker count the C++ side would pick, mirroring ``choose_num_kids``.
+
+    The C++ scanner clamps to ``hardware_concurrency`` before applying
+    ``max_processes``; the Python fork paths used ``max_processes`` raw, so on
+    a machine with fewer cores than that they oversubscribed (e.g. 56
+    expressions on a 4-core laptop forked one worker per expression).
+    """
+    hw = os.cpu_count() or 1
+    lo = int(config.get("min_processes", 1) or 1)
+    hi = int(config.get("max_processes", 1) or 1)
+    return max(1, min(max(hw, lo), hi))
+
+
+def _tracks_workload_too_small_for_fork(
+    intervals: pd.DataFrame, n_exprs: int, config: dict
+) -> bool:
+    """Return True if a track-parallel fork is not worth it.
+
+    The ``_workload_too_small_for_fork`` floors are expressed in base-pairs
+    of scope because they were calibrated for the *tiles* strategy, where
+    every worker walks its own slice of the genome.  Track-parallel splits
+    the *expressions* instead, so the work scales with intervals x
+    expressions and a bp-scope floor vetoes exactly the workloads it helps
+    most (many tracks over a modest peak set).  Reuse ``min_intervs4process``
+    as the floor, counting per-expression interval visits.
+    """
+    min_intervs = int(config.get("min_intervs4process", 250_000))
+    if min_intervs <= 0:
+        return False
+    return len(intervals) * max(1, n_exprs) < min_intervs
+
+
 def _validate_strategy(strategy: str) -> str:
     """Raise ValueError on unknown strategy; return lowercased value."""
     s = str(strategy).lower()
@@ -2337,11 +2370,22 @@ def _resolve_parallel_strategy(strategy: str, n_exprs: int, iterator: Any) -> st
     return "tiles"
 
 
+# Every track-parallel worker scans the *same* interval set, so passing it
+# through pool.map would pickle and pipe one full copy per worker - ~10 MB
+# per worker for a 345k-row peak set, growing linearly with max_processes.
+# The pool is forked, so children inherit this instead, at no copy cost.
+_FORK_SHARED_INTERVALS: pd.DataFrame | None = None
+
+
 def _worker_extract_tracks(args: tuple[Any, ...]) -> pd.DataFrame | None:
     """Worker for track-parallel gextract: process a subset of expressions
     over the full interval set."""
-    (intervals_dict, expr_subset, iterator_val, config_dict, vtracks_dict) = args
-    intervals_df = _pandas.DataFrame(intervals_dict)
+    (expr_subset, iterator_val, config_dict, vtracks_dict) = args
+    intervals_df = _FORK_SHARED_INTERVALS
+    if intervals_df is None:  # pragma: no cover - fork inheritance failed
+        raise RuntimeError(
+            "track-parallel worker started without the shared interval set"
+        )
     result = _pymisha.pm_extract(
         expr_subset,
         _df2pymisha(intervals_df),
@@ -2381,25 +2425,37 @@ def _parallel_extract_tracks(
     """
     import multiprocessing
 
-    max_procs = int(config.get("max_processes", 1))
-    if max_procs < 2 or len(exprs) < 2:
+    if len(exprs) < 2:
+        return None
+    # Repeated expressions are deduped into distinct column names ('expr',
+    # 'expr_', 'expr__') by the C++ writer, which only sees its own chunk -
+    # so the same expression in two chunks would come back twice as 'expr'.
+    # Rare enough that falling back beats threading a global name map.
+    if len(set(exprs)) != len(exprs):
         return None
 
-    n_workers = min(max_procs, len(exprs))
+    n_workers = min(_effective_max_procs(config), len(exprs))
+    if n_workers < 2:
+        return None
     expr_chunks = _split_exprs(exprs, n_workers)
 
     worker_config = dict(config)
     worker_config["progress"] = False
+    worker_config["multitasking"] = False  # workers must not fork again
 
-    intervals_dict = intervals.to_dict(orient="list")
     worker_args = [
-        (intervals_dict, chunk, iterator, worker_config, vtracks_dict)
-        for chunk in expr_chunks
+        (chunk, iterator, worker_config, vtracks_dict) for chunk in expr_chunks
     ]
 
+    # Publish the shared scope before Pool() forks; children inherit it.
+    global _FORK_SHARED_INTERVALS
     ctx = multiprocessing.get_context("fork")
-    with ctx.Pool(processes=n_workers) as pool:
-        results = pool.map(_worker_extract_tracks, worker_args)
+    _FORK_SHARED_INTERVALS = intervals
+    try:
+        with ctx.Pool(processes=n_workers) as pool:
+            results = pool.map(_worker_extract_tracks, worker_args)
+    finally:
+        _FORK_SHARED_INTERVALS = None
 
     non_empty = [(chunk, df) for chunk, df in zip(expr_chunks, results, strict=True)
                  if df is not None and len(df) > 0]
@@ -2458,7 +2514,7 @@ def _parallel_extract(
     """
     import multiprocessing
 
-    max_procs = int(config.get("max_processes", 1))
+    max_procs = _effective_max_procs(config)
     if max_procs < 2:
         return None
 
@@ -2523,6 +2579,7 @@ def _parallel_extract(
 
     worker_config = dict(config)
     worker_config["progress"] = False
+    worker_config["multitasking"] = False  # workers must not fork again
 
     worker_args = []
     run_parent_maps = []
@@ -2774,23 +2831,34 @@ def gextract(
         # Try parallel extraction if max_processes > 1.
         # Skip when a custom progress callback is provided (not compatible
         # with forked workers) or when file output is requested.
-        with _config_no_mt(_itr_id_map) as _cfg:
+        # Resolve the strategy before entering _config_no_mt: track-parallel is
+        # worth forking even when the iterator came in as a DataFrame, which
+        # otherwise pins the whole extraction to one process.
+        strategy = _resolve_parallel_strategy(
+            str(CONFIG.get("multitasking_strategy", "auto")),
+            n_exprs=len(exprs),
+            iterator=iterator,
+        )
+        track_parallel = strategy == "tracks" and not _tracks_workload_too_small_for_fork(
+            intervals, len(exprs), CONFIG
+        )
+        with _config_no_mt(_itr_id_map, keep=track_parallel) as _cfg:
             df = None
-            _max_procs = int(_cfg.get("max_processes", 1))
+            # Mirror the C++ gate, which divides the scope by the same
+            # core-clamped worker count it would actually fork.
+            _max_procs = _effective_max_procs(_cfg)
             use_parallel = (
                 _cfg.get("multitasking")
                 and _max_procs > 1
                 and not callable(progress)
                 and file is None
-                and not _workload_too_small_for_fork(intervals, _max_procs, _cfg)
+                and (
+                    track_parallel
+                    or not _workload_too_small_for_fork(intervals, _max_procs, _cfg)
+                )
             )
             if use_parallel:
-                strategy = _resolve_parallel_strategy(
-                    _cfg.get("multitasking_strategy", "auto"),
-                    n_exprs=len(exprs),
-                    iterator=iterator,
-                )
-                if strategy == "tracks":
+                if track_parallel:
                     df = _parallel_extract_tracks(
                         exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict,
                     )
@@ -2799,11 +2867,18 @@ def gextract(
 
             if df is None:
                 with _progress_context(progress, desc=progress_desc):
+                    # The C++ scanner cannot fork under a DataFrame-derived
+                    # iterator: intervalIDs are sequential indices into the
+                    # intersected scope and _remap_interval_ids relies on that.
+                    _serial_cfg = _cfg
+                    if _itr_id_map is not None and _cfg.get("multitasking"):
+                        _serial_cfg = dict(_cfg)
+                        _serial_cfg["multitasking"] = False
                     result = _pymisha.pm_extract(
                         exprs,
                         _df2pymisha(intervals),
                         iterator,
-                        _cfg,
+                        _serial_cfg,
                         vtracks_dict,
                     )
                 df = _pymisha2df(result)
