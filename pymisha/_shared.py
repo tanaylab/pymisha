@@ -10,6 +10,7 @@ Use PyMisha APIs from a single controlling thread or add external locking.
 from __future__ import annotations
 
 import contextlib as _contextlib
+import datetime as _datetime
 import os as _os
 import sys as _sys
 from contextlib import contextmanager
@@ -215,7 +216,33 @@ def _track_names_set() -> frozenset[str]:
     return _TRACK_NAMES_SET
 
 
-def _pm_dbreload() -> None:
+def _touch_db_cache_dirty(groot: str | None = None) -> None:
+    """Write R misha's ``.db.cache.dirty`` sentinel for *groot*.
+
+    R misha caches its track/interval-set inventory in
+    ``<groot>/.db.cache`` and decides whether that cache is stale purely
+    by checking whether ``<groot>/.db.cache.dirty`` exists (see misha's
+    ``R/db-cache.R``, ``.gdb.cache_is_dirty`` / ``.gdb.cache_mark_dirty``).
+    pymisha writes directly to the database through the C++ layer and
+    never wrote that sentinel, so a track or interval set created in
+    Python stayed invisible to a fresh R ``gsetroot()`` on the same
+    database until someone ran ``gdb.reload(rescan = TRUE)``.
+
+    Call this from every pymisha path that creates, removes, or renames
+    a track or interval set. Best-effort: a failure to write the
+    sentinel (e.g. a read-only database) is silently ignored, mirroring
+    R's own tolerant behavior in ``.gdb.cache_mark_dirty``.
+    """
+    if groot is None:
+        groot = _GROOT
+    if not groot:
+        return
+    dirty_path = _os.path.join(groot, ".db.cache.dirty")
+    with _contextlib.suppress(OSError), open(dirty_path, "w") as fh:
+        fh.write(_datetime.datetime.now().isoformat())
+
+
+def _pm_dbreload(groot: str | None = None) -> None:
     """Reload the C++ track scan + clear all Python-side caches.
 
     Every internal track-mutation site (gtrack_rm, gtrack_create_*,
@@ -224,11 +251,21 @@ def _pm_dbreload() -> None:
     caches (track names, computed-track types, expression-validation
     set).  Routing all those callers through this helper keeps the
     cached views in sync with the C++ side.
+
+    *groot*: the database root the triggering mutation actually wrote
+    to, when that can differ from the current ``_GROOT`` - a user-root
+    overlay (``_UROOT``, see ``_target_root()`` in tracks.py), or an
+    explicit ``db=`` argument on a track op that targets another loaded
+    database. Defaults to the current ``_GROOT`` (matching the previous,
+    implicit behavior) when the caller doesn't know any better.
     """
     _pymisha.pm_dbreload()
     _clear_track_names_cache()
     from .tracks import _clear_computed_track_cache
     _clear_computed_track_cache()
+    # Also tell a sibling R session sharing this database that its
+    # .db.cache is stale (R never sees pymisha's mutations otherwise).
+    _touch_db_cache_dirty(groot)
 
 
 def _df2pymisha(arg):

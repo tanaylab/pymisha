@@ -232,3 +232,59 @@ class TestGextractSmallIterator:
         assert np.allclose(coarse, expected, rtol=1e-5, atol=1e-7), (
             f"coarse={coarse} expected_mean={expected}"
         )
+
+
+class TestGextractIntervalsPositionTrackName:
+    """A track name in gextract's ``intervals`` position is a *documented,
+    deliberate* value, not an error condition.
+
+    R misha lets a track name stand in for the scope ("the intervals over
+    which that track is defined" - see ``_maybe_load_intervals_set`` in
+    pymisha/extract.py, commit 15e5ef8, CHANGELOG.md v0.4.0). Because of
+    this, ``gextract`` cannot distinguish "the caller meant this string as a
+    scope" from "the caller meant this string as a second expression and it
+    happens to share a track's name" - both produce an identical
+    ``intervals`` value, so there is no value-based check that could reject
+    one case without also rejecting the other.
+
+    This means R misha's own ``gextract(expr1, expr2, ..., intervals)`` call
+    shape does NOT port line-by-line to pymisha: pymisha's ``gextract`` has
+    a single fixed ``intervals`` argument, so a second expression string
+    silently lands there and - if it happens to name a track - is silently
+    accepted as a scope instead of raising. This is a real, documented
+    porting trap; see docs/guides/parity.md. It is not fixed here because it
+    cannot be fixed without breaking the legitimate feature these tests pin.
+    """
+
+    def test_track_name_as_intervals_scope_resolves_to_track_domain(self):
+        """gextract(expr, <track_name>) uses <track_name>'s own defined
+        intervals as the scope (R parity). No stored interval set shares the
+        name, so this is the plain (non-collision) path - the gap that let a
+        stricter, value-based check silently break this feature go untested."""
+        assert not pm.gintervals_exists("sparse_track")
+
+        def _sorted(df):
+            cols = [c for c in ("chrom", "start", "end") if c in df.columns]
+            return df.sort_values(cols).reset_index(drop=True)
+
+        # Oracle: sparse_track's own intervals, passed explicitly as a DataFrame scope.
+        scope_df = pm.gextract("sparse_track", pm.gintervals_all())[["chrom", "start", "end"]]
+        by_df = _sorted(pm.gextract("dense_track", scope_df))
+        by_name = _sorted(pm.gextract("dense_track", "sparse_track"))
+
+        assert len(by_name) == len(by_df)
+        assert list(by_name["start"]) == list(by_df["start"])
+        assert list(by_name["end"]) == list(by_df["end"])
+
+    def test_stored_interval_set_name_wins_over_track_name_collision(self):
+        """If a name resolves to both a track and a stored interval set, the
+        interval set wins (matches R misha's own name-resolution order and
+        pymisha's pre-existing ``_maybe_load_intervals_set`` precedent)."""
+        collision_name = "dense_track"
+        assert pm.gtrack_exists(collision_name)
+        pm.gintervals_save(pm.gintervals("1", 0, 100), collision_name)
+        try:
+            result = pm.gextract("sparse_track", collision_name)
+            assert result is not None
+        finally:
+            pm.gintervals_rm(collision_name, force=True)

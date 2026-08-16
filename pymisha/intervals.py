@@ -679,6 +679,8 @@ def gintervals_2d_band_intersect(
     """
     np = _numpy
 
+    _verify_2d_intervals(intervals)
+
     if band is None:
         raise ValueError("band cannot be None")
     if len(band) != 2:
@@ -770,6 +772,133 @@ def _validate_2d_intervals(intervals: pd.DataFrame, name: str = "intervals") -> 
         raise ValueError(
             f"{name} is missing required 2D columns: {missing}"
         )
+
+
+# Memoized (genome_root -> {chrom: size}) for _verify_2d_intervals's
+# past-the-chromosome-boundary check. That check is on the hot path of a
+# streaming extraction: giterator_intervals_2d dispatches _gextract_2d once
+# per input interval, and _gextract_2d's multi-track loop re-validates once
+# per required track, so a naive per-call gintervals_all() (a ~150us C++
+# round trip, independent of contig count) turns a 10^4-10^5-row streaming
+# job into seconds of pure validation overhead. The chrom set doesn't
+# change while its root stays loaded, so caching against the active root
+# and refetching only when the root itself changes is sufficient
+# invalidation -- no track/interval-set mutation touches chrom_sizes.txt.
+_chrom_sizes_cache: tuple[str | None, dict[str, int]] | None = None
+
+
+def _clear_chrom_sizes_cache() -> None:
+    """Drop the memoized chrom-size dict. Called on root transitions
+    (gdb_init/gdb_reload/gdb_unload), matching how _clear_track_names_cache
+    is wired in the same three places. Not called from every track/interval
+    mutation (unlike the track-names cache) since chrom_sizes.txt is a
+    genome-root-level file those mutations never touch -- doing so would
+    undercut the whole point of memoizing this for a streaming job."""
+    global _chrom_sizes_cache
+    _chrom_sizes_cache = None
+
+
+def _chrom_sizes_for_2d_verify() -> dict[str, int] | None:
+    """Chrom name -> size dict for the active genome root, memoized per root.
+
+    Returns ``None`` when there is no active root (or the lookup otherwise
+    fails), so the caller can skip the boundary check rather than erroring.
+    """
+    global _chrom_sizes_cache
+    from . import _shared
+
+    root = _shared._GROOT
+    if _chrom_sizes_cache is not None and _chrom_sizes_cache[0] == root:
+        return _chrom_sizes_cache[1]
+
+    try:
+        all_intervals = gintervals_all()
+    except Exception:
+        return None
+
+    sizes = dict(
+        zip(
+            all_intervals['chrom'].astype(str).tolist(),
+            all_intervals['end'].astype(int).tolist(), strict=False,
+        )
+    )
+    _chrom_sizes_cache = (root, sizes)
+    return sizes
+
+
+def _verify_2d_intervals(intervals: pd.DataFrame) -> None:
+    """Reject NaN, negative, inverted (``start >= end``), and
+    past-the-chromosome 2D interval coordinates.
+
+    The 1D path validates coordinates in C++ (``verify_interval_coords`` in
+    ``src/PMStubs.cpp``) and R misha validates 2D intervals via
+    ``GInterval2D::verify`` (``misha/src/GInterval2D.h``); pymisha's C++
+    never calls the 2D equivalent, so the raw-DataFrame 2D path validated
+    nothing. This is the shared Python-level check for that path, worded to
+    match both as closely as the two allow.
+
+    The chromosome-boundary check is best-effort: it is skipped for chrom
+    labels the active database does not resolve to a size, since
+    ``gintervals_2d_intersect``/``_union``/``_band_intersect`` operate on
+    rectangle frames without requiring a genome-registered chrom name.
+    """
+    if intervals is None or len(intervals) == 0:
+        return
+
+    np = _numpy
+    chrom1 = intervals['chrom1'].astype(str).to_numpy()
+    chrom2 = intervals['chrom2'].astype(str).to_numpy()
+    start1 = pd.to_numeric(intervals['start1'], errors='coerce').to_numpy(dtype='float64')
+    end1 = pd.to_numeric(intervals['end1'], errors='coerce').to_numpy(dtype='float64')
+    start2 = pd.to_numeric(intervals['start2'], errors='coerce').to_numpy(dtype='float64')
+    end2 = pd.to_numeric(intervals['end2'], errors='coerce').to_numpy(dtype='float64')
+
+    def _coord(v: float) -> str:
+        # Only called on finite values (NaN is handled separately, below).
+        return str(int(v))
+
+    def _raise(i: int, msg: str) -> None:
+        raise ValueError(
+            f"Interval ({chrom1[i]}, {_coord(start1[i])}, {_coord(end1[i])}, "
+            f"{chrom2[i]}, {_coord(start2[i])}, {_coord(end2[i])}): {msg}"
+        )
+
+    nan_mask = np.isnan(start1) | np.isnan(end1) | np.isnan(start2) | np.isnan(end2)
+    if nan_mask.any():
+        i = int(np.argmax(nan_mask))
+        raise ValueError(f"Interval coordinates contain a missing (NaN) value at index {i}")
+
+    neg_mask = (start1 < 0) | (start2 < 0)
+    if neg_mask.any():
+        _raise(int(np.argmax(neg_mask)), "start coordinate must be greater or equal than zero")
+
+    inverted_mask = (start1 >= end1) | (start2 >= end2)
+    if inverted_mask.any():
+        # The trailing hint mirrors R misha's 1D message (misha/src/GInterval.h):
+        # an inverted or zero-width rectangle is most often a 1-based input that
+        # was never converted. R's own 2D message omits it, and so does
+        # pymisha's 1D one (which lives in C++); see docs/guides/parity.md.
+        _raise(
+            int(np.argmax(inverted_mask)),
+            "start coordinate must be lesser than end coordinate. "
+            "misha uses 0-based, half-open [start, end) coordinates; "
+            "if your input is 1-based (GFF/GTF/VCF), subtract 1 from start.",
+        )
+
+    chrom_sizes = _chrom_sizes_for_2d_verify()
+    if chrom_sizes is None:
+        return  # No active genome root (or similar): skip the boundary check.
+
+    # Plain dict.get, not pd.Series(...).map(...): profiling the streaming
+    # path (giterator_intervals_2d, one _gextract_2d call per row) showed
+    # Series.map() -- which round-trips through pandas' Arrow string
+    # machinery on this dtype-backend default -- dominating this function's
+    # cost even after the chrom-size dict itself was memoized.
+    size1 = np.fromiter((chrom_sizes.get(c, np.nan) for c in chrom1), dtype='float64', count=len(chrom1))
+    size2 = np.fromiter((chrom_sizes.get(c, np.nan) for c in chrom2), dtype='float64', count=len(chrom2))
+    boundary_mask = (end1 > np.nan_to_num(size1, nan=np.inf)) | (end2 > np.nan_to_num(size2, nan=np.inf))
+    if boundary_mask.any():
+        _raise(int(np.argmax(boundary_mask)), "end coordinate exceeds chromosome boundaries")
 
 
 def _intersect_2d_rects(
@@ -936,6 +1065,8 @@ def gintervals_2d_intersect(intervals1: pd.DataFrame, intervals2: pd.DataFrame) 
 
     _validate_2d_intervals(intervals1, "intervals1")
     _validate_2d_intervals(intervals2, "intervals2")
+    _verify_2d_intervals(intervals1)
+    _verify_2d_intervals(intervals2)
 
     if len(intervals1) == 0 or len(intervals2) == 0:
         return None
@@ -988,6 +1119,8 @@ def gintervals_2d_union(intervals1: pd.DataFrame, intervals2: pd.DataFrame) -> p
 
     _validate_2d_intervals(intervals1, "intervals1")
     _validate_2d_intervals(intervals2, "intervals2")
+    _verify_2d_intervals(intervals1)
+    _verify_2d_intervals(intervals2)
 
     cols = ['chrom1', 'start1', 'end1', 'chrom2', 'start2', 'end2']
 
@@ -3797,6 +3930,12 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
         # Normalize chromosome names
         df["chrom1"] = _normalize_chroms(df["chrom1"].astype(str).tolist())
         df["chrom2"] = _normalize_chroms(df["chrom2"].astype(str).tolist())
+        # Reject bad coordinates before they reach the disk. Every query path
+        # validates its 2D frames, but a saved set is read back later (and by
+        # other processes), so an unvalidated write persists the corruption
+        # instead of raising at the point where the mistake was made. Runs on
+        # the normalized labels so an aliased chrom still resolves to a size.
+        _verify_2d_intervals(df)
         # Sort by (chrom1, chrom2)
         df = df.sort_values(["chrom1", "chrom2"]).reset_index(drop=True)
         # Convert chrom to categorical (R factor style)
@@ -3827,6 +3966,71 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     # pm_dbreload rescan of the tracks/ tree.
     with _contextlib.suppress(Exception):
         _pymisha.pm_interv_register(intervals_set)
+
+    # Tell a sibling R session sharing this database that its .db.cache
+    # is stale (R never sees pymisha's mutations otherwise).
+    _shared._touch_db_cache_dirty()
+
+
+def _replace_intervals_set(intervals: pd.DataFrame, intervals_set: str) -> None:
+    """Overwrite an existing interval set, keeping the old contents on disk
+    until the new ones are written and accepted.
+
+    ``gintervals_rm`` followed by ``gintervals_save`` cannot be used for this:
+    ``gintervals_save`` validates the frame (2D coordinates in particular),
+    so a rejected frame leaves the caller with no set at all - the removal
+    already happened. That is reachable from data the caller never supplied,
+    because R's ``gintervals.save`` fast path verifies nothing, so an
+    ordinary R-written set can hold rows that pymisha's writer refuses.
+
+    R updates a small set by rewriting the file in place
+    (``.gintervals.save_file``, no removal), so it has no window at all. This
+    is the same shape, one step safer: write under a temporary name, then
+    rename it over the original. ``os.replace`` is atomic, so a crash at any
+    point leaves either the old set or the new one, never nothing.
+
+    The old set's ``.iattr`` companion survives the rename, which is what R
+    does too - attributes describe the set, not its rows. A directory-backed
+    set still loses it with the rest of the directory, as it did before.
+    """
+    from . import _shared
+    assert _shared._GROOT is not None
+
+    dest = Path(_shared._GROOT) / "tracks" / f"{intervals_set.replace('.', '/')}.interv"
+
+    # An underscore suffix (not a dotted one) keeps the temporary set a sibling
+    # *file* of dest rather than a new dotted namespace, so the rename below
+    # stays inside one directory - and therefore one filesystem.
+    tmp_name = f"{intervals_set}_pmtmp{os.getpid()}_{os.urandom(4).hex()}"
+    tmp_path = Path(_shared._GROOT) / "tracks" / f"{tmp_name.replace('.', '/')}.interv"
+
+    # Raises before anything is destroyed if the frame is not saveable.
+    gintervals_save(intervals, tmp_name)
+
+    try:
+        if dest.is_dir():
+            # A directory-backed (big) set cannot be replaced by os.replace().
+            # This is the one branch with a window, but the payload is already
+            # complete under tmp_name, so a failure here leaves the data
+            # recoverable rather than gone.
+            gintervals_rm(intervals_set, force=True)
+        os.replace(tmp_path, dest)
+    except BaseException:
+        # Only drop the temporary copy if the original survived; if it did not,
+        # the temporary set is the only copy of the data left.
+        if dest.exists():
+            with _contextlib.suppress(Exception):
+                gintervals_rm(tmp_name, force=True)
+        raise
+
+    # tmp_name's registration now points at a path that no longer exists, and
+    # dest may have been unregistered by the gintervals_rm above.
+    with _contextlib.suppress(Exception):
+        _pymisha.pm_interv_unregister(tmp_name)
+    with _contextlib.suppress(Exception):
+        _pymisha.pm_interv_register(intervals_set)
+
+    _shared._touch_db_cache_dirty()
 
 
 def gintervals_update(
@@ -3936,9 +4140,7 @@ def gintervals_update(
     if len(kept) == 0:
         raise ValueError("Cannot save empty intervals")
 
-    # Remove and re-save
-    gintervals_rm(intervals_set, force=True)
-    gintervals_save(kept, intervals_set)
+    _replace_intervals_set(kept, intervals_set)
 
 
 def gintervals_mapply(
@@ -4106,8 +4308,12 @@ def gintervals_mapply(
 
     if intervals_set_out is not None:
         if gintervals_exists(intervals_set_out):
-            gintervals_rm(intervals_set_out, force=True)
-        gintervals_save(result_df, intervals_set_out)
+            # Same shape gintervals_update had: removing first means a save that
+            # refuses the frame (an empty result, say) leaves neither the old set
+            # nor the new one. Swap the new content in instead.
+            _replace_intervals_set(result_df, intervals_set_out)
+        else:
+            gintervals_save(result_df, intervals_set_out)
         return None
 
     return result_df
@@ -6000,6 +6206,10 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
     # the removal immediately (no pm_dbreload required).
     with _contextlib.suppress(Exception):
         _pymisha.pm_interv_unregister(intervals_set)
+
+    # Tell a sibling R session sharing this database that its .db.cache
+    # is stale (R never sees pymisha's mutations otherwise).
+    _shared._touch_db_cache_dirty()
 
 
 def _open_genes_file(path_or_url: str) -> tuple[IO[str], str | None]:

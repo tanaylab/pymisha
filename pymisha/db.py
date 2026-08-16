@@ -78,6 +78,10 @@ def gdb_init(path: str, userpath: str | None = None):
     # Track-names cache (Python list/set view over C++ track_cache).
     from ._shared import _clear_track_names_cache
     _clear_track_names_cache()
+    # Memoized 2D-interval-verify chrom-size lookup (keyed by root, but
+    # cleared here too rather than relying solely on that key changing).
+    from .intervals import _clear_chrom_sizes_cache
+    _clear_chrom_sizes_cache()
 
     _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _pymisha.pm_dbsetdatasets([])
@@ -131,6 +135,8 @@ def gdb_reload():
     _clear_computed_track_cache()
     from ._shared import _clear_track_names_cache
     _clear_track_names_cache()
+    from .intervals import _clear_chrom_sizes_cache
+    _clear_chrom_sizes_cache()
 
 
 def gdb_mark_cache_dirty():
@@ -139,9 +145,11 @@ def gdb_mark_cache_dirty():
 
     In R misha, this writes a ``.db.cache.dirty`` sentinel file so that
     the next ``gsetroot()`` or ``gdb.reload(rescan=FALSE)`` knows it must
-    re-scan the file system. In pymisha, :func:`gdb_reload` always
-    performs a full C++ rescan (there is no lazy cache), so calling this
-    function is equivalent to calling :func:`gdb_reload` directly.
+    re-scan the file system. pymisha does the same: it performs a full
+    C++ rescan in-process (there is no lazy cache on the Python side) and
+    also writes the ``.db.cache.dirty`` sentinel, so a sibling R session
+    sharing this database picks up the change without needing
+    ``gdb.reload(rescan = TRUE)``.
 
     This function is provided for API compatibility with R misha scripts
     that call ``gdb.mark_cache_dirty()``.
@@ -168,6 +176,7 @@ def gdb_mark_cache_dirty():
     """
     _checkroot()
     _pymisha.pm_dbreload()
+    _shared._touch_db_cache_dirty()
 
 
 def gdb_unload():
@@ -207,6 +216,8 @@ def gdb_unload():
     _clear_computed_track_cache()
     from ._shared import _clear_track_names_cache
     _clear_track_names_cache()
+    from .intervals import _clear_chrom_sizes_cache
+    _clear_chrom_sizes_cache()
 
 
 def gdb_examples_path():

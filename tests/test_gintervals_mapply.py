@@ -160,3 +160,52 @@ class TestGintervalsMapply:
         assert len(seen) == 2
         assert set(seen[0]) >= {"chrom", "start", "end"}
         assert seen[0]["chrom"] in ("1", "2")
+
+
+class TestGintervalsMapplyIntervalsSetOut:
+    """``intervals_set_out=`` overwrites an existing set (a divergence from R,
+    which refuses an existing name). The overwrite must not be able to leave
+    the caller with neither the old set nor the new one.
+    """
+
+    @pytest.fixture()
+    def _existing_set(self):
+        name = "test_mapply_out_set"
+        if pymisha.gintervals_exists(name):
+            pymisha.gintervals_rm(name, force=True)
+        pymisha.gintervals_save(pymisha.gintervals("1", 0, 1000), name)
+        yield name
+        if pymisha.gintervals_exists(name):
+            pymisha.gintervals_rm(name, force=True)
+
+    def test_overwrite_replaces_content(self, _existing_set):
+        """Baseline: a successful run replaces the set's content."""
+        intervals = pymisha.gintervals(["1", "2"], [0, 0], [10000, 10000])
+        assert pymisha.gintervals_mapply(
+            np.nanmax, "dense_track", intervals=intervals,
+            intervals_set_out=_existing_set,
+        ) is None
+        loaded = pymisha.gintervals_load(_existing_set)
+        assert len(loaded) == 2
+        assert "value" in loaded.columns
+
+    def test_rejected_result_leaves_the_old_set_intact(self, _existing_set):
+        """An empty query frame makes the save refuse ("Cannot save empty
+        intervals"); the pre-existing set must survive that refusal.
+        """
+        import pandas as pd
+
+        empty = pd.DataFrame({
+            "chrom": pd.Series([], dtype=object),
+            "start": pd.Series([], dtype="int64"),
+            "end": pd.Series([], dtype="int64"),
+        })
+        with pytest.raises(ValueError, match="Cannot save empty intervals"):
+            pymisha.gintervals_mapply(
+                lambda x: 0.0, "dense_track", intervals=empty,
+                intervals_set_out=_existing_set,
+            )
+        assert pymisha.gintervals_exists(_existing_set), "the failed run deleted the set"
+        loaded = pymisha.gintervals_load(_existing_set)
+        assert len(loaded) == 1
+        assert int(loaded.iloc[0]["end"]) == 1000

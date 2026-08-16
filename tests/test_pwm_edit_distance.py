@@ -4272,6 +4272,129 @@ class TestVtrackDirectionBelowMaxEdits:
                     f"max_edits={k} should be NaN when exact={exact}"
 
 
+class TestVtrackDirectionBelowMaxEditsAllN:
+    """Regression: all-N window + direction='below' + max_edits must be 0,
+    not NaN.
+
+    The sliding-window N-count prefilter (``use_n_skip``) is only sound for
+    direction='above' with substitutions only: an N is not a mandatory edit
+    when the goal is to fall *below* a threshold (an N is scored at
+    col_max, the worst case for going below), so an all-N window can
+    already be at/below threshold with 0 edits. Pruning on N-count alone
+    for direction='below' turns that correct 0 into NaN. R misha fixed
+    this in 5.10.3; this guards against the same regression in pymisha.
+    """
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    def test_all_n_below_max_edits_is_zero_not_nan(self):
+        import os
+        hg38_root = os.path.expanduser("~/hg38")
+        if not os.path.isdir(hg38_root):
+            pytest.skip(f"hg38 not available at {hg38_root}")
+
+        pm.gdb_init(hg38_root)
+
+        # chr1:0-100 in hg38 is an all-N telomeric-gap region.
+        interval = pm.gintervals(["chr1"], [0], [100])
+        seq = pm.gseq_extract(interval)[0]
+        assert set(seq.upper()) <= {"N"}, \
+            "expected an all-N region at hg38 chr1:0-100"
+
+        pssm = np.array([
+            [0.9, 0.05, 0.025, 0.025],
+            [0.05, 0.9, 0.025, 0.025],
+            [0.025, 0.9, 0.05, 0.025],
+            [0.025, 0.025, 0.9, 0.05],
+            [0.9, 0.025, 0.05, 0.025],
+            [0.05, 0.025, 0.9, 0.025],
+            [0.025, 0.05, 0.025, 0.9],
+            [0.9, 0.025, 0.025, 0.05],
+        ])
+
+        pm.gvtrack_create("edist_below_none", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=10, direction="below",
+                          bidirect=False, extend=False, max_edits=None)
+        pm.gvtrack_create("edist_below_1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=10, direction="below",
+                          bidirect=False, extend=False, max_edits=1)
+
+        result = pm.gextract(["edist_below_none", "edist_below_1"],
+                             interval, iterator=interval)
+
+        # R misha (5.10.3+) returns 0 for both max_edits=None and
+        # max_edits=1 on this exact case.
+        npt.assert_allclose(result["edist_below_none"].iloc[0], 0, atol=1e-6)
+        npt.assert_allclose(
+            result["edist_below_1"].iloc[0], 0, atol=1e-6,
+            err_msg="N-skip prefilter incorrectly pruned an all-N window "
+                    "under direction='below' + max_edits, returning NaN "
+                    "instead of 0",
+        )
+
+    def test_all_n_below_max_edits_with_indels_is_zero_not_nan(self):
+        """Same case with indels enabled - the guard's other new clause.
+
+        The fixed guard is
+        ``m_max_edits >= 0 && max_start > 0 && !is_below() && m_max_indels == 0``.
+        This exercises ``max_indels > 0``, which the substitutions-only test
+        above does not reach. (The ``m_max_indels == 0`` clause cannot be
+        isolated on its own: in this cost model an indel costs a full edit and
+        can remove at most one base from the alignment, so ``edits >= n_count``
+        holds with indels too and the prune never over-rejects for
+        ``direction="above"``. It is carried verbatim from R misha 5.10.3 so
+        the prune's stated domain and its guard stay in sync.)
+        """
+        import os
+        hg38_root = os.path.expanduser("~/hg38")
+        if not os.path.isdir(hg38_root):
+            pytest.skip(f"hg38 not available at {hg38_root}")
+
+        pm.gdb_init(hg38_root)
+        interval = pm.gintervals(["chr1"], [0], [100])
+        seq = pm.gseq_extract(interval)[0]
+        assert set(seq.upper()) <= {"N"}, \
+            "expected an all-N region at hg38 chr1:0-100"
+
+        pssm = np.array([
+            [0.9, 0.05, 0.025, 0.025],
+            [0.05, 0.9, 0.025, 0.025],
+            [0.025, 0.9, 0.05, 0.025],
+            [0.025, 0.025, 0.9, 0.05],
+            [0.9, 0.025, 0.05, 0.025],
+            [0.05, 0.025, 0.9, 0.025],
+            [0.025, 0.05, 0.025, 0.9],
+            [0.9, 0.025, 0.025, 0.05],
+        ])
+
+        pm.gvtrack_create("edist_below_ind_none", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=10, direction="below",
+                          bidirect=False, extend=False,
+                          max_edits=None, max_indels=1)
+        pm.gvtrack_create("edist_below_ind_1", None,
+                          func="pwm.edit_distance",
+                          pssm=pssm, score_thresh=10, direction="below",
+                          bidirect=False, extend=False,
+                          max_edits=1, max_indels=1)
+
+        result = pm.gextract(["edist_below_ind_none", "edist_below_ind_1"],
+                             interval, iterator=interval)
+
+        npt.assert_allclose(result["edist_below_ind_none"].iloc[0], 0, atol=1e-6)
+        npt.assert_allclose(
+            result["edist_below_ind_1"].iloc[0], 0, atol=1e-6,
+            err_msg="N-skip prefilter incorrectly pruned an all-N window "
+                    "under direction='below' + max_edits + max_indels",
+        )
+
+
 class TestVtrackDirectionBelowBidirectional:
     """Bidirectional scanning with direction='below' on virtual tracks."""
 

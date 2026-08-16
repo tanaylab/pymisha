@@ -2780,6 +2780,7 @@ def gtrack_liftover(
         _load_track_attributes,
         _save_track_attributes,
         _set_created_attrs,
+        _target_root,
         _track_dir_for_create,
         _track_exists,
         _validate_track_name,
@@ -2845,7 +2846,7 @@ def gtrack_liftover(
     if len(result["chrom"]) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(track, description, created_by)
         return None
 
@@ -2864,7 +2865,7 @@ def gtrack_liftover(
         if len(target_df) == 0:
             track_dir = _track_dir_for_create(track)
             track_dir.mkdir(parents=True, exist_ok=True)
-            _pm_dbreload()
+            _pm_dbreload(_target_root())
             _set_created_attrs(track, description, created_by)
             return None
         gtrack_create_dense(
@@ -2999,6 +3000,7 @@ def _gtrack_liftover_python(
         _load_track_attributes,
         _save_track_attributes,
         _set_created_attrs,
+        _target_root,
         _track_dir_for_create,
         _track_exists,
         _validate_track_name,
@@ -3041,7 +3043,7 @@ def _gtrack_liftover_python(
     if len(src_data) == 0 or len(chain) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(track, description, created_by)
         return
 
@@ -3064,7 +3066,7 @@ def _gtrack_liftover_python(
     if len(lifted) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(track, description, created_by)
         return
 
@@ -3101,7 +3103,7 @@ def _gtrack_liftover_python(
             if len(per_bin_nonnan) == 0:
                 track_dir = _track_dir_for_create(track)
                 track_dir.mkdir(parents=True, exist_ok=True)
-                _pm_dbreload()
+                _pm_dbreload(_target_root())
                 _set_created_attrs(track, description, created_by)
                 return
             # Each interval is exactly 1 bin wide and we pre-aggregated via the
@@ -3132,7 +3134,7 @@ def _gtrack_liftover_python(
     if len(target_data) == 0:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(track, description, created_by)
         return
 
@@ -3260,6 +3262,7 @@ def _gtrack_liftover_2d(
         _load_track_attributes,
         _save_track_attributes,
         _set_created_attrs,
+        _target_root,
         _track_dir_for_create,
         _track_exists,
         _validate_track_name,
@@ -3308,7 +3311,7 @@ def _gtrack_liftover_2d(
     def _empty_track() -> None:
         track_dir = _track_dir_for_create(track)
         track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(track, description, created_by)
 
     if len(result["chrom1"]) == 0:

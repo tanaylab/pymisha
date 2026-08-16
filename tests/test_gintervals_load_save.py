@@ -1,11 +1,36 @@
 """Tests for gintervals_load and gintervals_save functions."""
 
 
+import shutil
+import subprocess
+
 import numpy as np
 import pandas as pd
 import pytest
 
 import pymisha as pm
+
+
+_RSCRIPT_AVAILABLE = shutil.which("Rscript") is not None
+
+
+def _require_r_misha() -> None:
+    """Skip the calling test unless the R ``misha`` package actually loads.
+
+    Deliberately *not* probed at import time: pytest imports every test module
+    during collection, so a module-level ``library(misha)`` probe spawns an
+    Rscript subprocess (and pays R's package-load time) on every pytest
+    invocation, whether or not this file was selected.
+    """
+    try:
+        result = subprocess.run(
+            ["Rscript", "-e", "library(misha)"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001 -- any failure means "no R misha"
+        pytest.skip(f"R misha not usable: {exc}")
+    if result.returncode != 0:
+        pytest.skip("R misha not installed")
 
 
 class TestGintervalsLoad:
@@ -184,3 +209,67 @@ class TestGintervalsLoadGoldenMaster:
             assert str(result.iloc[i]["chrom"]) == chrom
             assert result.iloc[i]["start"] == start
             assert result.iloc[i]["end"] == end
+
+
+class TestGintervalsSaveRParity:
+    """An interval set written by pymisha must be loadable by R misha.
+
+    Regression for the missing OBJECT bit in `_r_serialize.py`'s data.frame
+    head word: without it, R unserializes an object whose `class` attribute
+    says "data.frame" but whose internal OBJECT flag is unset, so S3 dispatch
+    for `dim()`/`nrow()` never fires and `gintervals.load()` dies with
+    "argument is of length zero" even though the file is otherwise well-formed.
+    """
+
+    def test_object_bit_is_written(self, tmp_path):
+        """The head word of the written data.frame carries R's OBJECT bit.
+
+        Unconditional counterpart to the round-trip test below, which can only
+        run where R misha is installed. R's serialize.c ORs the OBJECT bit
+        (1 << 8) into the head word whenever the object carries a `class`
+        attribute; without it R's `dim`/`nrow` never dispatch. For a classed
+        VECSXP the head word is VECSXP | HAS_ATTR | OBJECT = 19 | 512 | 256
+        = 0x313.
+        """
+        import struct
+
+        from pymisha._r_serialize import write_dataframe
+
+        path = tmp_path / "object_bit.interv"
+        write_dataframe(str(path), pd.DataFrame({"chrom": ["1"], "start": [1.0], "end": [2.0]}))
+
+        raw = path.read_bytes()
+        # XDR R serialization: "X\n" magic, then version / writer / reader
+        # version ints, then the head word of the top-level object.
+        assert raw[:2] == b"X\n"
+        head = struct.unpack_from(">i", raw, 2 + 3 * 4)[0]
+        assert head == 0x313, f"head word 0x{head:x}, expected 0x313 (OBJECT bit missing?)"
+
+    @pytest.mark.skipif(
+        not _RSCRIPT_AVAILABLE, reason="Rscript not on PATH"
+    )
+    def test_saved_intervals_load_in_r(self):
+        _require_r_misha()
+        groot = pm._shared._GROOT
+        name = "test_r_object_bit_roundtrip"
+        intervals = pm.gintervals(["1", "2"], [100, 200], [1000, 2000])
+        pm.gintervals_save(intervals, name)
+        try:
+            r_script = (
+                "library(misha); "
+                f"gdb.init('{groot}', rescan=TRUE); "
+                f"res <- gintervals.load('{name}'); "
+                "cat('NROW=', nrow(res), '\\n', sep=''); "
+                "stopifnot(is.object(res), nrow(res) == 2L)"
+            )
+            result = subprocess.run(
+                ["Rscript", "-e", r_script],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert result.returncode == 0, (
+                "R failed to load a pymisha-written interval set:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
+            assert "NROW=2" in result.stdout
+        finally:
+            pm.gintervals_rm(name)

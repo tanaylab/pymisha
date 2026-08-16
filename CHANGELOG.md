@@ -1,5 +1,13 @@
 # Changelog
+## v0.9.3 (2026-08-14)
 
+- **Interval sets written by pymisha are readable by R misha again** - the serialized data.frame was missing R's OBJECT bit. Sets written by earlier versions must be re-saved.
+- **Tracks and interval sets created, removed or renamed in pymisha are now visible to a fresh R `gsetroot()`**; pymisha never wrote R's `.db.cache.dirty` marker, so R served a stale inventory.
+- **`pwm.edit_distance`, `pwm.edit_distance.pos` and `pwm.max.edit_distance` no longer return `NaN` for windows that already satisfy the threshold.** Ported from R misha 5.10.3.
+- **2D interval coordinates are now validated as 1D coordinates are.** Negative, `NaN`, inverted, zero-width and past-the-chromosome rectangles raise instead of returning wrong rows or `None` - in `gextract`, `gscreen`, the `gintervals_2d_*` set operations, `gintervals_save`, and `gtrack_2d_create` / `gtrack_2d_import` / `gtrack_2d_import_contacts`.
+- **A failed `gintervals_update` no longer deletes the set it was updating**, and a set's attributes survive an update. `gintervals_mapply(..., intervals_set_out=)` had the same flaw.
+- **A 2D virtual-track iterator shift that runs off a chromosome end no longer raises** - the rectangle is clamped as R does, and a shift that collapses it yields `NaN`.
+- **Porting trap:** `gextract("expr1", "expr2", intervals)`, R's variadic shape, silently drops `expr2`. Pass a list instead: `gextract([expr1, expr2], intervals=...)`. See "Argument shape" in `docs/guides/parity.md`.
 ## v0.9.2 (2026-08-14)
 
 - **`gextract` over many tracks is no longer pinned to a single process when the iterator is a DataFrame.** Passing `iterator=<DataFrame>` disabled multitasking for the whole call, so extracting dozens of tracks ran serially. With the track data not already in the page cache this cost roughly 25x - a 56-track scan of one chromosome took ~90s where R misha took ~4s. Extractions with 8 or more expressions now split the expressions across workers, as they already did for other iterator types.

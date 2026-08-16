@@ -257,6 +257,10 @@ def gdir_rm(dir: str, recursive: bool = False, force: bool = False) -> None:
             ) from None
     else:
         shutil.rmtree(target)
+        # A recursive delete may have swept away tracks/interval sets
+        # nested under this directory; tell a sibling R session sharing
+        # this database that its .db.cache is stale.
+        _shared._touch_db_cache_dirty()
 
     # Reload the database
     from .db import gdb_reload

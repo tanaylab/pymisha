@@ -493,6 +493,7 @@ def gtrack_lookup(
 
     from .tracks import (
         _ensure_track_absent,
+        _target_root,
         _track_dir_for_create,
         _validate_track_name,
         gtrack_create_dense,
@@ -572,5 +573,5 @@ def gtrack_lookup(
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)
-            _pm_dbreload()
+            _pm_dbreload(_target_root())
         raise

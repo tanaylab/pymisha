@@ -17,6 +17,7 @@ __pycache__/
 Thumbs.db
 
 # Testing / quality
+.db.cache.dirty
 .pytest_cache/
 .coverage
 htmlcov/

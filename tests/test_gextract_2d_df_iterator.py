@@ -67,10 +67,12 @@ class TestGextract2dDataFrameIterator:
     def test_empty_intersection_returns_none(self):
         full = _all_rects()
         # Two disjoint halves of the rect set with no shared rectangles: the
-        # first 50 and a far-away synthetic rect on a non-covered region.
+        # first 50 and a synthetic rect on a non-covered region -- still
+        # within chrom "1"'s 500000bp bounds (coordinates must validate),
+        # just far from any rects_track object.
         scope = full.iloc[:50][_COLS6].reset_index(drop=True)
         iterator = pd.DataFrame(
-            [("1", 10**8, 10**8 + 1, "1", 10**8, 10**8 + 1)], columns=_COLS6
+            [("1", 499_000, 499_001, "1", 499_000, 499_001)], columns=_COLS6
         )
         res = pm.gextract("rects_track", scope, iterator=iterator)
         assert res is None or len(res) == 0

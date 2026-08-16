@@ -603,20 +603,41 @@ def _gextract_2d_single_python(
 
 
 def _gextract_2d_single(
-    track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None
+    track: str,
+    col_name: str,
+    intervals: pd.DataFrame,
+    band: tuple[int, int] | None,
+    *,
+    _verified: bool = False,
 ) -> pd.DataFrame | None:
     """Extract objects from a 2D track via the native C++ binding.
 
     Returns a DataFrame with chrom1/start1/end1/chrom2/start2/end2/<col_name>/
     intervalID columns, sorted by (chrom1, start1, chrom2, start2, intervalID).
     Returns None if no objects intersect any interval.
+
+    ``_verified=True`` says the caller already ran ``_verify_2d_intervals`` on
+    this exact frame, or built it so that it cannot fail (``_apply_2d_shifts``
+    clamps).  Internal only.  Validation costs ~0.27 ms per call regardless of
+    row count, and a streamed job pays it once per row on top of the caller's
+    own check.
     """
-    from .intervals import _chrom_id_map
+    from .intervals import _chrom_id_map, _verify_2d_intervals
     from .tracks import gtrack_info
 
     n = len(intervals)
     if n == 0:
         return None
+
+    # R parity: validate here too (not just in the caller, _gextract_2d) so
+    # direct callers of this function -- it is exercised directly by
+    # test_extract_2d_fast.py and test_2d_band_cpp.py -- are covered as well.
+    # _gextract_2d passes _verified=True: it validates the scope itself, and
+    # the shifted frames it derives are clamped by construction, so they pass
+    # this check rather than being rejected by it (R clamps a shifted iterator
+    # rectangle; it does not reject one).
+    if not _verified:
+        _verify_2d_intervals(intervals)
 
     # COMPUTED 2D tracks: the C++ pm_extract_2d has no Computer2D dispatcher
     # port yet.  Read the per-rect cached value via the pure-Python path
@@ -861,16 +882,81 @@ def _maybe_load_2d_intervals_set(
     return intervals
 
 
-def _apply_2d_shifts(intervals: pd.DataFrame, sshift1: int, eshift1: int, sshift2: int, eshift2: int) -> pd.DataFrame:
-    """Apply 2D iterator shifts to interval coordinates."""
+def _apply_2d_shifts(
+    intervals: pd.DataFrame, sshift1: int, eshift1: int, sshift2: int, eshift2: int
+) -> tuple[pd.DataFrame, Any]:
+    """Apply 2D iterator shifts to interval coordinates, clamped to the chromosome.
+
+    R parity: ``TrackExpressionVars::Iterator_modifier2D::transform``
+    (misha/src/TrackExpressionVars.h) computes
+    ``max(start + sshift, 0)`` / ``min(end + eshift, chrom_size)`` and only flags
+    the rectangle ``out_of_range`` when the clamp collapses it
+    (``start >= end``), in which case the variable's value is NaN
+    (misha/src/TrackVarProcessor.cpp).  A shift that runs off the end of a
+    chromosome is never an error in R.
+
+    Returns ``(shifted, kept)``: ``kept`` is the positional index into
+    ``intervals`` of the rows that survived the clamp, or ``None`` when every
+    row survived (the common case, and the only one with no shifts at all).
+    Callers must map per-row results back through ``kept`` - see
+    ``_scatter_shifted_values``.
+    """
     if sshift1 == 0 and eshift1 == 0 and sshift2 == 0 and eshift2 == 0:
-        return intervals
+        return intervals, None
+
+    from .intervals import _chrom_sizes_for_2d_verify, _verify_2d_intervals
+
+    np = _numpy
+    start1 = _pandas.to_numeric(intervals["start1"], errors="coerce").to_numpy(dtype="float64") + sshift1
+    end1 = _pandas.to_numeric(intervals["end1"], errors="coerce").to_numpy(dtype="float64") + eshift1
+    start2 = _pandas.to_numeric(intervals["start2"], errors="coerce").to_numpy(dtype="float64") + sshift2
+    end2 = _pandas.to_numeric(intervals["end2"], errors="coerce").to_numpy(dtype="float64") + eshift2
+
+    if np.isnan(start1).any() or np.isnan(end1).any() or np.isnan(start2).any() or np.isnan(end2).any():
+        # Defensive: every caller validates the scope before shifting it, so a
+        # NaN here means the frame was never checked. Raise the normal message.
+        _verify_2d_intervals(intervals)
+
+    chrom1 = intervals["chrom1"].astype(str).to_numpy()
+    chrom2 = intervals["chrom2"].astype(str).to_numpy()
+
+    np.maximum(start1, 0.0, out=start1)
+    np.maximum(start2, 0.0, out=start2)
+
+    chrom_sizes = _chrom_sizes_for_2d_verify()
+    if chrom_sizes:
+        # Unknown chrom label -> no upper bound, matching the boundary check in
+        # _verify_2d_intervals, which is best-effort for the same reason.
+        size1 = np.fromiter((chrom_sizes.get(c, np.inf) for c in chrom1), dtype="float64", count=len(chrom1))
+        size2 = np.fromiter((chrom_sizes.get(c, np.inf) for c in chrom2), dtype="float64", count=len(chrom2))
+        np.minimum(end1, size1, out=end1)
+        np.minimum(end2, size2, out=end2)
+
     shifted = intervals.copy()
-    shifted["start1"] = shifted["start1"] + sshift1
-    shifted["end1"] = shifted["end1"] + eshift1
-    shifted["start2"] = shifted["start2"] + sshift2
-    shifted["end2"] = shifted["end2"] + eshift2
-    return shifted
+    shifted["start1"] = start1.astype("int64")
+    shifted["end1"] = end1.astype("int64")
+    shifted["start2"] = start2.astype("int64")
+    shifted["end2"] = end2.astype("int64")
+
+    keep = (start1 < end1) & (start2 < end2)
+    if keep.all():
+        return shifted, None
+    kept = np.flatnonzero(keep)
+    return shifted.iloc[kept].reset_index(drop=True), kept
+
+
+def _scatter_shifted_values(values: Any, kept: Any, n: int) -> Any:
+    """Realign per-row values computed on a clamped shifted frame to length ``n``.
+
+    Rows dropped by ``_apply_2d_shifts`` (the clamp collapsed the rectangle)
+    get NaN, which is what R's ``out_of_range`` produces for the same input.
+    """
+    arr = _numpy.asarray(values, dtype=float)
+    if kept is None:
+        return arr
+    out = _numpy.full(n, _numpy.nan, dtype=float)
+    out[kept] = arr
+    return out
 
 
 def _gextract_2d_vtrack_agg(
@@ -1435,9 +1521,16 @@ def _gextract_2d(
     Returns DataFrame with columns: chrom1, start1, end1, chrom2, start2, end2,
     [expr_columns...], intervalID.
     """
+    from .intervals import _verify_2d_intervals
     from .tracks import gtrack_info
 
     band = _validate_band(band)
+
+    # R parity: R's IntervalConverter runs GInterval2D::verify() on every
+    # converted interval; validate the scope here so every dispatch branch
+    # below (scanner, vtrack aggregation, and the legacy per-track path) is
+    # covered by one check instead of repeating it in each branch.
+    _verify_2d_intervals(intervals)
 
     # R parity: a value-based 2D vtrack with no explicit iterator iterates its
     # source 2D track's rects (the 2D analogue of the array-source default
@@ -1492,6 +1585,10 @@ def _gextract_2d(
     ):
         from ._iterator_policy import IntervalsPolicy
         from .intervals import _intersect_2d_rects
+
+        # A raw 2D DataFrame iterator (as opposed to a saved interval set or
+        # track name) reaches the intersect below un-validated otherwise.
+        _verify_2d_intervals(iterator)
 
         def _remap_scope_ids(df: pd.DataFrame | None, b_idx: Any) -> pd.DataFrame | None:
             # The scanner stamps intervalID = position of each unit in the units
@@ -1823,28 +1920,28 @@ def _gextract_2d(
         for vt_name in agg_vtracks:
             src_track = vtrack_to_track[vt_name]
             s = vtrack_shifts[vt_name]
-            shifted = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
+            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
             safe_col = _expr_safe_name(vt_name)
             agg_df = _gextract_2d_vtrack_agg(src_track, safe_col, shifted, band, vtrack_funcs[vt_name])
-            result[safe_col] = agg_df[safe_col].to_numpy(dtype=float, copy=False)
+            result[safe_col] = _scatter_shifted_values(agg_df[safe_col], kept, n)
 
         # Compute 2D object-level vtracks (exists, size, first, last, sample).
         for vt_name in obj_vtracks:
             src_track = vtrack_to_track[vt_name]
             s = vtrack_shifts[vt_name]
-            shifted = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
+            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
             safe_col = _expr_safe_name(vt_name)
             obj_df = _gextract_2d_vtrack_objects(src_track, safe_col, shifted, band, vtrack_funcs[vt_name])
-            result[safe_col] = obj_df[safe_col].to_numpy(dtype=float, copy=False)
+            result[safe_col] = _scatter_shifted_values(obj_df[safe_col], kept, n)
 
         # Compute 2D global.percentile vtracks.
         for vt_name in pct_vtracks:
             src_track = vtrack_to_track[vt_name]
             s = vtrack_shifts[vt_name]
-            shifted = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
+            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
             safe_col = _expr_safe_name(vt_name)
             pct_df = _gextract_2d_vtrack_global_percentile(src_track, safe_col, shifted, band)
-            result[safe_col] = pct_df[safe_col].to_numpy(dtype=float, copy=False)
+            result[safe_col] = _scatter_shifted_values(pct_df[safe_col], kept, n)
 
         # Compute dim-projected vtracks (1D source, dim=1 or dim=2).
         for vt_name in dim_vtracks:
@@ -1932,22 +2029,38 @@ def _gextract_2d(
 
         track_cols = {tname: _expr_safe_name(tname) for tname in required_tracks}
 
-        def _get_shifted_intervals(track_name: str) -> pd.DataFrame:
+        def _get_shifted_intervals(track_name: str) -> tuple[pd.DataFrame, Any]:
             """Return intervals with shifts applied if track is accessed via a shifted vtrack."""
             for vt_name, src in vtrack_to_track.items():
                 if src == track_name:
                     s = vtrack_shifts[vt_name]
                     return _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
-            return intervals
+            return intervals, None
 
-        result = _gextract_2d_single(anchor_track, track_cols[anchor_track], _get_shifted_intervals(anchor_track), band)
+        def _extract_shifted(track_name: str) -> pd.DataFrame | None:
+            """_gextract_2d_single over this track's (possibly shifted) frame.
+
+            The scope was validated at the top of _gextract_2d and the shifted
+            frame is clamped by construction, so skip the re-validation.  Rows
+            the clamp collapsed are absent from the query frame, so restamp
+            intervalID (a position into that frame) back to a position into the
+            original scope.
+            """
+            frame, kept = _get_shifted_intervals(track_name)
+            df = _gextract_2d_single(track_name, track_cols[track_name], frame, band, _verified=True)
+            if df is not None and kept is not None and len(df) > 0:
+                df = df.copy()
+                df["intervalID"] = kept[df["intervalID"].to_numpy(dtype=int)]
+            return df
+
+        result = _extract_shifted(anchor_track)
         if result is None:
             return None
 
         for tname in required_tracks:
             if tname == anchor_track:
                 continue
-            cur = _gextract_2d_single(tname, track_cols[tname], _get_shifted_intervals(tname), band)
+            cur = _extract_shifted(tname)
             if cur is None:
                 result[track_cols[tname]] = _numpy.nan
                 continue

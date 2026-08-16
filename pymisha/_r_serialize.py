@@ -619,6 +619,7 @@ _SYM_FLAG = _SYMSXP  # 1
 _LIST_FLAG = _LISTSXP  # 2
 _HAS_TAG_BIT = 1 << 10
 _HAS_ATTR_BIT = 1 << 9
+_OBJECT_BIT = 1 << 8  # R's IS_OBJECT: set whenever a `class` attribute is emitted
 _LATIN1_BIT = 1 << 12  # not used (we always emit UTF-8)
 _UTF8_BIT = 1 << 3 << 12  # bit 14: levels = 8 (UTF-8)
 _ASCII_BIT = 0  # default; we set bit 14 instead
@@ -740,6 +741,8 @@ def _write_vecsxp(fh: BinaryIO, items: list[Any], *, attrs: dict | None = None) 
     head = _VECSXP
     if attrs:
         head |= _HAS_ATTR_BIT
+        if "class" in attrs:
+            head |= _OBJECT_BIT
     _write_int(fh, head)
     _write_int(fh, len(items))
     for item in items:
@@ -896,8 +899,12 @@ def write_dataframe(path: str | Path, df: Any) -> None:
         _write_header(fh)
 
         # data.frame is VECSXP of columns + attrs (names, class, row.names).
-        # We always set has_attr on the head.
-        _write_int(fh, _VECSXP | _HAS_ATTR_BIT)
+        # We always set has_attr on the head, and object since a `class`
+        # attribute is always emitted below - without it R unserializes an
+        # object whose `class` attribute says "data.frame" but whose OBJECT
+        # flag is unset, so S3 dispatch (dim.data.frame, hence nrow()) never
+        # fires.
+        _write_int(fh, _VECSXP | _HAS_ATTR_BIT | _OBJECT_BIT)
         _write_int(fh, len(col_kinds))
 
         for _, kind, payload in col_kinds:

@@ -1261,7 +1261,7 @@ def gtrack_create_sparse(
             track_dir, description,
             f'gtrack.create_sparse("{track}", description, intervals, values)',
         )
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1449,7 +1449,7 @@ def gtrack_create_dense(
             created_by,
             {"type": "dense", "binsize": str(binsize)},
         )
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1631,10 +1631,10 @@ def gtrack_create_dense_direct(
 
     if reload:
         try:
-            _pm_dbreload()
+            _pm_dbreload(_target_root())
             if _db_is_indexed(_shared._GROOT):
                 gtrack_convert_to_indexed(track, remove_old=False)
-                _pm_dbreload()
+                _pm_dbreload(_target_root())
         except Exception as exc:
             warnings.warn(
                 f"post-create steps failed for track '{track}': {exc}; "
@@ -1824,7 +1824,7 @@ def gtrack_smooth(
         )
 
     try:
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         created_by = (
             f'gtrack.smooth({track}, description, {str(expr)}, {winsize}, '
             f'{weight_thr}, {smooth_nans}, {alg})'
@@ -1837,7 +1837,7 @@ def gtrack_smooth(
                 gtrack_attr_set(track, "binsize", str(int(new_info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2002,7 +2002,7 @@ def gtrack_create(
         )
 
     try:
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(
             track,
             description,
@@ -2015,7 +2015,7 @@ def gtrack_create(
                 gtrack_attr_set(track, "binsize", str(int(info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             gtrack_convert_to_indexed(track, remove_old=False)
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2569,7 +2569,7 @@ def gtrack_mv(src: str, dest: str) -> None:
         shutil.move(str(src_dir), str(dest_dir))
 
     _cleanup_empty_track_parents(src_dir, src_db)
-    _pm_dbreload()
+    _pm_dbreload(src_db)
 
 
 _TRACK_INTERNAL_FILES = frozenset(
@@ -2814,7 +2814,14 @@ def _gtrack_copy_one(
         raise
 
     if dest_db_loaded:
-        _pm_dbreload()
+        # dest_db can be the primary GROOT or a loaded secondary dataset;
+        # pass it explicitly so the right one's caches get refreshed.
+        _pm_dbreload(str(dest_db))
+    else:
+        # dest_db isn't loaded at all in this session, so _pm_dbreload()
+        # (which rescans/clears caches for the *current* session) would be
+        # both pointless and wrong here - just mark the sentinel directly.
+        _shared._touch_db_cache_dirty(str(dest_db))
 
     return destname
 
@@ -2999,7 +3006,7 @@ def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:
             f"failed to remove track directory: {track_dir}"
         )
     _cleanup_empty_track_parents(track_dir, db_root)
-    _pm_dbreload()
+    _pm_dbreload(db_root)
 
 
 def gtrack_import_mappedseq(
@@ -3135,7 +3142,7 @@ def gtrack_import_mappedseq(
         else:
             _write_created_attrs_at_path(tmp_dir, description, created_by)
 
-    _pm_dbreload()
+    _pm_dbreload(_target_root())
 
     cs = res["chrom_stats"]
     chrom_stat = pd.DataFrame({
@@ -4304,6 +4311,17 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
     _checkroot()
     _validate_track_name(track)
 
+    # R parity: validate coordinates before _normalize_2d_intervals's
+    # to_numeric(...).astype(np.int64) cast, which silently turns a NaN
+    # coordinate into a platform-dependent garbage int64 the same way the
+    # pre-v0.9.1 1D path did -- and before a negative/inverted/past-boundary
+    # rectangle is written straight into the track's binary quad-tree file.
+    if not isinstance(intervals, pd.DataFrame):
+        raise ValueError("intervals must be a DataFrame")
+    from .intervals import _validate_2d_intervals, _verify_2d_intervals
+    _validate_2d_intervals(intervals, "intervals")
+    _verify_2d_intervals(intervals)
+
     intervals_df, chrom_sizes_df = _normalize_2d_intervals(intervals)
     values_arr = np.asarray(values, dtype=np.float32)
     if len(values_arr) != len(intervals_df):
@@ -4367,7 +4385,7 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
             write_2d_track_file(filename, objs, arena, is_points=is_points)
 
     try:
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
         _set_created_attrs(
             track,
             description,
@@ -4621,6 +4639,13 @@ def gtrack_2d_import_contacts(
             # Ensure chrom columns are strings (pandas may parse '1' as int/float)
             df["chrom1"] = df["chrom1"].astype(str).str.replace(r'\.0$', '', regex=True)
             df["chrom2"] = df["chrom2"].astype(str).str.replace(r'\.0$', '', regex=True)
+            # R parity: validate the raw rectangle before it collapses to a
+            # midpoint below -- a negative/inverted/past-boundary interval
+            # can still average out to a plausible-looking midpoint, and
+            # the raw-int64 casts just below crash on NaN with a cryptic
+            # numpy error instead of this helper's clear message.
+            from .intervals import _verify_2d_intervals
+            _verify_2d_intervals(df)
             c1_arr = df["chrom1"].to_numpy(dtype=str)
             s1_arr = df["start1"].to_numpy(dtype=int)
             e1_arr = df["end1"].to_numpy(dtype=int)
@@ -4724,6 +4749,14 @@ def gtrack_2d_import_contacts(
     intervals_df = pd.DataFrame(rows)
     values_arr = np.array(values, dtype=np.float32)
 
+    # R parity: catches what check 1 (above, "intervals-value" mode only)
+    # cannot -- an out-of-range fend coordinate in "fends" mode has no raw
+    # rectangle to validate before this point, since a fend is a single
+    # coordinate, not a start/end pair. (start < end always holds here by
+    # construction: end = mid + 1.)
+    from .intervals import _verify_2d_intervals
+    _verify_2d_intervals(intervals_df)
+
     # ------------------------------------------------------------------
     # 6. Delegate to gtrack_2d_create (which handles quad-tree + attributes)
     #    Note: _ensure_track_absent was already called above, so we bypass it
@@ -4780,7 +4813,7 @@ def gtrack_2d_import_contacts(
                 )
 
     try:
-        _pm_dbreload()
+        _pm_dbreload(_target_root())
 
         contacts_str = '", "'.join(contacts)
         fends_str = f'"{fends}"' if fends else "NULL"
@@ -4982,6 +5015,11 @@ def gtrack_array_create(
         ),
     )
     _pymisha.pm_dbreload()
+    # gtrack_array_create predates _pm_dbreload() and still calls the raw
+    # C++ rescan directly, so the sentinel has to be touched explicitly
+    # here. It writes through _atomic_track_create(), i.e. _target_root()
+    # (_UROOT if set, else _GROOT) - not necessarily _GROOT.
+    _shared._touch_db_cache_dirty(_target_root())
 
 
 def gtrack_array_import(
@@ -5062,6 +5100,11 @@ def gtrack_array_import(
     )
     _set_created_attrs(track, description, created_by)
     _pymisha.pm_dbreload()
+    # gtrack_array_import predates _pm_dbreload() and still calls the raw
+    # C++ rescan directly, so the sentinel has to be touched explicitly
+    # here. It writes through _atomic_track_create(), i.e. _target_root()
+    # (_UROOT if set, else _GROOT) - not necessarily _GROOT.
+    _shared._touch_db_cache_dirty(_target_root())
 
 
 def gtrack_array_get_colnames(track: str) -> list[str]:
