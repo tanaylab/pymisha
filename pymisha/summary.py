@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import _shared
+from ._log import get_logger
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
@@ -29,6 +30,8 @@ from .expr import _caller_namespace, _expr_safe_name, _find_vtracks_in_expr, _pa
 from .extract import _is_2d_intervals, _maybe_load_2d_intervals_set, _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 from .vtracks import _compute_vtrack_values
+
+_logger = get_logger(__name__)
 
 
 def _interval_coord_cols(intervals: pd.DataFrame) -> list[str]:
@@ -918,7 +921,9 @@ def _format_percentile(value: float) -> str:
     """
     try:
         v = float(value)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
+        _logger.debug("percentile %r is not a float; formatting it as a string", value,
+                      exc_info=True)
         return str(value)
     for prec in range(1, 18):
         s = f"{v:.{prec}g}"

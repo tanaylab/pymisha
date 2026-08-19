@@ -1,4 +1,11 @@
 # Changelog
+## v0.9.4 (2026-08-19)
+
+- **Errors PyMisha recovers from are no longer invisible.** Every fallback reports what it caught on the `pymisha` logger, off by default: turn it on with `logging.getLogger("pymisha").setLevel("DEBUG")`.
+- **Handlers that meant "this is not that kind of track" no longer swallow everything else.** A probe written to tolerate a missing file also absorbed `MemoryError`, a corrupt file, and any bug in the code it was probing; those now propagate instead of turning into a plausible wrong answer.
+- **`gtrack_import_set` reports each file it could not import**, matching R's `gtrack.import_set`. A bulk import that quietly dropped files was the case a debug-level log would have hidden.
+- A database that cannot be marked dirty for a sibling R session - a read-only groot, say - warns instead of staying silent.
+
 ## v0.9.3 (2026-08-14)
 
 - **Interval sets written by pymisha are readable by R misha again** - the serialized data.frame was missing R's OBJECT bit. Sets written by earlier versions must be re-saved.

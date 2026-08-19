@@ -23,12 +23,16 @@ asymmetry with the bigZips-rooted assets above.
 """
 from __future__ import annotations
 
+import http.client
 from collections.abc import Iterable
 from io import StringIO
 
 import pandas as pd
 
+from .._log import get_logger
 from ._http import _open_url, _read_url_text
+
+_logger = get_logger(__name__)
 
 _UCSC_BASE = "https://hgdownload.soe.ucsc.edu/goldenPath"
 
@@ -148,7 +152,12 @@ def _fetch_gtf_with_priority(
         url = _ucsc_gtf_url(assembly, source)
         try:
             return _open_url(url), source
-        except Exception as exc:
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError/HTTPError are OSErrors, http.client's (IncompleteRead,
+            # BadStatusLine) are not and can escape resp.read(). A priority that
+            # 404s is the normal case, and the final failure re-raises with this
+            # exception attached.
+            _logger.debug("no GTF for %s at %s", assembly, url, exc_info=True)
             last_exc = exc
             continue
     raise FileNotFoundError(
@@ -203,7 +212,10 @@ def _ucsc_fetch_assets(
         text = _read_url_text(_ucsc_chrom_alias_url(assembly))
         out["chrom_alias"] = _parse_chrom_alias_tsv(text)
     except Exception:
-        # chromAlias is optional at fetch time.
+        # chromAlias is optional at fetch time, but losing it silently means
+        # the install maps no contig aliases at all - stays broad, and warns.
+        _logger.warning("could not fetch the chromAlias table for %s; installing without it",
+                        assembly, exc_info=True)
         out["chrom_alias"] = None
 
     if "genes" in sets:

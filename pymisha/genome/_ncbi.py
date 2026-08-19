@@ -17,7 +17,10 @@ from collections.abc import Iterable
 
 import pandas as pd
 
+from .._log import get_logger
 from ._http import _open_url
+
+_logger = get_logger(__name__)
 
 _NCBI_DATASETS_API = "https://api.ncbi.nlm.nih.gov/datasets/v2"
 
@@ -290,6 +293,14 @@ def _ncbi_fetch_assets(
             report = _ncbi_dataset_report(accession)
             asm_name = _ncbi_assembly_name_from_report(report)
         except Exception:
+            # Stays broad: the report is JSON of a shape NCBI changes, so the
+            # parse can fail in more ways than the fetch can, and the FTP
+            # fallback right below is designed to absorb all of them
+            # (test_ncbi_fetch_assets_warns_on_genes_no_ftp_no_asm_name pins
+            # that). Debug, not warning: a suppressed or empty dataset report
+            # is documented as the expected case here.
+            _logger.debug("no assembly name from the NCBI dataset report for %s", accession,
+                          exc_info=True)
             asm_name = ""
         if not asm_name:
             # /dataset_report was empty or suppressed; fall back to the FTP
@@ -300,7 +311,10 @@ def _ncbi_fetch_assets(
                 listing = _open_url(parent_url)
                 asm_name = _ncbi_assembly_name_from_ftp_listing(accession, listing)
             except Exception:
+                # Stays broad for the same reason as the report lookup above.
                 # Best-effort; FTP fetches will warn-and-skip when still empty.
+                _logger.debug("no assembly name from the NCBI FTP listing for %s", accession,
+                              exc_info=True)
                 asm_name = ""
 
     # Build the Datasets include list. Always SEQUENCE_REPORT (chromAlias),

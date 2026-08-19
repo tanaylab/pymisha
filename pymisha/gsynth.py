@@ -2241,9 +2241,10 @@ def gsynth_score(
     out_values = _numpy.concatenate(out_values_chunks)
 
     if overwrite:
-        import contextlib as _contextlib_local
-        with _contextlib_local.suppress(FileNotFoundError, ValueError):
+        try:
             gtrack_rm(track, force=True)
+        except (FileNotFoundError, ValueError):
+            _logger.debug("no existing track %r to overwrite", track, exc_info=True)
 
     gtrack_create_dense_direct(
         track,

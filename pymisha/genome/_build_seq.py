@@ -15,8 +15,11 @@ from __future__ import annotations
 import gzip
 import shutil
 import tempfile
-from contextlib import suppress
 from pathlib import Path
+
+from .._log import get_logger
+
+_logger = get_logger(__name__)
 
 
 def _build_seq(
@@ -77,8 +80,10 @@ def _build_seq_manual(
             verbose=verbose,
         )
     finally:
-        with suppress(OSError):
+        try:
             Path(fasta).unlink(missing_ok=True)
+        except OSError:
+            _logger.warning("could not remove the temporary FASTA %s", fasta, exc_info=True)
 
 
 def _build_seq_local(
@@ -159,8 +164,10 @@ def _build_seq_ucsc_hub(
             verbose=verbose,
         )
     finally:
-        with suppress(OSError):
+        try:
             Path(fasta).unlink(missing_ok=True)
+        except OSError:
+            _logger.warning("could not remove the temporary FASTA %s", fasta, exc_info=True)
 
 
 def _build_seq_ncbi(
@@ -205,5 +212,7 @@ def _build_seq_ncbi(
             verbose=verbose,
         )
     finally:
-        with suppress(OSError):
+        try:
             Path(fasta).unlink(missing_ok=True)
+        except OSError:
+            _logger.warning("could not remove the temporary FASTA %s", fasta, exc_info=True)

@@ -14,7 +14,6 @@ Struct Stat (pack(8)): [int64 occupied_area] [double weighted_sum] [double min_v
 
 from __future__ import annotations
 
-import contextlib
 import mmap
 import os
 import struct
@@ -22,11 +21,15 @@ from typing import Any
 
 import numpy as np
 
+from ._log import get_logger
+
 try:
     import _pymisha
     _HAS_CPP_QUADTREE = True
 except ImportError:
     _HAS_CPP_QUADTREE = False
+
+_logger = get_logger(__name__)
 
 # Format signatures from GenomeTrack.cpp::FORMAT_SIGNATURES.
 SIGNATURE_RECTS = -9
@@ -919,8 +922,13 @@ def query_2d_track_opened(
                                    int(r["x2"][i]), int(r["y2"][i]),
                                    float(r["val"][i])))
             return result
-        except Exception:
-            pass  # Fall back to Python implementation
+        except RuntimeError:
+            # pm_quadtree_query_* raises a builtin RuntimeError, not
+            # _pymisha.error (PMStubs.cpp). Deliberately *not* ValueError: the
+            # conversions of the C++ result inside this try raise that, and
+            # swallowing them would hide a binding bug behind a slow fallback.
+            _logger.warning("the C++ quad-tree object query failed; falling back to the Python "
+                            "implementation", exc_info=True)
 
     top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
 
@@ -1117,8 +1125,13 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
             return dict(_pymisha.pm_quadtree_query_stats(
                 data, int(qx1), int(qy1), int(qx2), int(qy2),
                 1 if is_points else 0, has_band, int(band_d1), int(band_d2)))
-        except Exception:
-            pass  # Fall back to Python implementation
+        except RuntimeError:
+            # pm_quadtree_query_* raises a builtin RuntimeError, not
+            # _pymisha.error (PMStubs.cpp). Deliberately *not* ValueError: the
+            # conversions of the C++ result inside this try raise that, and
+            # swallowing them would hide a binding bug behind a slow fallback.
+            _logger.warning("the C++ quad-tree stats query failed; falling back to the Python "
+                            "implementation", exc_info=True)
 
     if band is not None:
         # Band filtering requires per-object inspection -- fall back to object
@@ -1196,8 +1209,11 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
                 data, rects_arr,
                 1 if is_points else 0,
                 has_band, int(band_d1), int(band_d2)))
-        except Exception:
-            pass  # Fall back to Python per-rect loop
+        except (RuntimeError, ValueError):
+            # This stub is the one that also raises a builtin ValueError, for a
+            # rects array that is not contiguous int64 (N, 4) - PMStubs.cpp:5869.
+            _logger.warning("the C++ quad-tree batch stats query failed; falling back to the "
+                            "Python per-rect loop", exc_info=True)
 
     # Python fallback: loop over rects
     occ = np.zeros(n, dtype=np.int64)
@@ -1343,8 +1359,13 @@ def query_2d_track_opened_arrays(
                 result["x2"] = result["x1"] + 1
                 result["y2"] = result["y1"] + 1
             return result
-        except Exception:
-            pass  # Fall back to Python implementation
+        except RuntimeError:
+            # pm_quadtree_query_* raises a builtin RuntimeError, not
+            # _pymisha.error (PMStubs.cpp). Deliberately *not* ValueError: the
+            # conversions of the C++ result inside this try raise that, and
+            # swallowing them would hide a binding bug behind a slow fallback.
+            _logger.warning("the C++ quad-tree array query failed; falling back to the Python "
+                            "implementation", exc_info=True)
 
     # Python fallback: query tuples, convert to arrays
     objs = query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
@@ -1455,7 +1476,9 @@ class IndexedTrack2DReader:
 
         try:
             info = _pymisha.pm_track2d_index_info(self._track_dir)
-        except Exception:
+        except _pymisha.error:
+            _logger.warning("could not read the 2D index of %s; the indexed reader stays "
+                            "unloaded", self._track_dir, exc_info=True)
             return
 
         if not info.get("loaded"):
@@ -1557,13 +1580,21 @@ class IndexedTrack2DReader:
 
     def close(self) -> None:
         """Release the mmap and file handle."""
+        # Both stay broad and report at debug only: close() also runs from
+        # __del__, at interpreter shutdown, where nothing can be done about a
+        # failure and a warning would be noise.
         if self._dat_mmap is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._dat_mmap.close()
+            except Exception:
+                _logger.debug("could not close the mmap of %s", self._track_dir, exc_info=True)
             self._dat_mmap = None
         if self._dat_file is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._dat_file.close()
+            except Exception:
+                _logger.debug("could not close the data file of %s", self._track_dir,
+                              exc_info=True)
             self._dat_file = None
         self._loaded = False
 

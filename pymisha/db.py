@@ -14,15 +14,22 @@ from pathlib import Path
 import pandas as pd
 
 from . import _shared
+from ._log import get_logger
 from ._shared import CONFIG, _checkroot, _pymisha
+
+_logger = get_logger(__name__)
 
 _EXAMPLE_TMP_DIRS: list[str] = []
 
 
 def _cleanup_example_tmpdirs():
     for tmp in _EXAMPLE_TMP_DIRS:
-        with contextlib.suppress(Exception):
+        # Interpreter teardown: nothing can be done about a failure here, and
+        # a warning at exit is noise, so this one reports at debug only.
+        try:
             shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            _logger.debug("failed to remove example temp dir %s", tmp, exc_info=True)
 
 
 atexit.register(_cleanup_example_tmpdirs)
@@ -483,7 +490,11 @@ def gdb_info(groot: str | None = None):
             names=["chrom", "size"],
             dtype={"chrom": str, "size": "int64"},
         )
-    except Exception:
+    except (OSError, ValueError):
+        # ValueError covers pandas' ParserError / EmptyDataError / the dtype
+        # coercion, OSError the unreadable file - the two ways a chrom_sizes.txt
+        # is genuinely "invalid". Anything else is a bug and should surface.
+        _logger.debug("chrom_sizes.txt at %s is unreadable", chrom_sizes_path, exc_info=True)
         return {
             "path": db_path,
             "is_db": False,
@@ -799,8 +810,10 @@ def gdb_export_fasta(
 
         os.replace(tmp_path, out_path)
     except Exception:
-        with contextlib.suppress(OSError):
+        try:
             tmp_path.unlink()
+        except OSError:
+            _logger.warning("could not remove the partial export %s", tmp_path, exc_info=True)
         raise
 
     return str(out_path)

@@ -31,6 +31,7 @@ import pandas as pd
 
 from . import _shared
 from ._db_trash import _gdb_trash
+from ._log import PymishaWarning, get_logger, user_stacklevel
 from ._name_validation import validate_dotted_name
 from ._safe_pickle import restricted_load, restricted_loads
 from ._shared import (
@@ -44,6 +45,8 @@ from ._shared import (
     _track_names_set,
 )
 from ._types import Intervals, NumpyArray
+
+_logger = get_logger(__name__)
 
 # bgzip magic: gzip (1f 8b) with FLG byte 0x04 (FEXTRA set - bgzip block-size
 # subfield). Plain gzip files have FLG=0x00 or 0x08, so byte 4 reliably
@@ -148,7 +151,10 @@ def _is_computed_track_supported(track: str) -> bool:
 
     try:
         path = _pymisha.pm_track_path(track)
-    except Exception:
+    except _pymisha.error:
+        # "not a track" is the expected answer here; anything else (a bad
+        # argument, a memory error) is not this probe's business.
+        _logger.debug("no track path for %r; treating it as unsupported", track, exc_info=True)
         _COMPUTED_TYPE_OK_CACHE[track] = False
         return False
 
@@ -237,7 +243,9 @@ def _check_computed_tracks(exprs: str | list[str]) -> None:
         if cached is None:
             try:
                 info = _pymisha.pm_track_info(tname)
-            except Exception:
+            except _pymisha.error:
+                # The token is not a track name (a vtrack, a numpy call, ...).
+                _logger.debug("no track info for %r; not a COMPUTED track", tname, exc_info=True)
                 _COMPUTED_TRACK_CACHE[tname] = False
                 continue
             cached = info.get("type") == "computed"
@@ -529,14 +537,21 @@ def gtrack_info(track: str) -> dict[str, Any]:
                     magic = f.read(8)
                 if magic == b'MISHT2D\x00':
                     # This is a 2D indexed track.  Read type from header.
-                    import struct
+                    # NB: `struct` must stay the module-level import (tracks.py:20).
+                    # A function-local `import struct` here makes the name local to
+                    # gtrack_info, so the `except (OSError, struct.error)` below
+                    # cannot even be evaluated when open() fails before this line.
                     with open(idx_path, 'rb') as f:
                         f.seek(12)  # skip magic(8) + version(4)
                         track_type_int = struct.unpack('<I', f.read(4))[0]
                     info['type'] = 'points' if track_type_int == 1 else 'rectangles'
                     info['dimensions'] = 2
-            except Exception:
-                pass
+            except (OSError, struct.error):
+                # A truncated or unreadable track.idx: report the track as the
+                # C++ engine sees it (1D sparse), but say so - the misreport is
+                # otherwise indistinguishable from a genuinely 1D track.
+                _logger.warning("could not read the 2D header of %s; reporting %r as the engine "
+                                "sees it", idx_path, track, exc_info=True)
 
     attrs = _load_track_attributes(track)
     if attrs:
@@ -694,6 +709,9 @@ def _atomic_track_create(track: str):
             )
         os.rename(tmp_dir, track_dir)
     except BaseException:
+        # Deliberately BaseException, not Exception: a Ctrl-C in the middle of
+        # a track write must still take the half-written directory with it.
+        # Nothing is swallowed - the exception is re-raised unchanged.
         _gdb_trash(tmp_dir, async_unlink=True)
         raise
     finally:
@@ -743,7 +761,9 @@ def _canonicalize_known_chroms(df: pd.DataFrame) -> pd.DataFrame:
         try:
             c = _pymisha.pm_normalize_chroms([raw])[0]
             canon_map[raw] = c if c in known else None
-        except Exception:
+        except (_pymisha.error, IndexError):
+            _logger.debug("chromosome %r does not normalize to a known name; dropping its rows",
+                          raw, exc_info=True)
             canon_map[raw] = None
 
     # Vectorized apply via map
@@ -1044,7 +1064,11 @@ def _parse_tabular_track(path: str) -> pd.DataFrame:
             # Inferred dtypes: the C parser converts start/end/value directly
             # (reading as str + pd.to_numeric is markedly slower).
             df = pd.read_csv(io.StringIO("".join(kept)), sep="\t", header=0, engine="c")
-        except Exception:
+        except ValueError:
+            # pandas' ParserError / EmptyDataError / dtype coercion all derive
+            # from ValueError; the lenient per-row parser takes it from here.
+            _logger.debug("the fast tab-delimited parse of %s failed; using the general parser",
+                          path, exc_info=True)
             df = None
         if df is not None:
             df.columns = [str(c).strip() for c in df.columns]
@@ -1130,7 +1154,9 @@ def _parse_bigwig(path: str) -> pd.DataFrame:
         for chrom in (bw.chroms() or {}):
             try:
                 norm = _pymisha.pm_normalize_chroms([chrom])[0]
-            except Exception:
+            except (_pymisha.error, IndexError):
+                _logger.debug("BigWig chromosome %r does not normalize to a known name; skipping",
+                              chrom, exc_info=True)
                 continue
             if norm not in known:
                 continue
@@ -2209,13 +2235,19 @@ def gtrack_create_pwm_energy(
         attrs["created.by"] = created_by
         _save_track_attributes(track, attrs)
     except Exception:
-        # Clean up if track was partially created
-        with contextlib.suppress(Exception):
+        # Clean up if track was partially created. Stays broad: this runs while
+        # another exception is in flight and must not replace it.
+        try:
             gtrack_rm(track, force=True)
+        except Exception:
+            _logger.warning("could not remove the partially created track %r", track, exc_info=True)
         raise
     finally:
-        with contextlib.suppress(Exception):
+        try:
             gvtrack_rm(vtrack_name)
+        except Exception:
+            _logger.warning("could not remove the temporary virtual track %r", vtrack_name,
+                            exc_info=True)
 
 
 def gtrack_import(
@@ -2383,7 +2415,10 @@ def _download_ftp_matches(path_pattern: str, tmpdir: str) -> list[str]:
     finally:
         try:
             ftp.quit()
-        except Exception:
+        except (ftplib.Error, OSError, EOFError):
+            # ftplib.all_errors: a server that drops the control connection
+            # rather than answering QUIT is routine.
+            _logger.debug("FTP QUIT failed; closing the connection", exc_info=True)
             ftp.close()
 
 
@@ -2482,7 +2517,17 @@ def gtrack_import_set(
             try:
                 gtrack_import(track_name, description, file, binsize=binsize, defval=defval)
                 imported.append(file_base)
-            except Exception:
+            except Exception as exc:
+                # R's gtrack.import_set reports each failed file's reason with
+                # message(), which the user sees without configuring anything.
+                # A per-file failure inside a bulk import is exactly the case a
+                # silent log would hide, so warn to match.
+                _logger.warning("could not import %s as track %r", file, track_name, exc_info=True)
+                warnings.warn(
+                    f"could not import {file} as track {track_name!r}: {exc}",
+                    PymishaWarning,
+                    stacklevel=user_stacklevel(),
+                )
                 failed.append(file_base)
     finally:
         if tmpdir:
@@ -3229,7 +3274,9 @@ def _gtrack_import_mappedseq_python(
                     chrom = fields[cols_order_list[1] - 1]
                     coord = int(fields[cols_order_list[2] - 1])
                     strand = fields[cols_order_list[3] - 1]
-            except Exception:
+            except (ValueError, IndexError):
+                # A short or non-numeric line: counted as unmapped, as before.
+                _logger.debug("unparseable line %r in %s", line[:200], path, exc_info=True)
                 total_unmapped += 1
                 continue
 
@@ -4230,7 +4277,10 @@ def _normalize_2d_intervals(intervals: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
     try:
         norm = _pymisha.pm_normalize_chroms(all_chroms)
         cmap = dict(zip(all_chroms, norm, strict=False))
-    except Exception:
+    except _pymisha.error:
+        # Falling back to the identity map can drop every row as "unknown
+        # chromosome", so this one is worth a warning rather than a debug line.
+        _logger.warning("chromosome normalization failed; using the names as given", exc_info=True)
         cmap = {c: c for c in all_chroms}
     out["chrom1"] = out["chrom1"].map(cmap)
     out["chrom2"] = out["chrom2"].map(cmap)
@@ -4673,7 +4723,8 @@ def gtrack_2d_import_contacts(
     try:
         norm = _pymisha.pm_normalize_chroms(all_chroms_raw)
         cmap = dict(zip(all_chroms_raw, norm, strict=False))
-    except Exception:
+    except _pymisha.error:
+        _logger.warning("chromosome normalization failed; using the names as given", exc_info=True)
         cmap = {c: c for c in all_chroms_raw}
 
     from .intervals import gintervals_all

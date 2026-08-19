@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 import pandas as pd
 
 from . import _shared
+from ._log import get_logger
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
@@ -32,6 +33,8 @@ from ._shared import (
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
 from .vtracks import _compute_vtrack_values
+
+_logger = get_logger(__name__)
 
 
 def _scanner_for_intervals_enabled() -> bool:
@@ -66,7 +69,9 @@ def _resolve_exprs_for_scanner(exprs: list[str]) -> list[tuple[str, str, object,
             try:
                 if gtrack_info(expr).get("type") == "computed":
                     return None
-            except Exception:
+            except (_pymisha.error, ValueError):
+                _logger.debug("no track info for %r; leaving it to the legacy path", expr,
+                              exc_info=True)
                 return None
             # Bare physical track: default aggregation is "avg", no shifts.
             resolved.append((expr, "avg", None, 0, 0, 0, 0))
@@ -137,7 +142,9 @@ def _resolve_2d_compound_for_scanner(
                 from .tracks import gtrack_info
                 try:
                     info = gtrack_info(orig_name)
-                except Exception:
+                except (_pymisha.error, ValueError):
+                    _logger.debug("no track info for %r; leaving it to the legacy path",
+                                  orig_name, exc_info=True)
                     return None
                 if int(info.get("dimensions", 1) or 1) != 2:
                     return None  # 1D bare-track ref in a 2D expression
@@ -650,7 +657,9 @@ def _gextract_2d_single(
     # through to a C++ path that cannot serve COMPUTED tracks at all.
     try:
         _is_computed = gtrack_info(track).get("type") == "computed"
-    except Exception:
+    except (_pymisha.error, ValueError):
+        # *track* is an expression rather than a track name.
+        _logger.debug("no track info for %r; not a COMPUTED track", track, exc_info=True)
         _is_computed = False
     if _is_computed:
         return _gextract_2d_single_python(track, col_name, intervals, band)
@@ -774,7 +783,9 @@ def _resolve_2d_vtrack_var(expr: str) -> tuple[str, str, object, int, int, int, 
 
     try:
         info = gtrack_info(src)
-    except Exception:
+    except (_pymisha.error, ValueError):
+        _logger.debug("no track info for vtrack source %r; not scanner-eligible", src,
+                      exc_info=True)
         return None
     if int(info.get("dimensions", 1) or 1) != 2:
         return None  # 1D source track; can't use 2D scanner
@@ -875,7 +886,9 @@ def _maybe_load_2d_intervals_set(
 
     try:
         loaded = gintervals_load(intervals)
-    except Exception:
+    except (_pymisha.error, ValueError):
+        # Not a saved interval-set name: pass the value through untouched.
+        _logger.debug("could not load %r as an interval set", intervals, exc_info=True)
         return intervals
     if _is_2d_intervals(loaded):
         return loaded
@@ -1554,8 +1567,9 @@ def _gextract_2d(
                         _inf_info = gtrack_info(_inferred_iter)
                         if int(_inf_info.get("dimensions", 1) or 1) == 2:
                             iterator = _inferred_iter
-                except Exception:
-                    pass
+                except (_pymisha.error, ValueError):
+                    _logger.debug("could not infer a 2D iterator from %r", _inferred_iter,
+                                  exc_info=True)
 
     # A 2D interval-set name used as the iterator (not a track) is loaded to its
     # rectangles so the DataFrame branch below routes it through the scalable
@@ -1686,7 +1700,8 @@ def _gextract_2d(
 
         try:
             _iter_exists = gtrack_exists(iterator)
-        except Exception:
+        except (_pymisha.error, ValueError):
+            _logger.debug("could not test whether %r is a track", iterator, exc_info=True)
             _iter_exists = False
 
         if not _iter_exists:
@@ -1695,7 +1710,9 @@ def _gextract_2d(
 
             try:
                 _is_iset = gintervals_exists(iterator)
-            except Exception:
+            except (_pymisha.error, ValueError):
+                _logger.debug("could not test whether %r is an interval set", iterator,
+                              exc_info=True)
                 _is_iset = False
 
             if not _is_iset:
@@ -1857,7 +1874,9 @@ def _gextract_2d(
         for _t in used_tracks:
             try:
                 _info_t = gtrack_info(_t)
-            except Exception:
+            except (_pymisha.error, ValueError):
+                _logger.debug("no track info for %r; not a 2D iterator candidate", _t,
+                              exc_info=True)
                 continue
             if int(_info_t.get("dimensions", 1) or 1) == 2:
                 _two_d_used.append(_t)

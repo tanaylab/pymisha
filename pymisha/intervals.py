@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib as _contextlib
 import gzip
 import os
 import re
@@ -26,6 +25,7 @@ from ._crc64 import (
     crc64_init as _crc64_init,
 )
 from ._db_trash import _gdb_trash
+from ._log import get_logger
 from ._name_validation import validate_dotted_name
 from ._shared import (
     CONFIG,
@@ -40,6 +40,8 @@ from ._shared import (
     _pymisha2df,
     _remap_interval_ids,
 )
+
+_logger = get_logger(__name__)
 
 
 def _normalize_chroms(chroms: Any) -> Any:
@@ -813,7 +815,12 @@ def _chrom_sizes_for_2d_verify() -> dict[str, int] | None:
 
     try:
         all_intervals = gintervals_all()
-    except Exception:
+    except (_pymisha.error, RuntimeError, ValueError):
+        # No database (gintervals_all -> _checkroot raises RuntimeError), or one
+        # whose chromosome list cannot be read: the caller skips the boundary
+        # check rather than erroring, as documented above.
+        _logger.debug("no chromosome sizes available; skipping the 2D boundary check",
+                      exc_info=True)
         return None
 
     sizes = dict(
@@ -1786,8 +1793,12 @@ def gintervals_force_range(
         ``pmax``/``pmin`` fast path instead of looping per row.
         """
         chrom_vals = chrom_series.astype(str).tolist()
-        with _contextlib.suppress(Exception):
+        try:
             chrom_vals = _normalize_chroms(chrom_vals)
+        except (_pymisha.error, ValueError):
+            # Unknown names stay as given; the map below drops them anyway.
+            _logger.debug("could not normalize chromosome names; using them as given",
+                          exc_info=True)
         chrom_arr = _numpy.asarray(chrom_vals, dtype=object)
 
         sizes = pd.Series(chrom_arr).map(chrom_sizes)
@@ -3051,7 +3062,9 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
     # full db init (e.g. dataset bootstrap tests).
     try:
         interval_set_names = _pymisha.pm_interv_names()
-    except Exception:
+    except _pymisha.error:
+        _logger.debug("the C++ interval-set name cache is not available; walking the filesystem",
+                      exc_info=True)
         from . import _shared
         assert _shared._GROOT is not None
 
@@ -3552,7 +3565,8 @@ def _track_is_2d(track: str) -> bool:
     from .tracks import gtrack_info
     try:
         info = gtrack_info(track)
-    except Exception:
+    except (_pymisha.error, ValueError):
+        _logger.debug("no track info for %r; treating it as not 2D", track, exc_info=True)
         return False
     return info.get("dimensions") == 2
 
@@ -3964,8 +3978,13 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     # Register the new interval-set name in the C++ cache so it shows up
     # in gintervals_ls() / gintervals_exists() without paying a full
     # pm_dbreload rescan of the tracks/ tree.
-    with _contextlib.suppress(Exception):
+    try:
         _pymisha.pm_interv_register(intervals_set)
+    except _pymisha.error:
+        # The set is on disk either way; it just won't show up in
+        # gintervals_ls() until the next reload.
+        _logger.warning("could not register interval set %r in the C++ cache", intervals_set,
+                        exc_info=True)
 
     # Tell a sibling R session sharing this database that its .db.cache
     # is stale (R never sees pymisha's mutations otherwise).
@@ -4016,19 +4035,31 @@ def _replace_intervals_set(intervals: pd.DataFrame, intervals_set: str) -> None:
             gintervals_rm(intervals_set, force=True)
         os.replace(tmp_path, dest)
     except BaseException:
+        # Deliberately BaseException, not Exception: a Ctrl-C here must still
+        # clean up. Nothing is swallowed - the exception is re-raised unchanged.
         # Only drop the temporary copy if the original survived; if it did not,
         # the temporary set is the only copy of the data left.
         if dest.exists():
-            with _contextlib.suppress(Exception):
+            try:
                 gintervals_rm(tmp_name, force=True)
+            except Exception:
+                # Stays broad: another exception is in flight and must win.
+                _logger.warning("could not remove the temporary interval set %r", tmp_name,
+                                exc_info=True)
         raise
 
     # tmp_name's registration now points at a path that no longer exists, and
     # dest may have been unregistered by the gintervals_rm above.
-    with _contextlib.suppress(Exception):
+    try:
         _pymisha.pm_interv_unregister(tmp_name)
-    with _contextlib.suppress(Exception):
+    except _pymisha.error:
+        _logger.warning("could not unregister the temporary interval set %r from the C++ cache",
+                        tmp_name, exc_info=True)
+    try:
         _pymisha.pm_interv_register(intervals_set)
+    except _pymisha.error:
+        _logger.warning("could not register interval set %r in the C++ cache", intervals_set,
+                        exc_info=True)
 
     _shared._touch_db_cache_dirty()
 
@@ -4450,8 +4481,10 @@ def gintervals_convert_to_indexed(
 
     if remove_old:
         for chrom_file in files_to_remove:
-            with _contextlib.suppress(FileNotFoundError):
+            try:
                 chrom_file.unlink()
+            except FileNotFoundError:
+                _logger.debug("%s was already gone", chrom_file, exc_info=True)
     return
 
 
@@ -4568,8 +4601,10 @@ def gintervals_2d_convert_to_indexed(
 
     if remove_old:
         for path in files_to_remove:
-            with _contextlib.suppress(FileNotFoundError):
+            try:
                 path.unlink()
+            except FileNotFoundError:
+                _logger.debug("%s was already gone", path, exc_info=True)
     return
 
 
@@ -6204,8 +6239,13 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
 
     # Drop from C++ cache so gintervals_ls() / gintervals_exists() see
     # the removal immediately (no pm_dbreload required).
-    with _contextlib.suppress(Exception):
+    try:
         _pymisha.pm_interv_unregister(intervals_set)
+    except _pymisha.error:
+        # The set is gone from disk either way; gintervals_ls() may keep
+        # listing it until the next reload.
+        _logger.warning("could not unregister interval set %r from the C++ cache", intervals_set,
+                        exc_info=True)
 
     # Tell a sibling R session sharing this database that its .db.cache
     # is stale (R never sees pymisha's mutations otherwise).
@@ -6325,7 +6365,9 @@ def _parse_genes_file(
         # Normalize chromosome name
         try:
             chrom_norm = _normalize_chroms([chrom_raw])[0]
-        except Exception:
+        except (_pymisha.error, ValueError, IndexError):
+            _logger.debug("could not normalize chromosome %r on line %d; using it as given",
+                          chrom_raw, lineno, exc_info=True)
             chrom_norm = chrom_raw
 
         # Skip chromosomes not in the database

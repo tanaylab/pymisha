@@ -10,9 +10,12 @@ import tempfile
 
 import pandas as pd
 
-from ._shared import _checkroot
+from ._log import get_logger
+from ._shared import _checkroot, _pymisha
 from .extract import gextract
 from .intervals import gintervals_all
+
+_logger = get_logger(__name__)
 
 
 def gtrack_export_bedgraph(
@@ -88,9 +91,10 @@ def gtrack_export_bedgraph(
         if "2D tracks are not supported" in str(e):
             raise
         # Track expression or virtual track -- that's fine
-    except Exception:
+    except _pymisha.error:
         # gtrack_info may fail for track expressions or virtual tracks
-        pass
+        _logger.debug("no track info for %r; treating it as an expression or virtual track",
+                      track, exc_info=True)
 
     # Check output directory exists
     output_dir = os.path.dirname(file) or "."

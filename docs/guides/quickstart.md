@@ -33,3 +33,22 @@ pm.gdb_init_examples()
 print(pm.gtrack_ls())
 print(pm.gextract("dense_track", pm.gintervals("chr1", 0, 1000)))
 ```
+
+## Seeing what PyMisha recovered from
+
+PyMisha falls back rather than failing in a number of places - an optional
+dependency that is missing, a probe that decides a track is not of some type, a
+best-effort cleanup. Each fallback reports what it caught on the `pymisha`
+logger, which is silent until you configure logging:
+
+```python
+import logging
+logging.basicConfig()
+logging.getLogger("pymisha").setLevel(logging.DEBUG)
+```
+
+Every module logs to its own child (`pymisha.tracks`, `pymisha.intervals`, ...),
+so a single one can be turned up on its own. Failures that R misha itself warns
+about are raised as `pymisha.PymishaWarning` instead, so they are visible with
+no configuration; silence them with
+`warnings.filterwarnings("ignore", category=pm.PymishaWarning)`.

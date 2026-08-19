@@ -13,7 +13,7 @@ import tarfile
 import tempfile
 import warnings
 from collections.abc import Generator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
 from urllib import request as _urlrequest
@@ -30,6 +30,9 @@ from ._crc64 import (
 from ._crc64 import (
     crc64_init as _crc64_init,
 )
+from ._log import get_logger
+
+_logger = get_logger(__name__)
 
 
 def _sanitize_fasta_header(header: str) -> str:
@@ -395,6 +398,9 @@ def _convert_one_track_worker(
         try:
             info = gtrack_info(track)
         except Exception as exc:
+            # Runs in a forked pool worker: the parent only gets str(exc) back
+            # (and warns with it), so the traceback is logged here or nowhere.
+            _logger.warning("could not read info for track %r", track, exc_info=True)
             return (track, "failed", f"read info: {exc}")
         track_type = info.get("type")
         if track_type in {"dense", "sparse", "array"}:
@@ -405,6 +411,7 @@ def _convert_one_track_worker(
             return (track, "converted_2d", None)
         return (track, "skipped", None)
     except Exception as exc:
+        _logger.warning("could not convert track %r to indexed format", track, exc_info=True)
         return (track, "failed", str(exc))
 
 
@@ -486,6 +493,8 @@ def _convert_one_intervals_worker(
             )
         return (intervals_set, "converted", None)
     except Exception as exc:
+        _logger.warning("could not convert intervals set %r to indexed format", intervals_set,
+                        exc_info=True)
         return (intervals_set, "failed", str(exc))
 
 
@@ -818,8 +827,10 @@ def gdb_convert_to_indexed(
 
         if remove_old_files:
             for seq_path in dict.fromkeys(source_seq_files):
-                with suppress(FileNotFoundError):
+                try:
                     seq_path.unlink()
+                except FileNotFoundError:
+                    _logger.debug("old sequence file %s was already gone", seq_path, exc_info=True)
 
     if convert_tracks or convert_intervals:
         if verbose:
@@ -1143,8 +1154,10 @@ def _gdb_create_genome_from_s3(
                 )
         _safe_extract_tar(archive_path, dest_path)
     finally:
-        with suppress(OSError):
+        try:
             archive_path.unlink(missing_ok=True)
+        except OSError:
+            _logger.warning("could not remove the downloaded archive %s", archive_path, exc_info=True)
 
     extracted_root = dest_path / name
     if not extracted_root.exists():

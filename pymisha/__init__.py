@@ -17,6 +17,7 @@ import numpy as np  # noqa: F401
 
 from . import _shared
 from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
+from ._log import PymishaWarning
 from ._shared import (  # noqa: F401 — imported for _PMLOCALS C++ bridge
     CONFIG,
     _checkroot,
@@ -264,6 +265,7 @@ __all__ = [
     # Configuration
     'CONFIG',
     'gmax_processes',
+    'PymishaWarning',
 
     # Database functions
     'gdb_init',

@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from . import _shared
+from ._log import get_logger
 from ._shared import _checkroot, _pymisha
+
+_logger = get_logger(__name__)
 
 
 def _normalize_path(path: str) -> str:
@@ -136,12 +139,21 @@ def _parse_dataset_metadata(path: Path) -> dict[str, Any]:
 
     try:
         import yaml  # type: ignore
-
-        yaml_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if isinstance(yaml_data, dict):
-            return yaml_data
+    except ImportError:
+        _logger.debug("PyYAML is not installed; parsing %s as plain key: value", path, exc_info=True)
     except Exception:
-        pass
+        # A broken PyYAML install used to fall through to the plain parser too.
+        _logger.warning("PyYAML could not be imported; parsing %s as plain key: value", path,
+                        exc_info=True)
+    else:
+        try:
+            yaml_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            _logger.warning("could not parse %s as YAML; falling back to plain key: value", path,
+                            exc_info=True)
+        else:
+            if isinstance(yaml_data, dict):
+                return yaml_data
 
     data: dict[str, Any] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -603,7 +615,6 @@ def gdataset_example_path() -> str:
     1
     >>> pm.gdataset_unload(dataset_path)
     """
-    import contextlib
     import tempfile
 
     from .db import gdb_init_examples
@@ -615,11 +626,16 @@ def gdataset_example_path() -> str:
     _TRACK_NAME = "example_dataset_track"
     _INTERV_NAME = "example_dataset_intervals"
 
-    # Remove leftovers from a previous call (idempotent)
-    with contextlib.suppress(Exception):
+    # Remove leftovers from a previous call (idempotent). Kept as two independent
+    # handlers: a failure removing the track must not skip removing the intervals.
+    try:
         gtrack_rm(_TRACK_NAME, force=True)
-    with contextlib.suppress(Exception):
+    except (_pymisha.error, OSError, RuntimeError, ValueError):
+        _logger.debug("no leftover track %r to remove", _TRACK_NAME, exc_info=True)
+    try:
         gintervals_rm(_INTERV_NAME, force=True)
+    except (_pymisha.error, OSError, RuntimeError, ValueError):
+        _logger.debug("no leftover interval set %r to remove", _INTERV_NAME, exc_info=True)
 
     # Create a small interval set and a derived track
     example_intervs = gintervals("1", 0, 10000)

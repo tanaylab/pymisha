@@ -1567,6 +1567,9 @@ def _map_intervals_vectorized_python(
     n_iv = len(intervals)
 
     has_value_col = value_col and value_col in intervals.columns
+    # Bound unconditionally so the use below is not merely *conditionally*
+    # defined, mirroring how all_r_value is handled a few lines down.
+    iv_values: np.ndarray | None = None
     if has_value_col:
         iv_values = intervals[value_col].to_numpy(dtype=np.float64, copy=False)
 
@@ -1733,6 +1736,7 @@ def _map_intervals_vectorized_python(
 
         if has_value_col:
             assert all_r_value is not None
+            assert iv_values is not None
             all_r_value.append(iv_values[v_interval_ids])
 
     # Concatenate results from all chrom groups

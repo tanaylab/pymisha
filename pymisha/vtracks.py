@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import _shared
+from ._log import get_logger
 from ._shared import (
     CONFIG,
     _checkroot,
@@ -17,6 +18,8 @@ from ._shared import (
     _pandas,
     _pymisha,
 )
+
+_logger = get_logger(__name__)
 
 _FILTER_PASSTHROUGH_FUNCS = {"distance", "distance.center", "distance.edge"}
 _FILTER_WEIGHTED_FUNCS = {"avg", "mean", "coverage", "kmer.frac", "masked.frac"}
@@ -997,7 +1000,10 @@ def _load_pv_table(src: str) -> tuple[np.ndarray, np.ndarray] | None:
     result: tuple[np.ndarray, np.ndarray] | None = None
     try:
         track_path = _pymisha.pm_track_path(src)
-    except Exception:
+    except _pymisha.error:
+        # *src* is an expression or a vtrack rather than a physical track:
+        # there is no frozen percentile table to read.
+        _logger.debug("no track path for %r; no frozen percentile table", src, exc_info=True)
         track_path = None
     if track_path:
         fpath = os.path.join(track_path, "vars", "pv.percentiles")

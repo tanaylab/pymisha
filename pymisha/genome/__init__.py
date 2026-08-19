@@ -19,6 +19,10 @@ import time
 import warnings
 from pathlib import Path
 
+from .._log import get_logger
+
+_logger = get_logger(__name__)
+
 
 def gdb_install_intervals(
     groot: str,
@@ -95,6 +99,7 @@ def gdb_install_intervals(
     (list of unavailable set names), ``failed`` (reserved; currently
     always ``[]``).
     """
+    import _pymisha
     import pandas as pd
 
     import pymisha as pm
@@ -196,9 +201,11 @@ def gdb_install_intervals(
             try:
                 if pm.gintervals_exists(name):
                     pm.gintervals_rm(name)
-            except Exception:
+            except (_pymisha.error, OSError, RuntimeError, ValueError):
                 # Best-effort: don't let a failed pre-delete block install.
-                pass
+                # It does mean overwrite=True may not have overwritten, so say so.
+                _logger.warning("could not remove the existing interval set %r before "
+                                "installing over it", name, exc_info=True)
 
     installed: dict[str, int] = {}
 

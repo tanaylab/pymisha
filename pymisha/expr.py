@@ -10,6 +10,10 @@ from types import FrameType
 from typing import Any
 
 from . import _shared
+from ._log import get_logger
+from ._shared import _pymisha
+
+_logger = get_logger(__name__)
 
 _BUILTIN_EXPR_NAMES: set[str] = {"np", "numpy", "CHROM", "START", "END", "True", "False", "None"}
 _ALWAYS_ALLOWED_NAMES: set[str] = _BUILTIN_EXPR_NAMES | {"abs", "min", "max", "round", "float", "int", "bool"}
@@ -124,8 +128,10 @@ def _expr_is_2d(exprs: str | list[str]) -> bool:
                 try:
                     if gtrack_exists(cand) and int(gtrack_info(cand).get("dimensions", 1) or 1) == 2:
                         return True
-                except Exception:
-                    pass
+                except (_pymisha.error, ValueError):
+                    # The token is not a track name - the common case for any
+                    # identifier in an expression.
+                    _logger.debug("%r is not a resolvable track name", cand, exc_info=True)
     return False
 
 

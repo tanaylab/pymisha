@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymisha"
-version = "0.9.3"
+version = "0.9.4"
 description = "Python interface for misha genomic databases with C++ streaming backends"
 readme = "README.md"
 license = {text = "MIT"}
@@ -89,6 +89,13 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
+# Catches a name that is bound on only some paths through a function - including
+# a function-local `import x` that shadows the module-level one and makes an
+# `except (..., x.error)` clause unevaluable. That exact defect shipped in
+# gtrack_info and escaped review; this is the gate that reports it.
+# NB: only bodies of *annotated* functions are checked, so an unannotated
+# reproduction of such a bug will come back clean - check the real tree.
+enable_error_code = ["possibly-undefined"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "pymisha"]

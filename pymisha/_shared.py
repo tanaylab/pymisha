@@ -13,11 +13,16 @@ import contextlib as _contextlib
 import datetime as _datetime
 import os as _os
 import sys as _sys
+import warnings as _warnings
 from contextlib import contextmanager
 from typing import Any
 
 import numpy as _numpy
 import pandas as _pandas
+
+from ._log import PymishaWarning, get_logger, user_stacklevel
+
+_logger = get_logger(__name__)
 
 try:
     import _pymisha
@@ -118,7 +123,11 @@ def _make_progress_callback(progress, total=None, desc=None):
                 pbar.refresh()
 
             return cb, pbar.close
+        except ImportError:
+            _logger.debug("tqdm is not installed; falling back to text progress", exc_info=True)
+            style = 'text'
         except Exception:
+            _logger.warning("tqdm progress bar failed; falling back to text progress", exc_info=True)
             style = 'text'
 
     if style == 'rich':
@@ -137,7 +146,11 @@ def _make_progress_callback(progress, total=None, desc=None):
                 progress_obj.stop()
 
             return cb, close
+        except ImportError:
+            _logger.debug("rich is not installed; falling back to text progress", exc_info=True)
+            style = 'text'
         except Exception:
+            _logger.warning("rich progress bar failed; falling back to text progress", exc_info=True)
             style = 'text'
 
     if style == 'text':
@@ -230,16 +243,27 @@ def _touch_db_cache_dirty(groot: str | None = None) -> None:
 
     Call this from every pymisha path that creates, removes, or renames
     a track or interval set. Best-effort: a failure to write the
-    sentinel (e.g. a read-only database) is silently ignored, mirroring
-    R's own tolerant behavior in ``.gdb.cache_mark_dirty``.
+    sentinel (e.g. a read-only database) does not raise, mirroring R's
+    own tolerant behavior in ``.gdb.cache_mark_dirty`` - but it does warn,
+    as R does, because the consequence is a sibling R session serving a
+    stale inventory with no other sign that anything went wrong.
     """
     if groot is None:
         groot = _GROOT
     if not groot:
         return
     dirty_path = _os.path.join(groot, ".db.cache.dirty")
-    with _contextlib.suppress(OSError), open(dirty_path, "w") as fh:
-        fh.write(_datetime.datetime.now().isoformat())
+    try:
+        with open(dirty_path, "w") as fh:
+            fh.write(_datetime.datetime.now().isoformat())
+    except OSError as exc:
+        _warnings.warn(
+            f"could not write {dirty_path}: {exc}. An R misha session on this database "
+            "may keep serving a stale track/interval-set list until it runs "
+            "gdb.reload(rescan = TRUE).",
+            PymishaWarning,
+            stacklevel=user_stacklevel(),
+        )
 
 
 def _pm_dbreload(groot: str | None = None) -> None:
