@@ -224,6 +224,11 @@ from .vtracks import (
     gvtrack_rm,
 )
 
+# The C extension names this class "pymisha.error", so pickle (and hence
+# multiprocessing error propagation) looks it up here. Without the alias any
+# misha error raised inside a worker is replaced by an opaque PicklingError.
+error = _pymisha.error
+
 # Monkey-patch _pymisha.pm_dbreload so ANY caller (including tests that
 # import the C extension directly) triggers Python-side cache
 # invalidation.  The C++ side never mutates the track scan without
@@ -266,6 +271,7 @@ __all__ = [
     'CONFIG',
     'gmax_processes',
     'PymishaWarning',
+    'error',
 
     # Database functions
     'gdb_init',

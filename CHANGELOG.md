@@ -1,4 +1,8 @@
 # Changelog
+## v0.9.5 (2026-08-23)
+
+- **A misha error raised inside a worker process now reaches you with its message.** `pymisha.error` was not importable under its own name, so multiprocessing could not pickle it and any error raised during a parallel `gextract` surfaced as an opaque `PicklingError` instead.
+
 ## v0.9.4 (2026-08-19)
 
 - **Errors PyMisha recovers from are no longer invisible.** Every fallback reports what it caught on the `pymisha` logger, off by default: turn it on with `logging.getLogger("pymisha").setLevel("DEBUG")`.
