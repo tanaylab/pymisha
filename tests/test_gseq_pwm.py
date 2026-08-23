@@ -1166,3 +1166,51 @@ class TestGseqPwmBulkScoring:
 
         np.testing.assert_array_equal(r1, r2)
         np.testing.assert_array_equal(r1, r3)
+
+
+class TestCountRequiresThreshold:
+    """R misha 5.11.20 requires score.thresh for counting; pymisha follows."""
+
+    def test_gseq_pwm_count_without_threshold_raises(self):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="score_thresh"):
+            pm.gseq_pwm(["ACGTACGTACGT"], pssm, mode="count")
+
+    def test_gvtrack_pwm_count_without_threshold_raises(self):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="score_thresh"):
+            pm.gvtrack_create("vt_count_nothresh", None, func="pwm.count", pssm=pssm)
+
+    def test_other_modes_still_default(self):
+        """Only 'count' needs a threshold - the rest are unaffected."""
+        pssm = _create_test_pssm()
+        assert np.isfinite(pm.gseq_pwm(["ACGTACGTACGT"], pssm, mode="max")).all()
+
+
+class TestScoreThreshCoercion:
+    """R misha's .coerce_score_thresh: one number, never a silent default."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), "not-a-number", [-8, -9], [], True])
+    def test_uncoercible_thresholds_raise(self, bad):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="score_thresh"):
+            pm.gseq_pwm(["ACGTACGTACGT"], pssm, mode="count", score_thresh=bad)
+
+    def test_string_spelling_is_accepted(self):
+        """R's as.numeric() takes a character spelling, so pymisha does too."""
+        pssm = _create_test_pssm()
+        seq = ["ACGTACGTACGT"]
+        assert pm.gseq_pwm(seq, pssm, mode="count", score_thresh="-8") == \
+            pm.gseq_pwm(seq, pssm, mode="count", score_thresh=-8.0)
+
+    def test_nan_threshold_raises_on_vtrack(self):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="score_thresh"):
+            pm.gvtrack_create("vt_nan_thresh", None, func="pwm.count",
+                              pssm=pssm, score_thresh=float("nan"))
+
+    def test_edit_distance_requires_threshold(self):
+        pssm = _create_test_pssm()
+        with pytest.raises(ValueError, match="score_thresh"):
+            pm.gvtrack_create("vt_ed_nothresh", None, func="pwm.edit_distance",
+                              pssm=pssm)

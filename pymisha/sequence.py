@@ -8,7 +8,7 @@ import math as _math
 import numpy as _numpy
 import pandas as _pandas
 
-from ._shared import CONFIG, _checkroot, _df2pymisha, _pymisha
+from ._shared import CONFIG, _checkroot, _coerce_score_thresh, _df2pymisha, _pymisha
 from .extract import _maybe_load_intervals_set
 
 # Complement mapping for DNA bases
@@ -1172,7 +1172,7 @@ def gseq_pwm(
     mode: str = "lse",
     bidirect: bool = True,
     strand: int = 0,
-    score_thresh: float = 0,
+    score_thresh: float | None = None,
     start_pos: int | None = None,
     end_pos: int | None = None,
     extend: bool | int = False,
@@ -1215,8 +1215,9 @@ def gseq_pwm(
     strand : int, default 0
         When ``bidirect=False``: ``1`` = forward only, ``-1`` = reverse
         complement only, ``0`` = forward only (default).
-    score_thresh : float, default 0
-        Threshold for ``"count"`` mode.
+    score_thresh : float, optional
+        Threshold for ``"count"`` mode, where it is required: PWM scores are
+        log-likelihoods, so no default suits every PSSM. Ignored otherwise.
     start_pos : int or None
         1-based inclusive start of region of interest.
     end_pos : int or None
@@ -1299,6 +1300,17 @@ def gseq_pwm(
     # --- Validation ---
     if mode not in ("lse", "max", "pos", "count"):
         raise ValueError(f"mode must be 'lse', 'max', 'pos', or 'count', got '{mode}'")
+    if mode == "count":
+        if score_thresh is None:
+            raise ValueError(
+                "gseq_pwm(mode='count') requires a 'score_thresh' argument. PWM "
+                "scores are log-likelihoods, so there is no default that suits "
+                "every PSSM - pick a threshold from the score distribution of your "
+                "own matrix, e.g. with mode='max'."
+            )
+        score_thresh = _coerce_score_thresh(score_thresh)
+    elif score_thresh is None:
+        score_thresh = 0.0
     if strand not in (-1, 0, 1):
         raise ValueError(f"strand must be -1, 0, or 1, got {strand}")
     if prior < 0:
@@ -1640,6 +1652,8 @@ def gseq_pwm_edits(
                 extended.iloc[i, extended.columns.get_loc("end")] = min(extended.iloc[i]["end"], cs_map[c])
         seqs = gseq_extract(extended)
         extend = False  # already extended
+
+    score_thresh = _coerce_score_thresh(score_thresh)
 
     # Validate PSSM
     if isinstance(pssm, _pandas.DataFrame):

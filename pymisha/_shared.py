@@ -735,3 +735,55 @@ def _apply_gwd_to_names(names):
     if not prefix:
         return names
     return [n[len(prefix):] for n in names if n.startswith(prefix)]
+
+
+def _coerce_score_thresh(value: Any) -> float:
+    """Port of R misha's ``.coerce_score_thresh`` (``R/pssm_utils.R``).
+
+    One number, or a string spelling of one. Anything else - a sequence, a
+    bool, an uncoercible string, NaN - is an error rather than a silent 0.0,
+    because every ``>= nan`` comparison is false and a defaulted threshold is
+    indistinguishable from one that is simply out of reach.
+    """
+    if isinstance(value, (str, bytes)):
+        text = value.decode() if isinstance(value, bytes) else value
+        try:
+            out = float(text)
+        except ValueError:
+            raise ValueError(
+                "score_thresh must be a single number, or something coercible "
+                f"to one; {value!r} is not."
+            ) from None
+    elif isinstance(value, bool):
+        raise ValueError(
+            "score_thresh must be a single number, or a character spelling of "
+            "one, not a bool."
+        )
+    elif isinstance(value, (int, float, _numpy.number)):
+        out = float(value)
+    else:
+        try:
+            items = list(value)
+        except TypeError:
+            raise ValueError(
+                "score_thresh must be a single number, or a character spelling "
+                f"of one, not a {type(value).__name__}."
+            ) from None
+        if len(items) == 0:
+            raise ValueError(
+                "score_thresh must be a single value, and this one is empty."
+            )
+        if len(items) != 1:
+            raise ValueError(
+                f"score_thresh must be a single value, got a sequence of length "
+                f"{len(items)}. Only one threshold is used, so pass the single "
+                "value you mean."
+            )
+        return _coerce_score_thresh(items[0])
+
+    if out != out:  # NaN
+        raise ValueError(
+            "score_thresh must be a single number, or something coercible to "
+            "one; NaN is not."
+        )
+    return out

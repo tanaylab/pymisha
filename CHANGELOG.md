@@ -1,4 +1,10 @@
 # Changelog
+## v0.10.0 (2026-08-23)
+
+- **A PWM threshold must now be spelled out, and it must be a number.** `gvtrack_create(func="pwm.count")`, the `pwm.edit_distance` family and `gseq_pwm(mode="count")` used to default `score_thresh` to 0. PWM scores are log-likelihoods, so 0 counts nothing for most matrices: a forgotten argument came back as a confident zero. They now raise instead.
+- **A threshold that cannot be read as a number is an error, not a 0.** A list, a bool, a misspelled string or `NaN` were all silently accepted as 0; `NaN` in particular made every comparison false, which is indistinguishable from a threshold nothing reaches. A string spelling of a number is still accepted, as in R.
+- Matches misha 5.11.19/5.11.20. **Breaking:** calls that relied on the old default now raise, which is the point - pick a threshold from your own matrix's score distribution, e.g. with a `pwm` or `pwm.max` virtual track.
+
 ## v0.9.5 (2026-08-23)
 
 - **A misha error raised inside a worker process now reaches you with its message.** `pymisha.error` was not importable under its own name, so multiprocessing could not pickle it and any error raised during a parallel `gextract` surfaced as an opaque `PicklingError` instead.

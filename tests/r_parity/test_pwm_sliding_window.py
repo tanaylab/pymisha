@@ -16,12 +16,12 @@ Notes on R-parity subtleties resolved during the port:
   exact matrices were regenerated in R 4.4.1 and embedded here as literals
   (full float precision, column order A,C,G,T), so the Python side feeds the
   scanner byte-identical inputs without an R dependency at test time.
-* **pwm.count threshold.** The R tests pass ``params = list(pssm=, threshold=-10)``,
-  but R's vtrack param parser (``TrackExpressionParams.h``) only reads
-  ``score.thresh`` -- the ``threshold`` key is silently ignored, so those runs
-  use the default ``score_thresh = 0.0``. pymisha behaves identically (it reads
-  ``score_thresh`` / ``score.thresh``, never ``threshold``), so these cases are
-  reproduced by leaving ``score_thresh`` at its default, NOT by passing -10.
+* **pwm.count threshold.** misha 5.11.19 made ``score.thresh`` mandatory for
+  ``pwm.count`` -- PWM scores are log-likelihoods, so the old default of 0
+  counted nothing -- and the R tests were updated to pass ``-10`` / ``-8`` and
+  their three snapshots regenerated (Aug 2026, against Oct 2025 for the rest of
+  this file). The three ``pwm.count`` cases below pass R's own thresholds;
+  pymisha likewise requires ``score_thresh`` and has no default.
 
 R param -> pymisha kwarg mapping: ``pssm`` -> ``pssm``, ``bidirect`` ->
 ``bidirect``, ``prior`` -> ``prior``, ``spat_factor`` -> ``spat_factor``,
@@ -392,7 +392,7 @@ _CASES: dict[str, tuple] = {
     "pwm_sliding_window_test_1": (_case("pwm_test", _PWM1, "pwm", _iv(1, 10000, 11000), 1), None),
     "pwm_sliding_window_test_2": (_case("pwm_max_test", _PWM2, "pwm.max", _iv(1, 10000, 11000), 1), None),
     # pwm.count: R passes threshold=-10 but reads only score.thresh -> effective default 0.0.
-    "pwm_sliding_window_test_3": (_case("pwm_count_test", _PWM3, "pwm.count", _iv(1, 10000, 11000), 1), None),
+    "pwm_sliding_window_test_3": (_case("pwm_count_test", _PWM3, "pwm.count", _iv(1, 10000, 11000), 1, score_thresh=-10), None),
     "pwm_sliding_window_test_4": (_case("pwm_chrom_test", _PWM4, "pwm", _multi_iv((1, 1000, 2000), (2, 1000, 2000), (1, 2000, 3000)), 1), None),
     "pwm_sliding_window_test_5": (_case("pwm_iter_test", _PWM5, "pwm", _iv(1, 10000, 11000), 1), None),
     "pwm_sliding_window_test_6": (_case("pwm_iter_test", _PWM5, "pwm", _iv(1, 10000, 11000), 10), None),
@@ -411,7 +411,7 @@ _CASES: dict[str, tuple] = {
     "pwm_sliding_window_test_19": (_case("pwm_var_iter", _pssm("s321_7"), "pwm", _iv(1, 1000000, 1050000), 50, sshift=-150, eshift=150, bidirect=True), None),
     "pwm_sliding_window_test_20": (_case("pwm_var_iter", _pssm("s321_7"), "pwm", _iv(1, 1000000, 1050000), 100, sshift=-150, eshift=150, bidirect=True), None),
     "pwm_sliding_window_test_21": (_case("pwm_max_iter20", _pssm("s654_8"), "pwm.max", _iv(1, 1000000, 1100000), 20, sshift=-200, eshift=200, bidirect=True), None),
-    "pwm_sliding_window_test_22": (_case("pwm_count_iter20", _pssm("s987_6"), "pwm.count", _iv(1, 1000000, 1100000), 20, sshift=-100, eshift=100), None),
+    "pwm_sliding_window_test_22": (_case("pwm_count_iter20", _pssm("s987_6"), "pwm.count", _iv(1, 1000000, 1100000), 20, sshift=-100, eshift=100, score_thresh=-8), None),
     "pwm_sliding_window_test_34": (_case("pwm_pos_test", _pssm("s555_8"), "pwm.max.pos", _iv(1, 10000, 11000), 1, bidirect=True), None),
     "pwm_sliding_window_test_35": (_case("pwm_pos_iter20", _pssm("s666_10"), "pwm.max.pos", _iv(1, 1000000, 1100000), 20, sshift=-150, eshift=150, bidirect=True), None),
     "pwm_sliding_window_test_36": (_case("pwm_pos_no_shift", _pssm("s777_7"), "pwm.max.pos", _iv(1, 1000000, 1050000), 50, bidirect=True), None),
@@ -433,7 +433,7 @@ _CASES: dict[str, tuple] = {
     "pwm_sliding_window_iter20_no_shifts": (_case("pwm_reg_no_shift", _pssm("s100_20"), "pwm", _iv(1, 1000000, 1100000), 20, bidirect=True, prior=0.01), None),
     "pwm_sliding_window_iter100_with_shifts": (_case("pwm_reg100", _pssm("s100_20"), "pwm", _iv(1, 1000000, 1100000), 100, sshift=-200, eshift=200, bidirect=True, prior=0.01), None),
     "pwm_sliding_window_max_iter20_shifts": (_case("pwm_max_reg", _pssm("s200_8"), "pwm.max", _iv(1, 1000000, 1050000), 20, sshift=-100, eshift=100, bidirect=True), None),
-    "pwm_sliding_window_count_iter20_shifts": (_case("pwm_count_reg", _pssm("s300_6"), "pwm.count", _iv(1, 1000000, 1050000), 20, sshift=-100, eshift=100), None),
+    "pwm_sliding_window_count_iter20_shifts": (_case("pwm_count_reg", _pssm("s300_6"), "pwm.count", _iv(1, 1000000, 1050000), 20, sshift=-100, eshift=100, score_thresh=-8), None),
     "pwm_sliding_window_multi_intervals_iter20_shifts": (_case("pwm_multi_reg", _pssm("s400_12"), "pwm", _tiled(1000000, 10000, 10), 20, sshift=-100, eshift=100), None),
     "pwm_sliding_window_pos_iter1_shifts": (_case("pwm_pos_reg1", _pssm("s500_10"), "pwm.max.pos", _iv(1, 1000000, 1050000), 1, sshift=-150, eshift=150, bidirect=True), None),
     "pwm_sliding_window_pos_iter20_shifts": (_case("pwm_pos_reg20", _pssm("s500_10"), "pwm.max.pos", _iv(1, 1000000, 1100000), 20, sshift=-150, eshift=150, bidirect=True), None),

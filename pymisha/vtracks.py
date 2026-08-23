@@ -13,6 +13,7 @@ from ._log import get_logger
 from ._shared import (
     CONFIG,
     _checkroot,
+    _coerce_score_thresh,
     _df2pymisha,
     _numpy,
     _pandas,
@@ -1482,8 +1483,9 @@ def gvtrack_create(
           ``'masked.frac'``
     params : float, str, or None, optional
         Function-specific parameter. For example, a percentile in [0, 1]
-        for ``'quantile'``, a max-distance integer for ``'neighbor.count'``,
-        or a score threshold for ``'pwm.count'``.
+        for ``'quantile'`` or a max-distance integer for
+        ``'neighbor.count'``. PWM functions take their threshold via
+        ``score_thresh``, not here.
     sshift : int, default 0
         Shift added to the start coordinate of each iterator interval
         before the virtual track function is evaluated.
@@ -1500,8 +1502,9 @@ def gvtrack_create(
         - ``bidirect`` (bool) -- If True, score both DNA strands (PWM).
         - ``extend`` (bool) -- If True (default), extend the scanned
           sequence so boundary-anchored motifs retain full context.
-        - ``score_thresh`` (float) -- Score threshold for ``'pwm.count'``
-          and edit distance functions.
+        - ``score_thresh`` (float) -- Score threshold. Required for
+          ``'pwm.count'`` (PWM scores are log-likelihoods, so no default
+          suits every PSSM); also used by the edit distance functions.
         - ``max_edits`` (int or None) -- Maximum number of edits for edit
           distance functions. None (default) uses exact computation.
         - ``max_indels`` (int) -- Maximum insertions+deletions for
@@ -1639,6 +1642,25 @@ def gvtrack_create(
     config.update(kwargs)
 
     if str(config.get("func", "")).startswith("pwm"):
+        # R misha requires an explicit threshold wherever one decides what is
+        # counted or reached, and coerces it the same way at every site.
+        if func_lc == "pwm.count" or func_lc in _FILTER_EDIT_DISTANCE_FUNCS:
+            thresh = config.get("score_thresh", config.get("score.thresh"))
+            if thresh is None:
+                what = (
+                    "pwm.count" if func_lc == "pwm.count"
+                    else "pwm edit distance functions"
+                )
+                raise ValueError(
+                    f"{what} require a 'score_thresh' parameter. PWM scores are "
+                    "log-likelihoods, so there is no default that suits every "
+                    "PSSM - pick a threshold from the score distribution of "
+                    "your own matrix, e.g. with a 'pwm' or 'pwm.max' virtual "
+                    "track."
+                )
+            config["score_thresh"] = _coerce_score_thresh(thresh)
+            config.pop("score.thresh", None)
+
         spat_factor = config.get("spat_factor")
         if spat_factor is not None:
             try:
