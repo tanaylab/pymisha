@@ -1,4 +1,8 @@
 # Changelog
+## v0.10.1 (2026-08-24)
+
+- Internal: the C++ error path can no longer fall through and return to the code that raised it. Ported from misha 5.11.22, which shares these sources.
+
 ## v0.10.0 (2026-08-23)
 
 - **A PWM threshold must now be spelled out, and it must be a number.** `gvtrack_create(func="pwm.count")`, the `pwm.edit_distance` family and `gseq_pwm(mode="count")` used to default `score_thresh` to 0. PWM scores are log-likelihoods, so 0 counts nothing for most matrices: a forgotten argument came back as a confident zero. They now raise instead.

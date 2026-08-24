@@ -9,6 +9,7 @@ void TGLError(const char *format, ...)
 	TGLException e(-1, ap, format);
 	va_end(ap);
 	TGLException::s_error_handler(e);
+	throw e;
 }
 
 void TGLError(int errcode, const char *format, ...)
@@ -18,6 +19,7 @@ void TGLError(int errcode, const char *format, ...)
 	TGLException e(errcode, ap, format);
 	va_end(ap);
 	TGLException::s_error_handler(e);
+	throw e;
 }
 
 
@@ -25,6 +27,11 @@ void TGLError(int errcode, const char *format, ...)
 
 TGLException::Error_handler TGLException::s_error_handler = TGLException::throw_error_handler;
 
+//void TGLException::base_error_handler(TGLException &e)
+//{
+//    BaseError(e.msg());
+//}
+//
 void TGLException::throw_error_handler(TGLException &e)
 {
 	throw(e);
