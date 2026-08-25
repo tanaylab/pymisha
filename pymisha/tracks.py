@@ -5,6 +5,7 @@ from __future__ import annotations
 import bz2
 import contextlib
 import datetime as _datetime
+import errno
 import fnmatch
 import ftplib
 import getpass as _getpass
@@ -30,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from . import _shared
-from ._db_trash import _gdb_trash
+from ._db_trash import _gdb_trash, _gdb_trash_sweep_old
 from ._log import PymishaWarning, get_logger, user_stacklevel
 from ._name_validation import validate_dotted_name
 from ._safe_pickle import restricted_load, restricted_loads
@@ -602,6 +603,7 @@ def gtrack_dataset(track: str) -> str | None:
     return result
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def _save_track_attributes(track_name: str, attrs: dict[str, str]) -> None:
     """
     Save track attributes to the .attributes file (binary format).
@@ -677,6 +679,56 @@ def _db_is_indexed(root: str | None) -> bool:
     return (seq_dir / "genome.idx").exists() and (seq_dir / "genome.seq").exists()
 
 
+def _fsync_tree(path: Path) -> None:
+    """Force a staged directory tree to stable storage, depth first.
+
+    os.rename() is atomic against other *processes* - a killed writer leaves
+    either the old track or nothing - but it says nothing about stable storage.
+    The file contents and the directory entry naming them are two independent
+    sets of dirty pages with no ordering between them, so after a power loss or a
+    kernel panic a committed track name can point at data that never left the
+    page cache: the exact half-written state the staging exists to prevent, with
+    no error and no marker.
+
+    Files before the directory naming them, children before parents, so a
+    surviving directory entry always points at synced data.
+
+    Cost, measured on misha's identical writers 2026-08-24: nil on the lab NFS
+    (close-to-open consistency already forces the client to flush at close(), so
+    this only names a cost that was already being paid), nil on tmpfs, ~0.35s per
+    GB on local ext4 - under 1% of a track creation either way. Hence
+    unconditional. See misha 5.11.24.
+
+    Failures are not swallowed: EIO and ENOSPC from fsync are precisely the case
+    where completing the rename would publish a damaged track under a live name.
+    """
+    for entry in sorted(path.iterdir()):
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            _fsync_tree(entry)
+        elif entry.is_file():
+            fd = os.open(entry, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    _fsync_dir(path)
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory entry. EINVAL means the filesystem does not implement
+    it, which is "unsupported", not "lost data"."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno != errno.EINVAL:
+            raise
+    finally:
+        os.close(fd)
+
+
 @contextlib.contextmanager
 def _atomic_track_create(track: str):
     """Run a track-create body atomically: tmp dir + rename on success.
@@ -696,7 +748,8 @@ def _atomic_track_create(track: str):
 
     track_dir = _track_dir_for_create(track)
     parent = track_dir.parent
-    parent.mkdir(parents=True, exist_ok=True)
+    with _shared._with_umask():
+        parent.mkdir(parents=True, exist_ok=True)
     rand = secrets.token_hex(4)
     tmp_dir = parent / f".{track_dir.name}.tmp.{os.getpid()}.{rand}"
 
@@ -707,7 +760,16 @@ def _atomic_track_create(track: str):
             raise RuntimeError(
                 f"track writer did not produce expected directory: {tmp_dir}"
             )
+        # Durability, not just atomicity: sync the staged tree before the
+        # rename and the parent directory after it, so nothing is published
+        # before what it references is on stable storage.
+        _fsync_tree(tmp_dir)
         os.rename(tmp_dir, track_dir)
+        _fsync_dir(parent)
+        # Drop any index cached for this path in a previous track lifecycle:
+        # "rm <track>; create <track>" otherwise routes reads through the old
+        # layout (e.g. a track.dat that no longer exists).
+        _shared._invalidate_dir_cache(track_dir)
     except BaseException:
         # Deliberately BaseException, not Exception: a Ctrl-C in the middle of
         # a track write must still take the half-written directory with it.
@@ -791,6 +853,7 @@ def _set_created_attrs(track: str, description: str, created_by: str, attrs: dic
     _save_track_attributes(track, existing_attrs)
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def _write_created_attrs_at_path(
     track_dir: str | Path,
     description: str,
@@ -1485,6 +1548,7 @@ def gtrack_create_dense(
         raise
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def gtrack_create_dense_direct(
     track: str,
     description: str,
@@ -1735,7 +1799,28 @@ def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> 
 
     vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_modify")
 
-    _pymisha.pm_modify(track, str(expr), _df2pymisha(intervals), binsize, vtracks_dict)
+    # Staged, like every other writer: the C++ copies the data files the
+    # modification touches into stage_dir, writes the new values there, and
+    # renames them back over the originals only once the whole modification has
+    # succeeded. Until then the track on disk is the old one, so an interrupt, a
+    # bad expression or a full disk leaves it intact instead of durably
+    # half-old/half-new under its real name. This was the only pymisha writer
+    # that edited in place.
+    track_dir = Path(_pymisha.pm_track_path(track))
+    parent = track_dir.parent
+    _gdb_trash_sweep_old(parent)
+    stage_dir = parent / f".{track_dir.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    with _shared._with_umask():
+        stage_dir.mkdir(parents=True)
+    try:
+        _pymisha.pm_modify(
+            track, str(expr), _df2pymisha(intervals), binsize, vtracks_dict, str(stage_dir)
+        )
+    finally:
+        _gdb_trash(stage_dir, async_unlink=True)
+        # The staged copy was opened through the track-index cache under its own
+        # path; drop the entry so nothing later resolves that dead directory.
+        _shared._invalidate_dir_cache(stage_dir, track_dir)
 
     # Update created.by attribute (bypass readonly check for internal update)
     modify_str = f'gtrack.modify({track}, {str(expr)}, intervs)'
@@ -2613,6 +2698,10 @@ def gtrack_mv(src: str, dest: str) -> None:
     except OSError:
         shutil.move(str(src_dir), str(dest_dir))
 
+    # Both keys go stale: the source path no longer holds a track, and the
+    # destination path now holds a different one than anything cached for it.
+    _shared._invalidate_dir_cache(src_dir, dest_dir)
+
     _cleanup_empty_track_parents(src_dir, src_db)
     _pm_dbreload(src_db)
 
@@ -2858,6 +2947,10 @@ def _gtrack_copy_one(
             _gdb_trash(dest_dir, async_unlink=True)
         raise
 
+    # The destination path now holds a different track than anything cached for
+    # it (the copy pipeline rewrites track.idx in place at :_gtrack_copy_pipeline).
+    _shared._invalidate_dir_cache(dest_dir)
+
     if dest_db_loaded:
         # dest_db can be the primary GROOT or a loaded secondary dataset;
         # pass it explicitly so the right one's caches get refreshed.
@@ -2871,6 +2964,7 @@ def _gtrack_copy_one(
     return destname
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def gtrack_copy(
     src: str | Iterable[str],
     dest: str | None = None,
@@ -3640,6 +3734,9 @@ def gtrack_convert_to_indexed(track: str, remove_old: bool = False) -> None:
             )
 
     _pymisha.pm_track_convert_to_indexed(track, bool(remove_old))
+    # The layout under this path just changed; a cached "not indexed" is never
+    # stored, but a cached index from a previous conversion would be.
+    _shared._invalidate_dir_cache(_pymisha.pm_track_path(track))
     return None
 
 
@@ -3676,6 +3773,7 @@ def gtrack_create_empty_indexed(track: str) -> None:
         raise ValueError("track cannot be None")
     _checkroot()
     _pymisha.pm_track_create_empty_indexed(track)
+    _shared._invalidate_dir_cache(_pymisha.pm_track_path(track))
 
 
 def gtrack_2d_convert_to_indexed(track: str, remove_old: bool = True, force: bool = False) -> None:
@@ -4143,6 +4241,7 @@ def gtrack_var_get(track: str, var: str) -> Any:
     )
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def gtrack_var_set(track: str, var: str, value: Any) -> None:
     """
     Set the value of a track variable.
@@ -4305,6 +4404,7 @@ def _detect_points_vs_rects(intervals: pd.DataFrame) -> bool:
     return bool((widths1 == 1).all() and (widths2 == 1).all())
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, values: Any) -> None:
     """
     Create a 2D track from intervals and values.

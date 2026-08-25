@@ -94,9 +94,21 @@ protected:
 	static std::map<std::string, std::shared_ptr<TrackIndex>> s_index_cache;
 	static std::mutex s_cache_mutex;
 
-	// Helper to get-or-load the track index
+public:
+	// Helper to get-or-load the track index. Public because non-subclass callers
+	// need it: gtrack_modify's Stager has to know whether the track is indexed
+	// (one shared track.dat) or per-chromosome before it decides what to stage.
 	static std::shared_ptr<TrackIndex> get_track_index(const std::string &track_dir);
 
+	// Drop the memoised index for one track directory, or all of them. Without
+	// these, "rm <track>; create <track>" and gtrack_mv/copy/convert route later
+	// reads through an index describing a layout that is no longer on disk -
+	// "Cannot open .../track.dat", or silently wrong values. Mirrors misha's
+	// GenomeTrack::invalidate_index_cache / clear_index_cache (defect F, 5.11.20).
+	static void invalidate_index_cache(const std::string &track_dir);
+	static void clear_index_cache();
+
+protected:
 	// Helper to extract track directory from a per-chrom filename
 	static std::string get_track_dir(const std::string &filename);
 };

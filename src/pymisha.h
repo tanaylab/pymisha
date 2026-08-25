@@ -40,7 +40,12 @@ bool is_time_elapsed(int64_t delay_msec, const struct timespec &start_time);
 void vmsg(const char *fmt, ...);
 void vemsg(const char *fmt, ...);
 
-void verror(const char *fmt, ...);
+// Never returns. In a kid it reports through shared memory and _exit(1)s; in the
+// parent it throws TGLException, which every registered entry point catches and
+// converts to a Python exception. It used to return when s_ref_count was 0 - the
+// caller then kept running with a Python error set and invalid state, which is how
+// pm_interv_register() before gdb_init() reached a null g_pmdb and segfaulted.
+[[noreturn]] void verror(const char *fmt, ...);
 
 void vwarning(const char *fmt, ...);
 
@@ -263,7 +268,7 @@ protected:
     static void    check_kids_state(bool ignore_errors);
 
     friend void check_interrupt();
-    friend void verror(const char *fmt, ...);
+    [[noreturn]] friend void verror(const char *fmt, ...);
 };
 
 extern PyMisha    *g_pymisha;

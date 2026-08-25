@@ -139,6 +139,8 @@ size_t split_ws(char *buf, char *out_tokens[], size_t max_tokens)
  *
  * Raises pymisha.error on malformed input or empty file.
  */
+extern PyObject *s_pm_err;
+
 PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
 {
     const char *path;
@@ -312,7 +314,10 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     return_py(result);
 
     } catch (TGLException &e) {
-        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        // pymisha.error, as the docstring above promises. This catch was dead until
+        // verror() was made non-returning: a malformed file used to parse past the
+        // bad line and return a dict with a Python error already set.
+        PyErr_SetString(s_pm_err, e.msg());
         return_err();
     } catch (const std::bad_alloc &) {
         PyErr_SetString(PyExc_MemoryError, "Out of memory");

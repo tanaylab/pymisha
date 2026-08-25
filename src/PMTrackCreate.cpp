@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -405,6 +406,10 @@ PyObject *pm_track_create_sparse(PyObject *self, PyObject *args)
                 GInterval interv(cur_chromid, r.start, r.end);
                 gtrack.write_next_interval(interv, r.value);
             }
+            // init_write() flushes each chromosome as it moves to the next; the
+            // last one has nobody to flush it but us. Without this a full disk
+            // truncates it silently and the create reports success.
+            gtrack.flush_writes();
             // Empty per-chrom files: each is a 4-byte signature. For
             // genomes with many small alt contigs the create+close
             // roundtrip per file dominates on NFS (~2 ms / file -> -1.0 s
@@ -678,6 +683,11 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
 
             if (indexed_db)
                 writer->end_chrom();
+            else
+                // gtrack is per-iteration here, so its file is closed by the
+                // destructor below - where a deferred ENOSPC/EDQUOT has nobody
+                // to report to. Flush while it still can.
+                gtrack.flush_writes();
         }
 
         if (indexed_db)
@@ -768,6 +778,7 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
                     gtrack.init_write(path.c_str(), (unsigned)binsize, chromid);
                 }
             }
+            gtrack.flush_writes();   // the last file written; see pm_track_create_sparse
         } else {
             GenomeTrackSparse gtrack;
             int cur_chromid = -1;
@@ -791,6 +802,7 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
                     gtrack.init_write(path.c_str(), chromid);
                 }
             }
+            gtrack.flush_writes();   // the last file written; see pm_track_create_sparse
         }
 
         return_none();
@@ -803,6 +815,172 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
     }
 }
 
+
+namespace {
+
+// gtrack_modify was the only pymisha writer that edited a track in place ("rb+"
+// straight into the live file), so an interrupt, a bad expression or a full disk
+// left the track durably half-old/half-new under its real name, structurally
+// valid, with nothing to mark it as damaged. Worse than misha's on an indexed
+// database, where "rb+" opens the consolidated track.dat and rewrites bins inside
+// the shared file, and track.idx's CRC64 covers only (chrom_id, offset, length),
+// never content - so nothing detects it afterwards.
+//
+// It is now staged like every other writer: the data files the modification
+// touches are copied into a staging directory, the new values are written there,
+// and the result is committed by renaming the staged files back over the
+// originals. Until the commit the live track is untouched. Ported from misha
+// 5.11.22 (src/GenomeTrackModify.cpp), including 5.11.24's fsync.
+//
+// Whole-track atomicity is only as good as the number of files: on an indexed
+// database there is exactly one data file, so the commit is a single rename and
+// is atomic. On a per-chromosome track it is one rename per touched chromosome,
+// back to back with no interruptible work in between; each file is still
+// individually consistent.
+class Stager {
+public:
+    Stager(const string &track_dir, const string &stage_dir) :
+        m_track_dir(track_dir), m_stage_dir(stage_dir),
+        m_indexed(GenomeTrack::get_track_index(track_dir) != nullptr) {}
+
+    bool enabled() const { return !m_stage_dir.empty(); }
+
+    // Returns the path to open for update for this chromosome, copying whatever
+    // backing file the chromosome lives in on first use.
+    string stage(const string &chrom_filename)
+    {
+        if (m_indexed) {
+            // All chromosomes share track.dat; the index is needed alongside it
+            // so the staged copy resolves the same offsets.
+            stage_file("track.idx", false);
+            stage_file("track.dat", true);
+        } else
+            stage_file(chrom_filename, true);
+
+        return m_stage_dir + "/" + chrom_filename;
+    }
+
+    // Renames the staged data files over the originals. Nothing else may be
+    // interposed here: this is the commit. Each staged file is fsynced first and
+    // the track directory after - a rename is atomic against other processes but
+    // not against a machine death, which could otherwise leave the live name
+    // pointing at bytes that never reached stable storage.
+    void commit()
+    {
+        for (vector<string>::const_iterator i = m_committable.begin(); i != m_committable.end(); ++i)
+            fsync_path(m_stage_dir + "/" + *i, false);
+
+        for (vector<string>::const_iterator i = m_committable.begin(); i != m_committable.end(); ++i) {
+            string src = m_stage_dir + "/" + *i;
+            string dst = m_track_dir + "/" + *i;
+            if (rename(src.c_str(), dst.c_str()))
+                verror("Failed to commit %s to %s: %s", src.c_str(), dst.c_str(), strerror(errno));
+        }
+
+        if (!m_committable.empty())
+            fsync_path(m_track_dir, true);
+
+        m_committable.clear();
+    }
+
+private:
+    string         m_track_dir;
+    string         m_stage_dir;
+    bool           m_indexed;
+    set<string>    m_staged;
+    vector<string> m_committable;
+
+    // A directory fsync answers EINVAL on filesystems that do not implement it;
+    // that means "unsupported", not "lost data".
+    static void fsync_path(const string &path, bool is_dir)
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            verror("Failed to open %s for fsync: %s", path.c_str(), strerror(errno));
+
+        int rc = fsync(fd);
+        int err = errno;
+        close(fd);
+
+        if (rc && !(is_dir && err == EINVAL))
+            verror("Failed to fsync %s: %s", path.c_str(), strerror(err));
+    }
+
+    void stage_file(const string &name, bool committable)
+    {
+        if (!m_staged.insert(name).second)
+            return;
+        copy_file(m_track_dir + "/" + name, m_stage_dir + "/" + name);
+        if (committable)
+            m_committable.push_back(name);
+    }
+
+    static void copy_file(const string &src, const string &dst)
+    {
+        int in = ::open(src.c_str(), O_RDONLY);
+        if (in < 0)
+            verror("Cannot open %s: %s", src.c_str(), strerror(errno));
+
+        int out = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (out < 0) {
+            int err = errno;
+            ::close(in);
+            verror("Cannot create %s: %s", dst.c_str(), strerror(err));
+        }
+
+        // The staged file is renamed over the original, so it must carry the
+        // original's permissions rather than whatever the umask happens to be.
+        struct stat st;
+        if (!::fstat(in, &st))
+            (void)::fchmod(out, st.st_mode & 07777);
+
+        vector<char> buf(1 << 20);
+        while (1) {
+            ssize_t nread = ::read(in, &buf[0], buf.size());
+            if (nread < 0) {
+                if (errno == EINTR)
+                    continue;
+                int err = errno;
+                ::close(in);
+                ::close(out);
+                verror("Reading %s: %s", src.c_str(), strerror(err));
+            }
+            if (!nread)
+                break;
+
+            ssize_t written = 0;
+            while (written < nread) {
+                ssize_t n = ::write(out, &buf[written], nread - written);
+                if (n < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    int err = errno;
+                    ::close(in);
+                    ::close(out);
+                    verror("Writing %s: %s", dst.c_str(), strerror(err));
+                }
+                written += n;
+            }
+
+            // A multi-GB track.dat must stay interruptible.
+            try {
+                check_interrupt();
+            } catch (...) {
+                ::close(in);
+                ::close(out);
+                throw;
+            }
+        }
+
+        ::close(in);
+        // close() is where a deferred ENOSPC/EDQUOT surfaces on some filesystems.
+        if (::close(out))
+            verror("Writing %s: %s", dst.c_str(), strerror(errno));
+    }
+};
+
+}
+
 PyObject *pm_modify(PyObject *self, PyObject *args)
 {
     try {
@@ -813,8 +991,9 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
         PyObject *py_intervals = nullptr;
         long iterator_policy = 0;
         PyObject *py_vtracks = nullptr;
+        const char *stage_dir = nullptr;
 
-        if (!PyArg_ParseTuple(args, "ssOl|O", &track, &expr, &py_intervals, &iterator_policy, &py_vtracks))
+        if (!PyArg_ParseTuple(args, "ssOl|Oz", &track, &expr, &py_intervals, &iterator_policy, &py_vtracks, &stage_dir))
             verror("Invalid arguments to pm_modify");
         if (py_vtracks == Py_None)
             py_vtracks = nullptr;
@@ -841,6 +1020,7 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
         GenomeTrackFixedBin gtrack;
         int cur_chromid = -1;
+        Stager stager(track_dir, stage_dir ? string(stage_dir) : string());
 
         for (; !scanner.isend(); scanner.next()) {
             const GInterval &interv = scanner.last_interval();
@@ -849,7 +1029,12 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
                 cur_chromid = interv.chromid;
                 string fname = GenomeTrack::find_existing_1d_filename(chromkey, track_dir, cur_chromid);
                 string path = track_dir + "/" + fname;
-                gtrack.init_update(path.c_str(), cur_chromid);
+                // The values go to the staging copy; the live track keeps the old
+                // ones until commit() below.
+                if (stager.enabled())
+                    gtrack.init_update(stager.stage(fname).c_str(), cur_chromid);
+                else
+                    gtrack.init_update(path.c_str(), cur_chromid);
             }
 
             uint64_t bin_idx = interv.start / gtrack.get_bin_size();
@@ -857,6 +1042,11 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
             float v = (float)scanner.vdouble();
             gtrack.write_next_bin(v);
         }
+
+        // Everything is written and reported before anything is published: a
+        // short write must fail here, not silently at fclose() after commit.
+        gtrack.flush_writes();
+        stager.commit();
 
         return_none();
     } catch (TGLException &e) {

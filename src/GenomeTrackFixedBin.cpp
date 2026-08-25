@@ -754,6 +754,12 @@ void GenomeTrackFixedBin::init_read(const char *filename, const char *mode, int 
 
 void GenomeTrackFixedBin::init_write(const char *filename, unsigned bin_size, int chromid)
 {
+	// open() below drops whatever is still open, and fclose() is where a deferred
+	// ENOSPC/EDQUOT surfaces - with nothing left to report it to. Flush the
+	// previous chromosome's file while a failure can still be raised. The last
+	// chromosome of a run is the caller's flush_writes() after the loop.
+	flush_writes();
+
 	m_num_samples = 0;
 	m_cur_coord = 0;
 

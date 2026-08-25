@@ -34,6 +34,8 @@ from typing import Any, BinaryIO
 
 import numpy as _numpy
 
+from ._shared import _with_umask
+
 # Type codes (subset of R's SEXP type codes).
 _NILVALUE_SXP = 254
 _NILSXP = 0
@@ -859,6 +861,7 @@ def _series_to_r_column(series: Any) -> tuple[str, Any]:
     return ("character", [None if (v is None or (isinstance(v, float) and _numpy.isnan(v))) else str(v) for v in raw])
 
 
+@_with_umask()   # database writes carry misha's permissions
 def write_dataframe(path: str | Path, df: Any) -> None:
     """Write a pandas DataFrame to an R-serialize RDS file at *path*.
 
@@ -931,6 +934,7 @@ def write_dataframe(path: str | Path, df: Any) -> None:
         _write_pairlist_attrs(fh, attrs, ref_table=ref_table)
 
 
+@_with_umask()   # database writes carry misha's permissions
 def write(path: str | Path, value: Any) -> None:
     """Write *value* to *path* as an R-serialize RDS file.
 

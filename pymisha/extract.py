@@ -3281,7 +3281,7 @@ def gscreen(
         return result_2d
 
     # Handle DataFrame-as-iterator for 1D gscreen
-    intervals, iterator, _scr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    intervals, iterator, _scr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
 
     track_names = _track_names_set()
     vtrack_names = set(_shared._VTRACKS.keys())

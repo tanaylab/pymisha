@@ -251,6 +251,11 @@ void TrackIndex2D::clear_cache() {
     s_index_cache.clear();
 }
 
+void TrackIndex2D::invalidate_cache(const string &track_dir) {
+    std::lock_guard<std::mutex> lock(s_cache_mutex);
+    s_index_cache.erase(track_dir);
+}
+
 // --- Static write method ---
 
 void TrackIndex2D::write_index(const string &index_path,

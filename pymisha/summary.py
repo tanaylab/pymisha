@@ -210,7 +210,7 @@ def gdist(
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
     # Handle DataFrame-as-iterator
-    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
 
     # Band or 2D intervals require extract-then-bin path
     if band is not None or _is_2d_intervals(intervals):
@@ -1019,7 +1019,7 @@ def gsummary(
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
     # Handle DataFrame-as-iterator
-    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
 
     # Resolve user variables
     track_names = _track_names_set()
@@ -1146,7 +1146,7 @@ def gquantiles(
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
     # Handle DataFrame-as-iterator
-    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
 
     # Resolve user variables
     track_names = _track_names_set()
@@ -1599,7 +1599,7 @@ def gpartition(
     intervals = _maybe_load_intervals_set(intervals)
 
     # Handle DataFrame-as-iterator
-    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator)
+    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
 
     with _config_no_mt(_itr_id_map) as _cfg:
         result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator, include_lowest, _cfg)

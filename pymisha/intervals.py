@@ -5332,7 +5332,7 @@ def giterator_intervals(
         return units
 
     # Handle DataFrame-as-iterator
-    intervals, itr, _itr_id_map = _preprocess_intervals_iterator(intervals, itr)
+    intervals, itr, _itr_id_map = _preprocess_intervals_iterator(intervals, itr, canonic_scope=True)
     if isinstance(intervals, _pandas.DataFrame) and len(intervals) == 0:
         return None
 

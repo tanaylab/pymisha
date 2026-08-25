@@ -32,6 +32,7 @@ public:
     // Cache invalidation (called by init/reload/unload internally; also
     // safe to call from anything that mutates the chromosome key).
     void invalidate_caches();
+    static void clear_index_caches();
 
     // Build (and cache) the chrom/start/end DataFrame used by
     // pm_intervals_all. Returns a NEW reference: callers may either steal it

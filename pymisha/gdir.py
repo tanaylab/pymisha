@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import _shared
 from ._name_validation import validate_dotted_name
-from ._shared import _checkroot
+from ._shared import _checkroot, _with_umask
 
 
 def _tracks_root() -> Path:
@@ -120,6 +120,7 @@ def gdir_cd(dir: str) -> None:
         raise
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gdir_create(dir: str, show_warnings: bool = True) -> None:
     """
     Create a new directory in the genomic database.
@@ -267,6 +268,7 @@ def gdir_rm(dir: str, recursive: bool = False, force: bool = False) -> None:
     gdb_reload()
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gtrack_create_dirs(track: str, mode: str = "0777") -> None:
     """
     Create the directory hierarchy needed for a dotted track name.

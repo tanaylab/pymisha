@@ -16,6 +16,8 @@
 #include "PMDb.h"
 #include "PMDataFrame.h"
 #include "TGLException.h"
+#include "GenomeTrack.h"
+#include "TrackIndex2D.h"
 
 // Global database instance
 PMDb *g_pmdb = nullptr;
@@ -30,6 +32,7 @@ void PMDb::init(const std::string &groot, const std::string &uroot) {
     }
 
     invalidate_caches();
+    clear_index_caches();
 
     m_groot = groot;
     m_uroot = uroot;
@@ -63,6 +66,7 @@ void PMDb::reload() {
 
 void PMDb::unload() {
     invalidate_caches();
+    clear_index_caches();
     m_groot.clear();
     m_uroot.clear();
     m_datasets.clear();
@@ -73,7 +77,22 @@ void PMDb::unload() {
     m_initialized = false;
 }
 
+// Wholesale drop of the process-static per-directory index caches. Only for a
+// database swap: a groot rebuilt or converted under the same absolute path would
+// otherwise keep being read through the old layout, and unlike R misha there is no
+// gdb.reload(rescan = True) to recover a poisoned session. misha's defect F.
+void PMDb::clear_index_caches() {
+    GenomeTrack::clear_index_cache();
+    TrackIndex2D::clear_cache();
+}
+
 void PMDb::invalidate_caches() {
+    // Deliberately does NOT touch the per-directory track-index caches: reload()
+    // runs after every mutation, and dropping every parsed index there would
+    // re-read them all on the next query. Those caches are cleared wholesale only
+    // on a database swap (init/unload, below), and per directory at each site that
+    // changes what lives at a path. Same split as misha, whose
+    // gdb.reload(rescan = FALSE) also leaves the index cache alone.
     m_intervals_all_names.clear();
     m_intervals_all_names.shrink_to_fit();
     m_intervals_all_sizes.clear();

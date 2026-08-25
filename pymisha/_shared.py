@@ -47,6 +47,16 @@ CONFIG = {
     # count, so a small machine is unaffected.
     'max_processes': max(4, int((_os.cpu_count() or 1) * 0.7)),
     'max_data_size': 10000000,      # Max rows in memory
+    # Umask held around every write to the database. "0007" gives 660 files and
+    # 770 directories - group rwx, no world access - which is what pymisha's own
+    # C++ layer already sets (PyMisha's constructor) and what the shared lab
+    # databases look like on disk. The Python write sites used to leave the
+    # process umask alone, so a track directory written from C++ was 0770 inside
+    # a namespace directory written from Python at 0755, and a .interv or a
+    # .db.cache.dirty saved from Python was 0644 - which a colleague could not
+    # then overwrite from either package. Set to None to leave the process umask
+    # alone. Mirrors R misha's gpermissions.umask (5.11.21).
+    'permissions_umask': 0o007,
     # Workload floors for fork-based multitasking. Fork+IPC costs ~150ms on
     # this stack; below these floors serial is faster (measured 20-200x on
     # hg38/Phylo447 sparse-track ops). Set to 0 to fork unconditionally.
@@ -254,7 +264,7 @@ def _touch_db_cache_dirty(groot: str | None = None) -> None:
         return
     dirty_path = _os.path.join(groot, ".db.cache.dirty")
     try:
-        with open(dirty_path, "w") as fh:
+        with _with_umask(), open(dirty_path, "w") as fh:
             fh.write(_datetime.datetime.now().isoformat())
     except OSError as exc:
         _warnings.warn(
@@ -264,6 +274,57 @@ def _touch_db_cache_dirty(groot: str | None = None) -> None:
             PymishaWarning,
             stacklevel=user_stacklevel(),
         )
+
+
+@_contextlib.contextmanager
+def _with_umask():
+    """Hold ``CONFIG["permissions_umask"]`` for the shortest possible span.
+
+    The umask is process-global state, so it is taken immediately before the
+    write and restored in a ``finally`` that runs on a normal return, on an
+    error and on a KeyboardInterrupt alike. Never set it anywhere that outlives
+    a call: R misha used to set it once in ``.onLoad()`` and never restore it,
+    which silently changed the permissions of everything the session wrote,
+    misha or not.
+
+    ``None`` means "leave my umask alone". Mirrors R misha's ``.gwith_umask``.
+    """
+    um = CONFIG.get("permissions_umask")
+    if um is None:
+        yield
+        return
+    old = _os.umask(um)
+    try:
+        yield
+    finally:
+        _os.umask(old)
+
+
+def _invalidate_dir_cache(*paths: object) -> None:
+    """Drop the C++ memoised track index for one or more track directories.
+
+    ``GenomeTrack::get_track_index`` and ``TrackIndex2D`` memoise a parsed index
+    per track directory, keyed by absolute path, for the life of the process.
+    Nothing invalidated them, so any path that removes, recreates, renames or
+    converts a track directory left later reads routed through an index
+    describing a layout that is no longer on disk: ``Cannot open
+    .../track.dat``, or silently wrong values. Unlike R misha there is no
+    ``gdb.reload(rescan=True)`` here, so a poisoned session could only be fixed
+    by restarting the interpreter.
+
+    Call this from every path that changes what lives at a track directory.
+    Negative lookups are never cached, so per-chrom -> indexed conversion is
+    already safe; the stale case is "cache says indexed" and the index was then
+    removed or replaced under the same path.
+
+    Best-effort: a cache miss is not fatal, so failures are swallowed. Mirrors
+    misha's ``.gdb.invalidate_dir_cache`` (defect F, 5.11.20).
+    """
+    args = [str(p) for p in paths if p]
+    if not args:
+        return
+    with _contextlib.suppress(Exception):
+        _pymisha.pm_invalidate_dir_cache(args)
 
 
 def _pm_dbreload(groot: str | None = None) -> None:
@@ -522,7 +583,36 @@ def _intersect_scope_with_iterator(scope, iterator_intervals):
     return result_df, out_ids
 
 
-def _preprocess_intervals_iterator(intervals, iterator):
+def _canonic_scope(intervals):
+    """Sort and merge a 1D scope, preserving the caller's chromosome labels.
+
+    Same semantics as misha's ``GIntervals::unify_overlaps(true)``: overlapping
+    AND touching intervals merge. Only ``chrom``/``start``/``end`` survive - a
+    scope is a coordinate mask, and any extra column would be ambiguous once two
+    rows become one.
+    """
+    df = intervals[["chrom", "start", "end"]].sort_values(
+        ["chrom", "start", "end"], kind="mergesort"
+    )
+    out = []
+    for chrom, grp in df.groupby("chrom", sort=False):
+        cur_start, cur_end = None, None
+        for start, end in zip(grp["start"].to_numpy(), grp["end"].to_numpy(), strict=True):
+            if cur_end is not None and start <= cur_end:
+                if end > cur_end:
+                    cur_end = end
+                continue
+            if cur_end is not None:
+                out.append((chrom, cur_start, cur_end))
+            cur_start, cur_end = start, end
+        if cur_end is not None:
+            out.append((chrom, cur_start, cur_end))
+    return _pandas.DataFrame(out, columns=["chrom", "start", "end"]).astype(
+        {"start": intervals["start"].dtype, "end": intervals["end"].dtype}
+    )
+
+
+def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     """Handle DataFrame-as-iterator by intersecting with scope intervals.
 
     Parameters
@@ -612,6 +702,27 @@ def _preprocess_intervals_iterator(intervals, iterator):
         raise ValueError(
             "DataFrame iterator must have 'chrom', 'start', 'end' columns"
         )
+
+    # Canonicalise the SCOPE before intersecting, never the iterator. The C++
+    # entry points skip their own unify when they receive the intersection
+    # (iterator_policy == -1), because by then these are bins, not a scope -
+    # so this is the only place an overlapping scope gets merged on this path.
+    # R parity: an overlapping or duplicated scope with a two-bin touching
+    # iterator gives 2 in misha, exactly as a canonical scope does.
+    #
+    # Deliberately not gintervals_canonic(): it round-trips through the C++
+    # chromkey and hands back misha's internal chromosome names, so a caller's
+    # "chr1" comes back as "1" and the intersection below then matches nothing.
+    # Merging here in pandas keeps the caller's own labels.
+    # Opt-in, because it is only correct for the aggregating callers. misha
+    # canonicalises the scope in gsummary/gquantiles/gcor/gscreen/gsample/
+    # gsegment/gwilcox/gpartition/gdist/giterator.intervals and NOT in gextract,
+    # gintervals.summary or gintervals.quantiles, whose output is per scope
+    # interval - merging there would drop rows the caller asked for. gextract
+    # shares this preprocessing, so defaulting to True silently changed it: a
+    # duplicated scope returned 2 rows where misha returns 4.
+    if canonic_scope and len(intervals) > 1:
+        intervals = _canonic_scope(intervals)
 
     new_intervals, id_map = _intersect_scope_with_iterator(intervals, iterator)
     if len(new_intervals) == 0:

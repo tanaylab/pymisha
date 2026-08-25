@@ -28,6 +28,11 @@ public:
     void init_read(const char *filename, int chromid);
     void init_write(const char *filename, int chromid);
 
+    // Pushes the stdio buffer out and reports the failure a plain write() cannot:
+    // a sparse track file finalised without this can be silently truncated on a
+    // full disk. Mirrors GenomeTrackFixedBin::flush_writes (misha 5.11.22).
+    void flush_writes();
+
     void write_next_interval(const GInterval &interval, float val);
 
     const std::vector<GInterval> &get_intervals();

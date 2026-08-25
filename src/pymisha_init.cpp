@@ -58,6 +58,8 @@ PyObject *pm_track_create_sparse(PyObject *self, PyObject *args);
 PyObject *pm_track_create_dense(PyObject *self, PyObject *args);
 PyObject *pm_track_create_expr(PyObject *self, PyObject *args);
 PyObject *pm_set_create_dir_override(PyObject *self, PyObject *args);
+PyObject *pm_invalidate_dir_cache(PyObject *self, PyObject *args);
+PyObject *pm_clear_dir_caches(PyObject *self, PyObject *args);
 PyObject *pm_clear_create_dir_override(PyObject *self, PyObject *args);
 PyObject *pm_set_create_parallel_writers(PyObject *self, PyObject *args);
 PyObject *pm_intervals_all(PyObject *self, PyObject *args);
@@ -148,6 +150,8 @@ static PyMethodDef module_methods[] = {
     {"pm_track_create_dense", pm_track_create_dense, METH_VARARGS, "Create dense track from intervals+values"},
     {"pm_track_create_expr", pm_track_create_expr, METH_VARARGS, "Create track from expression in streaming mode"},
     {"pm_set_create_dir_override", pm_set_create_dir_override, METH_VARARGS, "Set thread-local override path for next pm_track_create_*"},
+    {"pm_invalidate_dir_cache", pm_invalidate_dir_cache, METH_VARARGS, "Drop the memoised track index for one or more track directories"},
+    {"pm_clear_dir_caches", pm_clear_dir_caches, METH_VARARGS, "Drop every memoised track index"},
     {"pm_clear_create_dir_override", pm_clear_create_dir_override, METH_VARARGS, "Clear thread-local create_dir_override"},
     {"pm_set_create_parallel_writers", pm_set_create_parallel_writers, METH_VARARGS, "Set thread-local worker count for empty-chrom file dispatch in pm_track_create_sparse"},
     {"pm_intervals_all", pm_intervals_all, METH_VARARGS, "Get all genome intervals"},

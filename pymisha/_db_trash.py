@@ -40,6 +40,13 @@ def _gdb_trash(path: str | os.PathLike[str], async_unlink: bool = True) -> bool:
     if not p.exists() and not p.is_symlink():
         return False
 
+    # Before the directory stops being what the C++ index cache thinks it is.
+    # Deferred import: _shared imports nothing from here, but this module is
+    # imported early enough that a top-level import would be circular.
+    from ._shared import _invalidate_dir_cache
+
+    _invalidate_dir_cache(p)
+
     parent = p.parent
     rand = secrets.token_hex(4)
     trash_path = parent / f".trash.{p.name}.{os.getpid()}.{rand}"
@@ -88,6 +95,8 @@ def _gdb_trash_sweep_old(
     int
         Number of stale entries removed.
     """
+    from ._shared import _invalidate_dir_cache
+
     parent_p = Path(parent)
     if not os.path.isdir(parent_p):
         return 0
@@ -112,6 +121,7 @@ def _gdb_trash_sweep_old(
         except OSError:
             continue
         if mtime < cutoff:
+            _invalidate_dir_cache(entry)
             shutil.rmtree(entry, ignore_errors=True)
             count += 1
     return count

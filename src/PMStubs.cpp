@@ -344,6 +344,13 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
 
 extern PyObject *s_pm_err;
 
+// Defined further down; declared here because the aggregating entry points above
+// canonicalise their 1D scope before scanning it. misha does the same in
+// GenomeTrackSummary/Quantiles/Cor/Screener/Sampler/Partition/Distribution:
+// an overlapping scope must be counted once, not once per covering interval.
+void intervals_sort(std::vector<GInterval> &intervals);
+void intervals_unify_overlaps(std::vector<GInterval> &intervals, bool merge_touching = true);
+
 static void parse_string_list(PyObject *obj, std::vector<std::string> &out, const char *what)
 {
     out.clear();
@@ -1542,6 +1549,20 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
 
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackScreener.cpp); pymisha did not.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
+
         if (intervals.empty()) {
             Py_INCREF(Py_None);
             return Py_None;
@@ -1889,6 +1910,22 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
 
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
+
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackSummary.cpp); pymisha did not, so the same call on the same
+        // data returned inflated statistics - 40 intervals and sum 2.557778
+        // where misha gave 30 and 2.337778.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         SummaryStats summary;
 
@@ -2248,6 +2285,22 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
 
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
+
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackQuantiles.cpp); pymisha did not, so the same call on the same
+        // data returned inflated statistics - 40 intervals and sum 2.557778
+        // where misha gave 30 and 2.337778.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         std::vector<double> quantiles(n, std::numeric_limits<double>::quiet_NaN());
 
@@ -3505,6 +3558,21 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
 
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackPartition.cpp:149); pymisha did not, so two identical
+        // scope intervals returned 74 partitions where misha returned 37.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
+
         if (intervals.empty()) {
             // Return None for empty intervals
             Py_INCREF(Py_None);
@@ -3727,14 +3795,14 @@ static bool intervals_compare_by_start(const GInterval &a, const GInterval &b) {
 }
 
 // Helper: sort intervals in place
-static void intervals_sort(std::vector<GInterval> &intervals) {
+void intervals_sort(std::vector<GInterval> &intervals) {
     if (!intervals.empty() && !std::is_sorted(intervals.begin(), intervals.end(), intervals_compare_by_start)) {
         std::sort(intervals.begin(), intervals.end(), intervals_compare_by_start);
     }
 }
 
 // Helper: merge overlapping intervals in place (intervals must be sorted)
-static void intervals_unify_overlaps(std::vector<GInterval> &intervals, bool merge_touching = true) {
+void intervals_unify_overlaps(std::vector<GInterval> &intervals, bool merge_touching) {
     if (intervals.empty()) return;
 
     size_t cur_idx = 0;
@@ -4333,8 +4401,16 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
         convert_py_intervals(py_intervals, intervals);
 
         // Sort and unify overlaps (like R misha does)
-        intervals_sort(intervals);
-        intervals_unify_overlaps(intervals);
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         if (intervals.empty()) {
             // Return zero-filled array for empty intervals
@@ -4699,8 +4775,16 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
 
-        intervals_sort(intervals);
-        intervals_unify_overlaps(intervals);
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         if (intervals.empty()) {
             Py_INCREF(Py_None);
@@ -4894,6 +4978,20 @@ PyObject *pm_sample(PyObject *self, PyObject *args)
 
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
+
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackSampler.cpp); pymisha did not.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         if (intervals.empty()) {
             Py_INCREF(Py_None);
@@ -5491,6 +5589,22 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
 
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackCor.cpp); pymisha did not, so the same call on the same
+        // data returned inflated statistics - 40 intervals and sum 2.557778
+        // where misha gave 30 and 2.337778.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
+
         size_t num_pairs = exprs.size() / 2;
         std::vector<CorSummary> summaries(num_pairs);
         std::vector<SpearmanSummary> spearman_summaries(num_pairs);
@@ -5962,6 +6076,7 @@ static int _pm_test_2d_get_array(PyObject *dict, const char *key, PyArrayObject 
 
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args)
 {
+  try {
     (void)self;
     PyObject *intervals_dict = NULL;
     if (!PyArg_ParseTuple(args, "O!", &PyDict_Type, &intervals_dict)) {
@@ -6059,6 +6174,14 @@ PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args)
     #undef SET_INT64
 
     return result;
+  } catch (TGLException &e) {
+    // The iterator can verror on malformed input, and verror throws now.
+    PyErr_SetString(s_pm_err, e.msg());
+    return NULL;
+  } catch (const std::bad_alloc &) {
+    PyErr_SetString(PyExc_MemoryError, "Out of memory");
+    return NULL;
+  }
 }
 
 //---------------------------------------------------------------------------

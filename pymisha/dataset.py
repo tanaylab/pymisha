@@ -13,7 +13,7 @@ from typing import Any
 
 from . import _shared
 from ._log import get_logger
-from ._shared import _checkroot, _pymisha
+from ._shared import _checkroot, _pymisha, _with_umask
 
 _logger = get_logger(__name__)
 
@@ -127,6 +127,7 @@ def _yaml_scalar(value: Any) -> str:
     return f"'{text}'"
 
 
+@_with_umask()   # database writes carry misha's permissions
 def _write_dataset_metadata(path: Path, metadata: dict[str, Any]) -> None:
     # Keep schema flat and scalar so the file can be parsed without pyyaml.
     lines = [f"{key}: {_yaml_scalar(value)}" for key, value in metadata.items()]
@@ -183,6 +184,7 @@ def _parse_dataset_metadata(path: Path) -> dict[str, Any]:
     return data
 
 
+@_with_umask()   # database writes carry misha's permissions
 def _copy_or_link(src: Path, dst: Path, symlinks: bool) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if symlinks:
@@ -401,6 +403,7 @@ def gdataset_unload(path: str, validate: bool = False):
     return
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gdataset_save(
     path: str,
     description: str,

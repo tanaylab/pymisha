@@ -87,8 +87,17 @@ void GenomeTrackSparse::init_read(const char *filename, int chromid)
     m_chromid = chromid;
 }
 
+void GenomeTrackSparse::flush_writes()
+{
+    if (m_bfile.opened() && m_bfile.flush())
+        TGLError<GenomeTrackSparse>("Failed to write a sparse track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
+}
+
 void GenomeTrackSparse::init_write(const char *filename, int chromid)
 {
+    // close() is where a deferred ENOSPC/EDQUOT surfaces, with nothing left to
+    // report it to. Flush the previous chromosome's file first.
+    flush_writes();
     m_bfile.close();
     m_loaded = false;
     write_type(filename);

@@ -34,6 +34,15 @@ public:
 
 	void init_update(const char *filename, int chromid) { init_read(filename, "rb+", chromid); }
 
+	// Pushes the stdio buffer out and reports the failure a plain write() cannot:
+	// a dense track file finalised without this can be silently truncated on a
+	// full disk. Ported from misha 5.11.22.
+	void flush_writes()
+	{
+		if (m_bfile.opened() && m_bfile.flush())
+			TGLError<GenomeTrackFixedBin>("Failed to write a dense track file %s: %s", m_bfile.file_name().c_str(), strerror(errno));
+	}
+
 	unsigned get_bin_size() const { return m_bin_size; }
 	int64_t  get_num_samples() const { return m_num_samples; }
 

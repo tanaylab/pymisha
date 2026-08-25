@@ -18,6 +18,8 @@
 
 // Forward declarations of helpers from PMStubs.cpp
 extern void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &intervals);
+extern void intervals_sort(std::vector<GInterval> &intervals);
+extern void intervals_unify_overlaps(std::vector<GInterval> &intervals, bool merge_touching = true);
 extern long parse_iterator_policy(PyObject *py_iterator, long default_policy, const char *caller);
 
 // ================================= gwilcox =================================
@@ -219,6 +221,20 @@ PyObject *pm_wilcox(PyObject *self, PyObject *args)
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
 
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackWilcox.cpp:260); pymisha did not.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
+
         if (intervals.empty()) {
             Py_INCREF(Py_None);
             return Py_None;
@@ -340,6 +356,20 @@ PyObject *pm_segment(PyObject *self, PyObject *args)
 
         std::vector<GInterval> intervals;
         convert_py_intervals(py_intervals, intervals);
+
+        // Canonicalise the scope: an overlapping 1D scope must contribute each
+        // base once, not once per covering interval. misha unifies here
+        // (GenomeTrackSegmentation.cpp:81); pymisha did not.
+        // Only when these really are the caller's scope. When the iterator is a
+        // DataFrame, the Python layer has already intersected it with the scope
+        // and passes the resulting BINS here with iterator_policy == -1;
+        // canonicalising those would merge adjacent bins into one, which is a
+        // different answer from misha's. Verified against R: a two-bin touching
+        // iterator must stay two bins whatever the scope looks like.
+        if (iterator_policy != -1) {
+            intervals_sort(intervals);
+            intervals_unify_overlaps(intervals);
+        }
 
         if (intervals.empty()) {
             Py_INCREF(Py_None);

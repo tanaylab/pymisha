@@ -101,6 +101,7 @@ public:
 
     // Clear the index cache
     static void clear_cache();
+    static void invalidate_cache(const std::string &track_dir);
 
     // Write a 2D index file
     // entries must be populated with chrom1_id, chrom2_id, offset, length

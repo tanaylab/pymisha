@@ -57,8 +57,26 @@ extern PyObject *s_pm_err;
 
 PyMisha::PyMisha(bool check_db)
 {
+    // Checked FIRST, before anything is initialised and before s_ref_count++.
+    // C++ does not run the destructor of an object whose constructor threw, so a
+    // throw from any later point leaks whatever this constructor has already set:
+    // the ref count (permanently skipping the init block for every later call,
+    // leaving g_pymisha pointing at a dead stack frame), the umask, and the
+    // TGLException error handler.
+    if (check_db && s_groot.empty())
+        verror("Database was not loaded. Please call gdb.init.");
+
     if (!s_ref_count) {
+        // The three pieces of global state the destructor restores are taken first,
+        // so the catch below has something valid to put back.
         m_old_umask = umask(07);
+        m_old_error_handler = TGLException::set_error_handler(TGLException::throw_error_handler);
+        g_pymisha = this;
+
+        // Everything from here on can throw - verror() does, and so can
+        // load_options(). ~PyMisha() does not run for an object whose constructor
+        // threw, so unwind by hand and rethrow.
+        try {
 
         ++g_transact_id;
 
@@ -72,9 +90,6 @@ PyMisha::PyMisha(bool check_db)
         s_shm = (Shm *)MAP_FAILED;
         s_fifo_fd = -1;
         s_running_pids.clear();
-
-        g_pymisha = this;
-        m_old_error_handler = TGLException::set_error_handler(TGLException::throw_error_handler);
 
         PMPY module(PyImport_AddModule("__main__"));
         if (!module)
@@ -109,14 +124,15 @@ PyMisha::PyMisha(bool check_db)
 
         load_options();
 
+        } catch (...) {
+            TGLException::set_error_handler(m_old_error_handler);
+            g_pymisha = NULL;
+            umask(m_old_umask);
+            throw;
+        }
     }
 
     s_ref_count++;
-
-    if (check_db) {
-        if (s_groot.empty())
-            verror("Database was not loaded. Please call gdb.init.");
-    }
 }
 
 PyMisha::~PyMisha()
@@ -608,7 +624,7 @@ void vemsg(const char *fmt, ...)
     fflush(stderr);
 }
 
-void verror(const char *fmt, ...)
+[[noreturn]] void verror(const char *fmt, ...)
 {
     va_list ap;
     char buf[1000];
@@ -617,10 +633,18 @@ void verror(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    if (PyMisha::s_ref_count)
-        TGLError("%s", buf);
-    else
+    // A kid reports through shared memory and _exit(1)s, so handle_error() never
+    // returns there.
+    if (PyMisha::s_is_kid)
         PyMisha::handle_error(buf);
+
+    // The parent always throws. This used to branch on s_ref_count and call
+    // handle_error() when it was 0 - which sets the Python error and RETURNS, so
+    // the caller ran on with an exception set and invalid state. Every registered
+    // entry point catches TGLException and converts it, so throwing is what the
+    // 432 call sites already assume; the s_ref_count == 0 branch was the odd one
+    // out. See handle_error(), still used from those catch blocks.
+    TGLError("%s", buf);
 }
 
 void vwarning(const char *fmt, ...)

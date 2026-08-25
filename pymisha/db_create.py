@@ -31,6 +31,7 @@ from ._crc64 import (
     crc64_init as _crc64_init,
 )
 from ._log import get_logger
+from ._shared import _with_umask
 
 _logger = get_logger(__name__)
 
@@ -437,6 +438,13 @@ def _convert_all_tracks_to_indexed(
         with ctx.Pool(threads) as pool:
             results = pool.map(_convert_one_track_worker, args_list)
 
+    # Whole-database layout flip: the workers converted in forked children, so the
+    # parent still holds a parsed index for the per-chrom layout of every track it
+    # had read. Drop them all rather than reconstruct which ones changed.
+    from . import _shared
+
+    _shared._pymisha.pm_clear_dir_caches()
+
     converted_1d = sum(1 for _, s, _ in results if s == "converted_1d")
     converted_2d = sum(1 for _, s, _ in results if s == "converted_2d")
     failures = [(t, e) for t, s, e in results if s == "failed"]
@@ -572,6 +580,7 @@ def _db_conversion_context(groot: str | Path) -> Generator[None, None, None]:
                 _shared._VTRACKS = old_vtracks
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gdb_create_linked(path: str, parent: str) -> bool:
     """
     Create a linked database that reuses sequence data from a parent DB.
@@ -649,6 +658,7 @@ def gdb_create_linked(path: str, parent: str) -> bool:
     return True
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gdb_convert_to_indexed(
     groot: str | None = None,
     remove_old_files: bool = False,
@@ -851,6 +861,7 @@ def gdb_convert_to_indexed(
     return
 
 
+@_with_umask()   # database writes carry misha's permissions
 def gdb_create(
     groot: str,
     fasta: str | list[str],
@@ -1099,6 +1110,7 @@ def gdb_create_genome(
     return
 
 
+@_with_umask()   # database writes carry misha's permissions
 def _gdb_create_genome_from_s3(
     name: str,
     dest_dir: str,

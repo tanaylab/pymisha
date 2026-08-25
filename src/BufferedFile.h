@@ -46,6 +46,14 @@ public:
 	// see fseek for return value
 	int seek(int64_t offset, int whence);
 
+	// Returns 0 on success, EOF on failure (errno set). Writes go through fwrite
+	// into a 1 MiB stdio buffer, so a successful write() return says nothing
+	// about the bytes reaching the disk: ENOSPC/EDQUOT surface here (or,
+	// unchecked, at fclose). Every writer that finalises a file must flush() and
+	// check before it stops being able to report an error.
+	// Ported from misha 5.11.22.
+	int flush() { return m_fp ? fflush(m_fp) : 0; }
+
 	int error() const { return !m_fp || ferror(m_fp); }
 
 	int eof() const { return m_eof; }
