@@ -268,7 +268,12 @@ protected:
     static void    check_kids_state(bool ignore_errors);
 
     friend void check_interrupt();
-    [[noreturn]] friend void verror(const char *fmt, ...);
+    // No [[noreturn]] here: clang rejects an attribute list on a friend
+    // declaration ("an attribute list cannot appear here") while gcc accepts it,
+    // so this built on Linux and broke every macOS build. The attribute belongs
+    // on the declaration above, which is what callers see; this line only grants
+    // access to private members.
+    friend void verror(const char *fmt, ...);
 };
 
 extern PyMisha    *g_pymisha;

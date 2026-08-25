@@ -1,4 +1,8 @@
 # Changelog
+## v0.11.1 (2026-08-25)
+
+- **Fixes the macOS build, which 0.11.0 broke.** `[[noreturn]]` was placed on a `friend` declaration in `src/pymisha.h`; gcc accepts that and clang rejects it, so every macOS build failed with "an attribute list cannot appear here". 0.11.0 published Linux wheels and an sdist but no macOS wheels, so `pip install pymisha==0.11.0` on a Mac fell back to the sdist and failed to compile. No behaviour change on any platform - the attribute stays on the function's own declaration, which is what callers see.
+
 ## v0.11.0 (2026-08-24)
 
 **MINOR, not a patch: the first item changes numbers that existing scripts already print.**
