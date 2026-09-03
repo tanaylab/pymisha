@@ -70,7 +70,11 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [build_wheels_linux, build_wheels_macos, build_sdist]
-    if: always() && needs.build_wheels_linux.result == 'success' && needs.build_sdist.result == 'success'
+    # All three build jobs must succeed. macOS was deliberately excluded here,
+    # which is how 0.11.0 published Linux-only wheels plus an sdist that could
+    # not compile on a Mac: pip fell back to the sdist and failed. A release
+    # that cannot build on a supported platform should fail, not ship partially.
+    if: always() && needs.build_wheels_linux.result == 'success' && needs.build_wheels_macos.result == 'success' && needs.build_sdist.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
