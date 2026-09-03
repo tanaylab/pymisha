@@ -110,7 +110,14 @@ def _check_vtrack_params(func: str | None, kwargs: dict) -> None:
         )
         return
 
-    accepted = _ACCEPTED_VTRACK_PARAMS.get(func_lc, frozenset())
+    # Annotated and None-guarded for mypy: func_lc is str | None while the table
+    # is keyed by str, and a bare empty-set default gave mypy nothing to infer
+    # the element type from. Behaviour is unchanged - no key is None, so the old
+    # .get(None, ...) already returned the empty set - and `accepted` is only
+    # ever tested for membership, sorted and truthiness, never mutated.
+    accepted: set[str] = set()
+    if func_lc is not None:
+        accepted = _ACCEPTED_VTRACK_PARAMS.get(func_lc, set())
     unknown = sorted(k for k in keys
                      if _DOTTED_PARAM_ALIASES.get(k, k) not in accepted)
     if not unknown:

@@ -1,4 +1,9 @@
 # Changelog
+## v0.12.1 (2026-09-03)
+
+- **Fixes the conda macOS build.** `drand48()` was called without including `<stdlib.h>`, which declares it; the include used to arrive transitively. conda-forge's macOS toolchain moved and every `arm64-apple-darwin` conda build began failing with "use of undeclared identifier 'drand48'". The usage is unchanged since 0.11.1 - the include was missing all along. PyPI wheels and Linux builds were never affected.
+- Internal: two mypy errors in `_check_vtrack_params` that blocked CI on Linux. Because the type check runs before the tests, 0.12.0's Linux test suite never ran; it passes (4753 tests).
+
 ## v0.12.0 (2026-09-03)
 
 Ports R misha 5.11.15-5.11.26.

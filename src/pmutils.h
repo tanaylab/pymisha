@@ -15,6 +15,12 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <cstring>
+// drand48() is POSIX and declared here. This used to arrive transitively, which
+// held until conda-forge's macOS toolchain moved (2026-09-03) and every
+// arm64-apple-darwin conda build failed with "use of undeclared identifier
+// 'drand48'". The Apple-clang wheels and the Linux builds were unaffected, so
+// the include was missing all along rather than newly needed.
+#include <stdlib.h>
 
 #include "TGLException.h"
 

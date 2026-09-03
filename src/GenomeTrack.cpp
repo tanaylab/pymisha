@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <errno.h>
+#include <stdlib.h>   // drand48, used for s_rnd_func below; see pmutils.h
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
