@@ -11,6 +11,7 @@
 #include <limits>
 #include <unistd.h>
 
+#include <string>
 #include "PMTrackExpressionVars.h"
 #include "TGLException.h"
 #include "PWMScorer.h"

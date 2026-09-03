@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <unistd.h>
 
+#include <string>
 #include "pymisha.h"
 #include "PMDb.h"
 #include "GInterval.h"

@@ -24,6 +24,7 @@
 #include <vector>
 #include <string>
 
+#include <stdlib.h>
 // Defined in PMStubs.cpp
 extern void convert_py_intervals(PyObject *py_intervals,
                                  std::vector<GInterval> &intervals);

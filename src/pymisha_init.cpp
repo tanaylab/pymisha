@@ -16,6 +16,7 @@
 #include <Python.h>
 #include <numpy/arrayobject.h>
 #include <numpy/npy_math.h>
+#include <stdlib.h>
 #include "PMDb.h"
 
 PyObject *g_module;

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <string>
 PMTrackExpressionFixedRectIterator::PMTrackExpressionFixedRectIterator(
     int64_t width, int64_t height,
     std::vector<GInterval2D> scope,

@@ -1,4 +1,8 @@
 # Changelog
+## v0.12.2 (2026-09-03)
+
+- **Finishes the conda macOS fix.** 0.12.1 closed the `drand48` half; the same stricter toolchain then rejected `std::to_string` used without `<string>` in four files. Both are the same latent bug - headers that used to arrive transitively - not a change in behaviour. Verified by compiling every translation unit against clang/libc++, which reproduces the failure and now passes.
+
 ## v0.12.1 (2026-09-03)
 
 - **Fixes the conda macOS build.** `drand48()` was called without including `<stdlib.h>`, which declares it; the include used to arrive transitively. conda-forge's macOS toolchain moved and every `arm64-apple-darwin` conda build began failing with "use of undeclared identifier 'drand48'". The usage is unchanged since 0.11.1 - the include was missing all along. PyPI wheels and Linux builds were never affected.
