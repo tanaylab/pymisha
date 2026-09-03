@@ -806,6 +806,77 @@ def _normalize_intervals_df(intervals: Any) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+_MAX_REPORTED_CHROMS = 20
+
+
+def _is_primary_chrom_name(name: str) -> bool:
+    """"chr7", "7", "X" - the names a genome database is expected to have.
+
+    Scaffolds, patches and unplaced contigs carry extra tokens and do not match;
+    neither does a mitochondrial name. Mirrors misha's
+    ``UnknownChroms::is_primary_chrom_name`` (5.11.18).
+    """
+    core = name[3:] if len(name) > 3 and name[:3].lower() == "chr" else name
+    if not core or len(core) > 2:
+        return False
+    if core.isdigit():
+        return True
+    return len(core) == 1 and core.upper() in "XYZW"
+
+
+def _report_skipped_chroms(parsed: pd.DataFrame, file_path: str) -> None:
+    """Report the chromosome names an import dropped (misha 5.11.18).
+
+    Which channel depends on what was dropped. A scaffold or unplaced contig is
+    what every whole-genome bigWig looks like against a primary-only database:
+    a log message. A primary chromosome means the naming is probably wrong and
+    real data is being lost silently: a warning.
+
+    Only names present in the file that did not resolve count - not database
+    chromosomes the file happens not to cover. A chr1-only bedGraph dropped
+    nothing.
+    """
+    from .intervals import gintervals_all
+
+    known = set(gintervals_all()["chrom"].astype(str))
+    unknown: list[str] = []
+    n_matched = 0
+    for raw in pd.unique(parsed["chrom"].astype(str)):
+        try:
+            canon = _pymisha.pm_normalize_chroms([raw])[0]
+        except (_pymisha.error, IndexError):
+            canon = None
+        if canon is not None and canon in known:
+            n_matched += 1
+        else:
+            unknown.append(raw)
+
+    # Nothing dropped, or nothing matched at all - the latter is the caller's
+    # "No intervals map to known chromosomes" error, not a partial import.
+    if not unknown or not n_matched:
+        return
+
+    shown = unknown[:_MAX_REPORTED_CHROMS]
+    more = "+" if len(unknown) > len(shown) else ""
+    names = ", ".join(shown) + (", ..." if more else "")
+    primary = [c for c in unknown if _is_primary_chrom_name(c)]
+
+    if primary:
+        warnings.warn(
+            f"{len(unknown)}{more} chromosome name(s) in {file_path} do not exist "
+            f"in the genome database and were skipped, among them primary "
+            f"chromosome(s): {', '.join(primary[:_MAX_REPORTED_CHROMS])}. Data for "
+            f"the remaining {n_matched} chromosome(s) was imported.",
+            stacklevel=3,
+        )
+    else:
+        _logger.info(
+            "%d%s chromosome name(s) in %s do not exist in the genome database "
+            "and were skipped: %s. Data for the remaining %d chromosome(s) was "
+            "imported.", len(unknown), more, file_path, names, n_matched,
+        )
+
+
 def _canonicalize_known_chroms(df: pd.DataFrame) -> pd.DataFrame:
     from .intervals import gintervals_all
 
@@ -2424,6 +2495,8 @@ def gtrack_import(
         parsed = _parse_wig_or_bedgraph(file_path)
     else:
         parsed = _parse_tabular_track(file_path)
+
+    _report_skipped_chroms(parsed, file_path)
 
     if binsize is None:
         binsize = 0

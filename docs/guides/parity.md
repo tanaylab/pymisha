@@ -87,9 +87,6 @@ for the same purpose, so it ports directly.
   format is not decoded. Workaround: re-write with
   `serialize(value, con, ascii = FALSE)` in R.
 
-- **`pwm.n_mutations`** virtual-track function (R misha's `Mode::N_MUTATIONS`).
-  Not implemented in PyMisha; the other `pwm.edit_distance*` functions are.
-
 ## Data-shape differences
 
 - **`chrom` column dtype.** PyMisha writes the `chrom` / `chrom1` / `chrom2`
@@ -97,6 +94,12 @@ for the same purpose, so it ports directly.
   whose levels are the genome's full `ALLGENOME` chromosome set. R reads the
   character form fine on every path we exercise, but code that relies on
   `levels()` or on factor codes will see the difference.
+
+- **When a missing `pssm` is reported.** R misha rejects a PWM virtual track
+  without a `pssm` at `gvtrack.create()`; PyMisha accepts the call and raises
+  when the virtual track is first evaluated. The message is the same either
+  way, and this applies to every `pwm*` function. Unrecognised *parameter
+  names* are rejected at creation time in both, as of 0.12.0.
 
 ## Numerical reproducibility
 

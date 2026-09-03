@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings as _warnings
 from typing import Any
 
 import numpy as np
@@ -58,7 +59,76 @@ _FILTER_EDIT_DISTANCE_FUNCS = {
     "pwm.max.edit_distance",
     "pwm.edit_distance.lse",
     "pwm.edit_distance.lse.pos",
+    "pwm.n_mutations",
 }
+# Keyword arguments each func accepts, mirroring R misha's .VTRACK_PARAM_HANDLERS
+# (5.11.15). A func that is not listed accepts none: a misspelled key used to be
+# dropped and silently defaulted, which is indistinguishable from the parameter
+# having had no effect. `filter` is a pymisha addition accepted everywhere.
+_PWM_PARAMS = {
+    "pssm", "bidirect", "prior", "extend", "strand",
+    "spat_factor", "spat_bin", "spat_min", "spat_max", "score_thresh",
+}
+_EDIT_DISTANCE_PARAMS = {
+    "pssm", "score_thresh", "max_edits", "max_indels", "score_min", "score_max",
+    "bidirect", "prior", "extend", "strand", "direction",
+}
+_LSE_EDIT_DISTANCE_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_indels"}
+_N_MUTATIONS_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_edits", "max_indels"}
+_ACCEPTED_VTRACK_PARAMS = {
+    "pwm": _PWM_PARAMS,
+    "pwm.max": _PWM_PARAMS,
+    "pwm.max.pos": _PWM_PARAMS,
+    "pwm.count": _PWM_PARAMS,
+    "kmer.count": {"kmer", "extend", "strand"},
+    "kmer.frac": {"kmer", "extend", "strand"},
+    "pwm.edit_distance": _EDIT_DISTANCE_PARAMS,
+    "pwm.edit_distance.pos": _EDIT_DISTANCE_PARAMS,
+    "pwm.max.edit_distance": _EDIT_DISTANCE_PARAMS,
+    "pwm.edit_distance.lse": _LSE_EDIT_DISTANCE_PARAMS,
+    "pwm.edit_distance.lse.pos": _LSE_EDIT_DISTANCE_PARAMS,
+    "pwm.n_mutations": _N_MUTATIONS_PARAMS,
+}
+# R spells these with a dot; pymisha reads either.
+_DOTTED_PARAM_ALIASES = {"score.thresh": "score_thresh", "score.min": "score_min",
+                         "score.max": "score_max"}
+# masked.count / masked.frac warn rather than raise, as R misha does.
+_WARN_ON_PARAMS_FUNCS = {"masked.count", "masked.frac"}
+
+
+def _check_vtrack_params(func: str | None, kwargs: dict) -> None:
+    """Reject kwargs that ``func`` does not accept (R misha 5.11.15)."""
+    keys = {k for k in kwargs if k != "filter"}
+    if not keys:
+        return
+
+    func_lc = str(func).lower() if func is not None else None
+    if func_lc in _WARN_ON_PARAMS_FUNCS:
+        _warnings.warn(
+            f"{func} does not accept parameters; ignoring {sorted(keys)}",
+            stacklevel=3,
+        )
+        return
+
+    accepted = _ACCEPTED_VTRACK_PARAMS.get(func_lc, frozenset())
+    unknown = sorted(k for k in keys
+                     if _DOTTED_PARAM_ALIASES.get(k, k) not in accepted)
+    if not unknown:
+        return
+
+    keylist = ", ".join(repr(k) for k in unknown)
+    plural = "s" if len(unknown) > 1 else ""
+    if not accepted:
+        raise ValueError(
+            f"function {func!r} does not accept parameter{plural} {keylist}; "
+            "this function takes no additional keyword arguments"
+        )
+    raise ValueError(
+        f"function {func!r} does not accept parameter{plural} {keylist}; "
+        f"accepted parameters are: {', '.join(sorted(accepted))}"
+    )
+
+
 _DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
 # Columns that never count as a "value" column when inferring a DataFrame source's
 # default function (mirrors R's TrackExpressionVars value-column detection).
@@ -1477,7 +1547,20 @@ def gvtrack_create(
           ``'pwm.max.pos'``, ``'pwm.count'``
         - **Edit distance** (src=None): ``'pwm.edit_distance'``,
           ``'pwm.edit_distance.pos'``, ``'pwm.max.edit_distance'``,
-          ``'pwm.edit_distance.lse'``, ``'pwm.edit_distance.lse.pos'``
+          ``'pwm.edit_distance.lse'``, ``'pwm.edit_distance.lse.pos'``,
+          ``'pwm.n_mutations'``
+
+        The ``*.pos`` funcs all report the 1-based position of the **first
+        base** of the match in **forward-strand** orientation, on either
+        strand and under either ``bidirect`` setting. Under
+        ``bidirect=True`` the sign says which strand won, not which end is
+        pointed at, so a span is ``pos .. pos + len(pssm) - 1`` in forward
+        coordinates in every case. Ties break by scan order, which is
+        strand-dependent: ``strand=-1`` scans a reverse-complemented buffer
+        and so keeps the most 3' tied anchor. (This convention holds from
+        pymisha 0.12.0 / misha 5.11.25; older builds returned an off-by-one
+        position for ``strand=-1`` and reverse-complemented coordinates from
+        ``pwm.edit_distance.pos``.)
         - **K-mer** (src=None): ``'kmer.count'``, ``'kmer.frac'``
         - **Masked sequence** (src=None): ``'masked.count'``,
           ``'masked.frac'``
@@ -1507,6 +1590,11 @@ def gvtrack_create(
           suits every PSSM); also used by the edit distance functions.
         - ``max_edits`` (int or None) -- Maximum number of edits for edit
           distance functions. None (default) uses exact computation.
+        - ``direction``/``score_min``/``score_max`` also apply to
+          ``'pwm.n_mutations'``, which counts the single-base substitutions
+          that each independently bring a window across ``score_thresh``
+          (0 when the threshold is already met, NaN when no single edit
+          suffices; MAX across the windows of an iterator interval).
         - ``max_indels`` (int) -- Maximum insertions+deletions for
           ``'pwm.edit_distance'``, ``'pwm.edit_distance.pos'``,
           ``'pwm.max.edit_distance'``. Default 0 (substitutions only).
@@ -1639,6 +1727,7 @@ def gvtrack_create(
         'sshift': sshift,
         'eshift': eshift,
     }
+    _check_vtrack_params(func, kwargs)
     config.update(kwargs)
 
     if str(config.get("func", "")).startswith("pwm"):

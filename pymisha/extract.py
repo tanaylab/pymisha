@@ -202,6 +202,7 @@ _CPP_SEQ_FUNCS = {
     "pwm.max.edit_distance",
     "pwm.edit_distance.lse",
     "pwm.edit_distance.lse.pos",
+    "pwm.n_mutations",
     "kmer.count",
     "kmer.frac",
     "masked.count",

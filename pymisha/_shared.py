@@ -40,12 +40,17 @@ CONFIG = {
     'multitasking_stdout': False,   # Debug output from children
     'multitasking_strategy': 'auto',  # 'auto' | 'tracks' | 'tiles' (R 5.6.18 parity)
     'min_processes': 4,             # Min workers for multitasking
-    # Max workers for multitasking. 70% of cores, as R misha's gmax.processes
-    # auto-calculates it; the old flat 20 left large-core machines idle (a
-    # 56-track extraction ran ~1.5x slower at 20 workers than at 40). Both the
-    # C++ scanner and the Python fork paths clamp this to the actual core
-    # count, so a small machine is unaffected.
-    'max_processes': max(4, int((_os.cpu_count() or 1) * 0.7)),
+    # Max workers for multitasking. 70% of cores capped at 32, as R misha's
+    # gmax.processes auto-calculates it (5.11.20); the old flat 20 left
+    # large-core machines idle (a 56-track extraction ran ~1.5x slower at 20
+    # workers than at 40). Past ~32 the per-worker cost - fork, shared memory,
+    # result merge - outweighs the extra parallelism: misha measured 89 workers
+    # on a 128-core host as slower than 32 on every workload tried, and
+    # cold-NFS whole-genome scans saturate at ~32 too. The cap only binds above
+    # 46 cores. Both the C++ scanner and the Python fork paths clamp to the
+    # actual core count, so a small machine is unaffected, and setting
+    # CONFIG['max_processes'] by hand still overrides it.
+    'max_processes': max(4, min(32, int((_os.cpu_count() or 1) * 0.7))),
     'max_data_size': 10000000,      # Max rows in memory
     # Umask held around every write to the database. "0007" gives 660 files and
     # 770 directories - group rwx, no world access - which is what pymisha's own
@@ -612,6 +617,58 @@ def _canonic_scope(intervals):
     )
 
 
+def _warn_overlapping_iterator(iterator):
+    """Warn that overlapping iterator intervals were merged (R misha 5.11.18).
+
+    Results are unchanged - the merge always happened - but three iterator
+    intervals coming back as two rows is silent data loss unless it is said out
+    loud. Exact duplicates stay quiet: both copies map to the same row, so no
+    interval goes missing. An interval nested inside another counts as merged;
+    it widens no row, which is precisely why it used to disappear unnoticed.
+
+    ponytail: warns on the iterator alone, where misha also checks the scope
+    actually reaches the merged row. Over-warns when the scope excludes the
+    overlap; make it scope-aware if that shows up in practice.
+    """
+    df = iterator[["chrom", "start", "end"]].drop_duplicates()
+    if len(df) < 2:
+        return
+    df = df.sort_values(["chrom", "start", "end"], kind="mergesort")
+
+    pair = None          # first overlapping pair, for the message
+    block = None         # the merged row it lands in
+    n_blocks = 0
+    cur_chrom = cur_start = cur_end = None
+    for chrom, start, end in zip(df["chrom"], df["start"], df["end"], strict=True):
+        if cur_chrom == chrom and start < cur_end:
+            if pair is None:
+                pair = ((cur_chrom, cur_start, cur_end), (chrom, start, end))
+                block = [chrom, min(cur_start, start), max(cur_end, end)]
+            elif block is not None and block[0] == chrom and start < block[2]:
+                block[2] = max(block[2], end)
+            cur_start = min(cur_start, start)
+            cur_end = max(cur_end, end)
+            continue
+        n_blocks += 1
+        cur_chrom, cur_start, cur_end = chrom, start, end
+
+    if pair is None:
+        return
+
+    (c1, s1, e1), (c2, s2, e2) = pair
+    _warnings.warn(
+        f"Overlapping intervals were used as an iterator: {len(df)} intervals "
+        f"were merged into {n_blocks} non-overlapping "
+        f"block{'' if n_blocks == 1 else 's'}. For example {c1} {s1}-{e1} and "
+        f"{c2} {s2}-{e2} are reported as a single row {block[0]} {block[1]}-"
+        f"{block[2]}, so the results do not correspond one-to-one to the "
+        f"iterator intervals. To get one value per interval, call gextract() "
+        f"with the same intervals as the scope (its 'intervals' argument) and "
+        f"map the rows back with the intervalID column.",
+        stacklevel=4,
+    )
+
+
 def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     """Handle DataFrame-as-iterator by intersecting with scope intervals.
 
@@ -690,6 +747,8 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     # 2D iterator DataFrame: leave for the 2D extraction path to handle.
     if "chrom1" in iterator.columns:
         return intervals, iterator, None
+
+    _warn_overlapping_iterator(iterator)
 
     if len(iterator) == 0 or len(intervals) == 0:
         empty = _pandas.DataFrame({"chrom": _pandas.Series([], dtype=str),

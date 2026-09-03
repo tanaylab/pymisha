@@ -729,7 +729,7 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
 
         // PWM edit distance functions
         bool is_edit_dist = (func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
-                             func == "pwm.max.edit_distance");
+                             func == "pwm.max.edit_distance" || func == "pwm.n_mutations");
         bool is_lse_edit_dist = (func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos");
 
         if (is_edit_dist) {
@@ -755,6 +755,7 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
             PWMEditDistanceScorer::Mode mode = PWMEditDistanceScorer::Mode::MIN_EDITS;
             if (func == "pwm.edit_distance.pos") mode = PWMEditDistanceScorer::Mode::MIN_EDITS_POSITION;
             else if (func == "pwm.max.edit_distance") mode = PWMEditDistanceScorer::Mode::PWM_MAX_EDITS;
+            else if (func == "pwm.n_mutations") mode = PWMEditDistanceScorer::Mode::N_MUTATIONS;
 
             vvar.scorer = std::make_unique<PWMEditDistanceScorer>(
                 pssm, vvar.seqfetch.get(), (float)score_thresh,

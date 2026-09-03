@@ -535,7 +535,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         // Sequence-based vtracks
         if (func == "pwm" || func == "pwm.max" || func == "pwm.max.pos" || func == "pwm.count" ||
             func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
-            func == "pwm.max.edit_distance" ||
+            func == "pwm.max.edit_distance" || func == "pwm.n_mutations" ||
             func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos" ||
             func == "kmer.count" || func == "kmer.frac" ||
             func == "masked.count" || func == "masked.frac") {
@@ -564,7 +564,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                 // PWM edit distance functions
                 bool is_edit_dist = (func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
-                                     func == "pwm.max.edit_distance");
+                                     func == "pwm.max.edit_distance" || func == "pwm.n_mutations");
                 bool is_lse_edit_dist = (func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos");
 
                 if (is_edit_dist || is_lse_edit_dist) {
@@ -586,6 +586,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                         PWMEditDistanceScorer::Mode mode = PWMEditDistanceScorer::Mode::MIN_EDITS;
                         if (func == "pwm.edit_distance.pos") mode = PWMEditDistanceScorer::Mode::MIN_EDITS_POSITION;
                         else if (func == "pwm.max.edit_distance") mode = PWMEditDistanceScorer::Mode::PWM_MAX_EDITS;
+                        else if (func == "pwm.n_mutations") mode = PWMEditDistanceScorer::Mode::N_MUTATIONS;
 
                         PWMEditDistanceScorer scorer(pssm, &shared_seq, (float)score_thresh,
                                                      max_edits, extend, strand, mode,

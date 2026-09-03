@@ -37,7 +37,8 @@ public:
     enum class Mode {
         MIN_EDITS,
         MIN_EDITS_POSITION,
-        PWM_MAX_EDITS
+        PWM_MAX_EDITS,
+        N_MUTATIONS
     };
 
     enum class Direction {
@@ -83,6 +84,7 @@ public:
     float get_last_pwm_max_logp() const { return m_last_metrics.best_pwm_logp; }
     float get_last_pwm_max_edits() const { return m_last_metrics.best_pwm_edits; }
     float get_last_pwm_max_pos() const { return m_last_metrics.best_pwm_position; }
+    float get_last_n_mutations() const { return m_last_metrics.n_mutations; }
     int get_max_indels() const { return m_max_indels; }
 
 private:
@@ -97,6 +99,8 @@ private:
         float best_pwm_position = std::numeric_limits<float>::quiet_NaN();
         size_t best_pwm_index = 0;
         int best_pwm_direction = 1;
+
+        float n_mutations = std::numeric_limits<float>::quiet_NaN();
     };
 
     DnaPSSM m_pssm;
@@ -214,6 +218,7 @@ private:
     inline bool should_scan_reverse() const;
     inline char complement_base(char base) const;
     inline float compute_window_edits(const int* bidx, int seq_avail, bool reverse);
+    float compute_n_mutations(const int* bidx, bool reverse);
 
     /**
      * Get the effective PSSM score and gain for a motif position aligned with a sequence base.

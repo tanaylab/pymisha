@@ -55,9 +55,12 @@ def test_effective_max_procs_clamps_to_core_count(monkeypatch):
 
 
 def test_max_processes_default_tracks_core_count():
-    """Default mirrors R's gmax.processes (70% of cores), floored at 4."""
-    expected = max(4, int((os.cpu_count() or 1) * 0.7))
+    """Default mirrors R's gmax.processes: 70% of cores, floored at 4 and
+    capped at 32 (misha 5.11.20 - past that the per-worker cost outweighs the
+    parallelism). The cap only binds above 46 cores."""
+    expected = max(4, min(32, int((os.cpu_count() or 1) * 0.7)))
     assert _shared.CONFIG["max_processes"] == expected
+    assert _shared.CONFIG["max_processes"] <= 32
 
 
 def test_tracks_floor_counts_intervals_times_exprs():

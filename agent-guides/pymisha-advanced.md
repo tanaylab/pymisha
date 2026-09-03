@@ -265,7 +265,8 @@ For ephemeral analyses, the two-vtrack-plus-expression form above is fine; for t
 | `"pwm.count"` | number of windows with score ≥ `score.thresh` | count above threshold |
 | `"pwm.edit_distance"` | min #edits to raise (`direction="above"`) or disrupt (`direction="below"`) the best-window score across `score.thresh` | search over edit budget |
 | `"pwm.edit_distance.lse"` | same but LSE of windows, not the max | LSE-based |
-| `"pwm.edit_distance.pos"` / `"pwm.edit_distance.lse.pos"` | 1-based position of the most impactful single edit; same sign-by-strand convention as `pwm.max.pos` when `bidirect=True` | argmax over edit positions |
+| `"pwm.edit_distance.pos"` / `"pwm.edit_distance.lse.pos"` | 1-based position of an edit in the optimal edit set; exactly "the most impactful single edit" only when one edit suffices. Same sign-by-strand convention as `pwm.max.pos` when `bidirect=True` | argmax over edit positions |
+| `"pwm.n_mutations"` | number of single-base substitutions that each *independently* bring a window across `score_thresh`; `0` if already met, `NaN` if no single edit suffices | max across windows |
 
 **Edit-distance knobs.** `direction="above"` (default) finds the minimum edits to *raise* the score across `score_thresh` - "how close is this site to becoming a hit". `direction="below"` finds the minimum edits to *disrupt* an existing hit - "how robust is this site". `max_edits` caps the total budget (exhaustive search for `max_edits <= 2`, greedy heuristic for `max_edits >= 3`). `max_indels` allows insertions / deletions in addition to substitutions. `score_min` / `score_max` clip the per-window score range before the edit search to keep the optimization bounded. With `bidirect=True`, an edit's effect is evaluated against both strands and the better orientation is kept.
 
@@ -299,7 +300,11 @@ pm.gvtrack_create("ctcf_rev", src=None, func="pwm.max",
                   pssm=ctcf_pssm, prior=0.01, strand=-1, bidirect=False)
 ```
 
-**Position semantics (`pwm.max.pos`, `pwm.edit_distance.pos`).** All `*.pos` values are **1-based** bp offsets *relative to the iterator interval* (after any `gvtrack_iterator()` `sshift` / `eshift` shifts), pointing at the first base of the best window. `pos = 1` means the best window starts at the very first base of the (possibly shifted) iterator interval; the motif occupies `pos .. pos + nrow(pssm) - 1`. The sign convention above only applies under `bidirect=True`; under `bidirect=False` the value is always positive regardless of `strand`.
+**Position semantics (`pwm.max.pos`, `pwm.edit_distance.pos`).** All `*.pos` values are **1-based** bp offsets *relative to the iterator interval* (after any `gvtrack_iterator()` `sshift` / `eshift` shifts), pointing at the first base of the best window **in forward-strand orientation** - on either strand and under either `bidirect` setting. `pos = 1` means the best window starts at the very first base of the (possibly shifted) iterator interval; the motif occupies `pos .. pos + nrow(pssm) - 1` in forward coordinates in every case. The sign convention above only applies under `bidirect=True`, where it says *which strand won*, not which end you are pointed at; under `bidirect=False` the value is always positive regardless of `strand`.
+
+Ties break by scan order, which is strand-dependent: `strand=1` (and `bidirect=True`) keeps the most 5' tied anchor and the forward strand wins a tie at the same coordinate, but `bidirect=False, strand=-1` scans a reverse-complemented buffer and so keeps the most 3' tied anchor in forward coordinates.
+
+> **Version caveat.** That uniform convention holds from pymisha 0.12.0. Earlier builds returned a position one less than the 1-based forward start for `strand=-1`, reverse-complemented target coordinates from `pwm.edit_distance.pos`, and a mirrored position from `pwm.edit_distance.lse.pos`. Reading positions off an older build: verify the offset on a planted motif before building spans from it.
 
 `prior` controls the strength of the uniform-background regularizer (smaller = sharper PWM; typical range 0.001-0.05). Tune by AUC on labelled data.
 

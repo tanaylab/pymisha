@@ -1,4 +1,26 @@
 # Changelog
+## v0.12.0 (2026-09-03)
+
+Ports R misha 5.11.15-5.11.26.
+
+**Fixes**
+
+- **PWM `*.pos` funcs reported wrong positions for `strand=-1`.** `pwm.max.pos` was off by one, `pwm.edit_distance.pos` returned reverse-complemented coordinates, and `pwm.edit_distance.lse.pos` mirrored the position about the interval. They now all report the 1-based start of the match in forward-strand orientation, on either strand and under either `bidirect` setting. **Recompute anything derived from a `*.pos` track.**
+- **PWM virtual tracks with `spat_factor` returned wrong values in every iterator bin after the first**, affecting `pwm`, `pwm.max`, `pwm.max.pos` and `pwm.count`. `gextract(..., iterator=N)` was enough to hit it; observed errors exceeded 3 log-likelihood units, and `pwm.max.pos` could be off by tens of bp. **Recompute anything derived from a spatially-weighted PWM track.**
+- **`pwm.max.pos` returns NaN instead of a fabricated position** when the fetched sequence is shorter than the PSSM, which happens at a chromosome end with `extend=True`.
+- **`gseq_pwm(mode="pos", strand=-1)` reported a position in neither forward nor reverse-complement coordinates.**
+- **`gvtrack_create` rejects parameters the function does not accept.** A misspelled key (`bidrect=`, `spat_binn=`) was silently dropped and defaulted.
+- **Overlapping intervals used as a 1D iterator now warn that they were merged**, naming one merged pair and the row it became. Results are unchanged, but an interval nested inside another used to disappear with no trace. For one value per interval, pass the same intervals as `gextract`'s scope and map back with `intervalID`.
+- **`gtrack_import` reports the chromosome names it skipped.** A partial name match imported the rest silently; unmatched scaffolds are now logged and an unmatched primary chromosome warns.
+
+**Features**
+
+- **New virtual track function `pwm.n_mutations`**: the number of single-base substitutions that each independently bring a window across `score_thresh` (0 when the threshold is already met, NaN when no single edit suffices). Takes the same parameters as the `pwm.edit_distance` family.
+
+**Behavior**
+
+- **`max_processes` now defaults to at most 32 workers**, past which the per-worker cost outweighs the added parallelism. The cap only binds above 46 cores; set `pm.CONFIG["max_processes"]` for workloads that scale further.
+
 ## v0.11.1 (2026-08-25)
 
 - **Fixes the macOS build, which 0.11.0 broke.** `[[noreturn]]` was placed on a `friend` declaration in `src/pymisha.h`; gcc accepts that and clang rejects it, so every macOS build failed with "an attribute list cannot appear here". 0.11.0 published Linux wheels and an sdist but no macOS wheels, so `pip install pymisha==0.11.0` on a Mac fell back to the sdist and failed to compile. No behaviour change on any platform - the attribute stays on the function's own declaration, which is what callers see.
