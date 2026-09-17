@@ -121,7 +121,7 @@ double KmerCounter::count_string(const char* seq, int seq_len)
     return (double)count;
 }
 
-float KmerCounter::score_interval(const GInterval &interval, const GenomeChromKey &chromkey)
+double KmerCounter::score_interval(const GInterval &interval, const GenomeChromKey &chromkey)
 {
     // Safety check - shouldn't happen due to constructor validation
     if (m_kmer.empty())

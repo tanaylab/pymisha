@@ -21,6 +21,8 @@
 #include "GenomeTrackSparse.h"
 #include "GenomeSeqFetch.h"
 #include "PWMScorer.h"
+#include "PottsScorer.h"
+#include "PMPottsParams.h"
 #include "PWMEditDistanceScorer.h"
 #include "PWMLseEditDistanceScorer.h"
 #include "KmerCounter.h"
@@ -538,6 +540,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             func == "pwm.edit_distance" || func == "pwm.edit_distance.pos" ||
             func == "pwm.max.edit_distance" || func == "pwm.n_mutations" ||
             func == "pwm.edit_distance.lse" || func == "pwm.edit_distance.lse.pos" ||
+            func == "potts" || func == "potts.max" || func == "potts.max.pos" ||
+            func == "potts.count" ||
             func == "kmer.count" || func == "kmer.frac" ||
             func == "masked.count" || func == "masked.frac") {
 
@@ -652,6 +656,33 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 GenomeSeqFetch shared_seq;
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
                 PWMScorer scorer(pssm, &shared_seq, extend, pwm_mode, strand, spat_factor, spat_bin, (float)score_thresh);
+
+                for (size_t i = 0; i < intervals.size(); ++i) {
+                    GInterval eval;
+                    if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
+                        set_nan(i);
+                        continue;
+                    }
+                    out[i] = scorer.score_interval(eval, chromkey);
+                }
+                return_py(py_vals);
+            }
+
+            if (func.rfind("potts", 0) == 0) {
+                // The same parser the expression path and pm_gseq_potts() use,
+                // so no two entry points can disagree about what a model means.
+                const PMPottsParams pp = PMPottsParams::parse(
+                    py_spec, std::string("virtual track function '") + func + "'");
+
+                PottsScorer::ScoringMode potts_mode = PottsScorer::TOTAL_LIKELIHOOD;
+                if (func == "potts.max") potts_mode = PottsScorer::MAX_LIKELIHOOD;
+                else if (func == "potts.max.pos") potts_mode = PottsScorer::MAX_LIKELIHOOD_POS;
+                else if (func == "potts.count") potts_mode = PottsScorer::MOTIF_COUNT;
+
+                GenomeSeqFetch shared_seq;
+                shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
+                PottsScorer scorer(pp.model, &shared_seq, pp.extend_flag, potts_mode,
+                                   pp.bidirect, pp.strand_mode, pp.score_thresh);
 
                 for (size_t i = 0; i < intervals.size(); ++i) {
                     GInterval eval;

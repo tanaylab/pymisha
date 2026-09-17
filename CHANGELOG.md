@@ -1,4 +1,28 @@
 # Changelog
+
+## v0.13.1 (2026-09-17)
+
+### Bug fixes
+
+* `pwm`, `pwm.max`, `pwm.max.pos`, `pwm.count` and every `gseq_pwm` mode silently scanned only the first 1,000,001 anchors of an interval, so a scan of anything longer than about 1 Mb answered from its first megabase and reported neither a warning nor an error. Recompute anything derived from either function over intervals larger than that - whole-chromosome iterators are the common case.
+
+* The sliding log-sum-exp lost the window's sum whenever the departing value was its maximum and the rest sat more than about 37 nats below it, so `pwm` and `potts` returned a silently wrong value, or a spurious `-Inf` that reads as "nothing was scorable". Recompute anything derived from such a track scored over overlapping windows with a wide-dynamic-range model.
+
+* `pwm.max.pos` and `potts.max.pos` reported a position rounded to an even neighbour once it exceeded 16,777,216, because positions were carried as single-precision floats. Positions are exact now; scores are unchanged.
+
+## v0.13.0 (2026-09-09)
+
+Ports the `potts` family from R misha, along with the pwm fixes that ship with it.
+
+**Features**
+
+- **New `potts` virtual track family and `gseq_potts()`**: scoring under a pairwise (Potts) energy model, `intercept + sum_i e[i, x_i] + sum_k J_k[x_i, x_j]` over a fixed-width window. Four virtual track functions - `potts`, `potts.max`, `potts.max.pos`, `potts.count` - plus `gseq_potts()` for bare sequences, both reading the same model: `e` (a `W x 4` energy matrix), `pairs` (1-based coupled positions) and `J` (their `4x4` coupling tables). A fitted model can be passed verbatim. A Potts carries energies, not probabilities, so there is no `prior` and no spatial weighting, and a window containing any non-ACGT base is left out of the reduction. `score_thresh` is required for `potts.count`, and `gseq_potts(bidirect=False)` requires an explicit `strand`. A `J` block labelled A, C, G, T is reordered by name, as `e`'s columns are. `gvtrack_filter` works on all four.
+
+**Fixes**
+
+- **`pwm.max` returned wrong values for `strand=-1` over overlapping iterator intervals.** The sliding window keyed its running maximum as if the scan target ran forward, but on the minus strand the target is reverse-complemented, so it evicted the anchors it had just brought in. Measured on 40 intervals stepping 1 bp with a 6 bp PSSM: 36 of 40 positions wrong, max difference 3.73. `pwm`, `pwm.count` and `pwm.max.pos` were unaffected. **Recompute anything derived from a minus-strand `pwm.max` track scanned with an overlapping iterator.**
+- **`gseq_pwm()` combines the two strands the way the pwm virtual tracks do.** Under `bidirect=True`, `mode="max"` took the maximum of the forward and reverse-complement scores where `pwm.max` log-sum-exps them, and `mode="count"` thresholded the two strands separately, so a window matching on both was counted twice. Both now take the vtrack's union. `mode="pos"` still maximises, because it has to name a strand. This affected the pure-Python scoring paths only - the ones reached with `neutral_chars`, `gap_chars`, `start_pos`/`end_pos`, `extend` or `return_strand` - so the C++ fast path's numbers do not move.
+
 ## v0.12.2 (2026-09-03)
 
 - **Finishes the conda macOS fix.** 0.12.1 closed the `drand48` half; the same stricter toolchain then rejected `std::to_string` used without `<string>` in four files. Both are the same latent bug - headers that used to arrive transitively - not a change in behaviour. Verified by compiling every translation unit against clang/libc++, which reproduces the failure and now passes.

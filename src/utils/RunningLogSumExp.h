@@ -10,6 +10,16 @@
 // Numerically stable via max-trick and single rescaling when max changes.
 // Includes periodic recomputation to prevent numerical drift over very long runs.
 struct RunningLogSumExp {
+    // exp(x - M), with the x == M == -inf case contributing nothing instead of
+    // exp(-inf + inf) == NaN. A NaN in sum_scaled is invisible while M stays
+    // -inf, because value() short-circuits on a non-finite maximum, and then
+    // surfaces on the first finite push - so a window that is entirely
+    // unscorable and then gains a real value reports NaN for the rest of its
+    // life. util.h's float log_sum_log() guards the same case.
+    static double scaled_contrib(float x, double M) {
+        return std::isfinite(M) ? std::exp(double(x) - M) : 0.0;
+    }
+
     double M = -std::numeric_limits<double>::infinity(); // current max
     double sum_scaled = 0.0;                              // sum exp(x - M)
     std::deque<float> window;                             // raw values (ℓ_i)
@@ -36,7 +46,7 @@ struct RunningLogSumExp {
         for (float v : vals) if (v > M) M = v;
         // Build sum_scaled and maxdq
         for (float v : vals) {
-            sum_scaled += std::exp(double(v) - M);
+            sum_scaled += scaled_contrib(v, M);
             while (!maxdq.empty() && maxdq.back() < v) maxdq.pop_back();
             maxdq.push_back(v);
             window.push_back(v);
@@ -57,7 +67,7 @@ struct RunningLogSumExp {
         // Recompute sum_scaled
         sum_scaled = 0.0;
         for (float v : window) {
-            sum_scaled += std::exp(double(v) - M);
+            sum_scaled += scaled_contrib(v, M);
         }
 
         // Rebuild maxdq
@@ -68,6 +78,56 @@ struct RunningLogSumExp {
         }
 
         steps_since_refresh = 0;
+    }
+
+    // Recompute sum_scaled from the window against the current maxdq front,
+    // leaving maxdq itself alone (its invariant survives a front/back pop).
+    //
+    // Needed because the incremental "subtract this element's contribution"
+    // update cancels catastrophically whenever the element being removed
+    // dominates the sum - above all when it IS the max. Rescaling to the new
+    // max and then subtracting exp(x - M_new) is exact in real arithmetic, but
+    // sum_scaled is then almost entirely the term being taken out: once
+    // x - M_new passes about 37 the surviving terms sit below the double
+    // epsilon relative to it, the subtraction yields 0, and the window's sum
+    // never recovers. The symptom is a silently wrong finite value, or a
+    // -inf that reads downstream as "nothing was scorable".
+    inline void resum() {
+        if (window.empty()) {
+            M = -std::numeric_limits<double>::infinity();
+            sum_scaled = 0.0;
+            return;
+        }
+        if (maxdq.empty()) {
+            M = -std::numeric_limits<double>::infinity();
+            for (float v : window) if (double(v) > M) M = v;
+        } else {
+            M = double(maxdq.front());
+        }
+        if (!std::isfinite(M)) {
+            sum_scaled = 0.0;
+            return;
+        }
+        double s = 0.0;
+        for (float v : window) s += std::exp(double(v) - M);
+        sum_scaled = s;
+    }
+
+    // Subtract one element's contribution, falling back to a full resum when
+    // that subtraction would be catastrophic. The cheap path is the common
+    // one: a window whose max is not the element leaving loses a small term.
+    inline void drop_term(float x) {
+        if (!std::isfinite(M)) {
+            sum_scaled = 0.0;
+            return;
+        }
+        const double term = std::exp(double(x) - M);
+        if (!(term < 0.5 * sum_scaled)) {
+            resum();
+            return;
+        }
+        sum_scaled -= term;
+        if (sum_scaled < 0) sum_scaled = 0;
     }
 
     inline void push(float x) {
@@ -82,7 +142,7 @@ struct RunningLogSumExp {
             if (std::isfinite(M)) sum_scaled *= std::exp(M - double(x));
             M = x;
         }
-        sum_scaled += std::exp(double(x) - M);
+        sum_scaled += scaled_contrib(x, M);
         while (!maxdq.empty() && maxdq.back() < x) maxdq.pop_back();
         maxdq.push_back(x);
         window.push_back(x);
@@ -94,22 +154,12 @@ struct RunningLogSumExp {
         // remove x from maxdq front if it matches
         if (!maxdq.empty() && maxdq.front() == x) {
             maxdq.pop_front();
-            // If max changed, rescale to the new max once
-            double M_new = maxdq.empty() ? -std::numeric_limits<double>::infinity()
-                                         : double(maxdq.front());
-            if (M_new != M) {
-                if (std::isfinite(M_new)) {
-                    sum_scaled *= std::exp(M - M_new);
-                } else {
-                    sum_scaled = 0.0;
-                }
-                M = M_new;
-            }
+            // The element leaving WAS the max, so the sum has to be rebuilt
+            // against the new one rather than rescaled and decremented.
+            resum();
+            return;
         }
-        // subtract x's scaled contribution (safe even if M changed due to rescale above)
-        if (std::isfinite(M)) sum_scaled -= std::exp(double(x) - M);
-        else sum_scaled = 0.0;
-        if (sum_scaled < 0) sum_scaled = 0; // guard tiny negatives due to FP
+        drop_term(x);
     }
 
     inline void pop_back() {
@@ -127,21 +177,17 @@ struct RunningLogSumExp {
                 }
                 sum_scaled = 0.0;
                 for (float v : window) {
-                    sum_scaled += std::exp(double(v) - M);
+                    sum_scaled += scaled_contrib(v, M);
                     while (!maxdq.empty() && maxdq.back() < v) maxdq.pop_back();
                     maxdq.push_back(v);
                 }
             } else {
-                // Max is still valid, just update sum_scaled
-                if (std::isfinite(M)) sum_scaled -= std::exp(double(x) - M);
-                else sum_scaled = 0.0;
+                // x was a max candidate, so it can dominate the sum
+                drop_term(x);
             }
         } else {
-            // x was not the max candidate at back, just subtract contribution
-            if (std::isfinite(M)) sum_scaled -= std::exp(double(x) - M);
-            else sum_scaled = 0.0;
+            drop_term(x);
         }
-        if (sum_scaled < 0) sum_scaled = 0; // guard tiny negatives due to FP
     }
 
     inline void push_front(float x) {
@@ -159,7 +205,7 @@ struct RunningLogSumExp {
             if (std::isfinite(M)) sum_scaled *= std::exp(M - double(x));
             M = x;
         }
-        sum_scaled += std::exp(double(x) - M);
+        sum_scaled += scaled_contrib(x, M);
 
         // Rebuild maxdq to maintain invariant
         // This is O(n) but necessary since we're adding at the front

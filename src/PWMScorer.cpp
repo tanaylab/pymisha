@@ -42,6 +42,26 @@ static inline float score_reverse_original(const DnaPSSM& pssm,
     return s;
 }
 
+// Genomic start of the motif window anchored at target index i.
+// On the minus strand the target is reverse-complemented, so its indices run
+// against the genome: index i covers [end - i - motif_len, end - i).
+static inline int64_t anchor_genomic_pos(const GInterval& expanded, size_t i,
+                                         size_t motif_len, char strand_mode)
+{
+    return (strand_mode == -1)
+        ? (expanded.end - int64_t(motif_len) - int64_t(i))
+        : (expanded.start + int64_t(i));
+}
+
+// Inverse of anchor_genomic_pos()
+static inline size_t anchor_target_index(const GInterval& expanded, int64_t genomic_pos,
+                                         size_t motif_len, char strand_mode)
+{
+    return (strand_mode == -1)
+        ? size_t(expanded.end - int64_t(motif_len) - genomic_pos)
+        : size_t(genomic_pos - expanded.start);
+}
+
 // Compute log-likelihood at position i with spatial weighting
 // Combines forward and reverse complement strands using logsumexp if bidirectional
 // This is used for TOTAL_LIKELIHOOD mode
@@ -162,7 +182,7 @@ PWMScorer::PWMScorer(const DnaPSSM& pssm, ScoringMode mode, char strand,
     }
 }
 
-float PWMScorer::score_string(const char* seq, int seq_len)
+double PWMScorer::score_string(const char* seq, int seq_len)
 {
     if (seq_len <= 0 || !seq) {
         return std::numeric_limits<float>::quiet_NaN();
@@ -219,7 +239,7 @@ inline float PWMScorer::get_spatial_log_factor(size_t pos_index) const
 }
 
 // Compute position result with strand and direction adjustments
-float PWMScorer::compute_position_result(size_t index, size_t target_length, 
+double PWMScorer::compute_position_result(size_t index, size_t target_length, 
                                          size_t motif_length, int direction) const
 {
     // A target shorter than the motif has no window at all; max_like_match()
@@ -229,7 +249,11 @@ float PWMScorer::compute_position_result(size_t index, size_t target_length,
         return std::numeric_limits<float>::quiet_NaN();
     }
 
-    float pos_result = float(index) + 1.0f; // 1-based
+    // double, not float: a position is an exact integer only up to 2^24 in
+    // binary32, so on an interval longer than ~16.7 Mb a reported position was
+    // rounded to an even neighbour. Scores are still accumulated in float, so
+    // widening the return type alone leaves every score bit-identical.
+    double pos_result = double(index) + 1.0; // 1-based
 
     if (m_strand == -1) {
         // target is reverse-complemented: a window at target index `index` covers
@@ -237,7 +261,7 @@ float PWMScorer::compute_position_result(size_t index, size_t target_length,
         // 1-based forward offset is target_length - index - motif_length + 1.
         // signed arithmetic: index + motif_length <= target_length holds at every
         // call site, but an unsigned underflow here would read as a huge position.
-        pos_result = float(std::ptrdiff_t(target_length) - std::ptrdiff_t(index) - std::ptrdiff_t(motif_length)) + 1.0f;
+        pos_result = double(std::ptrdiff_t(target_length) - std::ptrdiff_t(index) - std::ptrdiff_t(motif_length)) + 1.0;
     }
     
     if (m_pssm.is_bidirect()) {
@@ -248,7 +272,7 @@ float PWMScorer::compute_position_result(size_t index, size_t target_length,
 }
 
 // Count motif hits without spatial weighting
-float PWMScorer::count_motif_hits_no_spatial(const std::string& target, size_t motif_length)
+double PWMScorer::count_motif_hits_no_spatial(const std::string& target, size_t motif_length)
 {
     if (motif_length <= 0 || target.empty() || target.length() < motif_length) {
         return 0.0f;
@@ -283,7 +307,7 @@ float PWMScorer::count_motif_hits_no_spatial(const std::string& target, size_t m
 }
 
 // Count motif hits with spatial weighting
-float PWMScorer::count_motif_hits_with_spatial(const std::string& target, size_t motif_length)
+double PWMScorer::count_motif_hits_with_spatial(const std::string& target, size_t motif_length)
 {
     if (target.length() < motif_length) {
         return 0.0f;
@@ -317,7 +341,7 @@ float PWMScorer::count_motif_hits_with_spatial(const std::string& target, size_t
 }
 
 // Get max likelihood position with spatial weighting
-float PWMScorer::get_max_likelihood_pos_with_spatial(const std::string& target, size_t motif_length)
+double PWMScorer::get_max_likelihood_pos_with_spatial(const std::string& target, size_t motif_length)
 {
     if (target.length() < motif_length) {
         return std::numeric_limits<float>::quiet_NaN();
@@ -327,7 +351,7 @@ float PWMScorer::get_max_likelihood_pos_with_spatial(const std::string& target, 
     size_t best_index = 0;
     int best_dir = 1;
 
-    size_t max_i_idx = std::min<size_t>(m_pssm.get_max_range(), target.size() - motif_length);
+    size_t max_i_idx = m_pssm.max_offset(target.size());
     size_t min_i_idx = std::min<size_t>(std::max(0, m_pssm.get_min_range()), max_i_idx);
 
     // For bidirectional PSSMs, always check both strands (matching max_like_match behavior)
@@ -372,7 +396,7 @@ float PWMScorer::get_max_likelihood_pos_with_spatial(const std::string& target, 
 }
 
 // Score without spatial weighting
-float PWMScorer::score_without_spatial(const std::string& target, int64_t motif_length)
+double PWMScorer::score_without_spatial(const std::string& target, int64_t motif_length)
 {
     if (m_mode == TOTAL_LIKELIHOOD) {
         float energy;
@@ -400,7 +424,7 @@ float PWMScorer::score_without_spatial(const std::string& target, int64_t motif_
 }
 
 // Score with spatial weighting
-float PWMScorer::score_with_spatial(const std::string& target, int64_t motif_length)
+double PWMScorer::score_with_spatial(const std::string& target, int64_t motif_length)
 {
     if (m_spat_log_factors.empty()) {
         return std::numeric_limits<float>::quiet_NaN();
@@ -427,7 +451,7 @@ float PWMScorer::score_with_spatial(const std::string& target, int64_t motif_len
 }
 
 // Try to advance the sliding window by stride positions
-float PWMScorer::try_slide_window(const std::string& target,
+double PWMScorer::try_slide_window(const std::string& target,
                                   const GInterval& original_interval,
                                   const GInterval& expanded_interval,
                                   size_t i_min, size_t i_max, size_t motif_len, size_t stride)
@@ -499,13 +523,15 @@ float PWMScorer::try_slide_window(const std::string& target,
 
         // Push incoming values (log-summed strands, like TOTAL_LIKELIHOOD)
         for (size_t k = 0; k < stride; ++k) {
-            size_t incoming_i = i_max - (stride - 1 - k);
+            size_t incoming_i = (strand_mode == -1)
+                ? (i_min + (stride - 1 - k))
+                : (i_max - (stride - 1 - k));
             if (incoming_i + motif_len > tlen) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
             float val = pos_value_with_spat(m_pssm, target, incoming_i, strand_mode,
                                             get_spatial_log_factor(first_incoming_pos + k));
-            int64_t genomic_pos = expanded_interval.start + int64_t(incoming_i);
+            int64_t genomic_pos = anchor_genomic_pos(expanded_interval, incoming_i, motif_len, strand_mode);
             m_slide.rmax.push(val, 1, genomic_pos);  // Direction doesn't matter for MAX_LIKELIHOOD
         }
 
@@ -526,7 +552,9 @@ float PWMScorer::try_slide_window(const std::string& target,
 
         // Push incoming values with strand direction and genomic position
         for (size_t k = 0; k < stride; ++k) {
-            size_t incoming_i = i_max - (stride - 1 - k);
+            size_t incoming_i = (strand_mode == -1)
+                ? (i_min + (stride - 1 - k))
+                : (i_max - (stride - 1 - k));
             if (incoming_i + motif_len > tlen) {
                 return std::numeric_limits<float>::quiet_NaN();
             }
@@ -534,7 +562,7 @@ float PWMScorer::try_slide_window(const std::string& target,
             float val = pos_value_with_dir(m_pssm, target, incoming_i, strand_mode,
                                            get_spatial_log_factor(first_incoming_pos + k),
                                            best_dir);
-            int64_t genomic_pos = expanded_interval.start + int64_t(incoming_i);
+            int64_t genomic_pos = anchor_genomic_pos(expanded_interval, incoming_i, motif_len, strand_mode);
             m_slide.rmax.push(val, best_dir, genomic_pos);
         }
 
@@ -551,7 +579,7 @@ float PWMScorer::try_slide_window(const std::string& target,
         int best_dir = m_slide.rmax.argmax_direction();
 
         // Convert genomic position to index in target string
-        size_t pos_in_target = size_t(best_genomic_pos - expanded_interval.start);
+        size_t pos_in_target = anchor_target_index(expanded_interval, best_genomic_pos, motif_len, strand_mode);
 
         // Use compute_position_result like the non-sliding implementation
         return compute_position_result(pos_in_target, target.length(), motif_len, best_dir);
@@ -641,7 +669,7 @@ float PWMScorer::try_slide_window(const std::string& target,
 }
 
 // Initialize/seed the sliding window
-float PWMScorer::seed_sliding_window(const std::string& target,
+double PWMScorer::seed_sliding_window(const std::string& target,
                                      const GInterval& original_interval,
                                      const GInterval& expanded_interval,
                                      size_t i_min, size_t i_max, size_t motif_len)
@@ -667,7 +695,7 @@ float PWMScorer::seed_sliding_window(const std::string& target,
                                           get_spatial_log_factor(pos0 + (i - i_min)));
             vals.push_back(v);
             dirs.push_back(1);  // Direction doesn't matter for these modes
-            genomic_positions.push_back(expanded_interval.start + int64_t(i));
+            genomic_positions.push_back(anchor_genomic_pos(expanded_interval, i, motif_len, strand_mode));
         }
     } else if (m_mode == MAX_LIKELIHOOD_POS) {
         // Need best score and direction per position
@@ -678,7 +706,7 @@ float PWMScorer::seed_sliding_window(const std::string& target,
                                          best_dir);
             vals.push_back(v);
             dirs.push_back(best_dir);
-            genomic_positions.push_back(expanded_interval.start + int64_t(i));
+            genomic_positions.push_back(anchor_genomic_pos(expanded_interval, i, motif_len, strand_mode));
         }
     } else { // MOTIF_COUNT: handled separately below (per-position union)
         // no-op: we don't need vals/dirs here
@@ -698,6 +726,21 @@ float PWMScorer::seed_sliding_window(const std::string& target,
     m_slide.pos0 = 0;
     m_slide.stride = 0;
 
+    // RunningMaxDeque must be seeded in ascending genomic order, which on the
+    // minus strand is descending target index (the target is reverse-
+    // complemented). RunningLogSumExp is indexed by target position instead, so
+    // vals itself stays in ascending target-index order for TOTAL_LIKELIHOOD.
+    auto seed_rmax = [&]() {
+        if (strand_mode == -1) {
+            m_slide.rmax.clear();
+            for (size_t k = vals.size(); k > 0; --k) {
+                m_slide.rmax.push(vals[k - 1], dirs[k - 1], genomic_positions[k - 1]);
+            }
+        } else {
+            m_slide.rmax.init(vals, dirs, genomic_positions);
+        }
+    };
+
     // Seed aggregators based on mode
     if (m_mode == TOTAL_LIKELIHOOD) {
         m_slide.rlse.init(vals);
@@ -705,19 +748,19 @@ float PWMScorer::seed_sliding_window(const std::string& target,
     }
 
     if (m_mode == MAX_LIKELIHOOD) {
-        m_slide.rmax.init(vals, dirs, genomic_positions);
+        seed_rmax();
         return m_slide.rmax.value();
     }
 
     if (m_mode == MAX_LIKELIHOOD_POS) {
-        m_slide.rmax.init(vals, dirs, genomic_positions);
+        seed_rmax();
 
         // MAX_LIKELIHOOD_POS: Get genomic position directly from deque
         int64_t best_genomic_pos = m_slide.rmax.argmax_genomic_position();
         int best_dir = m_slide.rmax.argmax_direction();
 
         // Convert genomic position to index in target string
-        size_t pos_in_target = size_t(best_genomic_pos - expanded_interval.start);
+        size_t pos_in_target = anchor_target_index(expanded_interval, best_genomic_pos, motif_len, strand_mode);
 
         // Use compute_position_result like the non-sliding implementation
         return compute_position_result(pos_in_target, target.length(), motif_len, best_dir);
@@ -757,7 +800,7 @@ float PWMScorer::seed_sliding_window(const std::string& target,
 }
 
 // Try to use sliding window optimization
-float PWMScorer::score_with_sliding_window(const std::string& target,
+double PWMScorer::score_with_sliding_window(const std::string& target,
                                            const GInterval& original_interval,
                                            const GInterval& expanded_interval,
                                            size_t i_min, size_t i_max, size_t motif_len)
@@ -790,7 +833,7 @@ float PWMScorer::score_with_sliding_window(const std::string& target,
 
     // Try to slide if possible
     if (can_slide) {
-        float result = try_slide_window(target, original_interval, expanded_interval, i_min, i_max, motif_len, stride);
+        double result = try_slide_window(target, original_interval, expanded_interval, i_min, i_max, motif_len, stride);
         if (!std::isnan(result)) {
             return result;
         }
@@ -801,7 +844,7 @@ float PWMScorer::score_with_sliding_window(const std::string& target,
     return seed_sliding_window(target, original_interval, expanded_interval, i_min, i_max, motif_len);
 }
 
-float PWMScorer::score_interval(const GInterval& interval, const GenomeChromKey& chromkey)
+double PWMScorer::score_interval(const GInterval& interval, const GenomeChromKey& chromkey)
 {
     // Calculate expanded interval to include full motif coverage
     int64_t motif_length = m_pssm.size();
@@ -825,7 +868,7 @@ float PWMScorer::score_interval(const GInterval& interval, const GenomeChromKey&
         if (tlen >= motif_len) {
             // Calculate allowed start range
             size_t i_min = std::max(0, m_pssm.get_min_range());
-            size_t i_max = std::min<size_t>(m_pssm.get_max_range(), tlen - motif_len);
+            size_t i_max = m_pssm.max_offset(tlen);
 
             // Clamp the scanning window to anchors whose starts fall inside the iterator
             const int64_t interval_len = interval.end - interval.start;
@@ -1367,7 +1410,7 @@ void PWMScorer::spat_slide_once(const std::string& target, const GInterval& expd
 }
 
 // Answer functions
-float PWMScorer::spat_answer_TOTAL() {
+double PWMScorer::spat_answer_TOTAL() {
     SpatSlideCache& S = m_spat_slide;
 
     // Recompute dirty bins (rare)
@@ -1394,7 +1437,7 @@ float PWMScorer::spat_answer_TOTAL() {
     return (float)(A + std::log(Ssum));
 }
 
-float PWMScorer::spat_answer_MAX() {
+double PWMScorer::spat_answer_MAX() {
     SpatSlideCache& S = m_spat_slide;
     float best = -std::numeric_limits<float>::infinity();
     for (size_t b = 0; b < S.bins; ++b) {
@@ -1404,7 +1447,7 @@ float PWMScorer::spat_answer_MAX() {
     return best;
 }
 
-float PWMScorer::spat_answer_MAXPOS(const std::string& target,
+double PWMScorer::spat_answer_MAXPOS(const std::string& target,
                                     const GInterval& expd, size_t motif_len, size_t i_min) {
     SpatSlideCache& S = m_spat_slide;
 
@@ -1430,7 +1473,7 @@ float PWMScorer::spat_answer_MAXPOS(const std::string& target,
     return compute_position_result(target_idx, target.length(), motif_len, best_dir);
 }
 
-float PWMScorer::spat_answer_COUNT() const {
+double PWMScorer::spat_answer_COUNT() const {
     const SpatSlideCache& S = m_spat_slide;
     int total = 0;
     for (size_t b = 0; b < S.bins; ++b) {

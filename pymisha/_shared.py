@@ -957,3 +957,260 @@ def _coerce_score_thresh(value: Any) -> float:
             "one; NaN is not."
         )
     return out
+
+
+_POTTS_BASES = ("A", "C", "G", "T")
+# FLT_MAX, spelled out: the scorer reports in single precision.
+_FLT_MAX = 3.4028234663852886e38
+
+
+def _potts_e_matrix(e: Any, what: str) -> _numpy.ndarray:
+    """``e`` as a (W, 4) float array with columns in A, C, G, T order."""
+    if isinstance(e, _pandas.DataFrame):
+        cols = {str(c).upper(): c for c in e.columns}
+        if not all(b in cols for b in _POTTS_BASES):
+            raise ValueError(f"{what}: 'e' must have columns named A, C, G, T")
+        e = e[[cols[b] for b in _POTTS_BASES]].to_numpy(dtype=float)
+    arr = _numpy.asarray(e, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise ValueError(
+            f"{what}: 'e' must be a numeric matrix with 4 columns (A, C, G, T)"
+        )
+    return _numpy.ascontiguousarray(arr)
+
+
+def _orient_potts_J(jk: Any, k: int, what: str) -> _numpy.ndarray:
+    """Reorder a labelled 4x4 J block into A, C, G, T on both axes.
+
+    A J block's rows are indexed by the lower position's base and its columns
+    by the higher position's, both in A, C, G, T order. ``e`` is reordered by
+    column NAME, so a labelled J block has to be reordered too: reading a
+    relabelled block positionally is a wrong score with no warning, and a user
+    who has just seen ``e`` accept labelled columns has every reason to label J
+    as well. An unlabelled block is positional, as before.
+    """
+    if not isinstance(jk, _pandas.DataFrame):
+        return _numpy.asarray(jk, dtype=float)
+    rows = [str(x).upper() for x in jk.index]
+    cols = [str(x).upper() for x in jk.columns]
+    if set(rows) != set(_POTTS_BASES) or set(cols) != set(_POTTS_BASES):
+        raise ValueError(
+            f"{what}: 'J' table {k} is labelled, so both its rows and its "
+            "columns must be named A, C, G, T in some order"
+        )
+    out = jk.copy()
+    out.index = rows
+    out.columns = cols
+    ordered: _numpy.ndarray = out.loc[
+        list(_POTTS_BASES), list(_POTTS_BASES)
+    ].to_numpy(dtype=float)
+    return ordered
+
+
+def _coerce_potts_model(model: Any, what: str) -> dict[str, Any]:
+    """Port of R misha's ``.coerce_potts_model`` (``R/pssm_utils.R``).
+
+    One validator for both Potts entry points - ``gseq_potts`` and the potts
+    virtual tracks. It returns the model in the exact shape the C++ parser
+    takes: ``e`` a (W, 4) float array, ``J`` an (npair, 16) float array whose
+    rows are the 4x4 blocks flattened in Fortran order, ``pairs`` an (npair, 2)
+    int array (1-based), ``intercept`` a float.
+
+    It is deliberately tolerant of the extra fields a fitted Potts model
+    carries (``width``, ``pair_strength``, ``attr``, ``link``) so that a fitted
+    model can be passed verbatim, and it cross-checks ``width`` against the row
+    count of ``e`` when present, which catches a hand-edited model.
+    """
+    if not isinstance(model, dict):
+        raise ValueError(
+            f"{what}: `model` must be a dict with 'e', 'J', 'pairs' and "
+            f"'intercept'; it is a {type(model).__name__}"
+        )
+    if "e" not in model:
+        raise ValueError(
+            f"{what}: `model` requires an 'e' matrix - one row per position, "
+            "columns A, C, G, T"
+        )
+
+    e = _potts_e_matrix(model["e"], what)
+    if e.shape[0] < 1:
+        raise ValueError(f"{what}: 'e' has no rows, so the model covers no positions")
+    if not _numpy.isfinite(e).all():
+        n_bad = int((~_numpy.isfinite(e)).sum())
+        raise ValueError(f"{what}: 'e' has {n_bad} non-finite entries")
+    w = int(e.shape[0])
+
+    width = model.get("width")
+    if width is not None:
+        try:
+            width_ok = int(width) == w
+        except (TypeError, ValueError):
+            width_ok = False
+        if not width_ok:
+            raise ValueError(f"{what}: 'width' says {width} but 'e' has {w} rows")
+
+    pairs_in = model.get("pairs")
+    if pairs_in is None:
+        pairs = _numpy.zeros((0, 2), dtype=_numpy.int64)
+    else:
+        if isinstance(pairs_in, _pandas.DataFrame):
+            pairs_in = pairs_in.to_numpy()
+        pairs_arr = _numpy.asarray(pairs_in)
+        if pairs_arr.ndim != 2 or pairs_arr.shape[1] != 2:
+            raise ValueError(
+                f"{what}: 'pairs' must be a numeric matrix with 2 columns, one "
+                "row per coupling"
+            )
+        # Before the integer cast, which truncates: 2.9 with W = 2 is both
+        # fractional AND out of range, and the range check below would validate
+        # the truncated 2 and pass it. Every other index here is strict.
+        as_float = _numpy.asarray(pairs_arr, dtype=float)
+        if as_float.size and (
+            not _numpy.isfinite(as_float).all()
+            or not (as_float == _numpy.trunc(as_float)).all()
+        ):
+            raise ValueError(f"{what}: every 'pairs' index must be a whole number")
+        pairs = _numpy.ascontiguousarray(pairs_arr.astype(_numpy.int64))
+    npair = int(pairs.shape[0])
+
+    if npair:
+        if pairs.min() < 1 or pairs.max() > w:
+            raise ValueError(f"{what}: every 'pairs' index must be in 1..{w}")
+        bad = _numpy.flatnonzero(pairs[:, 0] >= pairs[:, 1])
+        if bad.size:
+            raise ValueError(
+                f"{what}: every row of 'pairs' must have the lower position "
+                f"first (i < j); row {int(bad[0]) + 1} does not"
+            )
+        seen = {(int(a), int(b)) for a, b in pairs}
+        if len(seen) != npair:
+            raise ValueError(
+                f"{what}: 'pairs' names the same pair of positions twice; a "
+                "pair carries one coupling table"
+            )
+
+    j_in = model.get("J")
+    if j_in is None:
+        j_in = []
+    if isinstance(j_in, (list, tuple)):
+        if len(j_in) != npair:
+            raise ValueError(
+                f"{what}: 'J' holds {len(j_in)} tables and 'pairs' names {npair}"
+            )
+        rows = []
+        for k, jk in enumerate(j_in):
+            block = _orient_potts_J(jk, k + 1, what)
+            if block.shape != (4, 4):
+                raise ValueError(
+                    f"{what}: 'J' table {k + 1} must be a 4 x 4 numeric matrix"
+                )
+            if not _numpy.isfinite(block).all():
+                raise ValueError(f"{what}: 'J' table {k + 1} has non-finite entries")
+            # Fortran-order flatten puts element [a, b] at b * 4 + a, which is
+            # what the C++ kernel indexes.
+            rows.append(block.flatten(order="F"))
+        j_flat = (
+            _numpy.vstack(rows) if rows else _numpy.zeros((0, 16), dtype=float)
+        )
+    else:
+        j_flat = _numpy.asarray(j_in, dtype=float)
+        if j_flat.ndim != 2 or j_flat.shape[0] != npair or (npair and j_flat.shape[1] != 16):
+            raise ValueError(f"{what}: a flat 'J' must be an {npair} x 16 numeric matrix")
+        if not _numpy.isfinite(j_flat).all():
+            raise ValueError(f"{what}: 'J' has non-finite entries")
+        j_flat = j_flat.reshape(npair, 16)
+    j_flat = _numpy.ascontiguousarray(j_flat, dtype=float)
+
+    intercept_in = model.get("intercept")
+    intercept = 0.0 if intercept_in is None else intercept_in
+    if isinstance(intercept, bool) or not isinstance(
+        intercept, (int, float, _numpy.number)
+    ):
+        raise ValueError(f"{what}: 'intercept' must be a single finite number")
+    intercept = float(intercept)
+    if not _numpy.isfinite(intercept):
+        raise ValueError(f"{what}: 'intercept' must be a single finite number")
+
+    # Per-entry finiteness is not enough. The scorer accumulates a window in
+    # double but reports in float - PottsScorer::score_interval() returns
+    # float, and its sliding aggregators hold float - so a model whose windows
+    # can leave the single-precision range makes its two scoring paths answer
+    # differently: the direct one returns an infinity, the sliding one maps a
+    # non-finite aggregate to NaN, and the whole point of having two paths is
+    # that they agree.
+    #
+    # Bounded here rather than checked per window in C++, so that
+    # PottsScorer::slid_answer() and anchor_value() can go on reading -inf as
+    # "no anchor was scorable" instead of "the arithmetic overflowed", and so
+    # that both entry points get it from the one validator they share.
+    worst = w * float(_numpy.abs(e).max()) + abs(intercept)
+    if npair:
+        worst += npair * float(_numpy.abs(j_flat).max())
+    if not _numpy.isfinite(worst) or worst > _FLT_MAX:
+        raise ValueError(
+            f"{what}: the model's largest possible window score is {worst:.3g}, "
+            "which overflows the single-precision range potts scores are "
+            "reported in (about 3.4e38) - a scored window would come back as "
+            "Inf. Scale 'e', 'J' and 'intercept' down by a common factor, and "
+            "'score_thresh' with them, or drop the entries that make the bound "
+            "this large."
+        )
+
+    return {"e": e, "J": j_flat, "pairs": pairs, "intercept": intercept}
+
+
+def _potts_params(
+    model: Any,
+    bidirect: bool = True,
+    extend: bool = True,
+    strand: int = 1,
+    score_thresh: float = 0.0,
+    what: str = "potts",
+) -> dict[str, Any]:
+    """The C++-ready parameter dict, built one way for both entry points.
+
+    Its shape is what ``PMPottsParams::parse()`` reads, so a field renamed here
+    must be renamed there; that is the price of having one parser instead of
+    two.
+    """
+    p = _coerce_potts_model(model, what)
+
+    if not isinstance(bidirect, (bool, _numpy.bool_)):
+        raise ValueError(f"{what}: bidirect must be True or False")
+    if not isinstance(extend, (bool, _numpy.bool_)):
+        raise ValueError(f"{what}: extend must be True or False")
+    if isinstance(strand, bool) or not isinstance(strand, (int, float, _numpy.number)):
+        raise ValueError(f"{what}: strand must be 1 or -1")
+    strand = int(strand)
+    if strand not in (1, -1):
+        raise ValueError(f"{what}: strand must be 1 or -1")
+    if isinstance(score_thresh, bool) or not isinstance(
+        score_thresh, (int, float, _numpy.number)
+    ):
+        raise ValueError(f"{what}: score_thresh must be a single number")
+    score_thresh = float(score_thresh)
+    if score_thresh != score_thresh:  # NaN
+        raise ValueError(f"{what}: score_thresh must be a single number")
+
+    # Under bidirect both strands are scored at every anchor, so `strand`
+    # cannot change which anchors are scored or what any of them scores. All it
+    # changes is the orientation the scan target is fetched in, and hence the
+    # ORDER the anchors are visited in - and the *.pos functions break an exact
+    # tie by keeping the first anchor they see. So an unclamped strand = -1
+    # reports a different, equally maximal, position for the same interval
+    # wherever two anchors tie, which a repeat region supplies readily. Clamped
+    # here rather than at either entry point so both get it: the pwm family
+    # clamps the same combination, for the same reason.
+    if bidirect:
+        strand = 1
+
+    return {
+        "e": p["e"],
+        "J": p["J"],
+        "pairs": p["pairs"],
+        "intercept": p["intercept"],
+        "bidirect": bool(bidirect),
+        "extend": bool(extend),
+        "strand": strand,
+        "score_thresh": score_thresh,
+    }

@@ -1019,3 +1019,225 @@ class TestPwmSlidingWindowRegression:
         )
         assert len(result) > 0
         assert not result["pwm_pos_reg100"].isna().any()
+
+
+# ---------------------------------------------------------------------------
+# First-principles baselines.
+#
+# The tests above compare one vtrack against another - a sliding path against a
+# spatial one built with unit weights. That cannot see a defect the two paths
+# share, which is how a wrong minus-strand MAX_LIKELIHOOD slide survived: the
+# RunningMaxDeque is keyed on genomic position and evicts from the low end, but
+# on the minus strand the target is reverse-complemented, so ascending target
+# index is DESCENDING genomic position. The MAX_LIKELIHOOD branch keyed its
+# entries as if the target ran forward and took its incoming anchors from the
+# plus-strand end, evicting the anchors it had just brought in.
+#
+# The tests below take their reference from Python, computed off the extracted
+# sequence. Ported from R misha's test-pwm-sliding-window.R.
+# ---------------------------------------------------------------------------
+
+_BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+
+def _create_graded_test_pssm():
+    """A PSSM whose consensus weight differs from row to row.
+
+    Two windows with the same number of mismatches therefore score
+    differently, so the maximum over a window has a unique argmax - which a
+    max/argmax test needs in order to assert an exact value instead of an
+    arbitrary pick between exact ties.
+    """
+    return np.array([
+        [0.90, 0.04, 0.03, 0.03],
+        [0.03, 0.85, 0.06, 0.06],
+        [0.05, 0.05, 0.80, 0.10],
+        [0.08, 0.08, 0.09, 0.75],
+        [0.70, 0.10, 0.10, 0.10],
+        [0.12, 0.65, 0.12, 0.11],
+    ])
+
+
+def _manual_pwm_scores_single_strand(seq, pssm, prior=0.01):
+    """Per-anchor log-likelihoods of ``seq`` under ``pssm``, one strand only.
+
+    Adds the prior and normalises exactly as the C++ scorer does, and reports
+    -inf for a window with a non-ACGT base or a zero probability.
+    """
+    mat = np.asarray(pssm, dtype=float)
+    if prior > 0:
+        mat = mat + prior
+        mat = mat / mat.sum(axis=1, keepdims=True)
+    w = mat.shape[0]
+
+    scores = []
+    for i in range(len(seq) - w + 1):
+        score = 0.0
+        for j in range(w):
+            idx = _BASE_IDX.get(seq[i + j])
+            if idx is None:
+                score = -np.inf
+                break
+            p = mat[j, idx]
+            if p == 0:
+                score = -np.inf
+                break
+            score += float(np.log(p))
+        scores.append(score)
+    return np.array(scores, dtype=float)
+
+
+def _graded_intervals(n=40, span=10, start=12000):
+    """``n`` intervals of ``span`` bp stepping 1 bp, so consecutive windows overlap."""
+    return pm.gintervals(["1"] * n, [start + i for i in range(n)],
+                         [start + i + span for i in range(n)])
+
+
+def _extended_strand_seq(chrom, start, end, motif_len, strand):
+    iv = pm.gintervals(str(chrom), int(start), int(end) + motif_len - 1)
+    iv["strand"] = strand
+    return pm.gseq_extract(iv)[0].upper()
+
+
+class TestPwmSlidingWindowManualBaseline:
+    """Sliding-window answers against a reference computed in Python.
+
+    Geometry: a 10 bp span with a 6 bp motif leaves 10 anchors per interval,
+    few enough that the maximum genuinely varies from interval to interval;
+    the graded PSSM makes the argmax unique so an exact position can be
+    asserted.
+    """
+
+    def setup_method(self):
+        _remove_all_vtracks()
+
+    def teardown_method(self):
+        _remove_all_vtracks()
+
+    @pytest.mark.parametrize("strand", [-1, 1])
+    def test_pwm_max_sliding_matches_manual_baseline(self, strand):
+        pssm = _create_graded_test_pssm()
+        motif_len = pssm.shape[0]
+        span = 10
+        ivs = _graded_intervals(span=span)
+
+        pm.gvtrack_create("pwmmax_manual", None, func="pwm.max",
+                          pssm=pssm, bidirect=False, strand=strand,
+                          extend=True, prior=0.01)
+        got = pm.gextract("pwmmax_manual", ivs, iterator=ivs)
+
+        manual = np.array([
+            _manual_pwm_scores_single_strand(
+                _extended_strand_seq(
+                    ivs["chrom"].iloc[i], ivs["start"].iloc[i],
+                    ivs["end"].iloc[i], motif_len, strand,
+                ),
+                pssm, prior=0.01,
+            )[:span].max()
+            for i in range(len(ivs))
+        ])
+
+        # The reference must actually discriminate: a saturated maximum (the
+        # same value at every interval) would agree with a broken slide too.
+        assert len(np.unique(np.round(manual, 6))) > 3
+        np.testing.assert_allclose(got["pwmmax_manual"].values, manual, atol=1e-5)
+
+    def test_pwm_count_minus_strand_sliding_matches_manual_baseline(self):
+        pssm = _create_graded_test_pssm()
+        motif_len = pssm.shape[0]
+        span = 10
+        thresh = -12.0
+        ivs = _graded_intervals(span=span)
+
+        pm.gvtrack_create("pwmcount_manual", None, func="pwm.count",
+                          pssm=pssm, bidirect=False, strand=-1,
+                          extend=True, prior=0.01, score_thresh=thresh)
+        got = pm.gextract("pwmcount_manual", ivs, iterator=ivs)
+
+        manual = np.array([
+            int((_manual_pwm_scores_single_strand(
+                _extended_strand_seq(
+                    ivs["chrom"].iloc[i], ivs["start"].iloc[i],
+                    ivs["end"].iloc[i], motif_len, -1,
+                ),
+                pssm, prior=0.01,
+            )[:span] >= thresh).sum())
+            for i in range(len(ivs))
+        ])
+
+        assert len(np.unique(manual)) > 3
+        np.testing.assert_allclose(got["pwmcount_manual"].values, manual, atol=1e-6)
+
+    def test_pwm_max_pos_minus_strand_matches_manual_baseline(self):
+        pssm = _create_graded_test_pssm()
+        motif_len = pssm.shape[0]
+        span = 10
+        ivs = _graded_intervals(span=span)
+
+        pm.gvtrack_create("pwmmaxpos_manual", None, func="pwm.max.pos",
+                          pssm=pssm, bidirect=False, strand=-1,
+                          extend=True, prior=0.01)
+        got = pm.gextract("pwmmaxpos_manual", ivs, iterator=ivs)
+
+        # The reported position is a 1-based index into the FORWARD sequence,
+        # so a target index i on the reverse-complemented fetch maps to
+        # tlen - i - motif_len + 1. Only asserted where the top two scores are
+        # far enough apart that the argmax cannot be a tie.
+        checked = 0
+        for i in range(len(ivs)):
+            seq_rev = _extended_strand_seq(
+                ivs["chrom"].iloc[i], ivs["start"].iloc[i],
+                ivs["end"].iloc[i], motif_len, -1,
+            )
+            scores = _manual_pwm_scores_single_strand(seq_rev, pssm, prior=0.01)[:span]
+            top2 = np.sort(scores)[::-1][:2]
+            if top2[0] - top2[1] < 1e-6:
+                continue
+            best_i0 = int(np.argmax(scores))
+            want = len(seq_rev) - best_i0 - motif_len + 1
+            assert got["pwmmaxpos_manual"].iloc[i] == want, i
+            checked += 1
+        assert checked > 3, "no interval had a unique argmax - fixture says nothing"
+
+    def test_pwm_with_zero_prior_slides_across_an_unscorable_stretch(self):
+        # RunningLogSumExp::push(-inf) into a window whose running maximum is
+        # already -inf used to evaluate exp(-inf + inf) into its scaled sum,
+        # and the resulting NaN then surfaced on the first finite push. A zero
+        # prior gives a PSSM with hard zeros a per-anchor score of -inf, so a
+        # sliding window that steps over a stretch with no scorable anchor and
+        # then reaches one hits exactly that. The pwm slide reads NaN as
+        # "sliding failed" and re-seeds, so the numbers below were already
+        # right at the cost of silently losing the optimization - which is why
+        # this locks the values rather than the mechanism.
+        pssm = _create_test_pssm()  # hard zeros: every non-"AC" window is -inf
+        motif_len = pssm.shape[0]
+
+        pm.gvtrack_create("pwm_zero_prior_slide", None, func="pwm",
+                          pssm=pssm, bidirect=False, strand=1,
+                          extend=True, prior=0)
+
+        scope = pm.gintervals("1", 1000, 1300)
+        res = pm.gextract("pwm_zero_prior_slide", scope, iterator=3)
+
+        manual = []
+        for i in range(len(res)):
+            start = int(res["start"].iloc[i])
+            end = int(res["end"].iloc[i])
+            seq = pm.gseq_extract(
+                pm.gintervals("1", start, end + motif_len - 1)
+            )[0].upper()
+            scores = _manual_pwm_scores_single_strand(seq, pssm, prior=0)[: end - start]
+            finite = scores[np.isfinite(scores)]
+            manual.append(
+                float(finite.max() + np.log(np.exp(finite - finite.max()).sum()))
+                if finite.size else -np.inf
+            )
+        manual = np.array(manual)
+
+        # the geometry must actually contain both kinds of bin, or nothing is tested
+        assert np.isinf(manual).any()
+        assert np.isfinite(manual).any()
+
+        got = res["pwm_zero_prior_slide"].to_numpy(dtype=float)
+        assert not np.isnan(got).any()
+        np.testing.assert_allclose(got, manual, atol=1e-6)

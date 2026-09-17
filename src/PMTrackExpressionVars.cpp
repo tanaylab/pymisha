@@ -17,6 +17,8 @@
 #include "PWMScorer.h"
 #include "PWMEditDistanceScorer.h"
 #include "PWMLseEditDistanceScorer.h"
+#include "PottsScorer.h"
+#include "PMPottsParams.h"
 #include "KmerCounter.h"
 #include "MaskedBpCounter.h"
 #include "GenomeSeqFetch.h"
@@ -650,7 +652,8 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
 
     // Determine vtrack type from func and src
     PyObject *py_src = vt_dict_get(spec, "src");
-    bool is_seq_func = (func.rfind("pwm", 0) == 0 || func == "kmer.count" || func == "kmer.frac" ||
+    bool is_seq_func = (func.rfind("pwm", 0) == 0 || func.rfind("potts", 0) == 0 ||
+                        func == "kmer.count" || func == "kmer.frac" ||
                         func == "masked.count" || func == "masked.frac");
 
     if (is_seq_func && (!py_src || py_src == Py_None)) {
@@ -820,6 +823,29 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
                 pssm, vvar.seqfetch.get(), extend, pwm_mode, strand,
                 spat_factor, spat_bin, (float)score_thresh);
         }
+    } else if (func.rfind("potts", 0) == 0) {
+        // The spec dict is what _potts_params() built, parsed by the same
+        // PMPottsParams::parse() pm_gseq_potts() uses, so a potts vtrack and
+        // gseq_potts() cannot disagree about what a model means.
+        const PMPottsParams pp = PMPottsParams::parse(
+            spec, std::string("virtual track function '") + func + "'");
+
+        PottsScorer::ScoringMode potts_mode = PottsScorer::TOTAL_LIKELIHOOD;
+        if (func == "potts.max") potts_mode = PottsScorer::MAX_LIKELIHOOD;
+        else if (func == "potts.max.pos") potts_mode = PottsScorer::MAX_LIKELIHOOD_POS;
+        else if (func == "potts.count") potts_mode = PottsScorer::MOTIF_COUNT;
+        else if (func != "potts")
+            TGLError("Unsupported potts virtual track function '%s' for vtrack '%s'",
+                     func.c_str(), vvar.name.c_str());
+
+        // strand_mode goes through unclamped, as it does in misha: under
+        // bidirect both strands are read at every anchor, so all `strand` can
+        // still change is the orientation the target is FETCHED in - and
+        // _potts_params() already clamps it to 1 there, for the tie-break
+        // reason recorded next to that clamp.
+        vvar.scorer = std::make_unique<PottsScorer>(
+            pp.model, vvar.seqfetch.get(), pp.extend_flag, potts_mode,
+            pp.bidirect, pp.strand_mode, pp.score_thresh);
     } else if (func == "kmer.count" || func == "kmer.frac") {
         std::string kmer = vt_obj_to_string(vt_dict_get(spec, "kmer"), "");
         if (kmer.empty()) {

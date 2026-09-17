@@ -8,7 +8,14 @@ import math as _math
 import numpy as _numpy
 import pandas as _pandas
 
-from ._shared import CONFIG, _checkroot, _coerce_score_thresh, _df2pymisha, _pymisha
+from ._shared import (
+    CONFIG,
+    _checkroot,
+    _coerce_score_thresh,
+    _df2pymisha,
+    _potts_params,
+    _pymisha,
+)
 from .extract import _maybe_load_intervals_set
 
 # Complement mapping for DNA bases
@@ -919,14 +926,22 @@ def _pwm_score_batch_vectorized(
                 results[i] = 0
             continue
 
+        # Under bidirect the forward and reverse-complement matches are two
+        # readings of the SAME window, so every mode but "pos" combines them
+        # per window by log-sum-exp before reducing over windows - the union
+        # the pwm, pwm.max and pwm.count virtual tracks take, and the one the
+        # C++ fast path above already takes. "pos" still maximises across the
+        # strands, because it has to name one; that asymmetry is the pwm
+        # family's own (pwm.max combines, pwm.max.pos does not).
+        union = (_numpy.logaddexp(all_scores[0][1], all_scores[1][1])
+                 if len(all_scores) == 2 else all_scores[0][1])
+
         # Aggregate scores by mode
         if mode == "lse":
-            combined = _numpy.concatenate([s for _, s in all_scores])
-            results[i] = _numpy_logsumexp(combined)
+            results[i] = _numpy_logsumexp(union)
 
         elif mode == "max":
-            combined = _numpy.concatenate([s for _, s in all_scores])
-            non_nan = combined[~_numpy.isnan(combined)]
+            non_nan = union[~_numpy.isnan(union)]
             if non_nan.size > 0:
                 results[i] = non_nan.max()
 
@@ -948,8 +963,10 @@ def _pwm_score_batch_vectorized(
                 strand_results[i] = best_strand
 
         elif mode == "count":
-            combined = _numpy.concatenate([s for _, s in all_scores])
-            results[i] = float(_numpy.sum(combined >= score_thresh))
+            # One window is at most one hit: the strands are combined before
+            # the threshold, not thresholded apart, so a window whose reverse
+            # complement also matches is not counted twice.
+            results[i] = float(_numpy.sum(union >= score_thresh))
 
     if return_strand and mode == "pos":
         assert strand_results is not None
@@ -1120,6 +1137,8 @@ def _pwm_score_sequence(
         else:
             spat_log = 0.0
 
+        win_scores: list[float] = []
+        win_dirs: list[int] = []
         for is_rev, strand_dir in ((False, 1), (True, -1)):
             if is_rev and not scan_rev:
                 continue
@@ -1129,20 +1148,41 @@ def _pwm_score_sequence(
             s = _pwm_score_window(window, log_pssm, avg_log, w, neutral_set, neutral_policy, is_rev)
             if _numpy.isnan(s):
                 continue
-            has_valid = True
 
             # Apply spatial weight in log space
             if use_spat and s > -_numpy.inf:
                 s += spat_log
 
-            if mode == "lse":
-                all_scores.append(s)
-            elif mode in ("max", "pos"):
+            win_scores.append(s)
+            win_dirs.append(strand_dir)
+
+        if not win_scores:
+            continue
+        has_valid = True
+
+        if mode == "lse":
+            # log-sum-exp is associative, so appending both strands is the
+            # same number as appending their union.
+            all_scores.extend(win_scores)
+        elif mode == "pos":
+            # "pos" has to name a strand, so it maximises across the two
+            # rather than combining them - what pwm.max.pos does.
+            for s, strand_dir in zip(win_scores, win_dirs, strict=False):
                 if s > best_score:
                     best_score = s
                     best_pos = phys_pos + 1  # 1-based
                     best_strand = strand_dir
-            elif mode == "count" and s >= score_thresh:
+        else:
+            # "max" and "count": the two strands are two readings of the same
+            # window, so they are combined by log-sum-exp before the reduction
+            # over windows - the union the pwm virtual tracks take. A window
+            # whose reverse complement also matches is one hit, not two.
+            u = (win_scores[0] if len(win_scores) == 1
+                 else float(_numpy.logaddexp(win_scores[0], win_scores[1])))
+            if mode == "max":
+                if u > best_score:
+                    best_score = u
+            elif u >= score_thresh:
                 count += 1
 
     # Aggregate final result
@@ -1527,6 +1567,153 @@ def gseq_pwm(
         return _pandas.DataFrame({"pos": results, "strand": strand_results})
 
     return _numpy.array(results, dtype=float)
+
+
+def gseq_potts(
+    seqs: str | list[str],
+    model: dict,
+    mode: str = "lse",
+    bidirect: bool = True,
+    strand: int = 0,
+    score_thresh: float | None = None,
+    extend: bool = False,
+) -> _numpy.ndarray:
+    """
+    Score DNA sequences under a Potts (pairwise energy) model.
+
+    The sequence-level entry point of the ``potts`` family, the way
+    :func:`gseq_pwm` is the ``pwm`` family's. The score of one width-``W``
+    window is ``intercept + sum_i e[i, x_i] + sum_k J_k[x_i, x_j]``, and a
+    sequence longer than ``W`` is reduced over every window by *mode*.
+
+    The parameterisation is not unique: adding a constant to a position's four
+    ``e`` entries, or a row or column shift to a ``J`` block, changes no score,
+    so ``e`` is comparable across positions only in the zero-sum gauge, where
+    each row of ``e`` sums to 0 and every ``J`` block has zero row and column
+    sums.
+
+    A Potts carries energies, not probabilities, so there is no ``prior`` and
+    no fallback for an ambiguous base: a window containing any non-ACGT base is
+    not scored and is left out of the reduction. A sequence that has windows
+    but none of them scorable returns ``nan``, and ``0`` for ``mode="count"``:
+    it counted, and found none. A sequence shorter than the model returns
+    ``nan`` for every mode including ``"count"`` - there was no window to count.
+
+    Parameters
+    ----------
+    seqs : str or list of str
+        DNA sequence(s) to score (case-insensitive).
+    model : dict
+        The energy model, with keys:
+
+        - ``e`` -- a ``(W, 4)`` numeric array or DataFrame with columns
+          ``A``, ``C``, ``G``, ``T``: the per-position energies.
+        - ``J`` -- a list of ``4x4`` arrays, or an ``(npair, 16)`` array: the
+          coupling tables, one per row of ``pairs``, indexed with the lower
+          position on the rows.
+        - ``pairs`` -- an ``(npair, 2)`` array of 1-based position pairs, lower
+          position first.
+        - ``intercept`` -- a single number.
+
+        Extra keys named ``width``, ``pair_strength``, ``attr`` or ``link`` are
+        accepted and ignored, so a fitted model can be passed verbatim;
+        ``width`` is cross-checked against the row count of ``e``.
+    mode : str, default ``"lse"``
+        ``"lse"`` for the log-sum-exp over windows, ``"max"`` for the best
+        window, ``"pos"`` for the 1-based position of the best window (signed
+        by strand when ``bidirect=True``), ``"count"`` for the number of
+        windows scoring at least *score_thresh*.
+    bidirect : bool, default True
+        If True both strands are read. The two strands are combined at each
+        window by log-sum-exp for ``"lse"``, ``"max"`` and ``"count"``, and by
+        the maximum for ``"pos"``, which has to name a strand. :func:`gseq_pwm`
+        splits the two the same way.
+    strand : int, default 0
+        Used only when ``bidirect=False``, and required there: ``1`` for the
+        forward strand, ``-1`` for the reverse. The default ``0`` is accepted
+        only under ``bidirect=True``, where both strands are read and it is
+        ignored.
+    score_thresh : float, optional
+        Required for ``mode="count"`` and ignored otherwise. A Potts score is
+        an energy whose usable range depends entirely on the model, so there is
+        no default; read one off ``mode="max"`` over your own sequences.
+    extend : bool, default False
+        Accepted for signature parity with :func:`gseq_pwm` and ignored - a
+        bare sequence has no genome to extend into.
+
+    Returns
+    -------
+    numpy.ndarray
+        One value per input sequence.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import pymisha as pm
+
+    A ``W=2`` model with a real coupling. On the per-position energies alone
+    the model prefers ``"AC"``, but the pair term penalises A-then-C and
+    rewards G-then-T, so ``"GT"`` wins instead:
+
+    >>> e = np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0]])
+    >>> J = [np.array([[0, -3.0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 3.0], [0, 0, 0, 0]])]
+    >>> model = {"e": e, "J": J, "pairs": np.array([[1, 2]]), "intercept": 0.0}
+    >>> pm.gseq_potts(["AC", "GT"], model, mode="max", bidirect=False, strand=1)
+    array([-1.,  3.])
+
+    See Also
+    --------
+    gseq_pwm : the same reduction for a position weight matrix.
+    gvtrack_create : the ``potts`` virtual track functions.
+    """
+    if mode not in ("lse", "max", "pos", "count"):
+        raise ValueError(f"mode must be 'lse', 'max', 'pos', or 'count', got '{mode}'")
+
+    if mode == "count":
+        if score_thresh is None:
+            raise ValueError(
+                "gseq_potts(mode='count') requires a 'score_thresh' argument. A "
+                "Potts score is an energy whose usable range depends entirely on "
+                "the model, so there is no default that suits every one - read a "
+                "threshold off mode='max' over your own sequences."
+            )
+        score_thresh = _coerce_score_thresh(score_thresh)
+    elif score_thresh is None:
+        score_thresh = 0.0
+
+    if not isinstance(bidirect, (bool, _numpy.bool_)):
+        raise ValueError("bidirect must be True or False")
+    if isinstance(strand, bool) or strand not in (-1, 0, 1):
+        raise ValueError("strand must be -1, 0, or 1")
+    if bidirect:
+        strand = 0
+    elif strand == 0:
+        # 0 is the signature default, kept for parity with gseq_pwm. Under
+        # bidirect=False it cannot mean anything: exactly one strand is read,
+        # and silently picking the forward one hands half an answer to a caller
+        # carrying gseq_pwm's "0 = both strands" reading over.
+        raise ValueError(
+            "gseq_potts(bidirect=False) needs an explicit strand: 1 for the "
+            "forward strand, -1 for the reverse."
+        )
+
+    if isinstance(seqs, str):
+        seqs = [seqs]
+
+    # The same dict the potts virtual tracks build, parsed by the same C++, so
+    # gseq_potts() and a potts vtrack cannot disagree about what a model means.
+    # strand = 0 never reaches strand_mode: bidirect already implies both.
+    params = _potts_params(
+        model,
+        bidirect=bool(bidirect),
+        extend=bool(extend),
+        strand=1 if strand == 0 else int(strand),
+        score_thresh=float(score_thresh),
+        what="gseq_potts",
+    )
+
+    out: _numpy.ndarray = _pymisha.pm_gseq_potts(list(seqs), params, mode)
+    return out
 
 
 def gseq_pwm_edits(

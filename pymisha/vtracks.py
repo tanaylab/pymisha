@@ -18,6 +18,7 @@ from ._shared import (
     _df2pymisha,
     _numpy,
     _pandas,
+    _potts_params,
     _pymisha,
 )
 
@@ -25,9 +26,10 @@ _logger = get_logger(__name__)
 
 _FILTER_PASSTHROUGH_FUNCS = {"distance", "distance.center", "distance.edge"}
 _FILTER_WEIGHTED_FUNCS = {"avg", "mean", "coverage", "kmer.frac", "masked.frac"}
-_FILTER_ADDITIVE_FUNCS = {"sum", "kmer.count", "masked.count", "pwm.count", "neighbor.count"}
+_FILTER_ADDITIVE_FUNCS = {"sum", "kmer.count", "masked.count", "pwm.count", "potts.count",
+                          "neighbor.count"}
 _FILTER_MIN_FUNCS = {"min"}
-_FILTER_MAX_FUNCS = {"max", "pwm.max"}
+_FILTER_MAX_FUNCS = {"max", "pwm.max", "potts.max"}
 _FILTER_STDDEV_FUNCS = {"stddev", "std"}
 _FILTER_QUANTILE_FUNCS = {"quantile"}
 _FILTER_NEAREST_FUNCS = {"nearest"}
@@ -46,13 +48,15 @@ _FILTER_MIN_POS_ABS_FUNCS = {"min.pos.abs"}
 _FILTER_MIN_POS_REL_FUNCS = {"min.pos.relative"}
 _FILTER_SAMPLE_POS_ABS_FUNCS = {"sample.pos.abs"}
 _FILTER_SAMPLE_POS_REL_FUNCS = {"sample.pos.relative"}
-_FILTER_LOGSUMEXP_FUNCS = {"pwm", "lse"}
+_FILTER_LOGSUMEXP_FUNCS = {"pwm", "potts", "lse"}
 _FILTER_GLOBAL_PERCENTILE_FUNCS = {
     "global.percentile",
     "global.percentile.min",
     "global.percentile.max",
 }
-_FILTER_PWM_MAX_POS_FUNCS = {"pwm.max.pos"}
+# Each of these picks the position from the unmasked part carrying the best
+# score, so each needs the matching *.max func to rank the parts by.
+_FILTER_MAX_POS_BY_SCORE_FUNCS = {"pwm.max.pos": "pwm.max", "potts.max.pos": "potts.max"}
 _FILTER_EDIT_DISTANCE_FUNCS = {
     "pwm.edit_distance",
     "pwm.edit_distance.pos",
@@ -75,11 +79,26 @@ _EDIT_DISTANCE_PARAMS = {
 }
 _LSE_EDIT_DISTANCE_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_indels"}
 _N_MUTATIONS_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_edits", "max_indels"}
+# The allowlist is deliberately wider than the parameters this family uses:
+# `width`, `pair_strength`, `attr` and `link` are accepted and ignored so that a
+# fitted Potts model - whose fields are exactly `e`, `J`, `pairs`,
+# `pair_strength`, `width`, `intercept`, `attr`, `link` - can be handed over
+# verbatim as `params`, with no subsetting at the call site.
+# _coerce_potts_model() cross-checks `width` against the row count of `e`.
+_POTTS_PARAMS = {
+    "e", "J", "pairs", "intercept", "bidirect", "extend", "strand",
+    "score_thresh", "width", "pair_strength", "attr", "link",
+}
+_POTTS_FUNCS = ("potts", "potts.max", "potts.max.pos", "potts.count")
 _ACCEPTED_VTRACK_PARAMS = {
     "pwm": _PWM_PARAMS,
     "pwm.max": _PWM_PARAMS,
     "pwm.max.pos": _PWM_PARAMS,
     "pwm.count": _PWM_PARAMS,
+    "potts": _POTTS_PARAMS,
+    "potts.max": _POTTS_PARAMS,
+    "potts.max.pos": _POTTS_PARAMS,
+    "potts.count": _POTTS_PARAMS,
     "kmer.count": {"kmer", "extend", "strand"},
     "kmer.frac": {"kmer", "extend", "strand"},
     "pwm.edit_distance": _EDIT_DISTANCE_PARAMS,
@@ -198,8 +217,8 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_SAMPLE_POS_ABS_FUNCS
     | _FILTER_SAMPLE_POS_REL_FUNCS
     | _FILTER_LOGSUMEXP_FUNCS
+    | set(_FILTER_MAX_POS_BY_SCORE_FUNCS)
     | _FILTER_GLOBAL_PERCENTILE_FUNCS
-    | _FILTER_PWM_MAX_POS_FUNCS
     | _FILTER_EDIT_DISTANCE_FUNCS
 )
 
@@ -982,12 +1001,23 @@ def _compute_filtered_segment_logsumexp(
     return out
 
 
-def _compute_filtered_pwm_max_pos(
+def _compute_filtered_max_pos_by_score(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
+    pos_func: str,
+    score_func: str,
 ) -> np.ndarray:
-    """pwm.max.pos under filter: select position from segment with best pwm.max score."""
+    """A ``*.max.pos`` func under a filter.
+
+    The position alone cannot be compared between two unmasked parts, so each
+    part is scored twice - once with *score_func* to rank the parts, once with
+    *pos_func* for the answer - and the winning part's position is offset into
+    the iterator interval's own coordinate frame, re-signed so the offset moves
+    it away from zero in whichever direction it already points. Serves
+    ``pwm.max.pos`` and ``potts.max.pos``, which differ only in those two
+    names.
+    """
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     if seg_df is None or len(seg_df) == 0:
@@ -997,9 +1027,9 @@ def _compute_filtered_pwm_max_pos(
     base_payload["sshift"] = 0
     base_payload["eshift"] = 0
     payload_score = dict(base_payload)
-    payload_score["func"] = "pwm.max"
+    payload_score["func"] = score_func
     payload_pos = dict(base_payload)
-    payload_pos["func"] = "pwm.max.pos"
+    payload_pos["func"] = pos_func
 
     seg_intervals = _df2pymisha(seg_df[["chrom", "start", "end"]])
     seg_scores = _numpy.asarray(_pymisha.pm_vtrack_compute(payload_score, seg_intervals, CONFIG), dtype=float)
@@ -1377,13 +1407,17 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     if func in _FILTER_GLOBAL_PERCENTILE_FUNCS:
         return _compute_filtered_global_percentile(intervals, payload_eval, filter_df, func)
 
-    # --- pwm: combine segment scores by logsumexp ---
-    if func == "pwm":
+    # --- pwm / potts: combine segment scores by logsumexp ---
+    if func in ("pwm", "potts"):
         return _compute_filtered_segment_logsumexp(intervals, payload_eval, filter_df)
 
-    # --- pwm.max.pos: pick the position from the segment with highest pwm.max ---
-    if func in _FILTER_PWM_MAX_POS_FUNCS:
-        return _compute_filtered_pwm_max_pos(intervals, payload_eval, filter_df)
+    # --- pwm.max.pos / potts.max.pos: the position from the segment holding
+    # the highest score, in the interval's own coordinates ---
+    if func in _FILTER_MAX_POS_BY_SCORE_FUNCS:
+        return _compute_filtered_max_pos_by_score(
+            intervals, payload_eval, filter_df, func,
+            _FILTER_MAX_POS_BY_SCORE_FUNCS[func],
+        )
 
     # --- max.pos.* / min.pos.*: find position of extremum across unmasked bins ---
     if func in _FILTER_MAX_POS_ABS_FUNCS:
@@ -1529,8 +1563,9 @@ def gvtrack_create(
           numeric value column -- acts as an in-memory sparse (value-based)
           track. Intervals must not overlap.
         - ``None`` -- for sequence-based functions (``'pwm'``, ``'pwm.max'``,
-          ``'pwm.count'``, ``'kmer.count'``, ``'kmer.frac'``,
-          ``'masked.count'``, ``'masked.frac'``).
+          ``'pwm.count'``, ``'potts'``, ``'potts.max'``, ``'potts.count'``,
+          ``'kmer.count'``, ``'kmer.frac'``, ``'masked.count'``,
+          ``'masked.frac'``).
     func : str, optional
         Aggregation function to apply. When omitted, defaults to ``'avg'``
         for a track or value-bearing source and to ``'distance'`` for an
@@ -1552,6 +1587,8 @@ def gvtrack_create(
           ``'global.percentile'``
         - **Motif/PWM** (src=None): ``'pwm'``, ``'pwm.max'``,
           ``'pwm.max.pos'``, ``'pwm.count'``
+        - **Potts / pairwise energy** (src=None): ``'potts'``,
+          ``'potts.max'``, ``'potts.max.pos'``, ``'potts.count'``
         - **Edit distance** (src=None): ``'pwm.edit_distance'``,
           ``'pwm.edit_distance.pos'``, ``'pwm.max.edit_distance'``,
           ``'pwm.edit_distance.lse'``, ``'pwm.edit_distance.lse.pos'``,
@@ -1587,6 +1624,17 @@ def gvtrack_create(
 
         - ``pssm`` (numpy.ndarray or pandas.DataFrame) -- Position-specific
           scoring matrix with 4 columns (A, C, G, T) for PWM functions.
+        - ``e``, ``J``, ``pairs``, ``intercept`` -- the Potts model, for the
+          ``'potts'`` family. The score of one window is
+          ``intercept + sum_i e[i, x_i] + sum_k J_k[x_i, x_j]``: ``e`` is a
+          ``(W, 4)`` matrix of per-position energies (columns A, C, G, T),
+          and each row of ``pairs`` names a coupled pair of positions
+          (1-based, lower position first) whose ``4x4`` coupling table is the
+          matching entry of ``J``, indexed with the lower position on the
+          rows. The whole model is normally passed at once as ``params``; a
+          fitted model can go through verbatim, since the extra fields
+          ``width``, ``pair_strength``, ``attr`` and ``link`` are accepted
+          and ignored (``width`` is cross-checked against ``e``).
         - ``prior`` (float) -- Pseudocount added to PSSM frequencies
           (default 0.01 for PWM functions).
         - ``bidirect`` (bool) -- If True, score both DNA strands (PWM).
@@ -1623,6 +1671,33 @@ def gvtrack_create(
         - ``spat_max`` (int) -- Maximum scan position (1-based).
         - ``filter`` (pandas.DataFrame, str, list, or None) -- Genomic mask
           filter. See ``gvtrack_filter`` for details.
+
+    Notes
+    -----
+    **The potts family.** A Potts carries energies, not probabilities, so
+    there is no ``prior`` and no spatial weighting: a window containing any
+    non-ACGT base is not scored and is left out of the reduction.
+    ``score_thresh`` is mandatory for ``'potts.count'`` - a Potts score is an
+    energy whose usable range depends on the model, so there is no default -
+    and ignored by the rest of the family. ``strand`` is used only when
+    ``bidirect=False``; it is clamped to 1 under ``bidirect=True``, as in the
+    pwm family.
+
+    "Counted nothing" and "nothing to count" are different answers. An
+    interval that has anchors but none of them scorable (for example, all
+    ``N``) gives NaN for ``'potts'``, ``'potts.max'`` and ``'potts.max.pos'``,
+    and 0 for ``'potts.count'``: it counted, and found none. An interval with
+    no anchor at all gives NaN for all four, ``'potts.count'`` included - an
+    interval narrower than the model with ``extend=False``, or a chromosome
+    end with the default ``extend=True``, where the end padding is clipped at
+    the contig boundary and the fetched sequence comes back shorter than the
+    model.
+
+    ``'potts'``, ``'potts.max'`` and ``'potts.count'`` combine the two strands
+    at each anchor by log-sum-exp; ``'potts.max.pos'`` takes the maximum,
+    because it has to name a strand. So ``'potts.max'`` and
+    ``'potts.max.pos'`` can select **different anchors**. This matches the pwm
+    family exactly and is inherited on purpose rather than fixed on one side.
 
     Returns
     -------
@@ -1734,8 +1809,80 @@ def gvtrack_create(
         'sshift': sshift,
         'eshift': eshift,
     }
-    _check_vtrack_params(func, kwargs)
-    config.update(kwargs)
+
+    # The potts family takes its whole model through `params`, the way R misha
+    # does, so a fitted model can be handed over verbatim; the individual
+    # fields are also accepted as keyword arguments.
+    if func_lc in _POTTS_FUNCS:
+        # A whole model object handed over as `params` may carry any number of
+        # fields its fit happened to produce - far more than the eight this
+        # family reads - so unknown names are IGNORED there rather than
+        # rejected. That is what lets a fitted model be passed verbatim, with
+        # no subsetting at the call site and no list of another package's field
+        # names hardcoded here to go stale. Keyword arguments are typed by
+        # hand, where an unknown name is a typo worth catching - a misspelled
+        # `bidirect` would silently score one strand - so those stay checked.
+        dots = dict(kwargs)
+        from_params = params is not None
+        if from_params:
+            if not isinstance(params, dict) or "e" not in params:
+                raise ValueError(
+                    "potts functions require a dict with at least an 'e' matrix "
+                    "parameter"
+                )
+            # R misha lets `params` shadow the named arguments and ignores them.
+            # pymisha refuses instead: a `bidirect=False` that vanishes because
+            # a model was also passed is the same silent-default failure the
+            # parameter allowlist exists to catch.
+            extra = sorted(k for k in kwargs if k != "filter")
+            if extra:
+                raise ValueError(
+                    f"function {func!r} was given both a model in 'params' and "
+                    f"the keyword argument(s) {', '.join(repr(k) for k in extra)}; "
+                    "the model in 'params' would silently win. Put them in the "
+                    "'params' dict, or pass every field as a keyword argument."
+                )
+            dots = dict(params)
+        else:
+            _check_vtrack_params(func, dots)
+        if "e" not in dots:
+            raise ValueError("potts functions require an 'e' matrix parameter")
+
+        # Same contract as pwm.count: a Potts score is an energy whose usable
+        # range depends entirely on the model, so no default suits every one.
+        score_thresh = dots.get("score_thresh", dots.get("score.thresh"))
+        if func_lc == "potts.count":
+            if score_thresh is None:
+                raise ValueError(
+                    "potts.count requires a 'score_thresh' parameter. A Potts "
+                    "score is an energy, so there is no default that suits every "
+                    "model - pick a threshold from the score distribution of your "
+                    "own model, e.g. with a 'potts' or 'potts.max' virtual track."
+                )
+            score_thresh = _coerce_score_thresh(score_thresh)
+        elif score_thresh is None:
+            score_thresh = 0.0
+
+        # _potts_params() is the same builder gseq_potts() uses, so the two
+        # entry points cannot drift on validation or on the dict's shape.
+        payload = _potts_params(
+            dots,
+            bidirect=dots.get("bidirect", True),
+            extend=dots.get("extend", True),
+            strand=dots.get("strand", 1),
+            score_thresh=score_thresh,
+            what=f"virtual track function '{func}'",
+        )
+        config.update(payload)
+        # The model now lives in the spec's own fields; leaving it under
+        # `params` as well would hand the C++ side a dict where it reads a
+        # number.
+        config["params"] = None
+        if "filter" in kwargs:
+            config["filter"] = kwargs["filter"]
+    else:
+        _check_vtrack_params(func, kwargs)
+        config.update(kwargs)
 
     if str(config.get("func", "")).startswith("pwm"):
         # R misha requires an explicit threshold wherever one decides what is
@@ -2087,6 +2234,21 @@ def gvtrack_filter(vtrack_name: str, mask: pd.DataFrame | str | list[Any] | None
         - ``None`` -- clears any existing filter from the virtual track.
     filter : pandas.DataFrame, str, list, or None
         Backward-compatible alias for ``mask``.
+
+    Notes
+    -----
+    For the sequence-scoring families a masked base is a hard boundary: a
+    match cannot span one. Each unmasked part of the iterator interval is
+    scored on its own and the parts are combined - log-sum-exp for ``'pwm'``
+    and ``'potts'``, maximum for ``'pwm.max'`` and ``'potts.max'``, sum for
+    ``'pwm.count'`` and ``'potts.count'``, and for ``'pwm.max.pos'`` and
+    ``'potts.max.pos'`` the position from whichever part carried the highest
+    score, reported in the iterator interval's own coordinates.
+
+    A fully masked interval, and one whose every unmasked part is narrower
+    than the model, give NaN for all four funcs - the counting ones included,
+    since neither held an anchor to count. A part that holds anchors and
+    merely has none of them scorable still counts 0.
 
     Returns
     -------

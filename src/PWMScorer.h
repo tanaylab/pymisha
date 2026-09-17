@@ -38,10 +38,10 @@ public:
               int spat_bin_size = 1, float score_thresh = 0.0f, bool extend = true);
 
     // Score a genomic interval using the PWM
-    float score_interval(const GInterval &interval, const GenomeChromKey &chromkey) override;
+    double score_interval(const GInterval &interval, const GenomeChromKey &chromkey) override;
 
     // Score a raw string (no genome database needed)
-    float score_string(const char* seq, int seq_len);
+    double score_string(const char* seq, int seq_len);
 
     // Invalidate sliding window cache
     void invalidate_cache();
@@ -109,13 +109,13 @@ private:
     };
 
     // Sliding window methods
-    float score_with_sliding_window(const std::string& target, const GInterval& original_interval,
+    double score_with_sliding_window(const std::string& target, const GInterval& original_interval,
                                      const GInterval& expanded_interval,
                                      size_t i_min, size_t i_max, size_t motif_len);
-    float seed_sliding_window(const std::string& target, const GInterval& original_interval,
+    double seed_sliding_window(const std::string& target, const GInterval& original_interval,
                               const GInterval& expanded_interval,
                               size_t i_min, size_t i_max, size_t motif_len);
-    float try_slide_window(const std::string& target, const GInterval& original_interval,
+    double try_slide_window(const std::string& target, const GInterval& original_interval,
                            const GInterval& expanded_interval,
                            size_t i_min, size_t i_max, size_t motif_len, size_t stride);
 
@@ -136,10 +136,10 @@ private:
                          size_t i_in_target);
 
     // Answers (return the window's score for the current mode)
-    float spat_answer_TOTAL();
-    float spat_answer_MAX();
-    float spat_answer_MAXPOS(const std::string& target, const GInterval& expd, size_t motif_len, size_t i_min);
-    float spat_answer_COUNT() const;
+    double spat_answer_TOTAL();
+    double spat_answer_MAX();
+    double spat_answer_MAXPOS(const std::string& target, const GInterval& expd, size_t motif_len, size_t i_min);
+    double spat_answer_COUNT() const;
 
     // Ring buffer and bin helpers
     inline size_t ring_idx_from_j(size_t j) const;
@@ -166,16 +166,16 @@ private:
     inline float combined_motif_score(size_t ridx) const;
     
     // Scoring methods
-    float score_without_spatial(const std::string& target, int64_t motif_length);
-    float score_with_spatial(const std::string& target, int64_t motif_length);
+    double score_without_spatial(const std::string& target, int64_t motif_length);
+    double score_with_spatial(const std::string& target, int64_t motif_length);
     
     // Motif counting
-    float count_motif_hits_no_spatial(const std::string& target, size_t motif_length);
-    float count_motif_hits_with_spatial(const std::string& target, size_t motif_length);
+    double count_motif_hits_no_spatial(const std::string& target, size_t motif_length);
+    double count_motif_hits_with_spatial(const std::string& target, size_t motif_length);
     
     // Position finding
-    float get_max_likelihood_pos_with_spatial(const std::string& target, size_t motif_length);
-    float compute_position_result(size_t index, size_t target_length, size_t motif_length, int direction) const;
+    double get_max_likelihood_pos_with_spatial(const std::string& target, size_t motif_length);
+    double compute_position_result(size_t index, size_t target_length, size_t motif_length, int direction) const;
     
     // Utilities
     inline float get_spatial_log_factor(size_t pos_index) const;

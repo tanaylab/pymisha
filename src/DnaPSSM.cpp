@@ -218,10 +218,7 @@ string::const_iterator DnaPSSM::max_like_match(const string &target,
 		return(target.begin());
 	}
 
-	string::const_iterator max_i = target.begin() + m_max_range;
-	if(max_i > target.end() - m_chars.size()) {
-		max_i = target.end() - m_chars.size();
-	}
+	string::const_iterator max_i = target.begin() + max_offset(target.length());
 	string::const_iterator best_pos;
 	best_logp = NEG_INF;
 	for(string::const_iterator i = target.begin() + m_min_range;
@@ -302,10 +299,7 @@ void DnaPSSM::integrate_like(const string &target, float &energy, vector<float> 
 		return;
 	}
 
-	string::const_iterator max_i = target.begin() + m_max_range;
-	if(max_i > target.end() - m_chars.size()) {
-		max_i = target.end() - m_chars.size();
-	}
+	string::const_iterator max_i = target.begin() + max_offset(target.length());
 	energy = NEG_INF;
 	for(string::const_iterator i = target.begin() + m_min_range;
 	    i <= max_i;
@@ -396,10 +390,7 @@ void DnaPSSM::integrate_energy_logspat(const string &target, float &energy, vect
 		return;
 	}
 
-	string::const_iterator max_i = target.begin() + m_max_range;
-	if(max_i > target.end() - m_chars.size()) {
-		max_i = target.end() - m_chars.size();
-	}
+	string::const_iterator max_i = target.begin() + max_offset(target.length());
 	energy = NEG_INF;
 	int pos = 0;
 	for(string::const_iterator i = target.begin() + m_min_range;
@@ -467,10 +458,7 @@ void DnaPSSM::integrate_energy_max_logspat(const string &target, float &energy, 
 		return;
 	}
 
-	string::const_iterator max_i = target.begin() + m_max_range;
-	if(max_i > target.end() - m_chars.size()) {
-		max_i = target.end() - m_chars.size();
-	}
+	string::const_iterator max_i = target.begin() + max_offset(target.length());
 
 	energy = NEG_INF;
 
