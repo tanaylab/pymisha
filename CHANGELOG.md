@@ -1,8 +1,46 @@
 # Changelog
 
-## v0.13.1 (2026-09-17)
+## v0.14.0 (2026-09-22)
+
+Supersedes 0.13.0 - 0.13.2, none of which were published: the last release on
+PyPI is 0.12.2, so everything below arrives in one step. Minor rather than
+patch because two changes are deliberate breaks - `gseq_pwm`'s `strand`
+contract and the sign of the position it reports.
+
+### Breaking
+
+* `gseq_pwm` refuses `strand=0` when `bidirect=False`, where exactly one strand is read and `0` cannot name it. The `strand` default is now `1`, so an ordinary `gseq_pwm(bidirect=False)` call is unaffected. `gseq_potts` and the pwm/potts virtual tracks have always refused the combination.
+
+* `gseq_pwm(mode="pos")` reports an unsigned position. Signing it by strand is the `pwm.max.pos` virtual track's convention, which that function had inherited by sharing a scorer; R reports the strand separately, through `return_strand`. The virtual track still signs.
+
+### New
+
+* The `potts`, `potts.max`, `potts.max.pos` and `potts.count` virtual track functions and `gseq_potts()`, ported from R misha - a pairwise (Potts) energy model scored across the genome.
 
 ### Bug fixes
+
+### Bug fixes
+
+* `gseq_pwm` refuses `strand=0` when `bidirect=False`, and its `strand` default is now `1`. Under `bidirect=False` exactly one strand is read, so `0` cannot name it; `gseq_potts` and the pwm/potts virtual tracks have always refused the combination. An ordinary `gseq_pwm(bidirect=False)` call is unaffected by the new default.
+
+* `pwm.count` returned 0 for every interval when `bidirect=False` was given without a `strand`: the missing value reached C++ as strand 0, where neither the forward nor the reverse scan is enabled and every anchor scored `-inf`. The pwm virtual tracks default `strand` to 1 now, as the potts family already did.
+
+* `gseq_pwm(mode="pos")` reported a position signed by strand. That is the `pwm.max.pos` virtual track's convention; `gseq_pwm` reports an unsigned position, as R does, and exposes the strand through `return_strand`.
+
+* `neutral_chars_policy="average"` silently returned the `log_quarter` answer, because the C++ fast path implements only `log_quarter` and the gate admitted both.
+
+* `gseq_pwm`'s Python fallback applied `prior` to the un-normalised matrix. On a count matrix - the ordinary way a motif arrives - that disagreed with both R and pymisha's own C++ path.
+
+* `gseq_pwm`'s vectorized path charged the neutral rate for every non-ACGT byte, ignoring `neutral_chars`. An unlisted character scores `-Inf` now, as in R.
+
+* A region of interest made `mode="pos"` report a position relative to the slice. Positions are on the full input sequence, as documented.
+
+* `neutral_chars_policy="na"` dropped the offending window and reduced over the rest. One unanswerable window makes the whole sequence unanswerable, in every mode.
+
+* A `pwm` or `potts` scan no longer materialises a sliding-window cache it cannot reuse: whole mm10 chr1 peaked at 4.3 GB and now peaks at 0.6 GB.
+
+* `pwm.max.pos` reported ~1.8e19 of stack garbage when no anchor was scorable. It reports `NaN`.
+
 
 * `pwm`, `pwm.max`, `pwm.max.pos`, `pwm.count` and every `gseq_pwm` mode silently scanned only the first 1,000,001 anchors of an interval, so a scan of anything longer than about 1 Mb answered from its first megabase and reported neither a warning nor an error. Recompute anything derived from either function over intervals larger than that - whole-chromosome iterators are the common case.
 
@@ -10,7 +48,7 @@
 
 * `pwm.max.pos` and `potts.max.pos` reported a position rounded to an even neighbour once it exceeded 16,777,216, because positions were carried as single-precision floats. Positions are exact now; scores are unchanged.
 
-## v0.13.0 (2026-09-09)
+### Earlier in this cycle
 
 Ports the `potts` family from R misha, along with the pwm fixes that ship with it.
 

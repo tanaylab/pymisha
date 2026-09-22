@@ -1119,7 +1119,12 @@ class TestGseqPwmBulkScoring:
         assert len(result) == 2
 
     def test_all_strand_modes_consistency(self):
-        """Forward, reverse, and both-strand modes all produce valid output."""
+        """Forward, reverse, and both-strand modes all produce valid output.
+
+        Both strands is ``bidirect=True``, where ``strand`` is ignored. It used
+        to be spelled ``strand=0, bidirect=False``, which is refused now: one
+        strand is read there and 0 cannot name it.
+        """
         pssm = _create_test_pssm()
         seqs = self._make_random_seqs(200, 60)
 
@@ -1130,7 +1135,7 @@ class TestGseqPwmBulkScoring:
             seqs, pssm, mode="max", bidirect=False, strand=-1, prior=0.01
         )
         result_both = pm.gseq_pwm(
-            seqs, pssm, mode="max", bidirect=False, strand=0, prior=0.01
+            seqs, pssm, mode="max", bidirect=True, prior=0.01
         )
 
         assert len(result_fwd) == 200
@@ -1139,6 +1144,9 @@ class TestGseqPwmBulkScoring:
         assert all(np.isfinite(result_fwd))
         assert all(np.isfinite(result_rev))
         assert all(np.isfinite(result_both))
+
+        with pytest.raises(ValueError, match="explicit strand"):
+            pm.gseq_pwm(seqs, pssm, mode="max", bidirect=False, strand=0, prior=0.01)
 
     def test_different_prior_values(self):
         """Different priors produce different scores on the same data."""

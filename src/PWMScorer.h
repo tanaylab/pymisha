@@ -112,9 +112,17 @@ private:
     double score_with_sliding_window(const std::string& target, const GInterval& original_interval,
                                      const GInterval& expanded_interval,
                                      size_t i_min, size_t i_max, size_t motif_len);
+    // The largest window the sliding cache will materialise, in anchors.
+    // Seeding costs ~21 bytes per anchor; that was bounded only because the
+    // scan itself stopped after a million anchors. Past this size no iterator
+    // that also fits in memory can start its next interval inside the window.
+    static const size_t MAX_CACHED_WINDOW_ANCHORS = 1000000;
+
+    double reduce_window(const std::string& target, const GInterval& expanded_interval,
+                         size_t i_min, size_t i_max, size_t motif_len);
     double seed_sliding_window(const std::string& target, const GInterval& original_interval,
                               const GInterval& expanded_interval,
-                              size_t i_min, size_t i_max, size_t motif_len);
+                              size_t i_min, size_t i_max, size_t motif_len, bool populate);
     double try_slide_window(const std::string& target, const GInterval& original_interval,
                            const GInterval& expanded_interval,
                            size_t i_min, size_t i_max, size_t motif_len, size_t stride);

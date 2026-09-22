@@ -101,3 +101,40 @@ def test_reported_position_is_exact_past_2_24():
     got = pm.gseq_pwm([s], _onehot_pssm(word), mode="pos",
                       bidirect=False, strand=1, prior=1e-7)
     assert float(np.asarray(got).ravel()[0]) == at + 1
+
+
+def test_gseq_pwm_refuses_strand_zero_without_bidirect():
+    """Under bidirect=False exactly one strand is read, so 0 cannot name it.
+
+    It used to be the default and was honoured three ways in R - forward for
+    lse/pos/count, BOTH for max, and "0 = both strands" in the docs. The
+    virtual tracks and gseq_potts have always refused the combination.
+    """
+    p = np.array([[.97, .01, .01, .01], [.97, .01, .01, .01],
+                  [.01, .97, .01, .01], [.01, .01, .97, .01]])
+    seqs = ["GGGG", "AACG", "CGTT"]          # CGTT is the revcomp of AACG
+    with pytest.raises(ValueError, match="explicit strand"):
+        pm.gseq_pwm(seqs, p, mode="max", bidirect=False, strand=0)
+
+    # the default is 1, so an ordinary call still works and reads forward
+    np.testing.assert_allclose(
+        np.asarray(pm.gseq_pwm(seqs, p, mode="max", bidirect=False)).ravel(),
+        np.asarray(pm.gseq_pwm(seqs, p, mode="max", bidirect=False, strand=1)).ravel(),
+    )
+
+    # and every mode honours that strand - the inconsistency this removes was
+    # `max` reading both where the others read one
+    long = ["AACGTTTTTT", "TTTTTTCGTT"]
+    for mode in ("lse", "max", "pos", "count"):
+        kw = {"score_thresh": -5} if mode == "count" else {}
+        fwd = np.asarray(pm.gseq_pwm(long, p, mode=mode, bidirect=False,
+                                     strand=1, prior=0.01, **kw), dtype=float)
+        rev = np.asarray(pm.gseq_pwm(long, p, mode=mode, bidirect=False,
+                                     strand=-1, prior=0.01, **kw), dtype=float)
+        assert not np.allclose(fwd, rev), mode
+
+    # bidirect=True ignores strand entirely
+    np.testing.assert_allclose(
+        np.asarray(pm.gseq_pwm(seqs, p, mode="max", bidirect=True)).ravel(),
+        np.asarray(pm.gseq_pwm(seqs, p, mode="max", bidirect=True, strand=-1)).ravel(),
+    )

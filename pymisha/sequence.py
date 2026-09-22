@@ -789,6 +789,7 @@ def _pwm_score_batch_vectorized(
     spat_log_factors: _numpy.ndarray | None = None,
     spat_bin: int = 1,
     neutral_policy: str = "average",
+    neutral_set: frozenset[str] | None = None,
 ) -> _numpy.ndarray | tuple[_numpy.ndarray, _numpy.ndarray]:
     """Vectorized PWM scoring for a batch of sequences (no ROI/gaps).
 
@@ -819,6 +820,23 @@ def _pwm_score_batch_vectorized(
         fwd_codes = _PWM_FWD_CODE[raw]  # A=0,C=1,G=2,T=3, other=-1
         rc_codes = _PWM_RC_CODE[raw]  # A=3,C=2,G=1,T=0, other=-1
 
+        # A code of -1 says "not ACGT"; it does NOT say "neutral". R charges
+        # the neutral rate only for characters the caller listed and returns
+        # -Inf for anything else, so a window holding an unlisted character
+        # must score -Inf rather than the column mean. Without this the two
+        # packages disagreed on a plain "X": -9.77 here against R's -Inf.
+        if neutral_set is None:
+            bad_byte = _numpy.zeros(256, dtype=bool)   # every non-ACGT is neutral
+        else:
+            bad_byte = _numpy.ones(256, dtype=bool)
+            bad_byte[_numpy.frombuffer(b"ACGTacgt", dtype=_numpy.uint8)] = False
+            for ch in neutral_set:
+                for enc in (ch.upper(), ch.lower()):
+                    bb = enc.encode("ascii")
+                    if len(bb) == 1:
+                        bad_byte[bb[0]] = False
+        is_bad = bad_byte[raw]
+
         n_windows = L - w + 1
 
         # Create sliding window views of codes: shape (n_windows, w)
@@ -838,13 +856,26 @@ def _pwm_score_batch_vectorized(
 
         all_scores = []
 
+        # Windows holding a character that is not ACGT and not listed neutral
+        bad_windows = (
+            _numpy.lib.stride_tricks.as_strided(
+                is_bad, shape=(n_windows, w),
+                strides=(is_bad.strides[0], is_bad.strides[0]),
+            ).any(axis=1)
+            if is_bad.any()
+            else _numpy.zeros(n_windows, dtype=bool)
+        )
+
         if scan_fwd:
             # Check for bases with code == -1 (neutral chars like N, *)
-            has_unknown = _numpy.any(fwd_windows == -1, axis=1)
+            has_unknown = _numpy.any(fwd_windows == -1, axis=1) & ~bad_windows
 
             # Score fully-valid windows via vectorized fancy indexing
             fwd_scores = _numpy.full(n_windows, -_numpy.inf)
-            valid = ~has_unknown
+            # A bad window keeps the -inf it was filled with. It must not fall
+            # into `valid`: a -1 code there would index log_pssm's LAST column
+            # and score a confident wrong number instead of -inf.
+            valid = ~has_unknown & ~bad_windows
             if valid.any():
                 valid_wins = fwd_windows[valid]
                 fwd_scores[valid] = log_pssm[pos_idx, valid_wins].sum(axis=1)
@@ -883,9 +914,9 @@ def _pwm_score_batch_vectorized(
             all_scores.append((_numpy.ones(n_windows, dtype=_numpy.int8), fwd_scores))
 
         if scan_rev:
-            has_unknown_rc = _numpy.any(rc_windows == -1, axis=1)
+            has_unknown_rc = _numpy.any(rc_windows == -1, axis=1) & ~bad_windows
             rc_scores = _numpy.full(n_windows, -_numpy.inf)
-            valid_rc = ~has_unknown_rc
+            valid_rc = ~has_unknown_rc & ~bad_windows
             if valid_rc.any():
                 valid_wins_rc = rc_windows[valid_rc]
                 rc_scores[valid_rc] = log_pssm_rev[pos_idx, valid_wins_rc].sum(axis=1)
@@ -1121,6 +1152,7 @@ def _pwm_score_sequence(
     best_strand = 0
     count = 0
     has_valid = False
+    na_seq = False
 
     for phys_pos, window in _pwm_iter_windows(seq_upper, start_min, start_max, w, skip_gaps, gap_set):
         # Spatial log factor for this window position.
@@ -1139,6 +1171,7 @@ def _pwm_score_sequence(
 
         win_scores: list[float] = []
         win_dirs: list[int] = []
+        seq_is_na = False
         for is_rev, strand_dir in ((False, 1), (True, -1)):
             if is_rev and not scan_rev:
                 continue
@@ -1147,7 +1180,14 @@ def _pwm_score_sequence(
 
             s = _pwm_score_window(window, log_pssm, avg_log, w, neutral_set, neutral_policy, is_rev)
             if _numpy.isnan(s):
-                continue
+                # neutral_chars_policy = "na" means the SEQUENCE is unanswerable,
+                # not that this window is skipped: R returns NA for the whole
+                # sequence as soon as one evaluated window is NA, and both
+                # packages document the policy that way. Dropping the window
+                # instead reduced over the rest and returned a confident number
+                # from the windows that happened to be clean.
+                seq_is_na = True
+                break
 
             # Apply spatial weight in log space
             if use_spat and s > -_numpy.inf:
@@ -1156,6 +1196,9 @@ def _pwm_score_sequence(
             win_scores.append(s)
             win_dirs.append(strand_dir)
 
+        if seq_is_na:
+            na_seq = True
+            break
         if not win_scores:
             continue
         has_valid = True
@@ -1186,6 +1229,15 @@ def _pwm_score_sequence(
                 count += 1
 
     # Aggregate final result
+    if na_seq:
+        # neutral_chars_policy = "na": one unanswerable window makes the whole
+        # sequence unanswerable, in every mode. `count` included - R returns NA
+        # there too, rather than a count of the windows that happened to be
+        # clean.
+        if mode == "pos" and return_strand:
+            return (float("nan"), 0)
+        return float("nan")
+
     if mode == "lse":
         if not has_valid:
             return float("nan")
@@ -1211,7 +1263,7 @@ def gseq_pwm(
     pssm: _numpy.ndarray | _pandas.DataFrame,
     mode: str = "lse",
     bidirect: bool = True,
-    strand: int = 0,
+    strand: int = 1,
     score_thresh: float | None = None,
     start_pos: int | None = None,
     end_pos: int | None = None,
@@ -1252,9 +1304,11 @@ def gseq_pwm(
     bidirect : bool, default True
         If True, score both forward and reverse complement strands.
         Overrides *strand*.
-    strand : int, default 0
-        When ``bidirect=False``: ``1`` = forward only, ``-1`` = reverse
-        complement only, ``0`` = forward only (default).
+    strand : int, default 1
+        Used only when ``bidirect=False``, and required there: ``1`` for the
+        forward strand, ``-1`` for the reverse complement. ``0`` is refused,
+        since exactly one strand is read and ``0`` cannot name it. Under
+        ``bidirect=True`` both strands are read and this is ignored.
     score_thresh : float, optional
         Threshold for ``"count"`` mode, where it is required: PWM scores are
         log-likelihoods, so no default suits every PSSM. Ignored otherwise.
@@ -1366,12 +1420,17 @@ def gseq_pwm(
     # Dispatch to the C++ PWMScorer when no Python-only features are needed.
     # The C++ path handles prior/log conversion internally and is significantly
     # faster than both the vectorized numpy path and the per-sequence Python path.
-    # Note: C++ uses log(0.25) for neutral characters, which matches the
-    # "log_quarter" policy exactly and closely approximates "average" in practice.
+    # The C++ scorer charges log(0.25) per neutral base, which IS the
+    # "log_quarter" policy and is not "average": "average" charges each
+    # position's own column mean, so the two differ by however far a column
+    # departs from uniform. The gate used to admit both and the comment called
+    # the difference an approximation, which made "average" - the default -
+    # silently return log_quarter's answer and disagree with R by ~0.015 nats
+    # on a 400-mer with five Ns. Only the policy it implements goes fast.
     _use_cpp = (
         gap_chars is None
         and neutral_chars is None
-        and neutral_chars_policy in ("average", "log_quarter")
+        and neutral_chars_policy == "log_quarter"
         and not (return_strand and mode == "pos")
         and not extend
     )
@@ -1408,10 +1467,16 @@ def gseq_pwm(
 
         # Apply ROI slicing in Python before passing to C++.
         cpp_seqs = list(seqs)
+        _roi_offset = 0
         if start_pos is not None or end_pos is not None:
             s = (start_pos - 1) if start_pos is not None else 0
             e = end_pos if end_pos is not None else None
             cpp_seqs = [seq[s:e] for seq in cpp_seqs]
+            # The slice is invisible to C++, so a position it reports counts
+            # from the slice. Positions are documented - in both packages - as
+            # being on the FULL input sequence, so the offset goes back on
+            # below. max/lse/count are unaffected: the window set is the same.
+            _roi_offset = s
 
         # Map strand for C++: in Python, strand=0 with bidirect=False
         # means "forward only"; the C++ scorer treats strand=0 as
@@ -1421,7 +1486,7 @@ def gseq_pwm(
             cpp_strand = 1
 
         try:
-            return _pymisha.pm_pwm_score_strings(
+            _res = _pymisha.pm_pwm_score_strings(
                 cpp_seqs,
                 cpp_pssm,
                 float(prior),
@@ -1433,6 +1498,12 @@ def gseq_pwm(
                 cpp_spat,
                 int(spat_bin),
             )
+            if mode == "pos" and _roi_offset:
+                # Back onto the full sequence's coordinates; a NaN (nothing
+                # scorable) stays NaN rather than becoming the offset.
+                _res = _numpy.asarray(_res, dtype=float)
+                _res = _numpy.where(_numpy.isnan(_res), _res, _res + _roi_offset)
+            return _res
         except AttributeError:
             # _pymisha not built with pm_pwm_score_strings — fall through.
             pass
@@ -1465,13 +1536,19 @@ def gseq_pwm(
 
     w = pssm_arr.shape[0]
 
-    # Apply prior and normalize rows into probabilities.
-    if prior > 0:
-        pssm_arr = pssm_arr + prior
+    # Normalise FIRST, then add the prior, then re-normalise. R's DnaProbVec
+    # constructor normalises before the prior is applied and pymisha's own C++
+    # path does the same; adding the prior to raw values instead makes it mean
+    # something different for every matrix scale. On a JASPAR-style count
+    # matrix - the ordinary way a motif arrives - the old order was 0.07 nats
+    # out at prior = 0.01 and far worse at prior = 1.
     row_sums = pssm_arr.sum(axis=1, keepdims=True)
     if _numpy.any(row_sums <= 0):
         raise ValueError("Each PSSM row must have a positive total weight")
     pssm_arr = pssm_arr / row_sums
+    if prior > 0:
+        pssm_arr = pssm_arr + prior
+        pssm_arr = pssm_arr / pssm_arr.sum(axis=1, keepdims=True)
 
     # Log-probabilities
     log_pssm = _numpy.full_like(pssm_arr, -_numpy.inf)
@@ -1485,7 +1562,19 @@ def gseq_pwm(
     if bidirect:
         scan_fwd, scan_rev = True, True
     else:
-        scan_fwd = strand in (0, 1)
+        # Exactly one strand is read here, so strand = 0 cannot name it and is
+        # refused - as gseq_potts() and the pwm/potts virtual tracks already do,
+        # and as R's gseq.pwm() now does. It used to be the DEFAULT, and R
+        # honoured it three different ways: forward for lse/pos/count, BOTH
+        # (hard max) for max, and "0 = both strands" in the documentation. The
+        # default is 1 now, so an ordinary gseq_pwm(bidirect=False) call keeps
+        # working and reads forward.
+        if strand == 0:
+            raise ValueError(
+                "gseq_pwm(bidirect=False) needs an explicit strand: "
+                "1 for the forward strand, -1 for the reverse."
+            )
+        scan_fwd = strand == 1
         scan_rev = strand == -1
 
     # --- Defaults ---
@@ -1524,6 +1613,7 @@ def gseq_pwm(
                 spat_log_factors=spat_log_factors,
                 spat_bin=spat_bin,
                 neutral_policy=neutral_chars_policy,
+                neutral_set=neutral_set,
             )
             if return_strand and mode == "pos":
                 return _pandas.DataFrame({"pos": r[0], "strand": r[1]})

@@ -140,6 +140,8 @@ private:
         int hit_count = 0;
     };
 
+    static const size_t MAX_CACHED_WINDOW_ANCHORS = 1000000;
+
     double score_with_sliding_window(const GInterval &original_interval,
                                     const GInterval &expanded_interval,
                                     size_t i_min, size_t i_max, size_t motif_len,

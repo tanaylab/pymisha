@@ -1011,12 +1011,23 @@ def _compute_filtered_max_pos_by_score(
     """A ``*.max.pos`` func under a filter.
 
     The position alone cannot be compared between two unmasked parts, so each
-    part is scored twice - once with *score_func* to rank the parts, once with
-    *pos_func* for the answer - and the winning part's position is offset into
-    the iterator interval's own coordinate frame, re-signed so the offset moves
-    it away from zero in whichever direction it already points. Serves
-    ``pwm.max.pos`` and ``potts.max.pos``, which differ only in those two
-    names.
+    part is scored to rank the parts, and again with *pos_func* for the answer;
+    the winning part's position is then offset into the iterator interval's own
+    coordinate frame, re-signed so the offset moves it away from zero in
+    whichever direction it already points. Serves ``pwm.max.pos`` and
+    ``potts.max.pos``, which differ only in those two names.
+
+    Ranking uses the max over anchors of the max over STRANDS, which is what
+    the ``*.max.pos`` scorer itself maximises - it has to name a strand, so it
+    does not combine them. *score_func* (``pwm.max`` / ``potts.max``) instead
+    log-sum-exps the two, and ranking by that picked a different part whenever
+    a part's strand bonus, ``log1p(exp(-|f-r|))`` in ``(0, log 2]``, outranked
+    a genuine strand-max gap below 0.693 nats: on one mm10 interval R answered
+    -7618 from the strand-max winner and this answered 1.0 from the union
+    winner, with every per-part value agreeing exactly. R reads the same
+    quantity off ``PWMScorer::get_last_max_score()``; there is no such side
+    channel through ``pm_vtrack_compute``, so it is rebuilt here as the
+    elementwise max of the two single-strand scans, which is the same number.
     """
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -1032,7 +1043,25 @@ def _compute_filtered_max_pos_by_score(
     payload_pos["func"] = pos_func
 
     seg_intervals = _df2pymisha(seg_df[["chrom", "start", "end"]])
-    seg_scores = _numpy.asarray(_pymisha.pm_vtrack_compute(payload_score, seg_intervals, CONFIG), dtype=float)
+
+    def _scan(payload: dict[str, Any]) -> _numpy.ndarray:
+        return _numpy.asarray(
+            _pymisha.pm_vtrack_compute(payload, seg_intervals, CONFIG), dtype=float
+        )
+
+    if bool(base_payload.get("bidirect", True)):
+        # max over strands, not their union: score each strand on its own and
+        # take the larger. A single-strand model needs no such split - its
+        # score_func result is already a strand maximum.
+        fwd = dict(payload_score)
+        fwd["bidirect"] = False
+        fwd["strand"] = 1
+        rev = dict(payload_score)
+        rev["bidirect"] = False
+        rev["strand"] = -1
+        seg_scores = _numpy.fmax(_scan(fwd), _scan(rev))
+    else:
+        seg_scores = _scan(payload_score)
     seg_pos = _numpy.asarray(_pymisha.pm_vtrack_compute(payload_pos, seg_intervals, CONFIG), dtype=float)
 
     best_score = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -1885,6 +1914,15 @@ def gvtrack_create(
         config.update(kwargs)
 
     if str(config.get("func", "")).startswith("pwm"):
+        # A missing `strand` under `bidirect=False` reached C++ as strand 0,
+        # where `scan_fwd = bidirect || strand == 1` and
+        # `scan_rev = bidirect || strand == -1` are BOTH false: every anchor
+        # scored -inf, so pwm.count returned 0 and the rest returned -inf, with
+        # no error. R defaults it to 1, and the potts family here already does
+        # (see _potts_params above); the pwm family was the one that did not.
+        if config.get("bidirect", True) is False and config.get("strand") is None:
+            config["strand"] = 1
+
         # R misha requires an explicit threshold wherever one decides what is
         # counted or reached, and coerces it the same way at every site.
         if func_lc == "pwm.count" or func_lc in _FILTER_EDIT_DISTANCE_FUNCS:

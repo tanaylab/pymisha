@@ -346,8 +346,25 @@ WindowResult compute_window_edits_detailed_with_indels(
         const int indel_levels = D + 1;
 
         // Flattened 3D DP table
-        std::vector<double> dp(rows * cols * indel_levels,
-                               -std::numeric_limits<double>::infinity());
+        // For "above" (maximise) the empty cell is -inf and better means
+        // greater; for "below" (minimise) it is +inf and better means less.
+        // This used to be -inf and `>` in both directions, so a "below" search
+        // maximised - it still reported a window satisfying the threshold, but
+        // a different one from R's, on 11 of 15 sequences.
+        const double dp_sentinel = below
+            ? std::numeric_limits<double>::infinity()
+            : -std::numeric_limits<double>::infinity();
+        std::vector<double> dp(rows * cols * indel_levels, dp_sentinel);
+
+        auto is_valid = [below](double v) -> bool {
+            if (below) return v < std::numeric_limits<double>::infinity() * 0.5;
+            else return v > -std::numeric_limits<double>::infinity() * 0.5;
+        };
+
+        auto is_better = [below](double candidate, double current) -> bool {
+            if (below) return candidate < current;
+            else return candidate > current;
+        };
 
         auto idx3 = [cols, indel_levels](int i, int j, int k) -> int {
             return i * cols * indel_levels + j * indel_levels + k;
@@ -394,9 +411,9 @@ WindowResult compute_window_edits_detailed_with_indels(
                     // 1. Match/Substitution (diagonal)
                     if (std::abs((i - 1) - (j - 1)) <= D) {
                         double prev = dp[idx3(i - 1, j - 1, k)];
-                        if (prev > -std::numeric_limits<double>::infinity() * 0.5) {
+                        if (is_valid(prev)) {
                             double new_score = prev + static_cast<double>(base_score);
-                            if (new_score > dp[idx3(i, j, k)]) {
+                            if (is_better(new_score, dp[idx3(i, j, k)])) {
                                 dp[idx3(i, j, k)] = new_score;
                             }
                         }
@@ -406,8 +423,8 @@ WindowResult compute_window_edits_detailed_with_indels(
                         // 2. Insertion: skip motif[i-1], advance motif not sequence
                         if (std::abs((i - 1) - j) <= D) {
                             double prev = dp[idx3(i - 1, j, k)];
-                            if (prev > -std::numeric_limits<double>::infinity() * 0.5) {
-                                if (prev > dp[idx3(i, j, k + 1)]) {
+                            if (is_valid(prev)) {
+                                if (is_better(prev, dp[idx3(i, j, k + 1)])) {
                                     dp[idx3(i, j, k + 1)] = prev;
                                 }
                             }
@@ -416,8 +433,8 @@ WindowResult compute_window_edits_detailed_with_indels(
                         // 3. Deletion: skip seq[j-1], advance sequence not motif
                         if (std::abs(i - (j - 1)) <= D) {
                             double prev = dp[idx3(i, j - 1, k)];
-                            if (prev > -std::numeric_limits<double>::infinity() * 0.5) {
-                                if (prev > dp[idx3(i, j, k + 1)]) {
+                            if (is_valid(prev)) {
+                                if (is_better(prev, dp[idx3(i, j, k + 1)])) {
                                     dp[idx3(i, j, k + 1)] = prev;
                                 }
                             }
@@ -430,7 +447,7 @@ WindowResult compute_window_edits_detailed_with_indels(
         // Extract results for each indel count k
         for (int k = 0; k <= D; ++k) {
             double score = dp[idx3(L, W, k)];
-            if (score <= -std::numeric_limits<double>::infinity() * 0.5) {
+            if (!is_valid(score)) {
                 continue;
             }
 
@@ -927,9 +944,19 @@ WindowResult find_best_window_edits(
             bool have_fwd = fwd.n_edits >= 0;
             bool have_rev = rev.n_edits >= 0;
             if (have_fwd && have_rev) {
-                if (fwd.n_edits >= rev.n_edits) {
+                // The harder strand governs, because one substitution moves
+                // both. When they are equally hard it says nothing about WHICH
+                // to report, so both go to the comparator and its
+                // score_before tie-break decides - as R's gseq.pwm_edits does.
+                // Taking the forward one outright here (the old `>=`) picked a
+                // different window from R on 3 of 6 sequences whose two strands
+                // both needed zero edits.
+                if (fwd.n_edits > rev.n_edits) {
                     consider_candidate(fwd, +1, s0);
+                } else if (rev.n_edits > fwd.n_edits) {
+                    consider_candidate(rev, -1, s0);
                 } else {
+                    consider_candidate(fwd, +1, s0);
                     consider_candidate(rev, -1, s0);
                 }
             } else if (have_fwd) {
