@@ -76,7 +76,7 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
         }
         double *out = (double *)PyArray_DATA((PyArrayObject *)*py_result);
 
-        std::vector<int8_t> codes;
+        std::vector<int8_t> codes, block_codes;
         std::vector<int32_t> nbad;
 
         for (Py_ssize_t r = 0; r < n; ++r) {
@@ -104,6 +104,7 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
             }
             const std::string target(seq, seq_len);
             potts_encode(target, codes, nbad);
+            potts_block_codes(codes, block_codes, 0, codes.size());
             const size_t n_anchor = target.size() - (size_t)W + 1;
 
             double acc_lse = -std::numeric_limits<double>::infinity();
@@ -120,10 +121,11 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
                 if (nbad[i + (size_t)W] - nbad[i] != 0)
                     continue;
                 const int8_t *c = &codes[i];
+                const int8_t *bc = &block_codes[i];
                 double f = -std::numeric_limits<double>::infinity();
                 double v = -std::numeric_limits<double>::infinity();
-                if (use_fwd) f = model.score_codes(c);
-                if (use_rev) v = rc.score_codes(c);
+                if (use_fwd) f = model.score_codes(c, bc);
+                if (use_rev) v = rc.score_codes(c, bc);
 
                 // The strand union: log-sum-exp for lse/max/count, maximum for
                 // pos, which has to name a strand. Inherited from the pwm
@@ -183,6 +185,94 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
 
         return_py(py_result);
 
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return nullptr;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+}
+
+/*
+ * pm_potts_score_codes_cmp(params, codes)  -- TEST ONLY
+ *
+ * pymisha's counterpart of misha's C_potts_score_codes_cmp: scores each row of
+ * `codes` (an (n, W) integer array of base codes 0..3, one window per row)
+ * with BOTH PottsModel kernels and returns them side by side, so the tests can
+ * check score_codes_naive() against score_codes_blocked() without a DNA
+ * string. Also returns use_blocked: which kernel score_codes() runs for the
+ * model and for its reverse complement. Not reachable from the pymisha API.
+ *
+ * Returns: dict with "naive" and "blocked" (float64 arrays of n) and
+ * "use_blocked" (a tuple of two bools).
+ */
+PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args)
+{
+    PyObject *py_params = nullptr;
+    PyObject *py_codes = nullptr;
+    if (!PyArg_ParseTuple(args, "OO", &py_params, &py_codes))
+        return nullptr;
+
+    try {
+        const PMPottsParams pp = PMPottsParams::parse(py_params, "potts kernel equivalence check");
+        const PottsModel &model = pp.model;
+        const int W = model.width();
+
+        PMPY codes_in(PyArray_FROM_O(py_codes), true);
+        if (!codes_in || PyArray_NDIM((PyArrayObject *)*codes_in) != 2 ||
+            !PyArray_ISINTEGER((PyArrayObject *)*codes_in)) {
+            PyErr_Clear();
+            TGLError("codes must be a 2D integer array, one window per row");
+        }
+        PMPY codes_arr(PyArray_FROM_OTF(codes_in, NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+        if (!codes_arr) {
+            PyErr_Clear();
+            TGLError("codes must be a 2D integer array, one window per row");
+        }
+        const npy_intp n = PyArray_DIM((PyArrayObject *)*codes_arr, 0);
+        if (PyArray_DIM((PyArrayObject *)*codes_arr, 1) != W)
+            TGLError("codes has %ld columns but the model width is %d",
+                     (long)PyArray_DIM((PyArrayObject *)*codes_arr, 1), W);
+        // score_codes_blocked() requires it (false only for W > 256).
+        if (!model.blocked_available())
+            TGLError("potts kernel equivalence check: blocked kernel unavailable for W = %d", W);
+        const int64_t *codes = (const int64_t *)PyArray_DATA((PyArrayObject *)*codes_arr);
+
+        npy_intp dims[1] = {n};
+        PMPY py_naive(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+        PMPY py_blocked(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+        double *naive = (double *)PyArray_DATA((PyArrayObject *)*py_naive);
+        double *blocked = (double *)PyArray_DATA((PyArrayObject *)*py_blocked);
+
+        // One base past the window, for the trailing block's second base.
+        std::vector<int8_t> win((size_t)W + 1), win_block_codes;
+        for (npy_intp i = 0; i < n; ++i) {
+            check_interrupt();
+            const int64_t *row = codes + (size_t)i * W;
+            for (int j = 0; j < W; ++j) {
+                // A code outside 0..3 is an out-of-bounds table read, not a
+                // wrong answer.
+                if (row[j] < 0 || row[j] > 3)
+                    TGLError("pm_potts_score_codes_cmp: code at row %ld, column %d is %lld, outside 0..3",
+                             (long)i, j, (long long)row[j]);
+                win[j] = (int8_t)row[j];
+            }
+            // The base past the window, which the trailing block's tables must
+            // ignore: win[0] varies it from window to window.
+            win[W] = win[0];
+            potts_block_codes(win, win_block_codes, 0, (size_t)W);
+            naive[i] = model.score_codes_naive(win.data());
+            blocked[i] = model.score_codes_blocked(win_block_codes.data());
+        }
+
+        PMPY res(Py_BuildValue("{s:O,s:O,s:(OO)}", "naive", (PyObject *)py_naive,
+                               "blocked", (PyObject *)py_blocked, "use_blocked",
+                               model.use_blocked() ? Py_True : Py_False,
+                               model.rc().use_blocked() ? Py_True : Py_False),
+                 true);
+        res.to_be_stolen();
+        return (PyObject *)res;
     } catch (const TGLException &e) {
         PyErr_SetString(PyExc_RuntimeError, e.msg());
         return nullptr;

@@ -523,6 +523,8 @@ bool PMTrackExprScanner::eval_next()
             }
 
             // Set track variable values
+            if (m_row_subs)
+                m_expr_vars.set_substitution((*m_row_subs)[m_itr->idx()]);
             m_expr_vars.set_vars(interval, m_eval_buf_size);
 
             m_itr->next();

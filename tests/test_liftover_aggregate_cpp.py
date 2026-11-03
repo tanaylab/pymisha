@@ -1,231 +1,133 @@
-import numpy as np
-import pytest
+"""pm_liftover_aggregate: the sparse target of gtrack_liftover, as R's GTrackLiftover.cpp.
+
+Per chromosome every run of overlapping intervals becomes one interval, valued
+by R's aggregate_values over the run: an interval counts its whole length,
+intervals sharing a key count once, and a NaN result is kept. Touching
+intervals are not merged. The end-to-end comparison with R is in
+test_liftover_1d_r_parity.py.
+"""
+
 import _pymisha
+import numpy as np
+import pandas as pd
+import pytest
+
+from pymisha.liftover import _TRACK_LIFTOVER_AGGS, _aggregate_overlapping
 
 
-def _call(chrom, start, end, value, agg_type="mean", na_rm=True, min_n=-1, nth_index=0):
-    chrom_arr = np.array(chrom, dtype=object)
-    start_arr = np.array(start, dtype=np.int64)
-    end_arr = np.array(end, dtype=np.int64)
-    value_arr = np.array(value, dtype=np.float64)
-    df_dict = {"chrom": chrom_arr, "start": start_arr, "end": end_arr, "value": value_arr}
-    return _pymisha.pm_liftover_aggregate(df_dict, agg_type, na_rm, int(min_n), int(nth_index))
+def _call(chrom, start, end, value, agg_type="mean", na_rm=True, min_n=-1, nth_index=0, key=None):
+    df_dict = {
+        "chrom": np.array(chrom, dtype=object),
+        "start": np.array(start, dtype=np.int64),
+        "end": np.array(end, dtype=np.int64),
+        "value": np.array(value, dtype=np.float64),
+    }
+    if key is not None:
+        df_dict["key"] = np.array(key, dtype=np.int64)
+    res = _pymisha.pm_liftover_aggregate(df_dict, agg_type, na_rm, int(min_n), int(nth_index))
+    return list(zip(res["chrom"], res["start"].tolist(), res["end"].tolist(), res["value"].tolist(), strict=True))
+
+
+def _same(got, expected):
+    assert len(got) == len(expected), (got, expected)
+    for g, e in zip(got, expected, strict=True):
+        assert g[:3] == e[:3], (got, expected)
+        assert (np.isnan(g[3]) and np.isnan(e[3])) or g[3] == e[3], (got, expected)
 
 
 def test_single_interval_passthrough():
-    res = _call(["chr1"], [100], [200], [5.0])
-    assert list(res["chrom"]) == ["chr1"]
-    assert list(res["start"]) == [100]
-    assert list(res["end"]) == [200]
-    assert list(res["value"]) == [5.0]
+    _same(_call(["chr1"], [100], [200], [5.0]), [("chr1", 100, 200, 5.0)])
 
 
-def test_two_overlapping_mean():
-    # intervals: [100,200)=2.0, [150,250)=4.0
-    # segments: [100,150)=2.0; [150,200)=mean(2,4)=3.0; [200,250)=4.0
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type="mean")
-    assert list(res["chrom"]) == ["chr1", "chr1", "chr1"]
-    assert list(res["start"]) == [100, 150, 200]
-    assert list(res["end"])   == [150, 200, 250]
-    assert list(res["value"]) == [2.0, 3.0, 4.0]
+@pytest.mark.parametrize("agg, value", [
+    ("mean", 3.0), ("sum", 6.0), ("min", 2.0), ("max", 4.0), ("count", 2.0), ("median", 3.0),
+    ("first", 2.0), ("last", 4.0),
+])
+def test_overlapping_run_is_one_interval(agg, value):
+    # [100,200)=2 and [150,250)=4 overlap: R writes [100,250)
+    _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type=agg),
+          [("chr1", 100, 250, value)])
 
 
-def test_fully_contained_mean():
-    # [100,500)=2.0, [200,300)=10.0
-    # segments: [100,200)=2.0; [200,300)=6.0; [300,500)=2.0
-    res = _call(["chr1", "chr1"], [100, 200], [500, 300], [2.0, 10.0], agg_type="mean")
-    assert list(res["start"]) == [100, 200, 300]
-    assert list(res["end"])   == [200, 300, 500]
-    assert list(res["value"]) == [2.0, 6.0, 2.0]
+def test_contained_interval():
+    _same(_call(["chr1", "chr1"], [100, 200], [500, 300], [2.0, 10.0]), [("chr1", 100, 500, 6.0)])
 
 
-def test_sum():
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type="sum")
-    assert list(res["start"]) == [100, 150, 200]
-    assert list(res["end"])   == [150, 200, 250]
-    assert list(res["value"]) == [2.0, 6.0, 4.0]
-
-
-def test_min():
-    # [100,150)=2.0; [150,200)=min(2,4)=2.0; [200,250)=4.0 - first two merge
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type="min")
-    assert list(res["start"]) == [100, 200]
-    assert list(res["end"])   == [200, 250]
-    assert list(res["value"]) == [2.0, 4.0]
-
-
-def test_max():
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type="max")
-    # [100,150)=2.0; [150,200)=4.0; [200,250)=4.0 - last two merge
-    assert list(res["start"]) == [100, 150]
-    assert list(res["end"])   == [150, 250]
-    assert list(res["value"]) == [2.0, 4.0]
-
-
-def test_count():
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type="count")
-    assert list(res["start"]) == [100, 150, 200]
-    assert list(res["end"])   == [150, 200, 250]
-    assert list(res["value"]) == [1.0, 2.0, 1.0]
-
-
-def test_median():
-    # [100,200)=1.0, [200,300)=2.0, [200,300)=3.0
-    # [100,200) active={0} -> 1.0
-    # [200,300) active={1,2} -> median(2,3) = 2.5
-    res = _call(["chr1"]*3, [100, 200, 200], [200, 300, 300], [1.0, 2.0, 3.0], agg_type="median")
-    assert list(res["start"]) == [100, 200]
-    assert list(res["end"])   == [200, 300]
-    assert list(res["value"]) == [1.0, 2.5]
-
-
-def test_first():
-    # [100,200)=10.0, [150,250)=20.0
-    # [100,150) -> 10
-    # [150,200) first=10 (row 0 before row 1)
-    # [200,250) -> 20
-    # adjacent [100,150)+[150,200) merge: same value 10.0
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="first")
-    assert list(res["start"]) == [100, 200]
-    assert list(res["end"])   == [200, 250]
-    assert list(res["value"]) == [10.0, 20.0]
-
-
-def test_last():
-    # [100,150) -> 10; [150,200) last=20; [200,250) -> 20 - last two merge
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="last")
-    assert list(res["start"]) == [100, 150]
-    assert list(res["end"])   == [150, 250]
-    assert list(res["value"]) == [10.0, 20.0]
+def test_touching_intervals_are_not_merged():
+    # [100,200) and [200,300) touch, so they are two runs; the second averages 2 and 3
+    _same(_call(["chr1"] * 3, [100, 200, 200], [200, 300, 300], [1.0, 2.0, 3.0], agg_type="median"),
+          [("chr1", 100, 200, 1.0), ("chr1", 200, 300, 2.5)])
 
 
 def test_nth():
-    # [100,150) active=[0] vals=[10] -> nth=2 NaN, drop
-    # [150,200) active=[0,1] vals=[10,20] -> nth=2 = 20.0
-    # [200,250) active=[1] vals=[20] -> nth=2 NaN, drop
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0],
-                agg_type="nth", nth_index=2)
-    assert list(res["start"]) == [150]
-    assert list(res["end"])   == [200]
-    assert list(res["value"]) == [20.0]
+    # in (start, end) order: 10, 20
+    _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="nth", nth_index=2),
+          [("chr1", 100, 250, 20.0)])
+    _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="nth", nth_index=3),
+          [("chr1", 100, 250, np.nan)])
 
 
-def test_na_rm_false_propagates_nan():
-    # [100,200)=2.0, [150,250)=NaN
-    # [100,150) vals=[2.0] (no NaN) -> 2.0
-    # [150,200) vals=[2.0, NaN] -> NaN, drop
-    # [200,250) vals=[NaN] -> NaN, drop
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, float("nan")],
-                agg_type="mean", na_rm=False)
-    assert list(res["start"]) == [100]
-    assert list(res["end"])   == [150]
-    assert list(res["value"]) == [2.0]
+def test_nan_is_kept():
+    # a NaN interval stretches the run, and a run of NaN alone is a NaN interval
+    nan = float("nan")
+    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan]),
+          [("chr1", 100, 250, 2.0), ("chr1", 400, 500, np.nan)])
+    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan], agg_type="count"),
+          [("chr1", 100, 250, 1.0), ("chr1", 400, 500, 0.0)])
+    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan], na_rm=False),
+          [("chr1", 100, 250, np.nan), ("chr1", 400, 500, np.nan)])
 
 
-def test_min_n_drops_segments():
-    # [100,150) n=1 < 2 -> drop
-    # [150,200) n=2 -> 3.0
-    # [200,250) n=1 -> drop
-    res = _call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0],
-                agg_type="mean", min_n=2)
-    assert list(res["start"]) == [150]
-    assert list(res["end"])   == [200]
-    assert list(res["value"]) == [3.0]
+def test_min_n():
+    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, 4.0, 1.0], min_n=2),
+          [("chr1", 100, 250, 3.0), ("chr1", 400, 500, np.nan)])
+
+
+def test_key_counts_once():
+    # [0,50) and [50,100) are one source interval (key 1) and [20,80) another
+    args = (["chr1"] * 3, [0, 20, 50], [50, 80, 100], [4.0, 10.0, 4.0])
+    _same(_call(*args, agg_type="count", key=[1, 2, 1]), [("chr1", 0, 100, 2.0)])
+    _same(_call(*args, agg_type="mean", key=[1, 2, 1]), [("chr1", 0, 100, 7.0)])
+    _same(_call(*args, agg_type="count"), [("chr1", 0, 100, 3.0)])
+
+
+@pytest.mark.parametrize("agg, value", [
+    ("max.coverage_len", 1.0), ("min.coverage_len", 5.0),
+    # every interval covers all of itself, so the fractions tie and the higher value wins
+    ("max.coverage_frac", 5.0), ("min.coverage_frac", 5.0),
+])
+def test_coverage(agg, value):
+    _same(_call(["chr1", "chr1"], [0, 50], [100, 120], [1.0, 5.0], agg_type=agg), [("chr1", 0, 120, value)])
 
 
 def test_multi_chrom():
-    res = _call(["chr1", "chr2", "chr1"],
-                [100, 100, 150],
-                [200, 200, 250],
-                [2.0, 5.0, 4.0],
-                agg_type="mean")
-    assert list(res["chrom"]) == ["chr1", "chr1", "chr1", "chr2"]
-    assert list(res["start"]) == [100, 150, 200, 100]
-    assert list(res["end"])   == [150, 200, 250, 200]
-    assert list(res["value"]) == [2.0, 3.0, 4.0, 5.0]
+    _same(_call(["chr2", "chr1", "chr1"], [100, 100, 150], [200, 200, 250], [5.0, 2.0, 4.0]),
+          [("chr1", 100, 250, 3.0), ("chr2", 100, 200, 5.0)])
 
 
 def test_empty_input():
-    res = _call([], [], [], [], agg_type="mean")
-    assert len(list(res["chrom"])) == 0
-    assert len(list(res["start"])) == 0
+    assert _call([], [], [], []) == []
 
 
-import pandas as pd
-from pymisha.liftover import _aggregate_overlapping, _AGG_FUNCS
-
-
-@pytest.mark.parametrize("agg_name", sorted(_AGG_FUNCS.keys()))
+@pytest.mark.parametrize("agg_name", _TRACK_LIFTOVER_AGGS)
 @pytest.mark.parametrize("na_rm", [True, False])
-def test_cross_validate_python(agg_name, na_rm):
+@pytest.mark.parametrize("min_n", [None, 2])
+def test_cross_validate_python(agg_name, na_rm, min_n):
+    """The C++ aggregation and its Python reference give the same intervals."""
     rng = np.random.default_rng(60427)
-    n = 200
-    chroms = rng.choice(["chrA", "chrB", "chrC"], size=n)
-    starts = rng.integers(0, 5000, size=n).astype(np.int64)
-    lengths = rng.integers(50, 500, size=n).astype(np.int64)
-    ends = starts + lengths
-    values = rng.normal(size=n)
-    nan_mask = rng.random(n) < 0.15
-    values[nan_mask] = np.nan
-
-    df = pd.DataFrame({"chrom": chroms, "start": starts, "end": ends, "value": values})
-    py_out = _aggregate_overlapping(df, _AGG_FUNCS[agg_name], na_rm=na_rm, min_n=None)
-
-    chrom_arr = df["chrom"].to_numpy(dtype=object)
-    start_arr = df["start"].to_numpy(dtype=np.int64)
-    end_arr = df["end"].to_numpy(dtype=np.int64)
-    value_arr = df["value"].to_numpy(dtype=np.float64)
-    cpp_dict = _pymisha.pm_liftover_aggregate(
-        {"chrom": chrom_arr, "start": start_arr, "end": end_arr, "value": value_arr},
-        agg_name, bool(na_rm), -1, 0,
-    )
-    cpp_out = pd.DataFrame({
-        "chrom": list(cpp_dict["chrom"]),
-        "start": list(cpp_dict["start"]),
-        "end":   list(cpp_dict["end"]),
-        "value": list(cpp_dict["value"]),
-    })
-    # Sort both by (chrom, start, end) for comparison (avoids tripping on
-    # multi-chrom ordering differences if any survive).
-    py_sorted = py_out.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
-    cpp_sorted = cpp_out.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
-    pd.testing.assert_frame_equal(py_sorted, cpp_sorted, atol=1e-9, rtol=1e-9, check_dtype=False)
-
-
-def test_nth_cross_validate():
-    """nth aggregator is C++-only (not in _AGG_FUNCS dict). Cross-validate
-    against a Python reference inlined here."""
-    rng = np.random.default_rng(60427)
-    n = 200
-    chroms = rng.choice(["chrA", "chrB", "chrC"], size=n)
-    starts = rng.integers(0, 5000, size=n).astype(np.int64)
-    lengths = rng.integers(50, 500, size=n).astype(np.int64)
-    ends = starts + lengths
-    values = rng.normal(size=n)
+    n = 300
+    starts = rng.integers(0, 20000, size=n).astype(np.int64)
+    values = rng.integers(-8, 8, size=n) / 4.0
     values[rng.random(n) < 0.15] = np.nan
-    df = pd.DataFrame({"chrom": chroms, "start": starts, "end": ends, "value": values})
-
-    def nth_at_3(v):
-        v = np.asarray(v, dtype=np.float64)
-        clean = v[~np.isnan(v)]
-        if len(clean) < 3:
-            return np.nan
-        return float(clean[2])
-
-    py_out = _aggregate_overlapping(df, nth_at_3, na_rm=True)
-    cpp_dict = _pymisha.pm_liftover_aggregate(
-        {"chrom": df["chrom"].to_numpy(dtype=object),
-         "start": df["start"].to_numpy(dtype=np.int64),
-         "end":   df["end"].to_numpy(dtype=np.int64),
-         "value": df["value"].to_numpy(dtype=np.float64)},
-        "nth", True, -1, 3,
-    )
-    cpp_out = pd.DataFrame({
-        "chrom": list(cpp_dict["chrom"]),
-        "start": list(cpp_dict["start"]),
-        "end":   list(cpp_dict["end"]),
-        "value": list(cpp_dict["value"]),
+    df = pd.DataFrame({
+        "chrom": rng.choice(["chrA", "chrB", "chrC"], size=n),
+        "start": starts,
+        "end": starts + rng.integers(1, 200, size=n),
+        "value": values,
+        "key": rng.integers(0, 40, size=n),
     })
-    py_sorted = py_out.sort_values(["chrom","start","end"]).reset_index(drop=True)
-    cpp_sorted = cpp_out.sort_values(["chrom","start","end"]).reset_index(drop=True)
-    pd.testing.assert_frame_equal(py_sorted, cpp_sorted, atol=1e-9, rtol=1e-9, check_dtype=False)
+    kw = {"agg_name": agg_name, "na_rm": na_rm, "min_n": min_n, "nth_index": 2 if agg_name == "nth" else 0}
+    cpp = _aggregate_overlapping(df, **kw)
+    py = _aggregate_overlapping(df, **kw, _force_pure_python=True)
+    assert len(cpp) > 100  # many runs, some of several pieces
+    pd.testing.assert_frame_equal(cpp, py, check_dtype=False)

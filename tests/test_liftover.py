@@ -87,7 +87,7 @@ class TestLoadChain:
         chain = chain.sort_values(["chrom", "start"]).reset_index(drop=True)
 
         # Chain 1 blocks (target = chr1)
-        chr1_rows = chain[chain["chrom"] == "1"].reset_index(drop=True)
+        chr1_rows = chain[chain["chrom"] == "chr1"].reset_index(drop=True)
         assert len(chr1_rows) == 3
 
         # Block 1
@@ -108,7 +108,7 @@ class TestLoadChain:
         assert chr1_rows.loc[2, "end"] == 18500
 
         # Chain 2 (target = chrX)
-        chrx_rows = chain[chain["chrom"] == "X"].reset_index(drop=True)
+        chrx_rows = chain[chain["chrom"] == "chrX"].reset_index(drop=True)
         assert len(chrx_rows) == 1
         assert chrx_rows.loc[0, "start"] == 5000
         assert chrx_rows.loc[0, "end"] == 7000
@@ -178,7 +178,7 @@ class TestLoadChain:
             f.write(content)
         chain = pm.gintervals_load_chain(path)
         assert len(chain) == 1
-        assert chain.iloc[0]["chrom"] == "1"
+        assert chain.iloc[0]["chrom"] == "chr1"
 
     def test_load_chain_invalid_policy(self):
         """Invalid overlap policies raise ValueError."""
@@ -412,7 +412,7 @@ class TestLiftover:
         assert "chain_id" in result.columns
         assert len(result) > 0
         # The source interval chr25:2000-2500 maps to chain 1 block 1: chr1:12000-12500
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 12000
         assert result.iloc[0]["end"] == 12500
         assert result.iloc[0]["intervalID"] == 0
@@ -427,7 +427,7 @@ class TestLiftover:
         result = pm.gintervals_liftover(intervals, CHAIN_FILE,
                                         tgt_overlap_policy="keep")
         assert len(result) > 0
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
 
     def test_liftover_no_overlap(self):
         """Interval not overlapping any chain returns empty."""
@@ -662,16 +662,16 @@ class TestLiftoverOverlapPoliciesParity:
 
         assert len(result) >= 2
         chroms = set(result["chrom"].tolist())
-        assert "1" in chroms
-        assert "X" in chroms
+        assert "chr1" in chroms
+        assert "chrX" in chroms
 
         # chr1 mapping: source[10,20) -> target[10,20) (offset within chain1)
-        chr1_rows = result[result["chrom"] == "1"]
+        chr1_rows = result[result["chrom"] == "chr1"]
         assert chr1_rows.iloc[0]["start"] == 10
         assert chr1_rows.iloc[0]["end"] == 20
 
         # chrX mapping: source[10,20) overlaps chain2 source[10,26) -> target[0,10)
-        chrx_rows = result[result["chrom"] == "X"]
+        chrx_rows = result[result["chrom"] == "chrX"]
         assert chrx_rows.iloc[0]["start"] == 0
         assert chrx_rows.iloc[0]["end"] == 10
 
@@ -730,7 +730,7 @@ class TestLiftoverOverlapPoliciesParity:
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
                                          tgt_overlap_policy="discard")
         assert len(chain) == 1
-        assert chain.iloc[0]["chrom"] == "X"
+        assert chain.iloc[0]["chrom"] == "chrX"
 
     def test_auto_first_exact_truncation(self, tmp_path):
         """auto_first truncates second chain at overlap boundary.
@@ -756,7 +756,7 @@ class TestLiftoverOverlapPoliciesParity:
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
                                          tgt_overlap_policy="auto_first")
-        chr1 = chain[chain["chrom"] == "1"].sort_values("start").reset_index(drop=True)
+        chr1 = chain[chain["chrom"] == "chr1"].sort_values("start").reset_index(drop=True)
         assert len(chr1) == 2
         assert chr1.loc[0, "start"] == 0
         assert chr1.loc[0, "end"] == 30
@@ -793,7 +793,7 @@ class TestLiftoverOverlapPoliciesParity:
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
                                          tgt_overlap_policy="auto_score")
-        chr1 = chain[chain["chrom"] == "1"].sort_values("start").reset_index(drop=True)
+        chr1 = chain[chain["chrom"] == "chr1"].sort_values("start").reset_index(drop=True)
         assert list(chr1["start"]) == [10, 15, 20]
         assert list(chr1["end"]) == [15, 20, 40]
         assert list(chr1["chain_id"]) == [1, 2, 3]
@@ -827,7 +827,7 @@ class TestLiftoverOverlapPoliciesParity:
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
                                          tgt_overlap_policy="agg")
-        chr1 = chain[chain["chrom"] == "1"].sort_values(
+        chr1 = chain[chain["chrom"] == "chr1"].sort_values(
             ["start", "chain_id"]).reset_index(drop=True)
         # Expected 9 segments: each breakpoint pair x contributing chains
         assert len(chr1) == 9
@@ -945,7 +945,7 @@ class TestLiftoverValueColParity:
                                          tgt_overlap_policy="agg")
         # agg creates duplicated entries (one per chain contributing to each segment)
         assert len(chain) == 2
-        assert all(chain["chrom"] == "1")
+        assert all(chain["chrom"] == "chr1")
 
     def test_value_col_multiple_chains(self, tmp_path):
         """value_col passes through when interval maps via multiple chains.
@@ -1224,7 +1224,7 @@ class TestLiftoverMappingParity:
         result = pm.gintervals_liftover(src, path, tgt_overlap_policy="keep")
 
         assert len(result) == 1
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 15
         assert result.iloc[0]["end"] == 30
         assert result.iloc[0]["intervalID"] == 0
@@ -1312,8 +1312,8 @@ class TestLiftoverMappingParity:
         chain = pm.gintervals_load_chain(path, tgt_overlap_policy="keep")
 
         assert len(chain) == 2
-        chr1_chain = chain[chain["chrom"] == "1"].iloc[0]
-        chrx_chain = chain[chain["chrom"] == "X"].iloc[0]
+        chr1_chain = chain[chain["chrom"] == "chr1"].iloc[0]
+        chrx_chain = chain[chain["chrom"] == "chrX"].iloc[0]
 
         # chr1: +/+ both forward
         assert chr1_chain["strand"] == 0
@@ -1717,8 +1717,8 @@ class TestBestSourceCluster:
         result = pm.gintervals_liftover(intervals, chain)
         assert len(result) == 2
         chroms = set(result["chrom"].tolist())
-        assert "1" in chroms
-        assert "X" in chroms
+        assert "chr1" in chroms
+        assert "chrX" in chroms
 
     def test_adjacent_disjoint_higher_mass_wins(self, tmp_path):
         """Adjacent disjoint chains: higher mass cluster wins.
@@ -1750,7 +1750,7 @@ class TestBestSourceCluster:
         intervals = pd.DataFrame({"chrom": ["src"], "start": [100], "end": [200]})
         result = pm.gintervals_liftover(intervals, chain)
         assert len(result) == 1
-        assert result.iloc[0]["chrom"] == "2"
+        assert result.iloc[0]["chrom"] == "chr2"
         assert result.iloc[0]["start"] == 130
         assert result.iloc[0]["end"] == 200
 
@@ -1784,8 +1784,8 @@ class TestBestSourceCluster:
         intervals = pd.DataFrame({"chrom": ["src"], "start": [100], "end": [200]})
         result = pm.gintervals_liftover(intervals, chain)
         assert len(result) == 2
-        assert any(result["chrom"] == "1")
-        assert any(result["chrom"] == "X")
+        assert any(result["chrom"] == "chr1")
+        assert any(result["chrom"] == "chrX")
 
     def test_transitive_overlap_bridge(self, tmp_path):
         """Transitive overlap: A-B-C (bridge) outweighs disjoint D.

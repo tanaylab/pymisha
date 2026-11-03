@@ -85,7 +85,7 @@ class TestGpartitionBasic:
         assert len(result) > 0, "Result should have at least one interval"
         _check_partition_invariants(result, breaks, intervals)
         # All chroms should be from the requested scope
-        assert set(result["chrom"].unique()) == {"1"}
+        assert set(result["chrom"].unique()) == {"chr1"}
 
     def test_partition_bin_values_are_1_indexed(self):
         """Bin indices are 1-based and cover the expected range for 4 bins."""
@@ -225,7 +225,7 @@ class TestGpartitionMatchesR:
         assert len(result) > 0
         _check_partition_invariants(result, breaks)
         # Test DB has chroms 1, 2, X
-        assert set(result["chrom"].unique()) == {"1", "2", "X"}
+        assert set(result["chrom"].unique()) == {"chr1", "chr2", "chrX"}
 
 
 class TestGpartitionInfBreaks:

@@ -578,8 +578,8 @@ def test_giterator_intervals_consumes_cartesian_grid_spec(_init_db):
         (95_000, 155_000, 95_000, 155_000),
     }
     assert got == expected
-    assert (cells["chrom1"].astype(str) == "1").all()
-    assert (cells["chrom2"].astype(str) == "1").all()
+    assert (cells["chrom1"].astype(str) == "chr1").all()
+    assert (cells["chrom2"].astype(str) == "chr1").all()
 
 
 def test_giterator_intervals_cartesian_grid_scope_clips_cells(_init_db):

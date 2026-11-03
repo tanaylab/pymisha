@@ -33,10 +33,16 @@ public:
     int64_t width = 0;
     int64_t height = 0;
 
+    // Intervals: the iterator intervals, cut by the scope as R's
+    // TrackExpressionIntervals2DIterator cuts them. Without them the scope
+    // itself is the iterator.
+    std::vector<GInterval2D> intervals;
+    bool has_intervals = false;
+
     // TrackRects:
     std::string track_name;
     // Non-owning pointer to the genome chrom key; must outlive make_iterator().
-    // Reused by K_CARTESIAN_GRID.
+    // Reused by K_INTERVALS and K_CARTESIAN_GRID.
     const GenomeChromKey *chromkey = nullptr;
 
     // CartesianGrid:

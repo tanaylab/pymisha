@@ -36,9 +36,13 @@ def _ensure_db(_init_db):
 
 def _reference_gcis_decay(track, breaks, src, domain, include_lowest=False):
     """Pure-Python reference implementation for parity checks."""
-    # Normalize chroms
+    # Normalize chroms (an alias such as "1" names chr1)
+    from pymisha.intervals import _normalize_chroms
+
     src = src.copy()
     domain = domain.copy()
+    src["chrom"] = _normalize_chroms(src["chrom"].astype(str).tolist())
+    domain["chrom"] = _normalize_chroms(domain["chrom"].astype(str).tolist())
 
     # Unify overlaps in src per chrom
     from pymisha.analysis import (

@@ -59,7 +59,7 @@ class TestGintervalsLoad:
         result = pm.gintervals_load("annotations")
         # First interval should be chr1:20-2000
         first = result.iloc[0]
-        assert str(first["chrom"]) == "1"
+        assert str(first["chrom"]) == "chr1"
         assert first["start"] == 20
         assert first["end"] == 2000
         assert first["strand"] == 1
@@ -74,7 +74,7 @@ class TestGintervalsLoad:
         result = pm.gintervals_load("annotations", chrom="1")
         assert result is not None
         # All intervals should be on chr1
-        assert all(str(c) == "1" for c in result["chrom"])
+        assert all(str(c) == "chr1" for c in result["chrom"])
 
     def test_load_with_chrom_filter_no_match(self):
         """Load with chromosome filter that matches nothing returns empty."""
@@ -116,7 +116,7 @@ class TestGintervalsSave:
         assert loaded is not None
         assert len(loaded) == 2
         # Check values (sorted by chrom, start)
-        assert loaded.iloc[0]["chrom"] == "1" or str(loaded.iloc[0]["chrom"]) == "1"
+        assert loaded.iloc[0]["chrom"] == "chr1" or str(loaded.iloc[0]["chrom"]) == "chr1"
         assert loaded.iloc[0]["start"] == 100
         assert loaded.iloc[0]["end"] == 1000
 
@@ -200,7 +200,7 @@ class TestGintervalsLoadGoldenMaster:
         result = pm.gintervals_load("annotations")
 
         # Expected values from R misha (verified with the interv file)
-        expected_chroms = ["1", "1", "2", "2", "2", "2", "2", "2"]
+        expected_chroms = ["chr1", "chr1", "chr2", "chr2", "chr2", "chr2", "chr2", "chr2"]
         expected_starts = [20, 2500, 20, 3000, 9000, 12000, 13000, 15000]
         expected_ends = [2000, 2600, 2000, 8000, 11000, 12001, 14000, 15500]
 

@@ -34,6 +34,7 @@ struct PMPottsParams {
     bool extend_flag = true;
     char strand_mode = 1;
     double score_thresh = 0.0;
+    int max_edits = 0;
 
     static PyObject *dict_get(PyObject *dict, const char *key) {
         if (!dict || !PyDict_Check(dict)) return nullptr;
@@ -158,6 +159,20 @@ struct PMPottsParams {
                 TGLError("%s: 'score_thresh' must be a single number", who.c_str());
             }
             params.score_thresh = PyFloat_AsDouble(tmp);
+        }
+
+        // potts.max only; vtracks.py rejects it on the other functions and
+        // leaves it out of the spec at 0.
+        if (PyObject *me = dict_get(spec, "max_edits")) {
+            PMPY tmp(PyBool_Check(me) ? nullptr : PyNumber_Float(me), true);
+            if (!tmp) {
+                PyErr_Clear();
+                TGLError("%s: 'max_edits' must be 0 or 1", who.c_str());
+            }
+            const double mv = PyFloat_AsDouble(tmp);
+            if (mv != 0.0 && mv != 1.0)
+                TGLError("%s: 'max_edits' must be 0 or 1", who.c_str());
+            params.max_edits = (int)mv;
         }
 
         return params;

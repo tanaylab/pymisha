@@ -14,6 +14,9 @@
 
 // g_pmdb is declared `extern` in PMDb.h; no need to redeclare here.
 
+// GenomeTrack::FORMAT_SIGNATURES of COMPUTED
+static const int32_t SIGNATURE_COMPUTED = -11;
+
 PMGenomeTrack2D::PMGenomeTrack2D() = default;
 
 PMGenomeTrack2D::~PMGenomeTrack2D() { close_pair(); }
@@ -57,6 +60,12 @@ void PMGenomeTrack2D::init(const std::string &track_name)
 
     if (track_type == GenomeTrack::RECTS) {
         m_is_points = false;
+    } else if (track_type == GenomeTrack::COMPUTED) {
+        // Its objects are stored as RECTS objects are; only their enumeration
+        // (query_objects, for a 2D iterator) is meaningful, not the statistics,
+        // which R recomputes through the track's Computer2D.
+        m_is_points = false;
+        m_is_computed = true;
     } else if (track_type == GenomeTrack::POINTS) {
         m_is_points = true;
     } else {
@@ -145,19 +154,13 @@ bool PMGenomeTrack2D::try_open_indexed(const Track2DPairEntry &entry)
 
 int PMGenomeTrack2D::try_open_per_pair(int chromid1, int chromid2)
 {
-    const std::string &name1 = g_pmdb->chromkey().id2chrom(chromid1);
-    const std::string &name2 = g_pmdb->chromkey().id2chrom(chromid2);
-
-    // Try pymisha naming: "name1-name2"
-    std::string path = m_track_path + "/" + name1 + "-" + name2;
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        // Try R misha naming: "chrname1-chrname2"
-        path = m_track_path + "/chr" + name1 + "-chr" + name2;
-        if (stat(path.c_str(), &st) != 0) {
-            return 0;  // genuinely absent
-        }
-    }
+    // The file of the pair as every reader finds it (GenomeTrack::ChromFiles): named by the
+    // canonical names, as R misha names it, or by aliases, as pymisha 0.14 and earlier named
+    // it in a per-chromosome database (by the chrom_sizes.txt names)
+    const GenomeTrack::ChromFiles &files = g_pmdb->chrom_files(m_track_path);
+    if (!files.exists(chromid1, chromid2))
+        return 0;  // genuinely absent
+    std::string path = files.path(chromid1, chromid2);
 
     // File exists. Try to open it. Failure here is a hard error.
     if (!m_mmap.open(path, false)) {
@@ -177,10 +180,21 @@ bool PMGenomeTrack2D::parse_pair_header(const uint8_t *buf, size_t len)
     int32_t signature;
     std::memcpy(&signature, buf, sizeof(int32_t));
     bool sig_is_points;
+    size_t header = 4;  // the signature
     if (signature == quadtree::SIGNATURE_RECTS) {
         sig_is_points = false;
     } else if (signature == quadtree::SIGNATURE_POINTS) {
         sig_is_points = true;
+    } else if (signature == SIGNATURE_COMPUTED && m_is_computed && len >= 20) {
+        // The Computer2D header: its type, then its state. The area and test
+        // computers (types 0 and 3) have no state; the others are not read.
+        int32_t computer_type;
+        std::memcpy(&computer_type, buf + 4, sizeof(int32_t));
+        if (computer_type != 0 && computer_type != 3)
+            TGLError("2D scanner: track '%s' uses a Computer2D of type %d, which is not supported",
+                     m_track_name.c_str(), computer_type);
+        sig_is_points = false;
+        header = 8;
     } else {
         return false;
     }
@@ -191,11 +205,11 @@ bool PMGenomeTrack2D::parse_pair_header(const uint8_t *buf, size_t len)
                  m_track_name.c_str(), m_cur_chromid1, m_cur_chromid2);
     }
 
-    std::memcpy(&m_num_objs, buf + 4, sizeof(uint64_t));
+    std::memcpy(&m_num_objs, buf + header, sizeof(uint64_t));
     if (m_num_objs == 0) {
         m_root_chunk_fpos = 0;
     } else {
-        std::memcpy(&m_root_chunk_fpos, buf + 12, sizeof(int64_t));
+        std::memcpy(&m_root_chunk_fpos, buf + header + 8, sizeof(int64_t));
     }
     m_cur_buf = buf;
     m_cur_len = len;

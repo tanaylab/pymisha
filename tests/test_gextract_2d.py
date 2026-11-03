@@ -88,8 +88,8 @@ class TestGextract2dBasic:
         )
         result = pm.gextract("rects_track", intervals)
         if result is not None and len(result) > 0:
-            # intervalID should be 0 or 1
-            assert set(result["intervalID"].unique()).issubset({0, 1})
+            # intervalID is the 1-based row of the scope interval, as in R
+            assert set(result["intervalID"].unique()).issubset({1, 2})
 
 
 class TestGextract2dCreatedTrack:
@@ -1159,7 +1159,7 @@ class TestIntervals2dChromSizes:
         sizes["chrom1"] = sizes["chrom1"].astype(str)
         sizes["chrom2"] = sizes["chrom2"].astype(str)
         pairs = set(zip(sizes["chrom1"], sizes["chrom2"], strict=True))
-        assert pairs == {("1", "1"), ("1", "2")}
+        assert pairs == {("chr1", "chr1"), ("chr1", "chr2")}
         assert int(sizes["size"].sum()) == len(intervals)
 
 

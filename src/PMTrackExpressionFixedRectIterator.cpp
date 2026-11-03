@@ -31,6 +31,15 @@ PMTrackExpressionFixedRectIterator::PMTrackExpressionFixedRectIterator(
         throw std::invalid_argument(
             "FixedRect: bin sizes must be positive (height=" +
             std::to_string(height) + ")");
+    // R walks the scope sorted by chromosome pair (r_2d_sort_order).
+    std::vector<size_t> order = r_2d_sort_order(m_scope);
+    std::vector<GInterval2D> sorted;
+    sorted.reserve(order.size());
+    for (size_t i : order)
+        sorted.push_back(m_scope[i]);
+    m_scope.swap(sorted);
+    m_scope_orig = std::move(order);
+
     // Caller must call begin() after construction; this matches the convention
     // of the other 2D iterators (e.g. PMTrackExpressionIntervals2DIterator).
 }

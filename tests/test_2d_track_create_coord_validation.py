@@ -114,7 +114,7 @@ class TestGtrack2dCreateCoordValidation:
 
 class TestGtrack2dImportCoordValidation:
     def test_negative_start_in_file_raises(self, tmp_path):
-        """gtrack_2d_import delegates to gtrack_2d_create; covered transitively."""
+        """gtrack_2d_import reads the file as R does and names the file, line and column."""
         tname = "test.ti_neg"
         _cleanup_track(tname)
         try:
@@ -123,7 +123,7 @@ class TestGtrack2dImportCoordValidation:
                 "chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tvalue\n"
                 "1\t-100\t1000\t1\t0\t1000\t1.0\n"
             )
-            with pytest.raises(ValueError, match="start coordinate must be greater"):
+            with pytest.raises(ValueError, match="line 2: invalid format of start1 coordinate"):
                 pm.gtrack_2d_import(tname, "d", str(f))
             assert not pm.gtrack_exists(tname)
         finally:
@@ -140,7 +140,7 @@ class TestGtrack2dImportContactsCoordValidation:
                 "chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tcount\n"
                 "1\t1000\t100\t1\t300\t400\t5.0\n"
             )
-            with pytest.raises(ValueError, match="lesser than end"):
+            with pytest.raises(ValueError, match="start1 coordinate exceeds or equals the end1 coordinate"):
                 pm.gtrack_2d_import_contacts(tname, "d", [str(f)])
             assert not pm.gtrack_exists(tname)
         finally:
@@ -155,15 +155,14 @@ class TestGtrack2dImportContactsCoordValidation:
                 "chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tcount\n"
                 "1\t-100\t100\t1\t300\t400\t5.0\n"
             )
-            with pytest.raises(ValueError, match="start coordinate must be greater"):
+            with pytest.raises(ValueError, match="invalid format of start1 coordinate"):
                 pm.gtrack_2d_import_contacts(tname, "d", [str(f)])
             assert not pm.gtrack_exists(tname)
         finally:
             _cleanup_track(tname)
 
     def test_out_of_range_fend_coord_raises(self, tmp_path):
-        """A fend past the chromosome end has no raw start/end rectangle to
-        check -- it must be caught by the post-midpoint boundary check."""
+        """A fend past the chromosome end is refused while the fends file is read."""
         tname = "test.tic_fend_oob"
         _cleanup_track(tname)
         try:
@@ -178,7 +177,7 @@ class TestGtrack2dImportContactsCoordValidation:
                 "fend1\tfend2\tcount\n"
                 "1\t2\t10.0\n"
             )
-            with pytest.raises(ValueError, match="exceeds chromosome boundaries"):
+            with pytest.raises(ValueError, match="line 3: coord is out of range"):
                 pm.gtrack_2d_import_contacts(
                     tname, "d", [str(contacts_file)], fends=str(fends_file)
                 )
@@ -200,3 +199,45 @@ class TestGtrack2dImportContactsCoordValidation:
             assert pm.gtrack_exists(tname)
         finally:
             _cleanup_track(tname)
+
+
+def _write_2d_intervals_file(tmp_path, *row):
+    src = tmp_path / "src.txt"
+    cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "value"]
+    pd.DataFrame([row], columns=cols).to_csv(src, sep="\t", index=False)
+    return str(src)
+
+
+class TestR2dImportStart2:
+    """Port of the 2D import tests of R misha's test-gtrack.import3.R (chr1 / chr2 there)."""
+
+    def test_gtrack_2d_import_rejects_a_negative_start2_rectangles(self, tmp_path):
+        tname = "test.ti_neg_start2_rects"
+        src = _write_2d_intervals_file(tmp_path, "1", 100, 200, "2", -5, 10, 1)
+        with pytest.raises(ValueError, match="invalid format of start2 coordinate"):
+            pm.gtrack_2d_import(tname, "negative start2", src)
+        assert not pm.gtrack_exists(tname)
+
+    def test_gtrack_2d_import_rejects_a_negative_start2_points(self, tmp_path):
+        tname = "test.ti_neg_start2_points"
+        src = _write_2d_intervals_file(tmp_path, "1", 100, 101, "2", -1, 0, 1)
+        with pytest.raises(ValueError, match="invalid format of start2 coordinate"):
+            pm.gtrack_2d_import(tname, "negative start2", src)
+        assert not pm.gtrack_exists(tname)
+
+    def test_gtrack_2d_import_contacts_rejects_a_negative_start2(self, tmp_path):
+        tname = "test.tic_neg_start2"
+        src = _write_2d_intervals_file(tmp_path, "1", 100, 101, "2", -5, 10, 1)
+        with pytest.raises(ValueError, match="invalid format of start2 coordinate"):
+            pm.gtrack_2d_import_contacts(tname, "negative start2", src)
+        assert not pm.gtrack_exists(tname)
+
+    def test_2d_importers_name_end2_when_start2_ge_end2(self, tmp_path):
+        tname = "test.ti_start2_end2"
+        src = _write_2d_intervals_file(tmp_path, "1", 100, 101, "2", 10, 10, 1)
+        msg = "start2 coordinate exceeds or equals the end2 coordinate"
+        with pytest.raises(ValueError, match=msg):
+            pm.gtrack_2d_import(tname, "start2 >= end2", src)
+        with pytest.raises(ValueError, match=msg):
+            pm.gtrack_2d_import_contacts(tname, "start2 >= end2", src)
+        assert not pm.gtrack_exists(tname)

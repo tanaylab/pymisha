@@ -19,6 +19,18 @@ from _dbpath import TESTDB_ROOT
 TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
+def _import_points_track(tname, description, intervals, values):
+    """A POINTS track: gtrack_2d_import of 1 x 1 intervals (gtrack_2d_create makes RECTS, as in R)."""
+    import tempfile
+
+    df = intervals[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+    df["value"] = list(values)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "points.tsv")
+        df.to_csv(path, sep="\t", index=False)
+        pm.gtrack_2d_import(tname, description, path)
+
+
 def _track_dir(name):
     """Get track directory path (dots become subdirectories)."""
     return os.path.join(TRACK_DIR, name.replace(".", "/") + ".track")
@@ -544,7 +556,7 @@ class TestRoundtripPointsExtraction:
                 ends2=[301, 3001, 400001],
             )
             values = [10.0, 20.0, 30.0]
-            pm.gtrack_2d_create(tname, "roundtrip points", intervals, values)
+            _import_points_track(tname, "roundtrip points", intervals, values)
 
             query = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
             before = pm.gextract(tname, intervals=query)
@@ -572,7 +584,7 @@ class TestRoundtripPointsExtraction:
                 ends2=[101, 201],
             )
             values = [5.0, 15.0]
-            pm.gtrack_2d_create(tname, "multi points", intervals, values)
+            _import_points_track(tname, "multi points", intervals, values)
 
             q1 = pm.gintervals_2d("1", 0, 500000, "2", 0, 300000)
             q2 = pm.gintervals_2d("2", 0, 300000, "2", 0, 300000)
@@ -641,7 +653,7 @@ class TestRoundtripBandFilter:
                 ends2=[101, 201, 10001],
             )
             values = [1.0, 2.0, 3.0]
-            pm.gtrack_2d_create(tname, "band pts test", intervals, values)
+            _import_points_track(tname, "band pts test", intervals, values)
 
             query = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
             band = (-50, 50)
@@ -1607,8 +1619,8 @@ class TestEdgeCases:
             pd.testing.assert_frame_equal(before, after, check_like=True)
 
             # Only 1-1 pair should have results
-            assert all(after["chrom1"] == "1")
-            assert all(after["chrom2"] == "1")
+            assert all(after["chrom1"] == "chr1")
+            assert all(after["chrom2"] == "chr1")
         finally:
             self._cleanup_track(tname)
 
@@ -1725,8 +1737,8 @@ class TestEdgeCases:
             pm.gvtrack_create("vt_min_ext", tname, func="min")
             pm.gvtrack_create("vt_max_ext", tname, func="max")
 
-            min_result = pm.gextract("vt_min_ext", intervals=query)
-            max_result = pm.gextract("vt_max_ext", intervals=query)
+            min_result = pm.gextract("vt_min_ext", intervals=query, iterator=query)
+            max_result = pm.gextract("vt_max_ext", intervals=query, iterator=query)
 
             assert min_result["vt_min_ext"].iloc[0] == -1e8
             assert max_result["vt_max_ext"].iloc[0] == 1e10
@@ -1869,7 +1881,7 @@ class TestMultiExpression:
             pm.gvtrack_create("vt_me_min", tname, func="min")
             pm.gvtrack_create("vt_me_max", tname, func="max")
 
-            result = pm.gextract(["vt_me_min", "vt_me_max"], intervals=query)
+            result = pm.gextract(["vt_me_min", "vt_me_max"], intervals=query, iterator=query)
 
             assert "vt_me_min" in result.columns
             assert "vt_me_max" in result.columns

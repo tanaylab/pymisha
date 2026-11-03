@@ -9,11 +9,16 @@
 #include "PMSourceTrack.h"
 #include "PMChainIntervals.h"
 #include "PMLiftoverAggregate.h"
+#include "TGLException.h"
+#include "GenomeChromKey.h"
 
 #include <algorithm>
+#include <sys/stat.h>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -211,6 +216,25 @@ PyObject *build_empty_result_dict(const std::string &track_type, int64_t bin_siz
 
 }  // namespace
 
+// Renames each source chromosome that is not a chain source chromosome to its name without
+// or with the "chr" prefix, if the chain has that one (R's map_src_chainid2genomeid).
+static void match_chain_src_chroms(const std::vector<std::string> &chain_chromsrc,
+                                   std::vector<std::string> &src_chrom)
+{
+    std::unordered_set<std::string> chain_names(chain_chromsrc.begin(), chain_chromsrc.end());
+    std::unordered_map<std::string, std::string> renamed;
+    for (std::string &chrom : src_chrom) {
+        if (chain_names.count(chrom))
+            continue;
+        auto it = renamed.find(chrom);
+        if (it == renamed.end()) {
+            std::string alt = chrom.compare(0, 3, "chr") ? "chr" + chrom : chrom.substr(3);
+            it = renamed.emplace(chrom, chain_names.count(alt) ? alt : chrom).first;
+        }
+        chrom = it->second;
+    }
+}
+
 /*
  * pm_liftover_track(src_track_dir, chain_df_dict, tgt_chrom_sizes,
  *                   cluster_strategy, agg_type, na_rm, min_n, nth_index)
@@ -228,10 +252,11 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
     int na_rm_int;
     long long min_n_ll;
     long long nth_index_ll;
-    if (!PyArg_ParseTuple(args, "sOOsspLL",
+    PyObject *src_db_chroms_py = nullptr;
+    if (!PyArg_ParseTuple(args, "sOOsspLL|O",
                           &src_track_dir, &chain_df_dict, &tgt_chrom_sizes_py,
                           &cluster_strategy_str, &agg_type_str,
-                          &na_rm_int, &min_n_ll, &nth_index_ll)) {
+                          &na_rm_int, &min_n_ll, &nth_index_ll, &src_db_chroms_py)) {
         return nullptr;
     }
     if (!PyDict_Check(chain_df_dict)) {
@@ -250,8 +275,39 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         std::vector<std::string> src_chrom;
         std::vector<int64_t>     src_start, src_end;
         std::vector<double>      src_value;
+
+        // 3) Extract chain dict into POD column buffers.
+        ChainColumnBuffers chain_buf;
+        if (!extract_chain_dict(chain_df_dict, chain_buf)) return nullptr;
+
+        // the chromosomes an indexed source is keyed by, as the caller read them for its
+        // database (R's .gdb.chrom_names_at), and the chain's source chromosomes, which
+        // name the files of a per-chromosome source by name or by "chr" toggled
+        std::vector<std::string> src_db_chroms;
+        if (src_db_chroms_py && src_db_chroms_py != Py_None) {
+            PMPY seq(PySequence_Fast(src_db_chroms_py, "src_db_chroms must be a sequence"), true);
+            if (!seq)
+                return nullptr;
+            for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE((PyObject *)seq); ++i) {
+                const char *name = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM((PyObject *)seq, i));
+                if (!name)
+                    return nullptr;
+                src_db_chroms.emplace_back(name);
+            }
+        }
+        std::vector<std::string> chain_src_names;
+        {
+            std::unordered_set<std::string> seen;
+            for (const std::string &name : chain_buf.chromsrc) {
+                if (seen.insert(name).second)
+                    chain_src_names.push_back(name);
+            }
+        }
+        GenomeChromKey src_chromkey;
+        chain_src_chromkey(chain_src_names, src_chromkey);
         read_source_track_1d_cpp(src_track_dir, src_type, src_bin_size,
-                                  src_chrom, src_start, src_end, src_value);
+                                  src_chrom, src_start, src_end, src_value, &src_chromkey,
+                                  src_db_chroms_py && src_db_chroms_py != Py_None ? &src_db_chroms : nullptr);
 
         // 2) Extract tgt_chrom_sizes Python dict -> vector<pair> preserving
         //    insertion order (Task 4 aggregate_per_bin_cpp API).
@@ -259,14 +315,18 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         if (!extract_tgt_chrom_sizes(tgt_chrom_sizes_py, tgt_sizes))
             return nullptr;
 
-        // 3) Extract chain dict into POD column buffers.
-        ChainColumnBuffers chain_buf;
-        if (!extract_chain_dict(chain_df_dict, chain_buf)) return nullptr;
-
         // Early exit if source empty OR chain empty.
         if (src_chrom.empty() || chain_buf.n == 0) {
             return build_empty_result_dict(src_type, src_bin_size);
         }
+
+        // An indexed source is read by its database's chromosomes, which match a chain
+        // chromosome by name, as is, then without or with the "chr" prefix; the files of a
+        // per-chromosome source are found by the chain's names, as is or "chr" toggled
+        // (R's gtrack.liftover).
+        struct stat idx_st;
+        if (stat((std::string(src_track_dir) + "/track.idx").c_str(), &idx_st) == 0)
+            match_chain_src_chroms(chain_buf.chromsrc, src_chrom);
 
         // 4) Map intervals.
         SrcRowInput src_in{
@@ -291,20 +351,20 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         }
 
         // 5) Aggregate. Dispatch on src_type.
+        // Dedup key = (chain id, source interval index), as R's. Pieces of the SAME
+        // source interval split by "agg" target segmentation share the key (counted
+        // once); DIFFERENT source intervals of the same chain landing in one target
+        // locus stay distinct and are aggregated. Keying by chain_id alone collapsed
+        // them to the first one's value (R 5.11.6, mirroring IntervalsLiftover's key).
+        std::vector<int64_t> agg_key(mapped.chain_id.size());
+        for (size_t k = 0; k < agg_key.size(); ++k)
+            agg_key[k] = (mapped.chain_id[k] << 32) ^ mapped.intervalID[k];
         AggType agg = parse_agg_type_str(agg_type_str);
         std::vector<std::string> out_chrom;
         std::vector<int64_t>     out_start, out_end;
         std::vector<double>      out_value;
         if (src_type == "dense") {
             // FIXED_BIN preservation per R-parity.
-            // Dedup key = (chain id, source bin index). Pieces of the SAME source
-            // bin split by "agg" target segmentation share the key (counted once);
-            // DIFFERENT source bins of the same chain landing in one target bin stay
-            // distinct and are aggregated. Keying by chain_id alone collapsed them to
-            // the first bin's value (R 5.11.6, mirroring IntervalsLiftover's key).
-            std::vector<int64_t> agg_key(mapped.chain_id.size());
-            for (size_t k = 0; k < agg_key.size(); ++k)
-                agg_key[k] = (mapped.chain_id[k] << 32) ^ mapped.intervalID[k];
             aggregate_per_bin_cpp(
                 mapped.chrom, mapped.start, mapped.end, mapped.value,
                 agg_key,
@@ -314,7 +374,7 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         } else {
             // SPARSE path.
             aggregate_overlapping_cpp(
-                mapped.chrom, mapped.start, mapped.end, mapped.value,
+                mapped.chrom, mapped.start, mapped.end, mapped.value, agg_key,
                 agg, na_rm_int != 0, (int64_t)min_n_ll, (int64_t)nth_index_ll,
                 out_chrom, out_start, out_end, out_value);
         }
@@ -328,6 +388,10 @@ PyObject *pm_liftover_track(PyObject *self, PyObject *args)
         return nullptr;
     } catch (const std::runtime_error &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    } catch (TGLException &e) {
+        // the source's chromosome files (GenomeTrack::ChromFiles): two files of a chromosome
+        PyErr_SetString(PyExc_ValueError, e.msg());
         return nullptr;
     } catch (const std::bad_alloc &) {
         PyErr_SetString(PyExc_MemoryError, "Out of memory");

@@ -16,7 +16,6 @@ import pymisha as pm
 from .baseline import assert_matches_baseline
 
 GAP_2D_ITER = "2D track/set/DataFrame iterator parity not complete (row counts/coords differ)"
-GAP_COMPUTED = "COMPUTED Hi-C tracks not supported"
 GAP_ARRAY = "array-track gextract not supported"
 
 
@@ -59,7 +58,6 @@ def test_gscreen_2d_rects():
     assert_matches_baseline(pm.gextract("test.rects", i1, iterator=i2), "gextract.gscreen.2d.rects")
 
 
-@pytest.mark.xfail(reason=GAP_COMPUTED, strict=True)
 def test_gscreen_2d_computed2d():
     i1, i2 = _screen_2d()
     assert_matches_baseline(pm.gextract("test.computed2d", i1, iterator=i2), "gextract.gscreen.2d.computed2d")

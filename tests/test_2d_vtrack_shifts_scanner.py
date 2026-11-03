@@ -520,8 +520,8 @@ class TestGlobalPercentileLegacyPath:
             f"global.percentile values must be in [0, 1): {valid_vals}"
         )
 
-    def test_global_percentile_with_fixed_rect_raises(self, shift_test_track):
-        """global.percentile + iterator=(N, M) raises NotImplementedError (deferred)."""
+    def test_global_percentile_with_fixed_rect(self, shift_test_track):
+        """global.percentile + iterator=(N, M) gives a value per cell of the grid."""
         intervals = pd.DataFrame({
             "chrom1": ["1"], "start1": [0], "end1": [12_000],
             "chrom2": ["1"], "start2": [0], "end2": [12_000],
@@ -529,7 +529,10 @@ class TestGlobalPercentileLegacyPath:
 
         pm.gvtrack_create("vt_gpct2", shift_test_track, func="global.percentile")
         try:
-            with pytest.raises(NotImplementedError):
-                pm.gextract("vt_gpct2", intervals=intervals, iterator=(1000, 1000))
+            res = pm.gextract("vt_gpct2", intervals=intervals, iterator=(1000, 1000))
+            assert len(res) == 144
+            vals = res["vt_gpct2"].to_numpy(dtype=float)
+            assert np.all(np.isnan(vals) | ((vals >= 0) & (vals <= 1)))
+            assert (res["intervalID"] == 1).all()
         finally:
             pm.gvtrack_rm("vt_gpct2")

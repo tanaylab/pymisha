@@ -13,6 +13,18 @@ from _dbpath import TESTDB_ROOT
 TRACK_DIR = os.path.join(str(TESTDB_ROOT), "tracks")
 
 
+def _import_points_track(tname, description, intervals, values):
+    """A POINTS track: gtrack_2d_import of 1 x 1 intervals (gtrack_2d_create makes RECTS, as in R)."""
+    import tempfile
+
+    df = intervals[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
+    df["value"] = list(values)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "points.tsv")
+        df.to_csv(path, sep="\t", index=False)
+        pm.gtrack_2d_import(tname, description, path)
+
+
 def _track_dir(name):
     """Get track directory path (dots become subdirectories)."""
     return os.path.join(TRACK_DIR, name.replace(".", "/") + ".track")
@@ -71,7 +83,7 @@ class TestGtrack2dCreate:
             self._cleanup_track(tname)
 
     def test_create_points_track(self):
-        """Create a 2D points track (all intervals are 1bp)."""
+        """A 2D track from 1bp intervals is a RECTS track, as in R."""
         tname = "test.test_2d_points"
         self._cleanup_track(tname)
         try:
@@ -88,7 +100,8 @@ class TestGtrack2dCreate:
 
             assert pm.gtrack_exists(tname)
             info = pm.gtrack_info(tname)
-            assert info["type"] == "points"
+            # R's gtrack.2d.create makes a RECTS track even from 1 x 1 intervals
+            assert info["type"] == "rectangles"
         finally:
             self._cleanup_track(tname)
 
@@ -244,7 +257,7 @@ class TestQuadTreeBinaryCompat:
             pm.gtrack_2d_create(tname, "bincompat", intervals, [42.0])
 
             # Check binary format
-            chrom_file = os.path.join(tdir, "1-1")
+            chrom_file = os.path.join(tdir, "chr1-chr1")
             assert os.path.exists(chrom_file), f"Expected 1-1 in {os.listdir(tdir)}"
             with open(chrom_file, "rb") as f:
                 data = f.read()
@@ -311,9 +324,9 @@ class TestQuadTreeBinaryCompat:
                 starts2=[300],
                 ends2=[301],
             )
-            pm.gtrack_2d_create(tname, "pts bin", intervals, [7.0])
+            _import_points_track(tname, "pts bin", intervals, [7.0])
 
-            chrom_file = os.path.join(tdir, "1-1")
+            chrom_file = os.path.join(tdir, "chr1-chr1")
             with open(chrom_file, "rb") as f:
                 sig = struct.unpack_from("<i", f.read(4), 0)[0]
             assert sig == -10  # POINTS format
@@ -353,7 +366,7 @@ class TestQuadTreeBinaryCompat:
                 starts2=[300],
                 ends2=[301],
             )
-            pm.gtrack_2d_create(tname, "cpp pts test", intervals, [5.0])
+            _import_points_track(tname, "cpp pts test", intervals, [5.0])
             info = pm.gtrack_info(tname)
             assert info["type"] == "points"
             assert info["dimensions"] == 2

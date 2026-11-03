@@ -128,7 +128,7 @@ class TestGtrack2dImportContacts:
             # Track should have 1-2 file (not 2-1)
             tdir = _track_dir(tname)
             files = [f for f in os.listdir(tdir) if not f.startswith(".")]
-            assert any("1-2" in f for f in files)
+            assert any("chr1-chr2" in f for f in files)
         finally:
             self._cleanup(tname)
 

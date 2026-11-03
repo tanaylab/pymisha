@@ -10,6 +10,7 @@ import pandas as _pandas
 
 from ._shared import (
     CONFIG,
+    _check_spat_bounds,
     _checkroot,
     _coerce_score_thresh,
     _df2pymisha,
@@ -223,290 +224,47 @@ def grevcomp(seq: str | list[str]) -> str | list[str]:
     return gseq_revcomp(seq)
 
 
-def _count_str_occurrences(haystack: str, needle: str) -> int:
-    """Count overlapping occurrences of needle in haystack using str.find."""
-    count = 0
-    pos = 0
-    while True:
-        pos = haystack.find(needle, pos)
-        if pos == -1:
-            break
-        count += 1
-        pos += 1
-    return count
-
-
-def _count_kmer_in_seq(
-    seq: str,
-    kmer: str,
-    strand: int,
-    start_pos: int | None,
-    end_pos: int | None,
-    extend: bool,
-    skip_gaps: bool,
-    gap_chars: list[str],
-) -> int:
-    """Count occurrences of a k-mer in a single sequence.
-
-    Parameters follow R misha conventions:
-    - start_pos/end_pos are 1-based inclusive
-    - extend: if True, allow k-mer to start outside ROI
-    - skip_gaps: skip gap characters when scanning
-    """
-    seq_upper = seq.upper()
-    k = len(kmer)
-    seq_len = len(seq_upper)
-
-    if seq_len == 0:
-        return 0
-
-    # Determine ROI bounds (convert 1-based inclusive to 0-based)
-    roi_start = max(0, start_pos - 1) if start_pos is not None else 0
-    roi_end = min(seq_len, end_pos) if end_pos is not None else seq_len
-
-    if roi_end <= roi_start:
-        return 0
-
-    # Determine scan window
-    if extend:
-        scan_start = max(0, roi_start - k + 1)
-        scan_end = min(seq_len, roi_end + k - 1)
-    else:
-        scan_start = roi_start
-        scan_end = roi_end
-
-    # Remove gap characters if skip_gaps
-    if skip_gaps and gap_chars:
-        gap_set = frozenset(gap_chars)
-        chars = []
-        for i in range(scan_start, scan_end):
-            if seq_upper[i] not in gap_set:
-                chars.append(seq_upper[i])
-        clean_seq = "".join(chars)
-    else:
-        clean_seq = seq_upper[scan_start:scan_end]
-
-    count = 0
-    kmer_rc = kmer[::-1].translate(_COMPLEMENT).upper() if strand != 1 else None
-
-    # Count forward strand
-    if strand in (0, 1):
-        count += _count_str_occurrences(clean_seq, kmer)
-
-    # Count reverse strand
-    if strand in (0, -1) and kmer_rc is not None:
-        count += _count_str_occurrences(clean_seq, kmer_rc)
-
-    return count
-
-
-def _numpy_count_kmer(seq_bytes: _numpy.ndarray, kmer_bytes: _numpy.ndarray, k: int) -> int:
-    """Count overlapping occurrences of kmer_bytes in seq_bytes using numpy.
-
-    Parameters
-    ----------
-    seq_bytes : numpy.ndarray of uint8
-        Upper-cased ASCII byte array of the sequence.
-    kmer_bytes : numpy.ndarray of uint8
-        Upper-cased ASCII byte array of the k-mer.
-    k : int
-        Length of the k-mer.
-
-    Returns
-    -------
-    int
-        Number of overlapping occurrences.
-    """
-    n = len(seq_bytes)
-    if n < k:
-        return 0
-    n_windows = n - k + 1
-    match = _numpy.ones(n_windows, dtype=bool)
-    for j in range(k):
-        match &= seq_bytes[j : j + n_windows] == kmer_bytes[j]
-    return int(match.sum())
-
-
-def _numpy_count_kmer_per_seq(
-    seq_bytes: _numpy.ndarray, boundaries: _numpy.ndarray, kmer_bytes: _numpy.ndarray, k: int
-) -> _numpy.ndarray:
-    """Count k-mer occurrences per sequence in a concatenated byte array.
-
-    Sequences are concatenated with N*k separators so k-mer matches cannot
-    span sequence boundaries.
-
-    Parameters
-    ----------
-    seq_bytes : numpy.ndarray of uint8
-        Concatenated upper-cased ASCII byte array with separators.
-    boundaries : numpy.ndarray of int64
-        Cumulative boundaries: seq i occupies bytes
-        [boundaries[i], boundaries[i+1] - k_sep) where k_sep = k (separator len).
-    kmer_bytes : numpy.ndarray of uint8
-        Upper-cased ASCII byte array of the k-mer.
-    k : int
-        Length of the k-mer.
-
-    Returns
-    -------
-    numpy.ndarray of int64
-        Count per sequence.
-    """
-    n_total = len(seq_bytes)
-    n_seqs = len(boundaries) - 1
-    counts = _numpy.zeros(n_seqs, dtype=_numpy.int64)
-
-    if n_total < k:
-        return counts
-
-    # Find all match positions in the concatenated array
-    n_windows = n_total - k + 1
-    match = _numpy.ones(n_windows, dtype=bool)
-    for j in range(k):
-        match &= seq_bytes[j : j + n_windows] == kmer_bytes[j]
-
-    match_positions = _numpy.flatnonzero(match)
-    if match_positions.size == 0:
-        return counts
-
-    # Assign each match to its sequence using searchsorted on boundaries
-    seq_idx = _numpy.searchsorted(boundaries[1:], match_positions, side="right")
-    return _numpy.bincount(seq_idx, minlength=n_seqs)
-
-
-def _gseq_kmer_fast(seqs: list[str], kmer: str, mode: str, strand: int, k: int) -> _numpy.ndarray:
-    """Fast path for gseq_kmer: no ROI, no gaps, no extend.
-
-    Uses numpy byte-level matching for vectorized k-mer counting.
-    """
-    n = len(seqs)
-    if n == 0:
-        return _numpy.zeros(0, dtype=float)
-
-    kmer_bytes = _numpy.frombuffer(kmer.encode("ascii"), dtype=_numpy.uint8)
-    kmer_rc = kmer[::-1].translate(_COMPLEMENT).upper() if strand != 1 else None
-    kmer_rc_bytes = _numpy.frombuffer(kmer_rc.encode("ascii"), dtype=_numpy.uint8) if kmer_rc is not None else None
-
-    # Determine which patterns to search for
-    search_fwd = strand in (0, 1)
-    search_rev = strand in (0, -1) and kmer_rc is not None
-
-    # For small batches of short sequences, str.find is faster than numpy overhead
-    total_bytes = sum(len(s) for s in seqs)
-    if total_bytes < 500:
-        results = _numpy.zeros(n, dtype=float)
-        for i in range(n):
-            seq = seqs[i]
-            seq_len = len(seq)
-            if seq_len < k:
-                continue
-            seq_upper = seq.upper()
-            count = 0
-            if search_fwd:
-                count += _count_str_occurrences(seq_upper, kmer)
-            if search_rev:
-                assert kmer_rc is not None
-                count += _count_str_occurrences(seq_upper, kmer_rc)
-            if mode == "frac":
-                possible = max(0, seq_len - k + 1)
-                if strand == 0:
-                    possible *= 2
-                results[i] = count / possible if possible > 0 else 0.0
-            else:
-                results[i] = count
-        return results
-
-    # For a single large sequence, avoid concatenation overhead
-    if n == 1:
-        seq = seqs[0]
-        seq_len = len(seq)
-        if seq_len < k:
-            return _numpy.zeros(1, dtype=float)
-
-        sb = _numpy.frombuffer(seq.upper().encode("ascii"), dtype=_numpy.uint8)
-        count = 0
-        if search_fwd:
-            count += _numpy_count_kmer(sb, kmer_bytes, k)
-        if search_rev:
-            assert kmer_rc_bytes is not None
-            count += _numpy_count_kmer(sb, kmer_rc_bytes, k)
-
-        if mode == "frac":
-            possible = max(0, seq_len - k + 1)
-            if strand == 0:
-                possible *= 2
-            return _numpy.array([count / possible if possible > 0 else 0.0], dtype=float)
-        return _numpy.array([float(count)], dtype=float)
-
-    # Multiple sequences: concatenate with N*k separators for batch processing.
-    # N (0x4E) cannot match any ACGT kmer byte, so matches won't cross boundaries.
-    sep = bytes([0x4E]) * k  # b'NNN...' with length k
-    seq_lens = _numpy.array([len(s) for s in seqs], dtype=_numpy.int64)
-    # Each seq contributes len(s) bytes + k separator bytes (except last)
-    # But we add separator after every seq for simplicity, extra sep at end is harmless
-    parts = []
-    boundaries = _numpy.empty(n + 1, dtype=_numpy.int64)
-    boundaries[0] = 0
-    for i, seq in enumerate(seqs):
-        parts.append(seq.upper().encode("ascii", "ignore"))
-        parts.append(sep)
-        boundaries[i + 1] = boundaries[i] + len(parts[-2]) + k
-
-    all_bytes = _numpy.frombuffer(b"".join(parts), dtype=_numpy.uint8)
-
-    fwd_counts = _numpy.zeros(n, dtype=_numpy.int64)
-    rev_counts = _numpy.zeros(n, dtype=_numpy.int64)
-
-    if search_fwd:
-        fwd_counts = _numpy_count_kmer_per_seq(all_bytes, boundaries, kmer_bytes, k)
-    if search_rev:
-        assert kmer_rc_bytes is not None
-        rev_counts = _numpy_count_kmer_per_seq(all_bytes, boundaries, kmer_rc_bytes, k)
-
-    total_counts: _numpy.ndarray = fwd_counts + rev_counts
-
-    if mode == "frac":
-        possible_arr = _numpy.maximum(0, seq_lens - k + 1).astype(float)
-        if strand == 0:
-            possible_arr *= 2
-        with _numpy.errstate(divide="ignore", invalid="ignore"):
-            return _numpy.where(possible_arr > 0, total_counts / possible_arr, 0.0)
-
-    return total_counts.astype(float)
-
-
 def gseq_kmer(
     seqs: str | list[str],
     kmer: str,
     mode: str = "count",
     strand: int = 0,
-    start_pos: int | None = None,
-    end_pos: int | None = None,
-    extend: bool = False,
+    start_pos: int | list[int] | None = None,
+    end_pos: int | list[int] | None = None,
+    extend: bool | int = False,
     skip_gaps: bool = True,
     gap_chars: list[str] | None = None,
 ) -> _numpy.ndarray:
     """
     Count k-mer occurrences in DNA sequences.
 
+    Scans every window start of the region of interest (ROI) and counts the
+    starts where the k-mer matches. With ``strand=0`` a start counts once when
+    the k-mer matches on either strand, so a palindromic k-mer is not counted
+    twice. ``mode="frac"`` divides the count by the number of window starts
+    scanned, whatever the strand.
+
     Parameters
     ----------
     seqs : str or list of str
-        DNA sequence(s) to search.
+        DNA sequence(s) to search (case-insensitive).
     kmer : str
         K-mer pattern to search for (only A, C, G, T characters).
     mode : str, default "count"
-        "count" returns raw counts, "frac" returns fraction of possible positions.
+        "count" returns raw counts, "frac" returns the fraction of window
+        starts that match.
     strand : int, default 0
-        0 = both strands, 1 = forward only, -1 = reverse complement only.
-    start_pos : int, optional
-        1-based start position of region of interest.
-    end_pos : int, optional
-        1-based end position of region of interest (inclusive).
-    extend : bool, default False
-        If True, allow k-mer to extend beyond ROI boundaries.
+        0 = either strand, 1 = forward only, -1 = reverse complement only.
+    start_pos : int or list of int, optional
+        1-based start of the ROI, per sequence (recycled); 1 by default.
+    end_pos : int or list of int, optional
+        1-based end of the ROI (inclusive), per sequence (recycled); the
+        sequence end by default.
+    extend : bool or int, default False
+        How far window starts may reach past the ROI on each side: False for
+        none, True for ``len(kmer) - 1``, or a non-negative number of bases.
     skip_gaps : bool, default True
-        If True, skip gap characters when scanning.
+        If True, gap characters are removed before scanning.
     gap_chars : list of str, optional
         Characters to treat as gaps. Default: ["-", "."].
 
@@ -519,111 +277,65 @@ def gseq_kmer(
     --------
     >>> import pymisha as pm
 
-    Count CG dinucleotides on both strands:
+    Count CG dinucleotides (a palindrome counts once per position):
 
     >>> pm.gseq_kmer(["CGCGCGCGCG", "ATATATATAT"], "CG")
-    array([10.,  0.])
+    array([5., 0.])
 
     Get fraction instead of count:
 
     >>> pm.gseq_kmer(["CGCGCGCGCG"], "CG", mode="frac")  # doctest: +ELLIPSIS
     array([0.555...])
 
-    Forward strand only:
-
-    >>> pm.gseq_kmer(["CGCGCGCGCG"], "CG", strand=1)
-    array([5.])
-
     Count in a specific region:
 
     >>> pm.gseq_kmer("ATCGATCG", "AT", start_pos=1, end_pos=4)
-    array([2.])
+    array([1.])
 
     See Also
     --------
     gseq_kmer_dist, gseq_pwm, gseq_extract
     """
+    if mode not in ("count", "frac"):
+        raise ValueError("mode must be 'count' or 'frac'")
+    if not isinstance(kmer, str):
+        raise ValueError("kmer must be a single character string")
+    kmer = kmer.upper()
+    if not kmer or not all(c in "ACGT" for c in kmer):
+        raise ValueError("kmer must contain only A, C, G, T characters")
+    if isinstance(strand, bool) or strand not in (-1, 0, 1):
+        raise ValueError("strand must be -1, 0, or 1")
     if gap_chars is None:
         gap_chars = ["-", "."]
+    if skip_gaps:
+        if isinstance(gap_chars, str) or len(gap_chars) == 0:
+            raise ValueError("gap_chars must be a non-empty list of characters")
+        if any(not isinstance(g, str) or len(g) != 1 for g in gap_chars):
+            raise ValueError("gap_chars must be single characters")
+        if len(set(gap_chars)) != len(gap_chars):
+            raise ValueError("gap_chars must be distinct")
+    if isinstance(extend, (bool, _numpy.bool_)):
+        extend_val = len(kmer) - 1 if extend else 0
+    elif isinstance(extend, (int, _numpy.integer)) and extend >= 0:
+        extend_val = int(extend)
+    else:
+        raise ValueError("extend must be False, True, or a non-negative integer")
 
     if isinstance(seqs, str):
         seqs = [seqs]
+    seqs = list(seqs)
+    n = len(seqs)
+    lengths = _numpy.array([len(x) if isinstance(x, str) else 0 for x in seqs], dtype=_numpy.int64)
+    roi_start = (_numpy.ones(n, dtype=_numpy.int64) if start_pos is None
+                 else _numpy.resize(_numpy.asarray(start_pos, dtype=_numpy.int64), n))
+    roi_end = (lengths if end_pos is None
+               else _numpy.resize(_numpy.asarray(end_pos, dtype=_numpy.int64), n))
 
-    kmer = kmer.upper()
-    if not all(c in "ACGT" for c in kmer):
-        raise ValueError("kmer must contain only A, C, G, T characters")
-    if len(kmer) == 0:
-        raise ValueError("kmer must be non-empty")
-
-    if strand not in (-1, 0, 1):
-        raise ValueError("strand must be -1, 0, or 1")
-
-    k = len(kmer)
-
-    # --- C++ fast path ---
-    _use_cpp = start_pos is None and end_pos is None and not extend
-    if _use_cpp and gap_chars is not None:
-        _gap_set = frozenset(gap_chars)
-        for seq in seqs:
-            if _gap_set.intersection(seq):
-                _use_cpp = False
-                break
-    elif _use_cpp and skip_gaps:
-        _default_gaps = frozenset("-.")
-        for seq in seqs:
-            if _default_gaps.intersection(seq):
-                _use_cpp = False
-                break
-    if _use_cpp:
-        try:
-            result: _numpy.ndarray = _pymisha.pm_kmer_count_strings(
-                list(seqs), kmer.upper(), mode, strand
-            )
-            return result
-        except AttributeError:
-            pass
-
-    # Fast path: no ROI constraints, no extend.
-    # Gap characters ("-", ".") are virtually never present in DNA sequences;
-    # even when skip_gaps is True, if no gap chars actually exist in the data
-    # the slow path and fast path produce identical results.  We check cheaply.
-    has_roi = start_pos is not None or end_pos is not None
-    if not has_roi and not extend:
-        # Quick gap scan: only fall back to slow path if gap chars are actually
-        # present in any sequence.
-        need_slow = False
-        if skip_gaps and gap_chars:
-            gap_set = frozenset(gap_chars)
-            for seq in seqs:
-                if gap_set.intersection(seq):
-                    need_slow = True
-                    break
-        if not need_slow:
-            return _gseq_kmer_fast(seqs, kmer, mode, strand, k)
-
-    # Slow path: handles ROI, gaps, extend
-    results = _numpy.zeros(len(seqs), dtype=float)
-
-    for i, seq in enumerate(seqs):
-        count = _count_kmer_in_seq(seq, kmer, strand, start_pos, end_pos, extend, skip_gaps, gap_chars)
-        if mode == "frac":
-            seq_len = len(seq)
-            if start_pos is not None and end_pos is not None:
-                roi_len = min(seq_len, end_pos) - max(0, start_pos - 1)
-            elif start_pos is not None:
-                roi_len = seq_len - max(0, start_pos - 1)
-            elif end_pos is not None:
-                roi_len = min(seq_len, end_pos)
-            else:
-                roi_len = seq_len
-            possible = max(0, roi_len - k + 1)
-            if strand == 0:
-                possible *= 2
-            results[i] = count / possible if possible > 0 else 0.0
-        else:
-            results[i] = count
-
-    return results
+    result: _numpy.ndarray = _pymisha.pm_kmer_count_strings(
+        seqs, kmer, mode, int(strand), roi_start, roi_end, extend_val, bool(skip_gaps),
+        "".join(gap_chars) if skip_gaps else "",
+    )
+    return result
 
 
 def gseq_kmer_dist(
@@ -642,7 +354,7 @@ def gseq_kmer_dist(
     k : int, default 6
         K-mer size (1-10).
     mask : DataFrame, optional
-        Intervals to exclude from counting.
+        Intervals to exclude: a k-mer that starts in one is not counted.
 
     Returns
     -------
@@ -677,14 +389,34 @@ def gseq_kmer_dist(
     # Extract sequences for the intervals
     seqs = gseq_extract(intervals)
 
-    # If mask is provided, extract mask intervals and subtract
+    # A k-mer is left out when its start is masked, as in R: masked positions
+    # per interval, from the mask intervals of its chromosome.
+    masked_starts: list[_numpy.ndarray | None] = [None] * len(seqs)
     if mask is not None:
-        from .intervals import gintervals_diff
+        from .intervals import _normalize_chroms
 
-        intervals_clean = gintervals_diff(intervals, mask)
-        if intervals_clean is None or len(intervals_clean) == 0:
-            return _pandas.DataFrame({"kmer": [], "count": []}).astype({"kmer": str, "count": int})
-        seqs = gseq_extract(intervals_clean)
+        assert isinstance(intervals, _pandas.DataFrame)  # loaded above
+
+        m = _pandas.DataFrame({
+            "chrom": _normalize_chroms(mask["chrom"].tolist()),
+            "start": mask["start"].to_numpy(dtype=_numpy.int64),
+            "end": mask["end"].to_numpy(dtype=_numpy.int64),
+        }).sort_values("start", kind="mergesort")
+        # Per chromosome: the mask starts, sorted, and the furthest end reached
+        # by any mask starting at or before each of them.
+        by_chrom = {
+            c: (g["start"].to_numpy(), _numpy.maximum.accumulate(g["end"].to_numpy()))
+            for c, g in m.groupby("chrom", sort=False)
+        }
+        iv_chrom = _normalize_chroms(intervals["chrom"].tolist())
+        iv_start = intervals["start"].to_numpy(dtype=_numpy.int64)
+        for i, seq in enumerate(seqs):
+            if iv_chrom[i] not in by_chrom:
+                continue
+            ms, me = by_chrom[iv_chrom[i]]
+            pos = iv_start[i] + _numpy.arange(len(seq), dtype=_numpy.int64)
+            j = _numpy.searchsorted(ms, pos, side="right") - 1
+            masked_starts[i] = (j >= 0) & (pos < me[_numpy.maximum(j, 0)])
 
     num_kmers = 4**k
     counts = _numpy.zeros(num_kmers, dtype=_numpy.int64)
@@ -692,7 +424,7 @@ def gseq_kmer_dist(
     # Pre-compute powers of 4 for the rolling hash
     powers = _numpy.int64(4) ** _numpy.arange(k - 1, -1, -1, dtype=_numpy.int64)
 
-    for seq in seqs:
+    for seq, masked in zip(seqs, masked_starts, strict=True):
         if not seq or len(seq) < k:
             continue
 
@@ -737,6 +469,8 @@ def gseq_kmer_dist(
                     window_codes *= 4
                     window_codes += segment[j : j + n_windows]
 
+            if masked is not None:
+                window_codes = window_codes[~masked[start:start + n_windows]]
             counts += _numpy.bincount(window_codes, minlength=num_kmers)
 
     nonzero_idx = _numpy.flatnonzero(counts)
@@ -1108,6 +842,8 @@ def _pwm_score_sequence(
     return_strand: bool,
     spat_log_factors: _numpy.ndarray | None = None,
     spat_bin: int = 1,
+    spat_min: int | None = None,
+    spat_max: int | None = None,
 ) -> float | int | tuple[float, int]:
     """Score a single uppercased sequence with PWM.
 
@@ -1118,6 +854,8 @@ def _pwm_score_sequence(
         no spatial weighting.
     spat_bin : int
         Bin size for spatial weighting (positions per bin).
+    spat_min, spat_max : int or None
+        1-based window counted from the ROI start; as R's C_gseq_pwm.
     """
     # ROI (1-based inclusive)
     roi_start = start_pos if start_pos is not None else 1
@@ -1134,6 +872,12 @@ def _pwm_score_sequence(
     # 0-based allowed window start range
     start_min = max(0, roi_start - 1 - E)
     start_max = min(L - w, roi_end - w + E)
+    bin_origin = roi_start
+    if spat_min is not None:
+        start_min = max(start_min, roi_start + spat_min - 2)
+        bin_origin = roi_start + spat_min - 1
+    if spat_max is not None:
+        start_max = min(start_max, roi_start + spat_max - 1 - w)
 
     if start_max < start_min or w > L:
         if mode == "count":
@@ -1156,10 +900,11 @@ def _pwm_score_sequence(
 
     for phys_pos, window in _pwm_iter_windows(seq_upper, start_min, start_max, w, skip_gaps, gap_set):
         # Spatial log factor for this window position.
-        # offset_from_roi = (phys_pos + 1) - roi_start  (matching C++: (s0+1) - roi_start1)
+        # offset = (phys_pos + 1) - bin_origin, as C++ (s0 + 1) - roi_start1, where
+        # roi_start1 is the spat window start when spat_min is given
         if use_spat:
             assert spat_log_factors is not None
-            offset = (phys_pos + 1) - roi_start
+            offset = (phys_pos + 1) - bin_origin
             sb = offset // spat_bin
             if sb < 0:
                 sb = 0
@@ -1329,9 +1074,12 @@ def gseq_pwm(
         Number of consecutive positions that share the same spatial
         weight.  Position *offset* maps to bin ``offset // spat_bin``.
     spat_min : float or None
-        Reserved for virtual-track context (not used in string scoring).
+        1-based position, counted from ``start_pos``, where the scanning
+        window starts (>= 1); spatial bins are counted from it.
     spat_max : float or None
-        Reserved for virtual-track context (not used in string scoring).
+        1-based position, counted from ``start_pos``, where the scanning
+        window ends: only windows ending at or before it are scored (>= 1).
+        A ``spat_min``..``spat_max`` window shorter than the PSSM is an error.
     return_strand : bool, default False
         For ``mode="pos"`` with bidirectional scoring, return a DataFrame
         with ``pos`` and ``strand`` columns instead of a plain array.
@@ -1416,30 +1164,45 @@ def gseq_pwm(
     if isinstance(seqs, str):
         seqs = [seqs]
 
+    # spat_min / spat_max: 1-based positions counted from start_pos, as in the
+    # pwm virtual tracks with the ROI in the interval's place. Windows must lie
+    # inside them and spatial bins count from spat_min. R truncates them with
+    # as.integer() after the same checks.
+    if spat_min is not None or spat_max is not None:
+        smin_f, smax_f = _check_spat_bounds(spat_min, spat_max, len(pssm))
+        spat_min = None if smin_f is None else int(smin_f)
+        spat_max = None if smax_f is None else int(smax_f)
+
     # --- C++ fast path ---
     # Dispatch to the C++ PWMScorer when no Python-only features are needed.
     # The C++ path handles prior/log conversion internally and is significantly
     # faster than both the vectorized numpy path and the per-sequence Python path.
-    # The C++ scorer charges log(0.25) per neutral base, which IS the
-    # "log_quarter" policy and is not "average": "average" charges each
-    # position's own column mean, so the two differ by however far a column
-    # departs from uniform. The gate used to admit both and the comment called
-    # the difference an approximation, which made "average" - the default -
-    # silently return log_quarter's answer and disagree with R by ~0.015 nats
-    # on a 400-mer with five Ns. Only the policy it implements goes fast.
+    # The C++ scorer follows no neutral-base policy exactly (see the N check
+    # below), so it only takes sequences without one, where every policy gives
+    # the same answer. Only "log_quarter" is routed to it, as before: the
+    # default stays on the Python paths, which compute in double as R's
+    # gseq.pwm does, where the C++ scorer sums in float.
+    # The minus strand alone stays in Python too: the C++ scorer reverse
+    # complements the string and so counts spatial bins from its 3' end and
+    # breaks "pos" ties from that end, where R's gseq.pwm counts both from the
+    # 5' end (up to 0.2 nats and 117 bp apart on a 200-mer).
     _use_cpp = (
         gap_chars is None
         and neutral_chars is None
         and neutral_chars_policy == "log_quarter"
         and not (return_strand and mode == "pos")
         and not extend
+        and (bidirect or strand != -1)
     )
     # The C++ scorer doesn't handle gap characters; fall back to Python if
-    # any sequence contains default gap chars ("-", ".").
-    if _use_cpp and skip_gaps:
-        _default_gaps = frozenset("-.")
+    # any sequence contains default gap chars ("-", "."). Nor does it charge a
+    # neutral base (N, n, *) log(1/4) on both strands: its lse charges the
+    # reverse strand the column mean and its max both strands, so any sequence
+    # holding one goes to Python too (0.04 nats out on a 10-mer with two Ns).
+    if _use_cpp:
+        _py_chars = frozenset("Nn*-." if skip_gaps else "Nn*")
         for seq in seqs:
-            if _default_gaps.intersection(seq):
+            if _py_chars.intersection(seq):
                 _use_cpp = False
                 break
     if _use_cpp:
@@ -1468,9 +1231,15 @@ def gseq_pwm(
         # Apply ROI slicing in Python before passing to C++.
         cpp_seqs = list(seqs)
         _roi_offset = 0
-        if start_pos is not None or end_pos is not None:
+        if start_pos is not None or end_pos is not None or spat_min is not None or spat_max is not None:
             s = (start_pos - 1) if start_pos is not None else 0
             e = end_pos if end_pos is not None else None
+            # The spat window, counted from the ROI start, narrows the slice;
+            # its start is also where the spatial bins begin.
+            if spat_max is not None:
+                e = s + spat_max if e is None else min(e, s + spat_max)
+            if spat_min is not None:
+                s += spat_min - 1
             cpp_seqs = [seq[s:e] for seq in cpp_seqs]
             # The slice is invisible to C++, so a position it reports counts
             # from the slice. Positions are documented - in both packages - as
@@ -1498,6 +1267,10 @@ def gseq_pwm(
                 cpp_spat,
                 int(spat_bin),
             )
+            if mode == "count":
+                # score_string() answers NaN for a string shorter than the
+                # motif; R counts no window there as 0, as the Python paths do.
+                _res = _numpy.nan_to_num(_numpy.asarray(_res, dtype=float), nan=0.0)
             if mode == "pos" and _roi_offset:
                 # Back onto the full sequence's coordinates; a NaN (nothing
                 # scorable) stays NaN rather than becoming the offset.
@@ -1600,8 +1373,11 @@ def gseq_pwm(
                     need_slow = True
                     break
         if not need_slow:
+            # With no ROI, the spat window is a slice of each sequence, and
+            # its start is where positions and spatial bins count from.
+            lo = 0 if spat_min is None else spat_min - 1
             r = _pwm_score_batch_vectorized(
-                seqs,
+                seqs if lo == 0 and spat_max is None else [seq[lo:spat_max] for seq in seqs],
                 log_pssm,
                 avg_log,
                 w,
@@ -1615,6 +1391,8 @@ def gseq_pwm(
                 neutral_policy=neutral_chars_policy,
                 neutral_set=neutral_set,
             )
+            if mode == "pos" and lo:   # NaN stays NaN
+                r = (r[0] + lo, r[1]) if isinstance(r, tuple) else r + lo
             if return_strand and mode == "pos":
                 return _pandas.DataFrame({"pos": r[0], "strand": r[1]})
             return r
@@ -1645,6 +1423,8 @@ def gseq_pwm(
             return_strand,
             spat_log_factors=spat_log_factors,
             spat_bin=spat_bin,
+            spat_min=spat_min,
+            spat_max=spat_max,
         )
         if return_strand and mode == "pos":
             assert isinstance(sr, tuple)

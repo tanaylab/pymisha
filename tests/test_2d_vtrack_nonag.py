@@ -10,6 +10,7 @@ import shutil
 
 import _pymisha
 import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -131,7 +132,7 @@ class TestExists:
         """exists returns 1.0 when objects intersect the query."""
         pm.gvtrack_create("vt_exists", rects_track, func="exists")
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_exists", intervals)
+        result = pm.gextract("vt_exists", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -141,7 +142,7 @@ class TestExists:
         """exists returns 0.0 when no objects intersect the query."""
         pm.gvtrack_create("vt_exists0", rects_track, func="exists")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_exists0", intervals)
+        result = pm.gextract("vt_exists0", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -158,7 +159,7 @@ class TestExists:
             starts2=[0, 900, 400000],
             ends2=[700, 2100, 500000],
         )
-        result = pm.gextract("vt_exists_m", intervals)
+        result = pm.gextract("vt_exists_m", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 3
@@ -171,7 +172,7 @@ class TestExists:
         """exists works on points tracks."""
         pm.gvtrack_create("vt_exists_p", points_track, func="exists")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_exists_p", intervals)
+        result = pm.gextract("vt_exists_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -181,7 +182,7 @@ class TestExists:
         """exists on chr1-chr2 where the track has no data returns 0."""
         pm.gvtrack_create("vt_exists_t", rects_track, func="exists")
         intervals = pm.gintervals_2d("1", 0, 500000, "2", 0, 300000)
-        result = pm.gextract("vt_exists_t", intervals)
+        result = pm.gextract("vt_exists_t", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -202,7 +203,7 @@ class TestSize:
         pm.gvtrack_create("vt_size", rects_track, func="size")
         # Query hits Rect A and Rect B
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_size", intervals)
+        result = pm.gextract("vt_size", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -213,7 +214,7 @@ class TestSize:
         pm.gvtrack_create("vt_size1", rects_track, func="size")
         # Query hits only Rect C
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_size1", intervals)
+        result = pm.gextract("vt_size1", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -223,7 +224,7 @@ class TestSize:
         """size returns 0.0 when no objects intersect."""
         pm.gvtrack_create("vt_size0", rects_track, func="size")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_size0", intervals)
+        result = pm.gextract("vt_size0", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -233,7 +234,7 @@ class TestSize:
         """size counts all three objects when query covers everything."""
         pm.gvtrack_create("vt_size3", rects_track, func="size")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_size3", intervals)
+        result = pm.gextract("vt_size3", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -244,7 +245,7 @@ class TestSize:
         pm.gvtrack_create("vt_size_p", points_track, func="size")
         # Covers P1 and P2 but not P3
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_size_p", intervals)
+        result = pm.gextract("vt_size_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -254,7 +255,7 @@ class TestSize:
         """size on missing chrom pair returns 0."""
         pm.gvtrack_create("vt_size_t", rects_track, func="size")
         intervals = pm.gintervals_2d("1", 0, 500000, "2", 0, 300000)
-        result = pm.gextract("vt_size_t", intervals)
+        result = pm.gextract("vt_size_t", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -274,7 +275,7 @@ class TestFirst:
         pm.gvtrack_create("vt_first", rects_track, func="first")
         # Query hits Rect A (val=5) and Rect B (val=10); first is A
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_first", intervals)
+        result = pm.gextract("vt_first", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -286,7 +287,7 @@ class TestFirst:
         """first returns the value of the single intersecting object."""
         pm.gvtrack_create("vt_first1", rects_track, func="first")
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_first1", intervals)
+        result = pm.gextract("vt_first1", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -296,7 +297,7 @@ class TestFirst:
         """first returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_first_nan", rects_track, func="first")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_first_nan", intervals)
+        result = pm.gextract("vt_first_nan", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -306,7 +307,7 @@ class TestFirst:
         """first works on points tracks."""
         pm.gvtrack_create("vt_first_p", points_track, func="first")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_first_p", intervals)
+        result = pm.gextract("vt_first_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -326,7 +327,7 @@ class TestLast:
         """last returns value of last intersecting object."""
         pm.gvtrack_create("vt_last", rects_track, func="last")
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_last", intervals)
+        result = pm.gextract("vt_last", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -337,7 +338,7 @@ class TestLast:
         """last returns the value of the single intersecting object."""
         pm.gvtrack_create("vt_last1", rects_track, func="last")
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_last1", intervals)
+        result = pm.gextract("vt_last1", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -347,7 +348,7 @@ class TestLast:
         """last returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_last_nan", rects_track, func="last")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_last_nan", intervals)
+        result = pm.gextract("vt_last_nan", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -357,7 +358,7 @@ class TestLast:
         """last works on points tracks."""
         pm.gvtrack_create("vt_last_p", points_track, func="last")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_last_p", intervals)
+        result = pm.gextract("vt_last_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -370,8 +371,8 @@ class TestLast:
         pm.gvtrack_create("vt_last_fl", rects_track, func="last")
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
 
-        result_f = pm.gextract("vt_first_fl", intervals)
-        result_l = pm.gextract("vt_last_fl", intervals)
+        result_f = pm.gextract("vt_first_fl", intervals, iterator=intervals)
+        result_l = pm.gextract("vt_last_fl", intervals, iterator=intervals)
 
         assert result_f is not None
         assert result_l is not None
@@ -392,7 +393,7 @@ class TestSample:
         """sample returns a value from one of the intersecting objects."""
         pm.gvtrack_create("vt_sample", rects_track, func="sample")
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_sample", intervals)
+        result = pm.gextract("vt_sample", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -404,7 +405,7 @@ class TestSample:
         """sample with one object always returns that object's value."""
         pm.gvtrack_create("vt_sample1", rects_track, func="sample")
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_sample1", intervals)
+        result = pm.gextract("vt_sample1", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -414,7 +415,7 @@ class TestSample:
         """sample returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_sample_nan", rects_track, func="sample")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_sample_nan", intervals)
+        result = pm.gextract("vt_sample_nan", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -424,7 +425,7 @@ class TestSample:
         """sample works on points tracks."""
         pm.gvtrack_create("vt_sample_p", points_track, func="sample")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_sample_p", intervals)
+        result = pm.gextract("vt_sample_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -435,7 +436,7 @@ class TestSample:
         """sample from all three objects always returns a valid value."""
         pm.gvtrack_create("vt_sample3", rects_track, func="sample")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_sample3", intervals)
+        result = pm.gextract("vt_sample3", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -462,9 +463,10 @@ class TestGlobalPercentile:
             starts2=[0, 900, 200],
             ends2=[700, 2100, 300],
         )
-        result = pm.gextract("vt_gpct", intervals)
+        # the intervals overlap, and an iterator must not: one at a time
+        result = pd.concat([pm.gextract("vt_gpct", intervals.iloc[[i]], iterator=intervals.iloc[[i]])
+                            for i in range(len(intervals))])
 
-        assert result is not None
         assert len(result) == 3
         vals = result["vt_gpct"].to_numpy(dtype=float)
         valid = vals[~np.isnan(vals)]
@@ -487,8 +489,8 @@ class TestGlobalPercentile:
             ends2=[700, 2100, 300],
         )
 
-        res_pct = pm.gextract("vt_gpct_o", intervals)
-        res_avg = pm.gextract("vt_avg_o", intervals)
+        res_pct = pm.gextract("vt_gpct_o", intervals, iterator=intervals)
+        res_avg = pm.gextract("vt_avg_o", intervals, iterator=intervals)
 
         assert res_pct is not None
         assert res_avg is not None
@@ -511,7 +513,7 @@ class TestGlobalPercentile:
         """global.percentile returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_gpct_nan", rects_track, func="global.percentile")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_gpct_nan", intervals)
+        result = pm.gextract("vt_gpct_nan", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -521,7 +523,7 @@ class TestGlobalPercentile:
         """global.percentile with a single interval returns 0.0 (no values are strictly less)."""
         pm.gvtrack_create("vt_gpct_1", rects_track, func="global.percentile")
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_gpct_1", intervals)
+        result = pm.gextract("vt_gpct_1", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -539,7 +541,7 @@ class TestGlobalPercentile:
             starts2=[0, 4000],
             ends2=[300, 6000],
         )
-        result = pm.gextract("vt_gpct_p", intervals)
+        result = pm.gextract("vt_gpct_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 2
@@ -559,12 +561,12 @@ class TestBandFilter:
     """Test non-aggregation functions with band filter."""
 
     def test_exists_with_band_excludes_all(self, rects_track):
-        """exists with a band that excludes all objects returns 0."""
+        """exists with a band that misses the query: no row, as in R."""
         pm.gvtrack_create("vt_exists_band", rects_track, func="exists")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_exists_band", intervals, band=(999000, 1000000))
-
-        assert result is not None
+        assert pm.gextract("vt_exists_band", intervals, band=(999000, 1000000), iterator=intervals) is None
+        # a band that meets the query but no object: 0
+        result = pm.gextract("vt_exists_band", intervals, band=(499000, 1000000), iterator=intervals)
         assert len(result) == 1
         assert result["vt_exists_band"].iloc[0] == 0.0
 
@@ -574,7 +576,7 @@ class TestBandFilter:
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
         # Use a band that passes some but not all objects.
         # band=(-500, 500) should pass most objects.
-        result = pm.gextract("vt_size_band", intervals, band=(-500, 500))
+        result = pm.gextract("vt_size_band", intervals, band=(-500, 500), iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -583,10 +585,10 @@ class TestBandFilter:
         assert val >= 0.0
 
     def test_first_with_band_excludes_all(self, rects_track):
-        """first with band that excludes all returns NaN."""
+        """first with a band that meets the query but no object returns NaN."""
         pm.gvtrack_create("vt_first_band", rects_track, func="first")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_first_band", intervals, band=(999000, 1000000))
+        result = pm.gextract("vt_first_band", intervals, band=(499000, 1000000), iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -610,7 +612,7 @@ class TestShifts:
         # Query: (0, 0, 600, 700) -> shifted to (1000, 1000, 1600, 1700)
         # Should hit Rect C (1000,1000,2000,2000)
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_exists_s", intervals)
+        result = pm.gextract("vt_exists_s", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -624,7 +626,7 @@ class TestShifts:
 
         # Shifted query hits only Rect C
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_size_s", intervals)
+        result = pm.gextract("vt_size_s", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -652,7 +654,7 @@ class TestOutputShape:
             starts2=[0, 900, 400000],
             ends2=[700, 2100, 500000],
         )
-        result = pm.gextract(vt_name, intervals)
+        result = pm.gextract(vt_name, intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 3
@@ -670,11 +672,11 @@ class TestOutputShape:
             starts2=[0, 900],
             ends2=[700, 2100],
         )
-        result = pm.gextract(vt_name, intervals)
+        result = pm.gextract(vt_name, intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 2
-        assert set(result["intervalID"].unique()) == {0, 1}
+        assert set(result["intervalID"].unique()) == {1, 2}
 
 
 # ===========================================================================
@@ -709,7 +711,7 @@ class TestExpressionMixing:
         pm.gvtrack_create("vt_sz", rects_track, func="size")
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_ex + vt_sz", intervals)
+        result = pm.gextract("vt_ex + vt_sz", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -723,7 +725,7 @@ class TestExpressionMixing:
         pm.gvtrack_create("vt_size_mix", rects_track, func="size")
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_area_mix + vt_size_mix", intervals)
+        result = pm.gextract("vt_area_mix + vt_size_mix", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1

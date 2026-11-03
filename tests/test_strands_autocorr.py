@@ -67,11 +67,11 @@ class TestComputeStrandsAutocorr:
         """Function runs and returns (dict, DataFrame) on a small file."""
         reads_file = str(tmp_path / "reads.tsv")
         rows = [
-            ("ACGT" * 5, "1", 1000, "+"),
-            ("ACGT" * 5, "1", 2000, "-"),
-            ("ACGT" * 5, "1", 3000, "+"),
-            ("ACGT" * 5, "1", 4000, "-"),
-            ("ACGT" * 5, "1", 5000, "+"),
+            ("ACGT" * 5, "chr1", 1000, "+"),
+            ("ACGT" * 5, "chr1", 2000, "-"),
+            ("ACGT" * 5, "chr1", 3000, "+"),
+            ("ACGT" * 5, "chr1", 4000, "-"),
+            ("ACGT" * 5, "chr1", 5000, "+"),
         ]
         _write_reads_file(reads_file, rows)
 
@@ -93,8 +93,8 @@ class TestComputeStrandsAutocorr:
     def test_return_format_bins_shape(self, tmp_path):
         """Bins DataFrame has correct number of rows based on maxread/binsize."""
         reads_file = str(tmp_path / "reads.tsv")
-        rows = [("A" * 20, "1", i * 100, "+") for i in range(100)]
-        rows += [("A" * 20, "1", i * 100, "-") for i in range(100)]
+        rows = [("A" * 20, "chr1", i * 100, "+") for i in range(100)]
+        rows += [("A" * 20, "chr1", i * 100, "-") for i in range(100)]
         _write_reads_file(reads_file, rows)
 
         binsize = 50
@@ -115,8 +115,8 @@ class TestComputeStrandsAutocorr:
     def test_different_binsize_changes_output_length(self, tmp_path):
         """Changing binsize with same maxread gives different number of bins."""
         reads_file = str(tmp_path / "reads.tsv")
-        rows = [("A" * 20, "1", i * 100, "+") for i in range(200)]
-        rows += [("A" * 20, "1", i * 100, "-") for i in range(200)]
+        rows = [("A" * 20, "chr1", i * 100, "+") for i in range(200)]
+        rows += [("A" * 20, "chr1", i * 100, "-") for i in range(200)]
         _write_reads_file(reads_file, rows)
 
         maxread = 400
@@ -148,8 +148,8 @@ class TestComputeStrandsAutocorr:
         np.random.seed(60427)
         for i in range(500):
             coord = np.random.randint(10000, 100000)
-            rows.append(("A", "1", coord, "+"))
-            rows.append(("A", "1", coord, "-"))
+            rows.append(("A", "chr1", coord, "+"))
+            rows.append(("A", "chr1", coord, "-"))
         _write_reads_file(reads_file, rows)
 
         binsize = 100
@@ -174,9 +174,9 @@ class TestComputeStrandsAutocorr:
         reads_file = str(tmp_path / "reads.tsv")
 
         # Put 20 forward reads in the same bin
-        rows = [("A" * 10, "1", 500, "+") for _ in range(20)]
+        rows = [("A" * 10, "chr1", 500, "+") for _ in range(20)]
         # Put 1 reverse read at another bin
-        rows.append(("A" * 10, "1", 2000, "-"))
+        rows.append(("A" * 10, "chr1", 2000, "-"))
         _write_reads_file(reads_file, rows)
 
         stats, bins_df = pm.gcompute_strands_autocorr(
@@ -200,7 +200,7 @@ class TestComputeStrandsAutocorr:
     def test_invalid_binsize_raises(self, tmp_path):
         """Raises ValueError for binsize <= 0."""
         reads_file = str(tmp_path / "reads.tsv")
-        _write_reads_file(reads_file, [("A", "1", 100, "+")])
+        _write_reads_file(reads_file, [("A", "chr1", 100, "+")])
 
         with pytest.raises(ValueError, match="binsize"):
             pm.gcompute_strands_autocorr(reads_file, "1", binsize=0)
@@ -211,7 +211,7 @@ class TestComputeStrandsAutocorr:
     def test_invalid_maxread_raises(self, tmp_path):
         """Raises ValueError for maxread <= 0."""
         reads_file = str(tmp_path / "reads.tsv")
-        _write_reads_file(reads_file, [("A", "1", 100, "+")])
+        _write_reads_file(reads_file, [("A", "chr1", 100, "+")])
 
         with pytest.raises(ValueError, match="maxread"):
             pm.gcompute_strands_autocorr(
@@ -221,7 +221,7 @@ class TestComputeStrandsAutocorr:
     def test_invalid_cols_order_raises(self, tmp_path):
         """Raises ValueError for bad cols_order."""
         reads_file = str(tmp_path / "reads.tsv")
-        _write_reads_file(reads_file, [("A", "1", 100, "+")])
+        _write_reads_file(reads_file, [("A", "chr1", 100, "+")])
 
         # Too few columns
         with pytest.raises(ValueError, match="4 elements"):
@@ -241,9 +241,9 @@ class TestComputeStrandsAutocorr:
         # Put columns at positions 1, 2, 3, 4
         custom_order = (1, 2, 3, 4)
         rows = [
-            ("ACGT" * 5, "1", 1000, "+"),
-            ("ACGT" * 5, "1", 2000, "-"),
-            ("ACGT" * 5, "1", 3000, "+"),
+            ("ACGT" * 5, "chr1", 1000, "+"),
+            ("ACGT" * 5, "chr1", 2000, "-"),
+            ("ACGT" * 5, "chr1", 3000, "+"),
         ]
         _write_reads_file(reads_file, rows, cols_order=custom_order)
 
@@ -260,10 +260,10 @@ class TestComputeStrandsAutocorr:
         """Only reads from the specified chromosome are counted."""
         reads_file = str(tmp_path / "reads.tsv")
         rows = [
-            ("ACGT" * 5, "1", 1000, "+"),
-            ("ACGT" * 5, "2", 1000, "+"),  # different chrom
-            ("ACGT" * 5, "1", 2000, "-"),
-            ("ACGT" * 5, "X", 3000, "+"),  # different chrom
+            ("ACGT" * 5, "chr1", 1000, "+"),
+            ("ACGT" * 5, "chr2", 1000, "+"),  # different chrom
+            ("ACGT" * 5, "chr1", 2000, "-"),
+            ("ACGT" * 5, "chrX", 3000, "+"),  # different chrom
         ]
         _write_reads_file(reads_file, rows)
 
@@ -281,9 +281,9 @@ class TestComputeStrandsAutocorr:
         """F and R strand notations work like + and -."""
         reads_file = str(tmp_path / "reads.tsv")
         rows = [
-            ("ACGT" * 5, "1", 1000, "F"),
-            ("ACGT" * 5, "1", 2000, "R"),
-            ("ACGT" * 5, "1", 3000, "F"),
+            ("ACGT" * 5, "chr1", 1000, "F"),
+            ("ACGT" * 5, "chr1", 2000, "R"),
+            ("ACGT" * 5, "chr1", 3000, "F"),
         ]
         _write_reads_file(reads_file, rows)
 
@@ -298,10 +298,10 @@ class TestComputeStrandsAutocorr:
         """Reads outside [min_coord, max_coord] are excluded."""
         reads_file = str(tmp_path / "reads.tsv")
         rows = [
-            ("A" * 20, "1", 500, "+"),    # inside [1000, 5000]? No
-            ("A" * 20, "1", 2000, "+"),   # inside
-            ("A" * 20, "1", 3000, "-"),   # inside
-            ("A" * 20, "1", 10000, "+"),  # outside
+            ("A" * 20, "chr1", 500, "+"),    # inside [1000, 5000]? No
+            ("A" * 20, "chr1", 2000, "+"),   # inside
+            ("A" * 20, "chr1", 3000, "-"),   # inside
+            ("A" * 20, "chr1", 10000, "+"),  # outside
         ]
         _write_reads_file(reads_file, rows)
 

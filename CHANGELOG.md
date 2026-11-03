@@ -1,5 +1,97 @@
 # Changelog
 
+## v0.15.0 (2026-11-03)
+
+Brings pymisha to R misha 5.14.1: 2D tracks and `gtrack_liftover`, chromosome naming and alias-named files, the bigWig, Parquet, mappedseq and 2D imports, `gextract_variants`, Potts, pwm and kmer scoring, names under `gdir_cd`, and failed writes.
+
+### Breaking
+
+* A database whose chrom_sizes.txt names lack the `chr` of its seq files (the lab's hg38 and mm10, the example database) names its chromosomes `chr1`, `chr2`, ... and orders them as R does (`chr1`, `chr1_KI270706v1_random`, `chr10`, ...). Results, exported files and new track and interval-set files carry these names; `"1"` is still accepted as input.
+* In such a database, `gtrack_import_mappedseq` and `gcompute_strands_autocorr` count only reads named as the database names the chromosome (`chr1`), as R does.
+* In such a database, an indexed track or interval set that pymisha 0.14 or earlier converted is read from the wrong chromosomes unless chrom_sizes.txt is already in R's order; a dense one fails with R's "Number of bins ... do not match" error. Convert it again from its per-chromosome files.
+* 2D track files that pymisha 0.14 or earlier wrote in such a database are named `1-2`, not `chr1-chr2`. pymisha reads them, and so does misha 5.13.3 or later; for an older misha, rename them in each track directory:
+  `for f in Path(track_dir).glob("*-*"): f.rename(f.with_name("-".join(c if c.startswith("chr") else "chr" + c for c in f.name.split("-", 1))))`
+* `gdb_convert_to_indexed` keeps the database's chromosome names and order, so the indexed tracks in it stay valid.
+* `gdb_init` stops, leaving the loaded database loaded, when `seq/genome.idx` disagrees with `chrom_sizes.txt` in order or sizes, or when `chrom_sizes.txt` lists one chromosome twice (as `chr1` and `1`); it warns when only the names differ.
+* `gdataset_load` refuses a dataset with indexed tracks or interval sets that numbers its chromosomes differently from the working database, or whose `seq/genome.idx` no longer matches its `chrom_sizes.txt`. Such a dataset without indexed files loads, but its tracks and interval sets cannot be converted to the indexed format in that session.
+* `gdb_convert_to_indexed` stops instead of converting inexactly: a `.seq` file whose length differs from `chrom_sizes.txt` (was a warning), a chromosome whose `.seq` file is `seq/genome.seq`, or a `seq/` or `chrom_sizes.txt` that belongs to another database (convert that one).
+* `gtrack_copy` and `gtrack_liftover` stop for an indexed track whose database's chromosome order cannot be read or whose index disagrees with its `chrom_sizes.txt`.
+* Two different files of one chromosome, both named by aliases, are an error, and converting a directory with a file not named by a chromosome stops.
+* `gintervals_2d_all()` returns every chromosome pair, as R does (cis pairs only above 100 chromosomes, `CONFIG["multicontig_2d_threshold"]`). `mode="diagonal"` gives the old result.
+* 2D `gextract`, `gscreen` and `giterator_intervals` return rows in R's walk order instead of sorted; sort by `chrom1`, `start1`, `chrom2`, `start2` for the old order. `intervalID` is 1-based, as in R.
+* With no iterator, a 2D `gextract` returns the track's objects cut by the scope (a band drops inter-chromosomal pairs), and a 2D virtual track returns one row per cut object. Pass `iterator=intervals` for one row per interval.
+* The `area` of a 2D query that meets no cell is 0, as in R (was NaN).
+* `gtrack_2d_create` always makes a RECTS track, as R does.
+* `gtrack_liftover` refuses the `best_cluster_*` / `best_source_cluster` overlap policies, as R does; `gintervals_liftover` still takes them.
+* `gtrack_import_mappedseq` places SAM/BAM reads at their 0-based 5' base, as R misha 5.13 does, and skips unmapped, secondary, QC-failed and supplementary records. Re-import SAM/BAM tracks made by earlier versions.
+* `gtrack_import_mappedseq` counts each record once in `total` and adds `total.filtered`. `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ` is removed.
+* `gtrack_2d_import` and `gtrack_2d_import_contacts` read their files as R does: the first six columns must be named `chrom1` ... `end2`, a non-numeric value is an error, errors name the file and line, contacts on fends the fends file does not define are skipped, and input with no records on known chromosomes gives an empty track.
+* `gtrack_import` refuses the WIG / bedGraph files R refuses: overlapping or unsorted records, a chromosome's records split across the file, a bedGraph record that is empty or runs past the chromosome end. fixedStep / variableStep records that cross the chromosome end are clipped.
+* `gtrack_import` computes dense bins with R's arithmetic, so they match R bit for bit; some values change in the last digit.
+* `gtrack_import` refuses a `.zip` holding more than one file, as R does (it read the first file).
+* `gextract(..., intervals_set_out=...)` returns None, as R does, instead of the extracted DataFrame; load the set with `gintervals_load()`.
+* A new file written by `gextract(file=)` or `gtrack_array_extract(file=)` gets mode 0660, as in R, whatever the caller's umask; a file it overwrites keeps its permissions.
+* `max_edits` on any potts function except `potts.max` is an error (it used to be ignored).
+* `gseq_kmer` counts as R's `gseq.kmer`: with `strand=0` (the default) a position counts once when the k-mer matches on either strand, and `mode="frac"` divides by the number of window starts. `frac` values of non-palindromic k-mers double, palindromic counts halve, and with gaps the denominator counts only non-gap bases.
+* `gseq_kmer_dist(mask=...)` leaves out only k-mers whose start is masked, as R does (it also dropped k-mers overlapping a mask edge).
+* `spat_min` and `spat_max` on `pwm`, `pwm.max`, `pwm.max.pos` and `pwm.count` virtual tracks work as in R: they are 1-based positions of the scanned window (the last motif ends at `spat_max`), and either can be given alone, with or without `spat_factor`. Before, they were ignored without `spat_factor` or when only `spat_min` was given, and were otherwise off by one (`spat_min`) and by the motif length (`spat_max`). Recompute anything that used them.
+* `spat_min` / `spat_max` below 1, not a single number, or a window shorter than the motif is an error, in pwm virtual tracks and `gseq_pwm()`.
+* After `gdir_cd()`, track and interval-set names are relative to the working directory in every function, as in R: they are read, created, copied, converted and removed there, and `gintervals_ls()` lists only the sets under it. `db=` naming the database the working directory is in means the names there in `gtrack_rm()` and `gtrack_copy()`.
+* `gdir_cd()` hides virtual tracks instead of deleting them; they come back on return to their directory, as in R.
+
+### New
+
+* `gtrack_import_mappedseq(paired=True)` imports paired-end fragments from SAM/BAM proper pairs or from fragment files (BED, 10x `fragments.tsv.gz`). It also takes `min_mapq`, `max_fraglen` and `one_based`, and reads named pipes again.
+* `gtrack_import` reads bigWig with misha's own reader; pyBigWig is no longer needed. A bigWig is recognized by its first bytes whatever its name, may be gzipped or zipped, and keeps full float precision.
+* `gtrack_import` imports a WIG, bedGraph or tab-delimited file with no records as an empty track, as R does.
+* `gextract(file="x.parquet")` writes a GZIP-compressed Parquet file (chrom, start, end and one float32 column per expression), as R misha 5.14.0 does. No new dependency.
+* `gtrack_import_parquet()` imports the value columns of one or more Parquet files (the path may be a glob) as dense tracks, one per column, all or nothing. `gtrack_import()` also reads a Parquet file with one value column.
+* `gextract_variants()` gives the value of a track expression under each single-base substitution that can change it, or under the variants of a table such as `gintervals_import_vcf()` output, as R misha 5.14.1's `gextract.variants`.
+* `potts.max` virtual tracks accept `max_edits=1`: the best score within one substitution.
+* `gtrack_liftover` takes `multi_target_agg="nth"` (n in `params`) and the four coverage aggregations.
+* `gcor` and `gsample` work on 2D expressions and take `band`; `gcis_decay` takes a 2D scope and `iterator`.
+* `(w, h)` and cartesian-grid iterators accept any 2D expression, and a computed 2D track can be the iterator.
+* `CONFIG["max_mem_usage"]` (KB) caps the memory of the parallel 2D imports, as R's `gmax.mem.usage`.
+* `gdir_cd()` accepts absolute paths and directories outside `tracks/` (`".."` from `tracks/` is the database root), as in R.
+
+### Performance
+
+* `gtrack_2d_import` and `gtrack_2d_import_contacts` read the files and write the chromosome pairs in parallel, with identical track files: 2M points from one file in 1.8 s and 3.0 s (were 6.6 s and 17.7 s).
+* Potts models score faster in the `potts` virtual tracks and `gseq_potts()`, most of all when their couplings link nearby positions (about 3x for four models summed side by side). Some scores change in the last digits, so a score exactly at a threshold can come out the other way.
+* Overlapping `pwm` windows longer than 1 Mb slide instead of rescanning each window: 40 windows of 1.1 Mb stepping 1 kb take 0.17 s (were 2.5 s).
+* 2D `gtrack_liftover` streams through C++ one chromosome pair at a time and writes R's files: 2M Hi-C points in 1.4 s (was 189 s); 56M points in 41 s and 4.4 GB.
+
+### Bug fixes
+
+* `gtrack_copy` of an indexed track from such a database keeps each value on its chromosome.
+* `gtrack_liftover` matches an indexed source's chromosomes to the chain's with or without the `chr` prefix, as R does.
+* `gtrack_array_import` reads a source file that names a chromosome by an alias (`1` for `chr1`), as R does.
+* Per-chromosome files named by a chromosome alias (`1`, `1-chr2`, ...) are read, converted, copied and lifted over like canonically named ones; a canonically named file wins.
+* `gdb_convert_to_indexed` leaves the database as it was when it fails or is interrupted, keeps the mode and group of `chrom_sizes.txt`, and puts the session back; a loaded dataset it changed is unloaded with a warning.
+* `gtrack_copy(overwrite=True)` checks first and keeps the existing track until the copy succeeds.
+* `gintervals_load` of an indexed big set no longer returns chromosomes deleted since, nor loses index data when other files sit next to the index.
+* A forced `gtrack_2d_convert_to_indexed` re-packs the track (it was a no-op) and leaves it as it was if it fails.
+* A call that could not fully write a track, interval set, track variable or attribute file (full disk, quota, an NFS error at close) fails and removes what it staged or half-wrote, instead of reporting success over a truncated file. `gtrack_modify` no longer commits a chromosome whose staged file failed to write.
+* A `pwm` virtual track gives an interval the same value whatever the other iterator intervals are; over gapped iterator intervals or windows longer than 1 Mb, values change by under 3e-07 and match R misha 5.14.0.
+* `pwm.count` with `spat_factor` respects `spat_min` / `spat_max` in every interval; it counted the whole interval after the first one of a scan.
+* pwm virtual tracks return NaN for an interval where no motif fits between `spat_min` and `spat_max`, and `pwm.max.pos` with `spat_factor` returns NaN when no position can be scored (it reported 1 or the bin length).
+* `gseq_pwm()` applies `spat_min` / `spat_max`, counted from `start_pos`, as R does (they were ignored).
+* `gseq_pwm(bidirect=False, strand=-1)` counts spatial bins and breaks position ties from the 5' end, as R does, and `mode="count"` gives 0 for a sequence with no window.
+* `pwm.max.pos` with `spat_factor` and a `gvtrack_filter` reports the position from the unmasked part R picks: parts are ranked by the score the position was chosen by, spatial weight included.
+* `gseq_pwm(neutral_chars_policy="log_quarter")` charges an N log(1/4) on both strands, as R does; on sequences holding N it charged the reverse strand the column mean.
+* `gvtrack_create` takes pwm, edit-distance and kmer parameters as a `params` dict, as R's `params` list does (these vtracks were created and then failed in `gextract`). `params` together with keyword arguments is an error, invalid kmers are refused at creation, and a palindromic kmer on `strand=0` warns, as in R.
+* `gseq_kmer` accepts per-sequence `start_pos` / `end_pos` lists and an integer `extend`.
+* `coverage` and `neighbor.count` virtual tracks return NaN, not 0, when an iterator shift moves the window off the chromosome.
+* 2D statistics over NaN cells follow R (NaN propagates); results no longer depend on the tree layout. Recreate 2D tracks with NaN values written by an earlier pymisha.
+* `gtrack_import` reads `.wig.zip` and `.bedgraph.zip` files, and WIG files that mix step sections with bedGraph lines, as R does.
+* A truncated or corrupt bigWig, or one with data for both `chr1` and `1`, is an error instead of a partial import.
+* `gtrack_2d_create`, `gtrack_2d_import` and `gtrack_2d_import_contacts` write R's files byte for byte. `gtrack_2d_import` reads each file's 7th column as the value, and `gtrack_2d_create` no longer mismatches values when some intervals are on unknown chromosomes.
+* 1D `gtrack_liftover` merges overlapping lifted intervals and keeps NaN values as R does; an empty lift gives R's track (1D and 2D).
+* 2D `gtrack_liftover` keeps NaN cells, turns infinite source values into NaN, and lifts indexed 2D sources, including from a relative path.
+* With no `intervals`, `gcor`, `gsample`, `gbins_*` and `gcis_decay` use the 2D genome for a 2D expression, and `gdist` over a 2D scope uses its `iterator`.
+* A computed 2D track read in Python values a partly covered object by its computer, as R does.
+* In a subdirectory of an indexed database, tracks and interval sets are not created or converted where the chromosome order may differ, and `gtrack_modify()` refuses an indexed track in no loaded database, as R misha 5.13.2 does. `gtrack_copy()` without `db=` stops when the working directory is in no loaded database, and `gdir_rm()` refuses to remove the working directory.
+
 ## v0.14.0 (2026-09-22)
 
 Supersedes 0.13.0 - 0.13.2, none of which were published: the last release on

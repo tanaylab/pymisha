@@ -7,14 +7,9 @@
  *   m_igp[0/1]       - current grid-point iterators
  *   m_igp_start[0/1] - anchors for the start of the current chromosome
  *   m_iexp[0/1]      - expansion pair upper-bound iterators
- *   m_scope_rect_idx - index into the current pair's scope rect list
- *                      (replaces R's m_iintersection / qtree queue with a
- *                       linear scan; same semantics, O(S) per cell)
- *
- * The "intersection queue" in R processed multiple matches from a single
- * quadtree query.  Here we scan scope rects one-by-one; because we return
- * after each match, the caller just calls next() again to continue from
- * where we left off (m_scope_rect_idx already points past the last match).
+ *   m_cell_inter     - the pieces of the current cell still to emit (R's
+ *                      m_intersection / m_iintersection), from a quad tree of
+ *                      the pair's scope intervals as R builds it
  */
 
 #include "PMTrackExpressionCartesianGridIterator.h"
@@ -97,18 +92,20 @@ PMTrackExpressionCartesianGridIterator::PMTrackExpressionCartesianGridIterator(
     int32_t                             min_band_idx,
     int32_t                             max_band_idx,
     std::vector<GInterval2D>            scope,
+    const GenomeChromKey               &chromkey,
     const quadtree::DiagonalBand       *band)
     : m_use_band_idx(use_band_idx),
       m_min_band_idx(min_band_idx),
       m_max_band_idx(max_band_idx),
-      m_scope(std::move(scope)),
+      m_chromkey(chromkey),
       m_band(band ? *band : quadtree::DiagonalBand{}),
       m_use_band(band != nullptr && band->active),
-      m_scope_rect_idx(0),
+      m_scope_first(0),
+      m_cell_pos(0),
+      m_scope_pos(0),
       m_emitted(0),
       m_gp0_idx(0),
-      m_isend(false),
-      m_cur_scope_rects(nullptr)
+      m_isend(false)
 {
     m_gpoints[0] = std::move(gp_axis0);
     m_gpoints[1] = std::move(gp_axis1);
@@ -122,16 +119,21 @@ PMTrackExpressionCartesianGridIterator::PMTrackExpressionCartesianGridIterator(
     if (m_expansion[1].size() < 2)
         throw std::runtime_error("Iterator grid expansion must contain at least 2 unique values");
 
+    // R walks the scope sorted by chromosome pair (r_2d_sort_order).
+    m_scope_orig = r_2d_sort_order(scope);
+    for (size_t i : m_scope_orig)
+        m_scope.push_back(scope[i]);
+
     // Build per-pair scope index.
     // When band is active, inter-chrom pairs are excluded entirely.
-    for (size_t i = 0; i < m_scope.size(); ++i) {
-        const GInterval2D &r = m_scope[i];
-        if (r.end1 <= r.start1 || r.end2 <= r.start2)
-            continue;
+    for (size_t first = 0, last; first < m_scope.size(); first = last) {
+        for (last = first; last < m_scope.size() && m_scope[last].is_same_chrom_pair(m_scope[first]); ++last)
+            ;
+        const GInterval2D &r = m_scope[first];
         if (m_use_band && r.chromid1 != r.chromid2)
             continue;
         PairKey key{static_cast<int32_t>(r.chromid1), static_cast<int32_t>(r.chromid2)};
-        m_scope_index[key].push_back(i);
+        m_scope_index[key] = std::make_pair(first, last);
     }
 }
 
@@ -142,11 +144,10 @@ PMTrackExpressionCartesianGridIterator::PMTrackExpressionCartesianGridIterator(
 bool PMTrackExpressionCartesianGridIterator::_load_scope_pair(int32_t c1, int32_t c2)
 {
     auto it = m_scope_index.find(PairKey{c1, c2});
-    if (it == m_scope_index.end()) {
-        m_cur_scope_rects = nullptr;
+    if (it == m_scope_index.end())
         return false;
-    }
-    m_cur_scope_rects = &it->second;
+    m_scope_first = it->second.first;
+    build_scope_qtree(m_scope_qtree, m_scope, it->second.first, it->second.second, m_chromkey);
     return true;
 }
 
@@ -162,11 +163,12 @@ void PMTrackExpressionCartesianGridIterator::begin()
     m_igp_start[1]   = m_gpoints[1].begin();
     m_iexp[0]        = m_expansion[0].begin() + 1;
     m_iexp[1]        = m_expansion[1].begin() + 1;
-    m_scope_rect_idx = 0;
+    m_cell_inter.clear();
+    m_cell_idx.clear();
+    m_cell_pos       = 0;
     m_emitted        = 0;
     m_gp0_idx        = 0;
     m_cur_chromid[0] = m_cur_chromid[1] = -1;
-    m_cur_scope_rects = nullptr;
     m_last           = GInterval2D{};
 
     if (m_gpoints[0].empty() || m_gpoints[1].empty() || m_scope_index.empty()) {
@@ -188,15 +190,7 @@ void PMTrackExpressionCartesianGridIterator::begin()
 //   OUTER: iterate over (gp0, gp1) pairs grouped by chromosome
 //     MIDDLE: iterate over expansion[0] values (m_iexp[0])
 //       INNER: iterate over expansion[1] values (m_iexp[1])
-//         SCOPE: linear scan over scope rects for (c1, c2)
-//
-// On each entry after an emission, m_scope_rect_idx points to the next
-// scope rect to try for the current (gp0, gp1, exp0, exp1).  Phase 4
-// will continue from there; if exhausted it advances m_iexp[1].
-//
-// Differences from R:
-//   - Linear scope scan vs. StatQuadTree.intersect()
-//   - No separate m_intersection vector; we emit one at a time
+//         SCOPE: the cell's pieces from the pair's scope quad tree
 // ---------------------------------------------------------------------------
 
 void PMTrackExpressionCartesianGridIterator::next()
@@ -207,17 +201,27 @@ void PMTrackExpressionCartesianGridIterator::next()
     while (true) {
 
         // ------------------------------------------------------------------
-        // PHASE 1: If we have a pending scope-rect scan (m_scope_rect_idx > 0
-        // meaning we just returned from an emission and need to continue
-        // scanning the same cell), skip directly to Phase 4.
-        // We detect this by checking whether we should skip the gpoint-advance
-        // and filter phases.  Since we always reset m_scope_rect_idx to 0
-        // when advancing exp or gpoint iterators, a non-zero value means
-        // we're mid-scan for the current cell.
+        // PHASE 1: emit the next piece of the current cell (R lines 103-113).
         // ------------------------------------------------------------------
-        // (Implemented inline: Phase 4 handles all scope scanning, and on
-        //  re-entry after an emission we fall through Phases 2-3 without
-        //  triggering their skip conditions, then Phase 4 continues scanning.)
+        if (m_cell_pos < m_cell_inter.size()) {
+            const Rectangle &r = m_cell_inter[m_cell_pos];
+            m_last.chromid1 = m_igp[0]->chromid;
+            m_last.chromid2 = m_igp[1]->chromid;
+            m_last.start1   = r.x1;
+            m_last.end1     = r.x2;
+            m_last.start2   = r.y1;
+            m_last.end2     = r.y2;
+            m_scope_pos     = m_scope_first + m_cell_idx[m_cell_pos];
+            m_gp0_idx       = static_cast<size_t>(m_igp[0] - m_gpoints[0].begin());
+            ++m_cell_pos;
+            if (m_cell_pos == m_cell_inter.size()) {
+                m_cell_inter.clear();
+                m_cell_pos = 0;
+                ++m_iexp[1];
+            }
+            ++m_emitted;
+            return;
+        }
 
         // ------------------------------------------------------------------
         // PHASE 2: Advance gpoint iterators (mirrors R lines 115-133).
@@ -252,8 +256,6 @@ void PMTrackExpressionCartesianGridIterator::next()
             // Reset inner state for new gp pair.
             m_iexp[0]        = m_expansion[0].begin() + 1;
             m_iexp[1]        = m_expansion[1].begin() + 1;
-            m_scope_rect_idx = 0;
-            m_gp0_idx        = static_cast<size_t>(m_igp[0] - m_gpoints[0].begin());
             continue;
         }
 
@@ -275,14 +277,13 @@ void PMTrackExpressionCartesianGridIterator::next()
             if (skip) {
                 m_iexp[0]        = m_expansion[0].begin() + 1;
                 m_iexp[1]        = m_expansion[1].begin() + 1;
-                m_scope_rect_idx = 0;
                 ++m_igp[1];
                 continue;
             }
         }
 
         // ------------------------------------------------------------------
-        // PHASE 4: Compute cell and scan scope rects.
+        // PHASE 4: Compute the cell and intersect it with the scope.
         // ------------------------------------------------------------------
         {
             int32_t c1 = m_igp[0]->chromid;
@@ -296,7 +297,6 @@ void PMTrackExpressionCartesianGridIterator::next()
 
             if (m_iexp[1] == m_expansion[1].end() || start1 == end1) {
                 m_iexp[1]        = m_expansion[1].begin() + 1;
-                m_scope_rect_idx = 0;
                 ++m_iexp[0];
                 continue;
             }
@@ -309,15 +309,13 @@ void PMTrackExpressionCartesianGridIterator::next()
 
             if (start2 == end2) {
                 ++m_iexp[1];
-                m_scope_rect_idx = 0;
                 continue;
             }
 
-            // Reload scope rects when chrom-pair changes (mirrors R lines 164-200).
+            // Rebuild the scope quad tree when the chrom-pair changes (mirrors R lines 164-200).
             if (c1 != m_cur_chromid[0] || c2 != m_cur_chromid[1]) {
                 m_cur_chromid[0] = c1;
                 m_cur_chromid[1] = c2;
-                m_scope_rect_idx = 0;
 
                 if (!_load_scope_pair(c1, c2)) {
                     // No scope rects for this pair: skip entire axis-1 chrom.
@@ -331,52 +329,19 @@ void PMTrackExpressionCartesianGridIterator::next()
                 }
             }
 
-            // Linear scope scan (replaces R's qtree.intersect()).
-            bool found = false;
-            const std::vector<size_t> &sr_idx = *m_cur_scope_rects;
+            // R lines 203-215: the band only where it does not contain the cell.
+            Rectangle r(start1, start2, end1, end2);
+            quadtree::Rectangle qr{start1, start2, end1, end2};
+            m_cell_inter.clear();
+            m_cell_idx.clear();
+            m_cell_pos = 0;
+            if (!m_use_band || m_band.do_contain(qr))
+                intersect_scope_qtree(m_scope_qtree, r, nullptr, m_cell_inter, m_cell_idx);
+            else if (m_band.do_intersect(qr))
+                intersect_scope_qtree(m_scope_qtree, r, &m_band, m_cell_inter, m_cell_idx);
 
-            while (m_scope_rect_idx < sr_idx.size()) {
-                const GInterval2D &sr = m_scope[sr_idx[m_scope_rect_idx]];
-                ++m_scope_rect_idx;
-
-                int64_t ix1 = std::max(start1, sr.start1);
-                int64_t ix2 = std::min(end1,   sr.end1);
-                int64_t iy1 = std::max(start2, sr.start2);
-                int64_t iy2 = std::min(end2,   sr.end2);
-
-                if (ix1 >= ix2 || iy1 >= iy2)
-                    continue;
-
-                // Apply diagonal band if active and same-chrom (mirrors R lines 205-210).
-                if (m_use_band && c1 == c2) {
-                    quadtree::Rectangle rc{ix1, iy1, ix2, iy2};
-                    if (!m_band.do_intersect(rc))
-                        continue;
-                    m_band.shrink2intersected(rc);
-                    if (rc.x1 >= rc.x2 || rc.y1 >= rc.y2)
-                        continue;
-                    ix1 = rc.x1; iy1 = rc.y1;
-                    ix2 = rc.x2; iy2 = rc.y2;
-                }
-
-                m_last.chromid1 = c1;
-                m_last.chromid2 = c2;
-                m_last.start1   = ix1;
-                m_last.end1     = ix2;
-                m_last.start2   = iy1;
-                m_last.end2     = iy2;
-                m_gp0_idx       = static_cast<size_t>(m_igp[0] - m_gpoints[0].begin());
-                ++m_emitted;
-                found = true;
-                break;
-            }
-
-            if (found)
-                return;
-
-            // All scope rects exhausted for this cell: advance exp[1].
-            m_scope_rect_idx = 0;
-            ++m_iexp[1];
+            if (m_cell_inter.empty())
+                ++m_iexp[1];
         }
     }
 }

@@ -81,6 +81,9 @@ public:
     // Read-only view of the emitted 2D intervals from the last run() call.
     // Valid until the next run() or run_single_var() call.
     const std::vector<GInterval2D> &emitted_intervals() const { return m_emitted_intervals; }
+    // 0-based index, into the scope given to run(), of the scope interval each
+    // emitted interval comes from (R: the scanner's last scope interval).
+    const std::vector<int64_t> &emitted_scope_idx() const { return m_emitted_scope_idx; }
 
     // Access the result array of the (only) registered var. Valid until
     // the next run_* call.
@@ -96,6 +99,7 @@ private:
     // State for run() / multi-var polymorphic path.
     size_t                  m_emitted{0};
     std::vector<GInterval2D> m_emitted_intervals;
+    std::vector<int64_t>     m_emitted_scope_idx;
 };
 
 #endif /* PMTRACKEXPRESSION2DSCANNER_H_ */

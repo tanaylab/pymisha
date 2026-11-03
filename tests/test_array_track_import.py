@@ -45,7 +45,7 @@ def test_csv_source_parses_header_and_intervals(tmp_path):
     ])
     src = _CSVSource(path)
     assert src.colnames == ["a", "b"]
-    intervals, vals = src.read_chrom("1")
+    intervals, vals = src.read_chrom("chr1")
     assert intervals.tolist() == [[0, 100], [100, 200]]
     assert vals.shape == (2, 2)
     assert vals[0].tolist() == [1.0, 2.0]
@@ -66,7 +66,7 @@ def test_csv_source_rejects_overlap(tmp_path):
     ])
     src = _CSVSource(path)
     with pytest.raises(ValueError, match="overlap"):
-        src.read_chrom("1")
+        src.read_chrom("chr1")
 
 
 def test_csv_source_rejects_zero_length(tmp_path):
@@ -75,7 +75,7 @@ def test_csv_source_rejects_zero_length(tmp_path):
     ])
     src = _CSVSource(path)
     with pytest.raises(ValueError, match="start coordinate exceeds"):
-        src.read_chrom("1")
+        src.read_chrom("chr1")
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +109,11 @@ def test_import_sources_single_csv(tmp_path):
     ])
     out_dir = tmp_path / "track"
     out_dir.mkdir()
-    chrom_order = ["1", "2", "X"]
+    chrom_order = ["chr1", "chr2", "chrX"]
     colnames = _import_sources(out_dir, [_CSVSource(csv)], chrom_order)
     assert colnames == ["a", "b"]
     write_colnames(out_dir, colnames)
-    query = pd.DataFrame({"chrom": ["1", "2"], "start": [0, 0], "end": [200, 50]})
+    query = pd.DataFrame({"chrom": ["chr1", "chr2"], "start": [0, 0], "end": [200, 50]})
     out = extract_array(out_dir, query, None, colnames, chrom_order=chrom_order)
     out = out.sort_values(["chrom", "start"]).reset_index(drop=True)
     assert out["a"].tolist() == [1.0, 3.0, 4.0]
@@ -129,12 +129,12 @@ def test_import_sources_two_csv_disjoint(tmp_path):
     ])
     out_dir = tmp_path / "track"
     out_dir.mkdir()
-    cols = _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["1", "2", "X"])
+    cols = _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["chr1", "chr2", "chrX"])
     assert cols == ["a", "b"]
     write_colnames(out_dir, cols)
-    query = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [200]})
+    query = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [200]})
     out = (
-        extract_array(out_dir, query, None, cols, chrom_order=["1", "2", "X"])
+        extract_array(out_dir, query, None, cols, chrom_order=["chr1", "chr2", "chrX"])
         .sort_values(["start"]).reset_index(drop=True)
     )
     assert out["start"].tolist() == [0, 100]
@@ -154,11 +154,11 @@ def test_import_sources_two_csv_shared_interval(tmp_path):
     ])
     out_dir = tmp_path / "track"
     out_dir.mkdir()
-    cols = _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["1", "2", "X"])
+    cols = _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["chr1", "chr2", "chrX"])
     assert cols == ["a", "b"]
     write_colnames(out_dir, cols)
-    query = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [100]})
-    out = extract_array(out_dir, query, None, cols, chrom_order=["1", "2", "X"]).reset_index(drop=True)
+    query = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [100]})
+    out = extract_array(out_dir, query, None, cols, chrom_order=["chr1", "chr2", "chrX"]).reset_index(drop=True)
     assert len(out) == 1
     assert out["a"].iloc[0] == 1.0
     assert out["b"].iloc[0] == 2.0
@@ -174,7 +174,7 @@ def test_import_sources_partial_overlap_raises(tmp_path):
     out_dir = tmp_path / "track"
     out_dir.mkdir()
     with pytest.raises(ValueError, match="overlaps interval"):
-        _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["1", "2", "X"])
+        _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["chr1", "chr2", "chrX"])
 
 
 def test_import_sources_chain_consistency_error(tmp_path):
@@ -187,7 +187,7 @@ def test_import_sources_chain_consistency_error(tmp_path):
     out_dir = tmp_path / "track"
     out_dir.mkdir()
     with pytest.raises(ValueError, match="Non matching values"):
-        _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["1", "2", "X"])
+        _import_sources(out_dir, [_CSVSource(csv1), _CSVSource(csv2)], ["chr1", "chr2", "chrX"])
 
 
 # ---------------------------------------------------------------------------

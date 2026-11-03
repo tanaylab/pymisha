@@ -1074,7 +1074,7 @@ def test_gvtrack_filter_kmer_count():
     """R test 36: kmer.count virtual track with filter."""
     pm.gvtrack_clear()
     pm.gvtrack_create("vt_kmer_cnt", None, func="kmer.count",
-                      kmer="ACGT", extend=True, strand=1)
+                      params={"kmer": "ACGT", "extend": True, "strand": 1})
     mask = pd.DataFrame({"chrom": ["chr1"], "start": [2000], "end": [4000]})
     pm.gvtrack_filter("vt_kmer_cnt", filter=mask)
 
@@ -1089,7 +1089,7 @@ def test_gvtrack_filter_kmer_frac():
     """R test 37: kmer.frac virtual track with filter."""
     pm.gvtrack_clear()
     pm.gvtrack_create("vt_kmer_frac", None, func="kmer.frac",
-                      kmer="CG", extend=False, strand=1)
+                      params={"kmer": "CG", "extend": False, "strand": 1})
     mask = pd.DataFrame({"chrom": ["chr1"], "start": [2000], "end": [4000]})
     pm.gvtrack_filter("vt_kmer_frac", filter=mask)
 
@@ -1122,7 +1122,7 @@ def test_gvtrack_filter_kmer_count_single_interval_iterator():
     """R test 39: kmer.count filter with single-interval iterator."""
     pm.gvtrack_clear()
     pm.gvtrack_create("vt_kmer_single", None, func="kmer.count",
-                      kmer="ACGT", extend=True, strand=1)
+                      params={"kmer": "ACGT", "extend": True, "strand": 1})
     mask = pd.DataFrame({"chrom": ["chr1"], "start": [2000], "end": [4000]})
     pm.gvtrack_filter("vt_kmer_single", filter=mask)
 
@@ -1132,7 +1132,7 @@ def test_gvtrack_filter_kmer_count_single_interval_iterator():
 
     # Compare with unfiltered: filtered should be <= unfiltered
     pm.gvtrack_create("vt_kmer_nofilter", None, func="kmer.count",
-                      kmer="ACGT", extend=True, strand=1)
+                      params={"kmer": "ACGT", "extend": True, "strand": 1})
     unfiltered_val = _single_value(pm.gextract("vt_kmer_nofilter", query, iterator=-1))
     assert filtered_val <= unfiltered_val
 

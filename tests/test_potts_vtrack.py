@@ -63,8 +63,7 @@ def _vt(name, func, model, **kwargs):
 
 def _n_run_end(chrom, limit=300000):
     """The 0-based position just past the first N run of ``chrom``, or None."""
-    all_iv = pm.gintervals_all()
-    size = int(all_iv.loc[all_iv["chrom"].astype(str) == str(chrom), "end"].iloc[0])
+    size = int(pm.gintervals(chrom)["end"].iloc[0])   # the whole chromosome
     s = _seq(chrom, 0, min(limit, size))
     m = re.search("N+", s)
     return None if m is None else m.end()
@@ -142,6 +141,24 @@ def test_a_whole_fitted_model_goes_into_params_verbatim_but_a_typo_does_not():
 
     with pytest.raises(ValueError, match="bidrect"):
         pm.gvtrack_create("pv_typo", None, "potts.max", bidrect=False, **m)
+
+
+def test_a_model_field_is_read_by_its_exact_name_only():
+    # misha 5.14.0: R read the model with `$`, which partial-matches, so a
+    # fitted model carrying `bidirectional` or `strand_prior` was scored with
+    # `bidirect` or `strand` taken from it. Those fields belong to the fit and
+    # must be ignored: the model scores as if they were absent.
+    m = potts_ref_model(4, npair_mode="sparse", seed=191)
+    fitted = dict(m, bidirectional=False, strand_prior=-1, extended=False)
+
+    iv = pm.gintervals(1, 2000, 2100)
+    pm.gvtrack_create("pv_fitted", None, "potts", params=fitted)
+    pm.gvtrack_create("pv_plain", None, "potts", params=m)
+    pm.gvtrack_create("pv_one_strand", None, "potts", params=dict(m, bidirect=False))
+    got = pm.gextract(["pv_fitted", "pv_plain", "pv_one_strand"], iv, iterator=iv)
+    assert got["pv_fitted"].iloc[0] == got["pv_plain"].iloc[0]
+    # and what a partial match would have produced is a different number
+    assert got["pv_one_strand"].iloc[0] != got["pv_plain"].iloc[0]
 
 
 def test_a_model_whose_window_score_cannot_fit_a_float_is_rejected():
@@ -578,6 +595,35 @@ def test_the_sliding_cache_returns_what_the_seeded_path_returns(orient, geom):
             fn, dict(m, **o, extend=True, score_thresh=th), pad, iv,
             info=f"{orient} {nm} {fn}", it=it, check_varies=varies,
         )
+
+
+def test_an_odd_w_potts_vtrack_scores_like_gseq_potts_seeded_and_slid():
+    # The blocked kernel reads block codes up to i + W - 1 for an odd W (its
+    # trailing size-1 block), one further than for an even W, so the block-code
+    # ranges PottsScorer fills on the seeded and the slid paths are only fully
+    # exercised at an odd W. Every other test in this file uses an even W.
+    w = 9
+    m = potts_ref_model(w, npair_mode="full", seed=151)
+
+    iv = pm.gintervals(1, 200, 300)
+    seq_ext = _seq(1, 200, 300 + w - 1)
+    _vt("p_lse", "potts", m, bidirect=True, extend=True)
+    _vt("p_max", "potts.max", m, bidirect=True, extend=True)
+    got = pm.gextract(["p_lse", "p_max"], iv, iterator=iv)
+    assert got["p_lse"].iloc[0] == pytest.approx(
+        float(pm.gseq_potts(seq_ext, m, mode="lse", bidirect=True)[0]), rel=1e-5)
+    assert got["p_max"].iloc[0] == pytest.approx(
+        float(pm.gseq_potts(seq_ext, m, mode="max", bidirect=True)[0]), rel=1e-5)
+
+    iv = pm.gintervals(1, 5000, 5100)
+    for o in _ORIENTS.values():
+        th = _potts_cache_thresh(m, iv, 40, o["bidirect"], o["strand"])
+        for it in (1, 7):
+            for fn in _FUNCS:
+                _assert_potts_cache_agrees(
+                    fn, dict(m, **o, extend=True, score_thresh=th), 40, iv,
+                    info=f"W = 9, bidirect {o['bidirect']} iterator {it} {fn}", it=it,
+                )
 
 
 def test_the_potts_cache_re_seeds_where_the_chromosome_end_clips_the_fetch():

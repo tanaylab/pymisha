@@ -84,6 +84,7 @@ private:
     std::string                  m_track_name;
     std::string                  m_track_path;
     bool                         m_is_points{false};
+    bool                         m_is_computed{false};
 
     // Indexed-format index (may be nullptr if the track is per-pair).
     std::shared_ptr<TrackIndex2D> m_index;

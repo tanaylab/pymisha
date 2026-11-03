@@ -37,7 +37,7 @@ def test_pm_import_mappedseq_pileup_negative(tmp_path):
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        inp.write_text("A\t1\t10\t+\n")
+        inp.write_text("A\tchr1\t10\t+\n")
         with pytest.raises(Exception, match="pileup cannot be negative"):
             _pymisha.pm_import_mappedseq(
                 _track_dir(root, "x"), str(inp),
@@ -52,7 +52,7 @@ def test_pm_import_mappedseq_sparse_requires_binsize_minus_one(tmp_path):
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        inp.write_text("A\t1\t10\t+\n")
+        inp.write_text("A\tchr1\t10\t+\n")
         with pytest.raises(Exception, match="binsize must be -1"):
             _pymisha.pm_import_mappedseq(
                 _track_dir(root, "x"), str(inp),
@@ -67,7 +67,7 @@ def test_pm_import_mappedseq_dense_requires_positive_binsize(tmp_path):
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        inp.write_text("A\t1\t10\t+\n")
+        inp.write_text("A\tchr1\t10\t+\n")
         with pytest.raises(Exception, match="binsize must be > 0"):
             _pymisha.pm_import_mappedseq(
                 _track_dir(root, "x"), str(inp),
@@ -82,7 +82,7 @@ def test_pm_import_mappedseq_cols_order_dupes(tmp_path):
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        inp.write_text("A\t1\t10\t+\n")
+        inp.write_text("A\tchr1\t10\t+\n")
         with pytest.raises(Exception, match="share index"):
             _pymisha.pm_import_mappedseq(
                 _track_dir(root, "x"), str(inp),
@@ -111,7 +111,7 @@ def test_pm_import_mappedseq_returns_dict(tmp_path):
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        inp.write_text("A\t1\t10\t+\n")
+        inp.write_text("A\tchr1\t10\t+\n")
         result = _pymisha.pm_import_mappedseq(
             _track_dir(root, "x"), str(inp),
             0, -1, (1, 2, 3, 4), True,
@@ -132,11 +132,11 @@ def test_pm_import_mappedseq_parser_counts_basic(tmp_path):
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
         inp.write_text(
-            "A\t1\t10\t+\n"          # mapped
-            "A\t1\t20\t-\n"          # mapped
+            "A\tchr1\t10\t+\n"          # mapped
+            "A\tchr1\t20\t-\n"          # mapped
             "A\tchrZZ\t30\t+\n"      # unknown chrom -> unmapped
-            "A\t1\tNOTNUM\t+\n"      # bad coord -> unmapped
-            "A\t1\t10\t?\n",         # bad strand -> unmapped
+            "A\tchr1\tNOTNUM\t+\n"      # bad coord -> unmapped
+            "A\tchr1\t10\t?\n",         # bad strand -> unmapped
             encoding="utf-8",
         )
         res = _pymisha.pm_import_mappedseq(
@@ -157,9 +157,9 @@ def test_pm_import_mappedseq_parser_sam_mode(tmp_path):
         inp = tmp_path / "in.sam"
         inp.write_text(
             "@HD\tVN:1.6\n"
-            "@SQ\tSN:1\tLN:500000\n"
-            "r1\t0\t1\t100\t30\t5M\t*\t0\t0\tAAAAA\t*\n"   # flag=0 -> +
-            "r2\t16\t1\t200\t30\t5M\t*\t0\t0\tAAAAA\t*\n"  # flag=16 -> -
+            "@SQ\tSN:chr1\tLN:500000\n"
+            "r1\t0\tchr1\t100\t30\t5M\t*\t0\t0\tAAAAA\t*\n"   # flag=0 -> +
+            "r2\t16\tchr1\t200\t30\t5M\t*\t0\t0\tAAAAA\t*\n"  # flag=16 -> -
             "r3\t4\tunknown\t1\t0\t*\t*\t0\t0\t*\t*\n",     # unknown chrom -> unmapped
             encoding="utf-8",
         )
@@ -181,8 +181,8 @@ def test_pm_import_mappedseq_parser_gzip(tmp_path):
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv.gz"
         with gzip.open(inp, "wt") as fh:
-            fh.write("A\t1\t10\t+\n")
-            fh.write("A\t1\t20\t-\n")
+            fh.write("A\tchr1\t10\t+\n")
+            fh.write("A\tchr1\t20\t-\n")
         res = _pymisha.pm_import_mappedseq(
             _track_dir(root, "x"), str(inp),
             0, -1, (1, 2, 3, 4), True,
@@ -211,7 +211,7 @@ def test_pm_import_mappedseq_dense_single_read(tmp_path):
     """Single +read with pileup=5, coord=100 -> covers [100, 105], single bin."""
     try:
         res, root = _pileup_via_cpp(
-            tmp_path, ["AAAAA\t1\t100\t+\n"], pileup=5, binsize=5,
+            tmp_path, ["AAAAA\tchr1\t100\t+\n"], pileup=5, binsize=5,
         )
         assert res["total"]["total.mapped"] == 1.0
         out = pm.gextract(
@@ -230,7 +230,7 @@ def test_pm_import_mappedseq_dense_minus_strand_extension(tmp_path):
     So the pileup window is [100, 105], same as +strand at coord=100."""
     try:
         res, root = _pileup_via_cpp(
-            tmp_path, ["AAAAA\t1\t100\t-\n"], pileup=5, binsize=5,
+            tmp_path, ["AAAAA\tchr1\t100\t-\n"], pileup=5, binsize=5,
         )
         assert res["total"]["total.mapped"] == 1.0
         out = pm.gextract(
@@ -249,7 +249,7 @@ def test_pm_import_mappedseq_dense_dedup_counts(tmp_path):
     try:
         res, root = _pileup_via_cpp(
             tmp_path,
-            ["AAAAA\t1\t100\t+\n", "AAAAA\t1\t100\t+\n"],
+            ["AAAAA\tchr1\t100\t+\n", "AAAAA\tchr1\t100\t+\n"],
             pileup=5, binsize=5,
         )
         assert res["total"]["total.mapped"] == 2.0
@@ -270,7 +270,7 @@ def test_pm_import_mappedseq_sparse_dedup_value(tmp_path):
     try:
         res, root = _pileup_via_cpp(
             tmp_path,
-            ["AAAAA\t1\t100\t+\n", "AAAAA\t1\t100\t+\n", "AAAAA\t1\t100\t+\n"],
+            ["AAAAA\tchr1\t100\t+\n", "AAAAA\tchr1\t100\t+\n", "AAAAA\tchr1\t100\t+\n"],
             pileup=0, binsize=-1, track_name="ms1",
         )
         assert res["total"]["total.mapped"] == 3.0  # raw count
@@ -291,9 +291,9 @@ def test_pm_import_mappedseq_sparse_keep_dups(tmp_path):
         pm.gdb_init(str(root))
         inp = tmp_path / "m.tsv"
         inp.write_text(
-            "A\t1\t100\t+\n"
-            "A\t1\t100\t+\n"
-            "A\t1\t100\t+\n",
+            "A\tchr1\t100\t+\n"
+            "A\tchr1\t100\t+\n"
+            "A\tchr1\t100\t+\n",
         )
         track_dir = str(root / "tracks" / "ms2.track")
         res = _pymisha.pm_import_mappedseq(
@@ -318,7 +318,7 @@ def test_pm_import_mappedseq_sparse_strands_merge_same_coord(tmp_path):
     try:
         res, root = _pileup_via_cpp(
             tmp_path,
-            ["AAAAA\t1\t100\t+\n", "AAAAA\t1\t95\t-\n"],
+            ["AAAAA\tchr1\t100\t+\n", "AAAAA\tchr1\t95\t-\n"],
             pileup=0, binsize=-1, track_name="ms3",
         )
         assert res["total"]["total.mapped"] == 2.0
@@ -339,7 +339,7 @@ def test_pm_import_mappedseq_sparse_two_coords(tmp_path):
     try:
         res, root = _pileup_via_cpp(
             tmp_path,
-            ["AAAAA\t1\t100\t+\n", "AAAAA\t1\t200\t+\n"],
+            ["AAAAA\tchr1\t100\t+\n", "AAAAA\tchr1\t200\t+\n"],
             pileup=0, binsize=-1, track_name="ms4",
         )
         assert res["total"]["total.mapped"] == 2.0
@@ -357,7 +357,7 @@ def test_pm_import_mappedseq_dense_multibin(tmp_path):
     """Read at coord=10 with pileup=15, binsize=5 covers [10, 25] -> bins 2,3,4 fully."""
     try:
         res, root = _pileup_via_cpp(
-            tmp_path, ["AAAAA\t1\t10\t+\n"], pileup=15, binsize=5,
+            tmp_path, ["AAAAA\tchr1\t10\t+\n"], pileup=15, binsize=5,
         )
         assert res["total"]["total.mapped"] == 1.0
         out = pm.gextract(
@@ -384,7 +384,7 @@ def test_pm_import_mappedseq_stdin_dash(tmp_path):
     a child Python process so we don't trample the pytest stdin."""
     root = _copy_db(tmp_path)
     sam = tmp_path / "reads.sam"
-    sam.write_text("A\t1\t10\t+\nA\t1\t20\t-\n")
+    sam.write_text("A\tchr1\t10\t+\nA\tchr1\t20\t-\n")
     track_dir = str(root / "tracks" / "stdin_test.track")
     repo_root = str(Path(__file__).resolve().parent.parent)
 

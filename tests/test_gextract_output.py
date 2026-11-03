@@ -82,6 +82,25 @@ class TestGextractFileOutput1D:
         )
         assert result is None
 
+    def test_file_mode(self, tmp_path):
+        """R parity: R misha writes the file from C++ under umask 007, so a new file is
+        0660 whatever the caller's umask, and a file it replaces is written in place and
+        keeps its permission bits."""
+        intervals = pm.gintervals("1", 0, 1000)
+        new = tmp_path / "new.tsv"
+        old_file = tmp_path / "old.tsv"
+        old_file.write_text("existing\n")
+        os.chmod(old_file, 0o604)
+        prev = os.umask(0o022)
+        try:
+            pm.gextract("dense_track", intervals, iterator=200, file=str(new), progress=False)
+            pm.gextract("dense_track", intervals, iterator=200, file=str(old_file), progress=False)
+        finally:
+            os.umask(prev)
+        assert new.stat().st_mode & 0o777 == 0o660
+        assert old_file.stat().st_mode & 0o777 == 0o604
+        assert len(pd.read_csv(old_file, sep="\t")) == 5
+
 
 # ── 1D intervals_set_out ─────────────────────────────────────────────
 
@@ -93,16 +112,16 @@ class TestGextractIntervalsSetOut1D:
         iset_name = "test.gextract_iset_1d"
         try:
             intervals = pm.gintervals("1", 0, 1000)
-            df = pm.gextract(
+            result = pm.gextract(
                 "dense_track", intervals, iterator=200,
                 intervals_set_out=iset_name, progress=False
             )
-            # Should still return the DataFrame
-            assert df is not None
-            assert len(df) == 5
+            # R parity: nothing is returned when the result goes to an interval set
+            assert result is None
 
             loaded = pm.gintervals_load(iset_name)
             assert loaded is not None
+            assert len(loaded) == 5
             assert "chrom" in loaded.columns
             assert "start" in loaded.columns
             assert "end" in loaded.columns
@@ -114,10 +133,11 @@ class TestGextractIntervalsSetOut1D:
         iset_name = "test.gextract_iset_coords"
         try:
             intervals = pm.gintervals("1", 0, 2000)
-            df = pm.gextract(
+            df = pm.gextract("dense_track", intervals, iterator=500, progress=False)
+            assert pm.gextract(
                 "dense_track", intervals, iterator=500,
                 intervals_set_out=iset_name, progress=False
-            )
+            ) is None
             loaded = pm.gintervals_load(iset_name)
             # The saved coords should be deduplicated extraction output coords
             expected_coords = (
@@ -153,7 +173,6 @@ class TestGextractBothParams1D:
                 "dense_track", intervals, iterator=200,
                 file=str(out), intervals_set_out=iset_name, progress=False
             )
-            # file takes precedence -> returns None
             assert result is None
             # file was written
             assert out.exists()
@@ -215,15 +234,15 @@ class TestGextractIntervalsSetOut2D:
         iset_name = "test.gextract_iset_2d"
         try:
             intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-            df = pm.gextract(
+            result = pm.gextract(
                 "rects_track", intervals,
                 intervals_set_out=iset_name, progress=False
             )
-            assert df is not None
-            assert len(df) > 0
+            assert result is None
 
             loaded = pm.gintervals_load(iset_name)
             assert loaded is not None
+            assert len(loaded) > 0
             assert "chrom1" in loaded.columns
             assert "start1" in loaded.columns
             assert "end2" in loaded.columns

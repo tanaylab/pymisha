@@ -1241,3 +1241,83 @@ class TestPwmSlidingWindowManualBaseline:
         got = res["pwm_zero_prior_slide"].to_numpy(dtype=float)
         assert not np.isnan(got).any()
         np.testing.assert_allclose(got, manual, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# The answer must not depend on which path computed it (misha 5.14.0, PR #179)
+# ---------------------------------------------------------------------------
+
+_PATH_FUNCS = ("pwm", "pwm.max", "pwm.max.pos", "pwm.count")
+_PATH_STRANDS = {
+    "bidirect": {"bidirect": True},
+    "plus": {"bidirect": False, "strand": 1},
+    "minus": {"bidirect": False, "strand": -1},
+}
+
+
+def _path_thresh(pssm):
+    """A pwm.count threshold in a wide gap between per-anchor scores, near the
+    top 5%, so no anchor sits on it."""
+    pm.gvtrack_create("path_anchor", None, "pwm.max", pssm=pssm, prior=0.01)
+    scope = pm.gintervals("1", 0, 20000)
+    v = pm.gextract("path_anchor", scope, iterator=1)["path_anchor"].to_numpy()
+    pm.gvtrack_rm("path_anchor")
+    v = np.unique(v[np.isfinite(v)])
+    q = int(np.searchsorted(v, np.quantile(v, 0.95)))
+    k = q - 50 + int(np.argmax(np.diff(v[q - 50:q + 50])))
+    assert v[k + 1] - v[k] > 1e-3, "no usable gap near the 95th percentile"
+    return float((v[k] + v[k + 1]) / 2)
+
+
+class TestPwmSlidingWindowPathIndependence:
+    """A scan whose next interval cannot reuse the window answers it without
+    building the cache (PWMScorer::reduce_window), and one that can slides it.
+    Each interval must still get exactly the number it gets when scored on its
+    own: `pwm` used to come back from the uncached path un-rounded to float,
+    so it depended on its neighbours by up to ~2e-07 (misha 5.14.0)."""
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        _remove_all_vtracks()
+        yield
+        _remove_all_vtracks()
+
+    @pytest.mark.parametrize("strand", list(_PATH_STRANDS))
+    @pytest.mark.parametrize("geom", ["sparse", "tiled", "overlapping"])
+    def test_a_batch_equals_each_interval_scored_alone(self, strand, geom):
+        pssm = _make_random_pssm(8)
+        thresh = _path_thresh(pssm)
+        names = [f"path_{f.replace('.', '_')}" for f in _PATH_FUNCS]
+        for name, func in zip(names, _PATH_FUNCS, strict=True):
+            kw = dict(pssm=pssm, prior=0.01, **_PATH_STRANDS[strand])
+            if func == "pwm.count":
+                kw["score_thresh"] = thresh
+            pm.gvtrack_create(name, None, func, **kw)
+            if geom == "overlapping":
+                pm.gvtrack_iterator(name, sshift=-250, eshift=250)
+
+        if geom == "sparse":
+            # same width, gaps between them: no interval can slide onto the
+            # previous one, so every one after the first takes the uncached path
+            starts = np.arange(1000, 41000, 2000)
+            ivs = pd.DataFrame({"chrom": "1", "start": starts, "end": starts + 500})
+        elif geom == "tiled":
+            starts = np.arange(1000, 21000, 1000)
+            ivs = pd.DataFrame({"chrom": "1", "start": starts, "end": starts + 1000})
+        else:
+            starts = np.arange(5000, 7000, 100)
+            ivs = pd.DataFrame({"chrom": "1", "start": starts, "end": starts + 100})
+
+        batch = pm.gextract(names, ivs, iterator=ivs).sort_values("start")
+        alone = pd.concat(
+            [pm.gextract(names, ivs.iloc[[i]], iterator=ivs.iloc[[i]]) for i in range(len(ivs))]
+        ).sort_values("start")
+
+        assert len(batch) == len(alone) == len(ivs)
+        for name in names:
+            got = batch[name].to_numpy(dtype=float)
+            want = alone[name].to_numpy(dtype=float)
+            assert np.isfinite(want).all(), name
+            np.testing.assert_array_equal(got, want, err_msg=name)
+        # pwm.count must actually count something, or its comparison says nothing
+        assert batch["path_pwm_count"].sum() > 0

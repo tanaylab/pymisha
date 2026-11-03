@@ -118,6 +118,25 @@ class TestPwmPositionStrand:
         r = pm.gextract("tail", intervals=iv, iterator=iv)
         assert np.isnan(r["tail"].iloc[0])
 
+    @pytest.mark.parametrize("strand", [0, 1, -1])  # 0: bidirect
+    def test_pos_is_nan_when_no_anchor_is_scorable(self, strand):
+        """A zero prior gives a hard-zero PSSM a score of -inf at every anchor
+        that misses its word. With the word nowhere in the interval nothing is
+        scorable, so there is no position to report: NaN, not one made up from
+        the scan's starting point (misha 5.14.0, where it was a random 1.8e19)."""
+        word = "GATTACAGATTACA"
+        iv = pm.gintervals("1", 1000, 3000)
+        seq = str(pm.gseq_extract(pm.gintervals("1", 1000, 3000 + len(word)))[0]).upper()
+        assert word not in seq and _rc(word) not in seq
+        pssm = np.zeros((len(word), 4))
+        for i, base in enumerate(word):
+            pssm[i, "ACGT".index(base)] = 1.0
+        kw = {"bidirect": True} if strand == 0 else {"bidirect": False, "strand": strand}
+        pm.gvtrack_create("nopos", None, "pwm.max.pos", pssm=pssm, prior=0, **kw)
+        r = pm.gextract("nopos", intervals=iv, iterator=500)
+        assert len(r) == 4
+        assert np.isnan(r["nopos"].to_numpy(dtype=float)).all()
+
 
 class TestPwmLseEditDistancePos:
     """The LSE scorer's reverse pass indexes a reverse-complemented copy."""

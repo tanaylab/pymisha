@@ -10,6 +10,9 @@
 #include <cstring>
 #include <limits>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <mutex>
+#include <unordered_map>
 
 #include <string>
 #include "PMTrackExpressionVars.h"
@@ -22,6 +25,104 @@
 #include "KmerCounter.h"
 #include "MaskedBpCounter.h"
 #include "GenomeSeqFetch.h"
+#include "BufferedFile.h"
+#include "PMDb.h"
+#include "TrackIndex.h"
+#include "pmutils.h"
+
+namespace {
+
+// R misha's check of a dense track (TrackExprScanner): every chromosome the track holds
+// has ceil(chromosome size / bin size) bins. A track whose files or index entries belong
+// to other chromosomes fails it, e.g. an indexed track keyed by other chrom ids (such as
+// one that pymisha 0.14 or earlier converted in a per-chromosome database).
+void check_dense_num_bins_now(const std::string &track_name, const std::string &track_dir)
+{
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    const int num_chroms = (int)chromkey.get_num_chroms();
+    auto check = [&](int chromid, int64_t num_samples, int64_t bin_size) {
+        const int64_t expected = (int64_t)ceil(chromkey.get_chrom_size(chromid) / (double)bin_size);
+        if (num_samples != expected)
+            TGLError("Number of bins in track %s, chrom %s do not match the chromosome size "
+                     "(expecting: %lld, reading: %lld)",
+                     track_name.c_str(), chromkey.id2chrom(chromid).c_str(),
+                     (long long)expected, (long long)num_samples);
+    };
+
+    int32_t bin_size = 0;
+    auto idx = GenomeTrack::get_track_index(track_dir);
+    if (idx) {
+        const std::string dat_path = track_dir + "/track.dat";
+        for (const auto &entry : idx->get_all_entries()) {
+            if (entry.length == 0)
+                continue;
+            if (!bin_size) {
+                BufferedFile bf;
+                if (bf.open(dat_path.c_str(), "rb"))
+                    TGLError("Cannot open %s: %s", dat_path.c_str(), strerror(errno));
+                if (bf.seek((long)entry.offset, SEEK_SET) ||
+                    bf.read(&bin_size, sizeof(bin_size)) != sizeof(bin_size) || bin_size <= 0)
+                    TGLError("Invalid fixed-bin header in %s", dat_path.c_str());
+            }
+            if (entry.length < sizeof(bin_size) || (entry.length - sizeof(bin_size)) % sizeof(float))
+                TGLError("Invalid fixed-bin format in %s", dat_path.c_str());
+            if ((int64_t)entry.chrom_id >= num_chroms)
+                TGLError("Track %s index references chromosome id %u outside the current genome (stale index?)",
+                         track_name.c_str(), entry.chrom_id);
+            check((int)entry.chrom_id, (int64_t)((entry.length - sizeof(bin_size)) / sizeof(float)), bin_size);
+        }
+        return;
+    }
+
+    // a file per chromosome, named by any of its names (GenomeTrack::ChromFiles)
+    const GenomeTrack::ChromFiles &files = g_pmdb->chrom_files(track_dir);
+    for (int chromid : files.chromids()) {
+        const std::string path = files.path(chromid);
+        BufferedFile bf;
+        if (bf.open(path.c_str(), "rb"))
+            TGLError("Cannot open %s: %s", path.c_str(), strerror(errno));
+        if (bf.read(&bin_size, sizeof(bin_size)) != sizeof(bin_size) || bin_size <= 0)
+            TGLError("Invalid format of a dense track file %s", path.c_str());
+        const uint64_t data_bytes = bf.file_size() - sizeof(bin_size);
+        if (data_bytes % sizeof(float))
+            TGLError("Invalid format of a dense track file %s", path.c_str());
+        check(chromid, (int64_t)(data_bytes / sizeof(float)), bin_size);
+    }
+}
+
+// The modification times of a track directory and of its track.idx (0 if none), which
+// change when a file of the track is added, removed, renamed or its index rewritten.
+std::pair<int64_t, int64_t> track_dir_mtimes(const std::string &track_dir)
+{
+    auto mtime = [](const std::string &path) -> int64_t {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0)
+            return 0;
+        return (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+    };
+    return {mtime(track_dir), mtime(track_dir + "/track.idx")};
+}
+
+// check_dense_num_bins_now, skipped for a track already checked in this database since its
+// files last changed. R checks on every call; that is an open per chromosome file, which
+// made a small gextract of a dense hg38 track (455 files, over NFS) take 97 ms instead of 5.
+void check_dense_num_bins(const std::string &track_name, const std::string &track_dir)
+{
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::pair<std::string, std::pair<int64_t, int64_t>>> checked;
+    const auto mtimes = track_dir_mtimes(track_dir);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = checked.find(track_dir);
+        if (it != checked.end() && it->second.first == g_pmdb->groot() && it->second.second == mtimes)
+            return;
+    }
+    check_dense_num_bins_now(track_name, track_dir);
+    std::lock_guard<std::mutex> lock(mutex);
+    checked[track_dir] = {g_pmdb->groot(), mtimes};
+}
+
+}  // namespace
 
 // ---- helpers for reading Python spec dicts (same logic as PMVTrack.cpp) ----
 namespace {
@@ -218,6 +319,8 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
     }
 
     if (track_type == GenomeTrack::FIXED_BIN) {
+        check_dense_num_bins(track_name, var.track_path);
+
         // Create fixed bin track object
         var.track = std::make_unique<GenomeTrackFixedBin>();
         auto *fixed_bin = static_cast<GenomeTrackFixedBin *>(var.track.get());
@@ -225,7 +328,7 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
         // Pre-load bin size from first available chromosome to enable proper iterator selection
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
         for (unsigned i = 0; i < chromkey.get_num_chroms(); ++i) {
-            std::string chrom_file = GenomeTrack::find_existing_1d_filename(chromkey, var.track_path, i);
+            std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(i);
             if (!chrom_file.empty()) {
                 std::string full_path = var.track_path + "/" + chrom_file;
                 fixed_bin->init_read(full_path.c_str(), i);
@@ -424,8 +527,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             GenomeTrackSparse *sparse = static_cast<GenomeTrackSparse *>(var.track.get());
 
             if (var.cur_chromid != interval.chromid) {
-                std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-                    g_pmdb->chromkey(), var.track_path, interval.chromid);
+                std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(interval.chromid);
 
                 std::string full_path = var.track_path + "/" + chrom_file;
                 // Indexed tracks have no per-chrom file (data is in track.dat via
@@ -458,8 +560,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             GenomeTrackArray *array = static_cast<GenomeTrackArray *>(var.track.get());
 
             if (var.cur_chromid != interval.chromid) {
-                std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-                    g_pmdb->chromkey(), var.track_path, interval.chromid);
+                std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(interval.chromid);
                 std::string full_path = var.track_path + "/" + chrom_file;
                 // Indexed tracks have no per-chrom file (data is in track.dat via
                 // track.idx); init_read reads through the index. Only gate on the
@@ -491,8 +592,7 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
         // Load chromosome if needed
         if (var.cur_chromid != interval.chromid) {
             // Find the chromosome file in the track directory
-            std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-                g_pmdb->chromkey(), var.track_path, interval.chromid);
+            std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(interval.chromid);
 
             if (chrom_file.empty()) {
                 // Chromosome not found in track
@@ -795,7 +895,6 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
             // Standard PWM scoring: pwm, pwm.max, pwm.max.pos, pwm.count
             std::vector<float> spat_factor;
             int spat_bin = (int)vt_obj_to_int64(vt_dict_get(spec, "spat_bin"), 1);
-            bool has_spat = false;
             if (PyObject *spat = vt_dict_get(spec, "spat_factor")) {
                 PMPY arr(PyArray_FROM_OTF(spat, NPY_DOUBLE, NPY_ARRAY_ALIGNED | NPY_ARRAY_FORCECAST), true);
                 if (arr && PyArray_NDIM((PyArrayObject *)*arr) == 1) {
@@ -804,13 +903,16 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
                     for (npy_intp i = 0; i < n; ++i) {
                         spat_factor[i] = (float)(*(double *)PyArray_GETPTR1((PyArrayObject *)*arr, i));
                     }
-                    has_spat = true;
                 }
             }
 
-            int64_t spat_min = vt_obj_to_int64(vt_dict_get(spec, "spat_min"), 0);
-            int64_t spat_max = vt_obj_to_int64(vt_dict_get(spec, "spat_max"), 0);
-            if (has_spat && spat_max > spat_min) {
+            // R's PWMParams::parse(): spat_min / spat_max (already 0-based anchor
+            // starts, see _convert_spat_range) apply whenever either is given,
+            // with or without spat_factor; a missing end stays open.
+            bool has_smin = false, has_smax = false;
+            int64_t spat_min = vt_obj_to_int64(vt_dict_get(spec, "spat_min"), 0, &has_smin);
+            int64_t spat_max = vt_obj_to_int64(vt_dict_get(spec, "spat_max"), DnaPSSM::NO_RANGE_CAP, &has_smax);
+            if (has_smin || has_smax) {
                 pssm.set_range((int)spat_min, (int)spat_max);
             }
 
@@ -845,7 +947,7 @@ void PMTrackExpressionVars::build_vtrack_scorer(VTrackVar &vvar, PyObject *spec)
         // reason recorded next to that clamp.
         vvar.scorer = std::make_unique<PottsScorer>(
             pp.model, vvar.seqfetch.get(), pp.extend_flag, potts_mode,
-            pp.bidirect, pp.strand_mode, pp.score_thresh);
+            pp.bidirect, pp.strand_mode, pp.score_thresh, pp.max_edits);
     } else if (func == "kmer.count" || func == "kmer.frac") {
         std::string kmer = vt_obj_to_string(vt_dict_get(spec, "kmer"), "");
         if (kmer.empty()) {
@@ -1040,12 +1142,10 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
     }
 
     const std::string &func = vvar.func;
-    const GenomeChromKey &chromkey = g_pmdb->chromkey();
 
     // Load chromosome if needed
     if (vvar.src_cur_chromid != eval.chromid) {
-        std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-            chromkey, vvar.src_track_path, eval.chromid);
+        std::string chrom_file = g_pmdb->chrom_files(vvar.src_track_path).filename(eval.chromid);
         std::string full_path = vvar.src_track_path + "/" + chrom_file;
         // Indexed tracks have no per-chrom file; init_read reads through
         // track.idx. Gating on the per-chrom file made value-based vtracks over
@@ -1262,4 +1362,33 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
     }
 
     return std::numeric_limits<double>::quiet_NaN();
+}
+
+void PMTrackExpressionVars::set_substitution(const SeqSubstitution &sub)
+{
+    if (sub == m_substitution)
+        return;
+    m_substitution = sub;
+    // Each sequence vtrack reads through its own fetcher, so each gets it. The
+    // pwm and potts scorers also keep scores of earlier reads between calls.
+    for (auto &vvar : m_vtrack_vars) {
+        if (!vvar.scorer)
+            continue;
+        vvar.seqfetch->set_substitution(sub);
+        if (auto *pwm = dynamic_cast<PWMScorer *>(vvar.scorer.get()))
+            pwm->invalidate_cache();
+        else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get()))
+            potts->invalidate_cache();
+    }
+}
+
+std::vector<std::pair<int64_t, int64_t>> PMTrackExpressionVars::seq_read_offsets() const
+{
+    std::vector<std::pair<int64_t, int64_t>> offs;
+    for (const auto &vvar : m_vtrack_vars) {
+        if (!vvar.scorer)
+            continue;
+        offs.emplace_back(vvar.sshift, vvar.eshift + vvar.scorer->read_extension());
+    }
+    return offs;
 }

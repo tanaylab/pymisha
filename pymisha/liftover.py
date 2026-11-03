@@ -14,16 +14,16 @@ Strand note: intervals APIs use {-1,0,1}, while chain-derived columns
 from __future__ import annotations
 
 import heapq
+import math
 import os
 import struct
-from collections import defaultdict
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from . import _shared
 from ._crc64 import (
     crc64_finalize as _crc64_finalize,
 )
@@ -33,7 +33,7 @@ from ._crc64 import (
 from ._crc64 import (
     crc64_init as _crc64_init,
 )
-from ._shared import _checkroot, _pm_dbreload, _pymisha
+from ._shared import _checkroot, _pm_dbreload, _pymisha, _sort_by_chrom, _with_canonical_chroms
 from .intervals import gintervals_all
 
 # ---------------------------------------------------------------------------
@@ -41,11 +41,13 @@ from .intervals import gintervals_all
 # ---------------------------------------------------------------------------
 
 _SRC_POLICIES = {"error", "keep", "discard"}
-_TGT_POLICIES = {
-    "error", "auto", "auto_first", "auto_longer", "auto_score",
-    "discard", "keep", "agg",
+_CLUSTER_TGT_POLICIES = (
     "best_source_cluster", "best_cluster_union",
     "best_cluster_sum", "best_cluster_max",
+)
+_TGT_POLICIES = {
+    "error", "auto", "auto_first", "auto_longer", "auto_score",
+    "discard", "keep", "agg", *_CLUSTER_TGT_POLICIES,
 }
 
 _EMPTY_CHAIN_COLS = [
@@ -1908,7 +1910,9 @@ def gintervals_liftover(
             min_score=min_score,
         )
     else:
-        chain_df = chain
+        # a target chromosome named by an alias (such as "1" for chr1) is the
+        # database's chromosome, as in misha
+        chain_df = _with_canonical_chroms(chain)
 
     if chain_df.empty:
         cols = ["chrom", "start", "end", "intervalID", "chain_id"]
@@ -1957,8 +1961,8 @@ def gintervals_liftover(
     if helper_cols:
         result = result.drop(columns=helper_cols)
 
-    # Sort by target coordinates
-    return result.sort_values(["chrom", "start", "end"]).reset_index(drop=True)
+    # Sort by target coordinates, a chromosome by its id
+    return _sort_by_chrom(result, ["chrom", "start", "end"])
 
 
 
@@ -2015,20 +2019,46 @@ def _canonic_merge(
 # Public API: gtrack_liftover
 # ===================================================================
 
-# Supported aggregation functions for multi-target value merging
-_AGG_FUNCS = {
-    "mean": lambda v: np.nanmean(v),
-    "median": lambda v: np.nanmedian(v),
-    "sum": lambda v: np.nansum(v),
-    "min": lambda v: np.nanmin(v),
-    "max": lambda v: np.nanmax(v),
-    "count": lambda v: np.sum(~np.isnan(v)),
-    "first": lambda v: v[~np.isnan(v)][0] if np.any(~np.isnan(v)) else np.nan,
-    "last": lambda v: v[~np.isnan(v)][-1] if np.any(~np.isnan(v)) else np.nan,
-}
+# The multi_target_agg values gtrack_liftover accepts, as R's gtrack.liftover
+_TRACK_LIFTOVER_AGGS = (
+    "mean", "median", "sum", "min", "max", "count", "first", "last", "nth",
+    "max.coverage_len", "min.coverage_len", "max.coverage_frac", "min.coverage_frac",
+)
+
+
+def _nth_param(multi_target_agg: str, params: dict[str, Any] | int | None) -> int:
+    """The 1-based n of multi_target_agg="nth" (0 for any other), validated as R's gtrack.liftover.
+
+    *params* is the n itself or a dict holding it as "n" (or as its only value).
+    """
+    if multi_target_agg not in _TRACK_LIFTOVER_AGGS:
+        raise ValueError(
+            f"Unsupported aggregation: {multi_target_agg}. "
+            f"Supported: {', '.join(_TRACK_LIFTOVER_AGGS)}"
+        )
+    if multi_target_agg != "nth":
+        if params is not None:
+            raise ValueError(f"params is only supported for 'nth' aggregation, not '{multi_target_agg}'")
+        return 0
+    if params is None:
+        raise ValueError("params must be supplied for 'nth' aggregation (e.g. params=2 or params={'n': 2})")
+    n: Any = params
+    if isinstance(params, dict):
+        if "n" in params:
+            n = params["n"]
+        elif len(params) == 1:
+            n = next(iter(params.values()))
+        else:
+            raise ValueError("params must contain a single numeric value (or 'n') for 'nth'")
+    if isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, float, np.integer, np.floating)) or np.isnan(n):
+        raise ValueError("params for 'nth' must be a single positive integer")
+    if int(n) <= 0:
+        raise ValueError("params for 'nth' must be a positive integer")
+    return int(n)
 
 
 _TRACK_IDX_MAGIC = b"MISHATDX"
+_TRACK_IDX_2D_MAGIC = b"MISHT2D\x00"  # track.idx of an indexed 2D track (TrackIndex2D.h)
 _TRACK_IDX_VERSION = 1
 _TRACK_IDX_FLAG_LITTLE_ENDIAN = 0x01
 _TRACK_TYPE_DENSE = 0
@@ -2039,13 +2069,29 @@ _SIGNATURE_RECTS_2D = -9
 _SIGNATURE_POINTS_2D = -10
 
 
+def _refuse_cluster_policy(chain: pd.DataFrame, tgt_overlap_policy: str) -> None:
+    """Refuse the cluster target-overlap policies, as R's gtrack.liftover does.
+
+    They are implemented only for gintervals_liftover. The policy is the
+    chain's own, or *tgt_overlap_policy* for a chain that carries none.
+    """
+    policy = chain.attrs.get("tgt_overlap_policy", tgt_overlap_policy)
+    if policy in _CLUSTER_TGT_POLICIES:
+        raise ValueError(
+            f"tgt_overlap_policy = '{policy}' is only supported by gintervals.liftover(), "
+            "not gtrack.liftover(). Use 'auto', 'agg', 'keep', or 'discard'."
+        )
+
+
 def _detect_source_track_2d(src_track_dir: str) -> bool:
-    """Return True if the source-track directory contains 2D quadtree per-pair files.
+    """Return True if the source-track directory holds a 2D track.
 
     Signatures: ``-9`` (RECTS) or ``-10`` (POINTS) in the first 4 bytes of any
     non-index data file. Any 1D signature (dense > 0 or sparse == -1) returns
-    False immediately. Directories with neither are treated as 1D-by-default
-    so empty directories don't accidentally route through the 2D path.
+    False immediately. With no per-pair file, an indexed 2D track is recognized
+    by the magic of its ``track.idx``. Directories with neither are treated as
+    1D-by-default so empty directories don't accidentally route through the 2D
+    path.
     """
     src_track_dir = str(src_track_dir)
     if not os.path.isdir(src_track_dir):
@@ -2065,6 +2111,10 @@ def _detect_source_track_2d(src_track_dir: str) -> bool:
             return True
         if sig > 0 or sig == -1:
             return False
+    idx_path = os.path.join(src_track_dir, "track.idx")
+    if os.path.isfile(idx_path):
+        with open(idx_path, "rb") as f:
+            return f.read(len(_TRACK_IDX_2D_MAGIC)) == _TRACK_IDX_2D_MAGIC
     return False
 
 
@@ -2108,19 +2158,24 @@ def _read_track_idx(idx_path: str) -> tuple[int, list[tuple[int, int, int, int]]
 
 
 def _source_db_root_from_track_dir(src_track_dir: str) -> Path | None:
+    """The database that holds the track directory: the parent of the nearest enclosing
+    "tracks" directory that has a chrom_sizes.txt next to it, or None."""
     p = Path(src_track_dir).resolve()
     for parent in p.parents:
-        if parent.name == "tracks":
+        if parent.name == "tracks" and (parent.parent / "chrom_sizes.txt").exists():
             return parent.parent
     return None
 
 
 def _load_source_chrom_names(src_track_dir: str) -> dict[int, str]:
+    # An indexed track is keyed by the chrom ids of its own database, as pymisha (and
+    # misha) gives them when it opens that database.
     db_root = _source_db_root_from_track_dir(src_track_dir)
     if db_root is None:
         raise ValueError(
-            "Indexed source track path must be located under a database tracks directory "
-            f"(got: {src_track_dir})"
+            f"Indexed source track {src_track_dir} is not in a database (a directory with "
+            'chrom_sizes.txt whose "tracks" directory contains the track); an indexed track '
+            "is read by the chromosome ids of its database"
         )
 
     chrom_sizes_path = db_root / "chrom_sizes.txt"
@@ -2128,19 +2183,21 @@ def _load_source_chrom_names(src_track_dir: str) -> dict[int, str]:
         raise ValueError(
             f"Cannot resolve chromosome IDs for indexed source track: missing {chrom_sizes_path}"
         )
-
-    chroms = []
-    with open(chrom_sizes_path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                raise ValueError(f"Invalid line in {chrom_sizes_path}: {line!r}")
-            chroms.append(parts[0])
-
+    # as R's .gdb.chrom_names_at: the session's order for a loaded database, and an
+    # error for one whose order cannot be read
+    try:
+        chroms = _shared._gdb_chrom_names_at(str(db_root))
+    except _pymisha.error as exc:
+        raise ValueError(str(exc)) from exc
     return dict(enumerate(chroms))
+
+
+def _indexed_source_db_chroms(src_track_dir: str) -> list[str] | None:
+    """The chromosome names by chrom id of the database holding an indexed source track
+    (``_load_source_chrom_names``), None for a per-chromosome one."""
+    if not os.path.exists(os.path.join(src_track_dir, "track.idx")):
+        return None
+    return list(_load_source_chrom_names(src_track_dir).values())
 
 
 def _parse_dense_payload(
@@ -2157,16 +2214,12 @@ def _parse_dense_payload(
     if bin_size <= 0:
         raise ValueError(f"Invalid dense bin size for {chrom_name} in {source_label}: {bin_size}")
 
-    data = np.frombuffer(payload, dtype="<f4", offset=4).astype(np.float64, copy=False)
-    data[np.isinf(data)] = np.nan
-    valid_idx = np.flatnonzero(~np.isnan(data))
-    if valid_idx.size == 0:
-        return []
-
-    starts = (valid_idx * bin_size).astype(np.int64, copy=False)
+    # every bin, an infinite value as NaN, as R's GenomeTrackFixedBin reads it
+    vals = np.frombuffer(payload, dtype="<f4", offset=4).astype(np.float64)
+    vals[np.isinf(vals)] = np.nan
+    starts = np.arange(vals.size, dtype=np.int64) * int(bin_size)
     ends = starts + int(bin_size)
-    vals = data[valid_idx]
-    chroms = np.full(valid_idx.size, chrom_name, dtype=object)
+    chroms = np.full(vals.size, chrom_name, dtype=object)
     return list(zip(chroms.tolist(), starts.tolist(), ends.tolist(), vals.tolist(), strict=False))
 
 
@@ -2234,15 +2287,11 @@ def _parse_sparse_payload(
                 f"Invalid sparse 32-bit records for {chrom_name} in {source_label}"
             )
 
-    vals = recs["value"].astype(np.float64, copy=False)
+    # every interval, an infinite value as NaN, as R's GenomeTrackSparse reads it
+    vals = recs["value"].astype(np.float64)
     vals[np.isinf(vals)] = np.nan
-    valid = ~np.isnan(vals)
-    if not np.any(valid):
-        return []
-
-    starts = recs["start"].astype(np.int64, copy=False)[valid]
-    ends = recs["end"].astype(np.int64, copy=False)[valid]
-    vals = vals[valid]
+    starts = recs["start"].astype(np.int64, copy=False)
+    ends = recs["end"].astype(np.int64, copy=False)
     chroms = np.full(starts.size, chrom_name, dtype=object)
     return list(zip(chroms.tolist(), starts.tolist(), ends.tolist(), vals.tolist(), strict=False))
 
@@ -2352,7 +2401,7 @@ def _aggregate_value_for_bin(
     min_n: int | None,
     nth_index: int,
 ) -> float:
-    """Per-bin reducer matching R's aggregate_values for the 9 supported types.
+    """Per-bin reducer matching R's aggregate_values.
 
     Matches AggregationHelpers.h semantics:
     1. Merge contributions sharing the same chain_id (sum overlap_len).
@@ -2378,6 +2427,7 @@ def _aggregate_value_for_bin(
         for mc in merged:
             if mc["chain_id"] == c["chain_id"]:
                 mc["overlap_len"] += c["overlap_len"]
+                mc["coverage_frac"] = mc.get("coverage_frac", 0.0) + c.get("coverage_frac", 0.0)
                 mc["start"] = min(mc["start"], c["start"])
                 mc["end"] = max(mc["end"], c["end"])
                 found = True
@@ -2423,6 +2473,16 @@ def _aggregate_value_for_bin(
         if nth_index is None or nth_index <= 0 or nth_index > len(sorted_v):
             return float("nan")
         return float(sorted_v[nth_index - 1]["value"])
+    if agg_name in ("max.coverage_len", "min.coverage_len", "max.coverage_frac", "min.coverage_frac"):
+        # The contributor covering the most (least) of the locus; a tie goes to the higher value.
+        key = "overlap_len" if agg_name.endswith("_len") else "coverage_frac"
+        sign = 1.0 if agg_name.startswith("max") else -1.0
+        best = valid[0]
+        for c in valid[1:]:
+            cur, top = sign * c.get(key, 0.0), sign * best.get(key, 0.0)
+            if cur > top or (cur == top and c["value"] > best["value"]):
+                best = c
+        return float(best["value"])
     raise ValueError(f"Unhandled agg_name: {agg_name}")
 
 
@@ -2440,13 +2500,15 @@ def _aggregate_per_bin_python(
 
     For each target chrom in tgt_chrom_sizes, iterate output bins. Per bin,
     collect (value, overlap_len, chain_id) contributions from every interval
-    overlapping [bin_start, bin_end). Merge contributions sharing the same
-    chain_id (sum overlap_len). Apply the agg function. Emit one row per bin
-    (NaN value for bins with no contributions).
+    overlapping [bin_start, bin_end), in R's order (start, end, chain_id,
+    value). Merge contributions sharing the same chain_id (sum overlap_len).
+    Apply the agg function. Emit one row per bin: a bin with no contributions
+    gets what R's aggregate_values gives it (NaN, or 0 for "count" without
+    min_n), and a chrom with none at all is NaN throughout, as R writes it.
 
     intervals_df must have columns chrom, start, end, value, chain_id.
     """
-    if agg_name not in _AGG_FUNCS and agg_name != "nth":
+    if agg_name not in _TRACK_LIFTOVER_AGGS:
         raise ValueError(f"Unsupported agg: {agg_name}")
     if bin_size <= 0:
         raise ValueError(f"bin_size must be positive, got {bin_size}")
@@ -2454,7 +2516,7 @@ def _aggregate_per_bin_python(
     # Group by chrom for fast lookup.
     by_chrom: dict[str, tuple] = {}
     for chrom, group in intervals_df.groupby("chrom", sort=False):
-        g = group.sort_values(["start", "end"], kind="mergesort")
+        g = group.sort_values(["start", "end", "chain_id", "value"], kind="mergesort")
         by_chrom[str(chrom)] = (
             g["start"].to_numpy(dtype=np.int64, copy=False),
             g["end"].to_numpy(dtype=np.int64, copy=False),
@@ -2501,6 +2563,7 @@ def _aggregate_per_bin_python(
                     contribs.append({
                         "value": v,
                         "overlap_len": float(ovl_e - ovl_s),
+                        "coverage_frac": float(ovl_e - ovl_s) / float(be - bs),
                         "start": ovl_s,
                         "end": ovl_e,
                         "is_na": bool(np.isnan(v)),
@@ -2508,7 +2571,8 @@ def _aggregate_per_bin_python(
                     })
                 k += 1
 
-            v_out = _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
+            v_out = (_aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
+                     if n_iv else float("nan"))
             out_rows.append((chrom, bs, be, v_out))
 
     return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"])
@@ -2612,120 +2676,116 @@ def _read_source_track_python(src_track_dir: str) -> tuple[str, pd.DataFrame]:
     return track_type or "sparse", df
 
 
+def _agg_key(lifted: pd.DataFrame) -> np.ndarray:
+    """R's aggregation key of each lifted piece: (chain id, source interval index).
+
+    Pieces sharing it, one source interval split by the chain, count once;
+    different source intervals of one chain stay apart. R 5.11.6.
+    """
+    cid = lifted["chain_id"].to_numpy(dtype=np.int64)
+    iid = lifted["intervalID"].to_numpy(dtype=np.int64)
+    key: np.ndarray = (cid << np.int64(32)) ^ iid
+    return key
+
+
 def _aggregate_overlapping(
     intervals_df: pd.DataFrame,
-    agg_func: Callable[[np.ndarray], float],
+    *,
+    agg_name: str,
     na_rm: bool = True,
     min_n: int | None = None,
-    *,
-    agg_name: str | None = None,
     nth_index: int = 0,
+    _force_pure_python: bool = False,
 ) -> pd.DataFrame:
-    """Aggregate values for overlapping target intervals.
+    """The intervals of a sparse lifted track, as R's gtrack.liftover writes them.
 
-    Segments each chromosome into disjoint regions using interval breakpoints,
-    applies the aggregation function to values covering each segment, and
-    merges adjacent segments with identical aggregated values.
+    *intervals_df* holds the lifted pieces: chrom, start, end, value and key
+    (``_agg_key``). Per chromosome, in (start, end, key, value) order, every
+    run of overlapping pieces becomes one interval, valued by R's
+    aggregate_values over the run (``_aggregate_value_for_bin``): a piece
+    counts its whole length, pieces sharing a key count once, and a NaN value
+    is kept, so a run of NaN source values gives a NaN interval. Touching
+    pieces are not merged.
 
-    When *agg_name* is one of the named aggregators in :data:`_AGG_FUNCS` (or
-    ``"nth"``), the work runs through the C++ fast path
-    :func:`_pymisha.pm_liftover_aggregate`. When *agg_name* is None or a custom
-    callable is supplied as *agg_func*, the pure-Python sweep is used.
+    Runs through the C++ ``pm_liftover_aggregate``; ``_force_pure_python``
+    runs the same steps in Python.
     """
-    if len(intervals_df) == 0:
-        return intervals_df
-
-    if agg_name is not None and (agg_name in _AGG_FUNCS or agg_name == "nth"):
+    if not _force_pure_python:
         from _pymisha import pm_liftover_aggregate
-        df = intervals_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
-        chrom_arr = df["chrom"].to_numpy(dtype=object, copy=False)
-        start_arr = df["start"].to_numpy(dtype=np.int64, copy=False)
-        end_arr = df["end"].to_numpy(dtype=np.int64, copy=False)
-        value_arr = df["value"].to_numpy(dtype=np.float64, copy=False)
-        df_dict = {"chrom": chrom_arr, "start": start_arr, "end": end_arr, "value": value_arr}
         out = pm_liftover_aggregate(
-            df_dict, agg_name, bool(na_rm),
-            int(-1 if min_n is None else min_n),
-            int(nth_index),
+            {
+                "chrom": intervals_df["chrom"].astype(str).to_numpy(dtype=object),
+                "start": intervals_df["start"].to_numpy(dtype=np.int64),
+                "end": intervals_df["end"].to_numpy(dtype=np.int64),
+                "value": intervals_df["value"].to_numpy(dtype=np.float64),
+                "key": intervals_df["key"].to_numpy(dtype=np.int64),
+            },
+            agg_name, bool(na_rm), int(-1 if min_n is None else min_n), int(nth_index),
         )
-        return pd.DataFrame({
-            "chrom": out["chrom"],
-            "start": out["start"],
-            "end": out["end"],
-            "value": out["value"],
-        }).reset_index(drop=True)
+        return pd.DataFrame({c: out[c] for c in ("chrom", "start", "end", "value")})
 
-    def _agg_vals(vals: np.ndarray) -> float:
-        vals = np.asarray(vals, dtype=np.float64)
-        if not na_rm and np.any(np.isnan(vals)):
-            return float(np.nan)
-        vals_clean = vals[~np.isnan(vals)]
-        if min_n is not None and len(vals_clean) < min_n:
-            return float(np.nan)
-        if len(vals_clean) == 0:
-            return float(np.nan)
-        return float(agg_func(vals_clean if na_rm else vals))
-
-    out_rows = []
-    data = intervals_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
-
-    for chrom, group in data.groupby("chrom", sort=False):
-        starts = group["start"].to_numpy(dtype=np.int64, copy=False)
-        ends = group["end"].to_numpy(dtype=np.int64, copy=False)
-        vals = group["value"].to_numpy(dtype=np.float64, copy=False)
-
-        if len(group) == 0:
-            continue
-
-        points = np.unique(np.concatenate((starts, ends)))
-        if points.size < 2:
-            continue
-
-        starts_at = defaultdict(list)
-        ends_at = defaultdict(list)
-        for i in range(len(group)):
-            starts_at[int(starts[i])].append(i)
-            ends_at[int(ends[i])].append(i)
-
-        active: set[int] = set()
-        merged: list[dict[str, Any]] = []
-
-        for i in range(len(points) - 1):
-            coord = int(points[i])
-            next_coord = int(points[i + 1])
-
-            for idx in ends_at.get(coord, ()):
-                active.discard(idx)
-            for idx in starts_at.get(coord, ()):
-                active.add(idx)
-
-            if next_coord <= coord or not active:
-                continue
-
-            seg_val = _agg_vals(vals[sorted(active)])
-            if np.isnan(seg_val):
-                continue
-
-            if (
-                merged
-                and merged[-1]["end"] == coord
-                and np.isclose(merged[-1]["value"], seg_val, rtol=1e-12, atol=0.0)
-            ):
-                merged[-1]["end"] = next_coord
-            else:
-                merged.append({
-                    "chrom": chrom,
-                    "start": coord,
-                    "end": next_coord,
-                    "value": float(seg_val),
+    df = intervals_df[intervals_df["start"] < intervals_df["end"]]
+    df = df.assign(chrom=df["chrom"].astype(str)).sort_values(
+        ["chrom", "start", "end", "key", "value"], kind="mergesort")
+    rows: list[tuple[str, int, int, float]] = []
+    for chrom, group in df.groupby("chrom", sort=True):
+        starts = group["start"].to_numpy(dtype=np.int64)
+        ends = group["end"].to_numpy(dtype=np.int64)
+        vals = group["value"].to_numpy(dtype=np.float64)
+        keys = group["key"].to_numpy(dtype=np.int64)
+        i, n = 0, len(group)
+        while i < n:
+            run_start, run_end = int(starts[i]), int(ends[i])
+            contribs = []
+            while i < n and starts[i] < run_end:
+                run_end = max(run_end, int(ends[i]))
+                v = float(vals[i])
+                contribs.append({
+                    "value": v, "overlap_len": float(ends[i] - starts[i]), "coverage_frac": 1.0,
+                    "start": int(starts[i]), "end": int(ends[i]), "is_na": math.isnan(v),
+                    "chain_id": int(keys[i]),
                 })
+                i += 1
+            rows.append((str(chrom), run_start, run_end,
+                         _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)))
+    return pd.DataFrame(rows, columns=["chrom", "start", "end", "value"])
 
-        out_rows.extend(merged)
 
-    if not out_rows:
-        return intervals_df.iloc[0:0][["chrom", "start", "end", "value"]].copy()
+def _create_empty_lifted_track(
+    track: str, description: str, created_by: str, track_type: str, bin_size: int,
+) -> None:
+    """The track R's gtrack.liftover writes when it lifts no value: for a dense source a
+    dense track of NaN in its bins, otherwise a sparse track with no interval (an empty
+    file per chromosome, or the indexed track of one in an indexed database)."""
+    from .tracks import (
+        _apply_create_parallel_writers_from_config,
+        _atomic_track_create,
+        _df2pymisha,
+        _load_track_attributes,
+        _save_track_attributes,
+        _set_created_attrs,
+        _target_root,
+        gtrack_create_dense,
+    )
 
-    return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"]).reset_index(drop=True)
+    if track_type == "dense" and bin_size > 0:
+        chrom = str(gintervals_all()["chrom"].iloc[0])
+        gtrack_create_dense(track, description, pd.DataFrame({"chrom": [chrom], "start": [0], "end": [1]}),
+                            [np.nan], binsize=bin_size)
+        attrs = _load_track_attributes(track)
+        attrs["created.by"] = created_by
+        _save_track_attributes(track, attrs)
+        return
+
+    no_intervals = pd.DataFrame({
+        "chrom": pd.Series([], dtype=object), "start": pd.Series([], dtype=np.int64),
+        "end": pd.Series([], dtype=np.int64), "value": pd.Series([], dtype=np.float64),
+    })
+    with _atomic_track_create(track):
+        _apply_create_parallel_writers_from_config()
+        _pymisha.pm_track_create_sparse(track, _df2pymisha(no_intervals))
+    _pm_dbreload(_target_root())
+    _set_created_attrs(track, description, created_by)
 
 
 def gtrack_liftover(
@@ -2736,7 +2796,7 @@ def gtrack_liftover(
     src_overlap_policy: str = "error",
     tgt_overlap_policy: str = "auto",
     multi_target_agg: str = "mean",
-    params: dict[str, Any] | None = None,
+    params: dict[str, Any] | int | None = None,
     na_rm: bool = True,
     min_n: int | None = None,
     min_score: float | None = None,
@@ -2783,9 +2843,6 @@ def gtrack_liftover(
     from .tracks import (
         _load_track_attributes,
         _save_track_attributes,
-        _set_created_attrs,
-        _target_root,
-        _track_dir_for_create,
         _track_exists,
         _validate_track_name,
         gtrack_create_dense,
@@ -2796,11 +2853,7 @@ def gtrack_liftover(
     _validate_track_name(track)
     if _track_exists(track):
         raise ValueError(f"Track '{track}' already exists")
-    if multi_target_agg not in _AGG_FUNCS:
-        raise ValueError(
-            f"Unsupported aggregation: {multi_target_agg}. "
-            f"Supported: {', '.join(sorted(_AGG_FUNCS))}"
-        )
+    nth_index = _nth_param(multi_target_agg, params)
 
     if isinstance(chain, str):
         chain = gintervals_load_chain(
@@ -2810,18 +2863,9 @@ def gtrack_liftover(
         )
     elif not isinstance(chain, pd.DataFrame):
         raise TypeError("chain must be a file path string or a chain DataFrame")
-
-    effective_tgt_policy = chain.attrs.get(
-        "tgt_overlap_policy", tgt_overlap_policy
-    )
-    if effective_tgt_policy == "auto":
-        effective_tgt_policy = "auto_score"
-    cluster_strategy = {
-        "best_source_cluster": "union",
-        "best_cluster_union":  "union",
-        "best_cluster_sum":    "sum",
-        "best_cluster_max":    "max",
-    }.get(effective_tgt_policy, "")
+    else:
+        chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+    _refuse_cluster_policy(chain, tgt_overlap_policy)
 
     chain_dict = {
         "chrom":     chain["chrom"].to_numpy(dtype=object),
@@ -2836,22 +2880,19 @@ def gtrack_liftover(
         "score":     chain["score"].to_numpy(dtype=np.float64),
     }
     tgt_chrom_sizes = _get_db_chrom_sizes()
-    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
     result = _pymisha.pm_liftover_track(
         str(src_track_dir), chain_dict, tgt_chrom_sizes,
-        cluster_strategy, multi_target_agg, bool(na_rm),
+        "", multi_target_agg, bool(na_rm),
         int(-1 if min_n is None else min_n),
         int(nth_index),
+        _indexed_source_db_chroms(str(src_track_dir)),
     )
 
     created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
     track_type = result["track_type"]
     bin_size = int(result["bin_size"])
     if len(result["chrom"]) == 0:
-        track_dir = _track_dir_for_create(track)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload(_target_root())
-        _set_created_attrs(track, description, created_by)
+        _create_empty_lifted_track(track, description, created_by, track_type, bin_size)
         return None
 
     target_df = pd.DataFrame({
@@ -2867,10 +2908,7 @@ def gtrack_liftover(
         # contribution bin returns that value as-is.
         target_df = target_df[~target_df["value"].isna()].reset_index(drop=True)
         if len(target_df) == 0:
-            track_dir = _track_dir_for_create(track)
-            track_dir.mkdir(parents=True, exist_ok=True)
-            _pm_dbreload(_target_root())
-            _set_created_attrs(track, description, created_by)
+            _create_empty_lifted_track(track, description, created_by, track_type, bin_size)
             return None
         gtrack_create_dense(
             track, description,
@@ -2899,7 +2937,7 @@ def _gtrack_liftover_python(
     src_overlap_policy: str = "error",
     tgt_overlap_policy: str = "auto",
     multi_target_agg: str = "mean",
-    params: dict[str, Any] | None = None,
+    params: dict[str, Any] | int | None = None,
     na_rm: bool = True,
     min_n: int | None = None,
     min_score: float | None = None,
@@ -2938,16 +2976,22 @@ def _gtrack_liftover_python(
         Target overlap policy, used only when *chain* is a file path.
         One of ``"error"``, ``"auto"`` (default), ``"auto_score"``,
         ``"auto_longer"``, ``"auto_first"``, ``"keep"``, ``"discard"``,
-        ``"agg"``, ``"best_source_cluster"``, ``"best_cluster_union"``,
-        ``"best_cluster_sum"``, ``"best_cluster_max"``.
+        ``"agg"``. The cluster policies (``"best_source_cluster"``,
+        ``"best_cluster_union"``, ``"best_cluster_sum"``,
+        ``"best_cluster_max"``) are refused, here or in a pre-loaded chain,
+        as in R misha: they are for ``gintervals_liftover`` only.
     multi_target_agg : str, optional
         Aggregation function applied when multiple source values map to
         the same target locus. One of ``"mean"`` (default), ``"median"``,
         ``"sum"``, ``"min"``, ``"max"``, ``"count"``, ``"first"``,
-        ``"last"``.
-    params : dict, optional
-        Extra parameters for specific aggregation methods (e.g., ``n`` for
-        ``"nth"`` aggregation).
+        ``"last"``, ``"nth"``, ``"max.coverage_len"``,
+        ``"min.coverage_len"``, ``"max.coverage_frac"``,
+        ``"min.coverage_frac"``. The coverage aggregations take the value
+        of the contributor that covers the most (least) of the locus, by
+        length or by fraction of the locus; a tie goes to the higher value.
+    params : int or dict, optional
+        The ``n`` of ``"nth"`` aggregation (1-based), given as is or as
+        ``{"n": n}``. Required for ``"nth"`` and not allowed otherwise.
     na_rm : bool, optional
         If ``True`` (default), ``NaN`` values are removed before
         aggregation. If ``False``, any ``NaN`` in the group causes the
@@ -3003,9 +3047,6 @@ def _gtrack_liftover_python(
         _checkroot,
         _load_track_attributes,
         _save_track_attributes,
-        _set_created_attrs,
-        _target_root,
-        _track_dir_for_create,
         _track_exists,
         _validate_track_name,
         gtrack_create_dense,
@@ -3018,12 +3059,7 @@ def _gtrack_liftover_python(
         raise ValueError(f"Track '{track}' already exists")
 
     # Validate aggregation function
-    if multi_target_agg not in _AGG_FUNCS:
-        raise ValueError(
-            f"Unsupported aggregation: {multi_target_agg}. "
-            f"Supported: {', '.join(sorted(_AGG_FUNCS))}"
-        )
-    agg_func = _AGG_FUNCS[multi_target_agg]
+    nth_index = _nth_param(multi_target_agg, params)
 
     # Load chain if path
     if isinstance(chain, str):
@@ -3034,10 +3070,12 @@ def _gtrack_liftover_python(
             min_score=min_score,
         )
     elif isinstance(chain, pd.DataFrame):
-        # Pre-loaded chain — policies are already baked in
-        pass
+        # Pre-loaded chain — policies are already baked in. An alias names the
+        # database's chromosome.
+        chain = _with_canonical_chroms(chain)
     else:
         raise TypeError("chain must be a file path string or a chain DataFrame")
+    _refuse_cluster_policy(chain, tgt_overlap_policy)
 
     # Read source track
     src_type, src_data = _read_source_track(src_track_dir)
@@ -3045,18 +3083,27 @@ def _gtrack_liftover_python(
     created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
 
     if len(src_data) == 0 or len(chain) == 0:
-        track_dir = _track_dir_for_create(track)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload(_target_root())
-        _set_created_attrs(track, description, created_by)
+        _create_empty_lifted_track(track, description, created_by, src_type,
+                                   _detect_source_bin_size(src_track_dir) if src_type == "dense" else 0)
         return
 
-    # Liftover source intervals to target coordinates
+    # An indexed source is read by its database's chromosomes, which match a chain
+    # chromosome by name, as is, then without or with the "chr" prefix; the files of a
+    # per-chromosome source are found by the chain's names, as is or "chr" toggled
+    # (R's gtrack.liftover).
+    chain_names = set(chain["chromsrc"].astype(str))
+    renamed = {}
+    for c in src_data["chrom"].astype(str).unique():
+        alt = c[3:] if c.startswith("chr") else f"chr{c}"
+        renamed[c] = alt if c not in chain_names and alt in chain_names else c
+    src_data = src_data.assign(chrom=src_data["chrom"].astype(str).map(renamed))
+
+    # Liftover source intervals to target coordinates: the pieces R's
+    # map_interval gives, not merged (R does not merge touching pieces)
     lifted = gintervals_liftover(
         src_data[["chrom", "start", "end", "value"]].copy(),
         chain,
         value_col="value" if "value" in src_data.columns else None,
-        canonic=True,
     )
 
     # If gintervals_liftover didn't carry values (shouldn't happen with value_col),
@@ -3068,13 +3115,9 @@ def _gtrack_liftover_python(
         )
 
     if len(lifted) == 0:
-        track_dir = _track_dir_for_create(track)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload(_target_root())
-        _set_created_attrs(track, description, created_by)
+        _create_empty_lifted_track(track, description, created_by, src_type,
+                                   _detect_source_bin_size(src_track_dir) if src_type == "dense" else 0)
         return
-
-    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
 
     if src_type == "dense":
         # R-parity: FIXED_BIN source -> FIXED_BIN target (GTrackLiftover.cpp:702-768).
@@ -3084,15 +3127,7 @@ def _gtrack_liftover_python(
 
         if bin_size is not None:
             tgt_chrom_sizes = _get_db_chrom_sizes()
-            # Dedup key = (chain_id, source-bin index) so that DIFFERENT source bins
-            # of the same chain landing in one target bin stay distinct and are
-            # aggregated, instead of being collapsed to the first bin's value.
-            # intervalID is the source-bin index. R 5.11.6.
-            dense_in = lifted[["chrom", "start", "end", "value", "chain_id"]].copy()
-            if "intervalID" in lifted.columns:
-                cid = lifted["chain_id"].to_numpy(dtype=np.int64)
-                iid = lifted["intervalID"].to_numpy(dtype=np.int64)
-                dense_in["chain_id"] = (cid << np.int64(32)) ^ iid
+            dense_in = lifted[["chrom", "start", "end", "value"]].assign(chain_id=_agg_key(lifted))
             per_bin = _aggregate_per_bin_python(
                 dense_in,
                 bin_size,
@@ -3105,10 +3140,7 @@ def _gtrack_liftover_python(
             # Filter NaN bins; gtrack_create_dense fills uncovered bins with defval=NaN.
             per_bin_nonnan = per_bin[~per_bin["value"].isna()].reset_index(drop=True)
             if len(per_bin_nonnan) == 0:
-                track_dir = _track_dir_for_create(track)
-                track_dir.mkdir(parents=True, exist_ok=True)
-                _pm_dbreload(_target_root())
-                _set_created_attrs(track, description, created_by)
+                _create_empty_lifted_track(track, description, created_by, "dense", bin_size)
                 return
             # Each interval is exactly 1 bin wide and we pre-aggregated via the
             # per-bin helper; func="weighted.mean" of a single-contribution bin
@@ -3127,19 +3159,14 @@ def _gtrack_liftover_python(
             return
 
     # SPARSE path (also used as fallback when dense bin_size cannot be detected).
-    target_data = lifted[["chrom", "start", "end", "value"]].copy()
     target_data = _aggregate_overlapping(
-        target_data, agg_func,
-        na_rm=na_rm, min_n=min_n,
-        agg_name=multi_target_agg,
-        nth_index=nth_index,
+        lifted[["chrom", "start", "end", "value"]].assign(key=_agg_key(lifted)),
+        agg_name=multi_target_agg, na_rm=na_rm, min_n=min_n, nth_index=nth_index,
+        _force_pure_python=True,
     )
 
     if len(target_data) == 0:
-        track_dir = _track_dir_for_create(track)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload(_target_root())
-        _set_created_attrs(track, description, created_by)
+        _create_empty_lifted_track(track, description, created_by, "sparse", 0)
         return
 
     gtrack_create_sparse(
@@ -3158,89 +3185,6 @@ def _gtrack_liftover_python(
 # 2D source-track liftover (G1.P3.D)
 # ===================================================================
 
-def _aggregate_2d_rects(
-    x1: np.ndarray,
-    y1: np.ndarray,
-    x2: np.ndarray,
-    y2: np.ndarray,
-    v: np.ndarray,
-    agg_name: str,
-    na_rm: bool,
-    min_n: int | None,
-    nth_index: int,
-) -> list[tuple[int, int, int, int, float]]:
-    """Aggregate possibly-overlapping mapped rectangles into DISJOINT rects.
-
-    A StatQuadTree requires non-overlapping objects; disjoint source rects can
-    map onto overlapping target rects because the chain shifts x and y
-    independently, so the 2D path needs the same collect -> segment -> aggregate
-    treatment the 1D path has. Coordinate-compress the x/y boundaries into a grid
-    and, for every cell, aggregate the values of all rects covering it. Each
-    contribution gets a unique key so distinct sources are never folded together.
-    Port of R GTrackLiftover.cpp::aggregate_2d_rects (5.11.8).
-
-    ponytail: O(active rects per x-slab) per cell - ~O(N) for grid-aligned data
-    (Hi-C points / uniform bins, one cell per rect), O(N^2) worst case for
-    pathological nested/offset rects. Upgrade path if it ever bites: move to C++
-    (as R does) or decompose per overlap-cluster.
-    """
-    n = len(x1)
-    out: list[tuple[int, int, int, int, float]] = []
-    if n == 0:
-        return out
-
-    xs = np.unique(np.concatenate([x1, x2]))
-    ys = np.unique(np.concatenate([y1, y2]))
-    by_x1 = np.argsort(x1, kind="mergesort")
-    by_x2 = np.argsort(x2, kind="mergesort")
-
-    active: set[int] = set()
-    ia = 0
-    ir = 0
-    encounter = 0  # unique id per contribution -> reducer never merges them
-
-    for xi in range(len(xs) - 1):
-        xa = int(xs[xi])
-        xb = int(xs[xi + 1])
-
-        while ir < n and int(x2[by_x2[ir]]) <= xa:
-            active.discard(int(by_x2[ir]))
-            ir += 1
-        while ia < n and int(x1[by_x1[ia]]) <= xa:
-            active.add(int(by_x1[ia]))
-            ia += 1
-
-        if not active:
-            continue
-
-        # Per y-band aggregation over the rects active in this x-slab. Iterate the
-        # active rects in index order (mirrors R's std::set<size_t>) so the unique
-        # ids - and thus first/last/nth ordering - are deterministic.
-        band_contribs: dict[int, list] = {}
-        for ri in sorted(active):
-            b_lo = int(np.searchsorted(ys, y1[ri], side="left"))
-            b_hi = int(np.searchsorted(ys, y2[ri], side="left"))
-            val = float(v[ri])
-            is_na = bool(np.isnan(val))
-            for b in range(b_lo, b_hi):
-                band_contribs.setdefault(b, []).append({
-                    "value": val,
-                    "overlap_len": 1.0,
-                    "start": encounter,
-                    "end": encounter,
-                    "is_na": is_na,
-                    "chain_id": encounter,
-                })
-                encounter += 1
-
-        for b, contribs in band_contribs.items():
-            agg = _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
-            if not np.isnan(agg):
-                out.append((xa, int(ys[b]), xb, int(ys[b + 1]), agg))
-
-    return out
-
-
 def _gtrack_liftover_2d(
     track: str,
     description: str,
@@ -3250,7 +3194,7 @@ def _gtrack_liftover_2d(
     src_overlap_policy: str = "error",
     tgt_overlap_policy: str = "auto",
     multi_target_agg: str = "mean",
-    params: dict[str, Any] | None = None,
+    params: dict[str, Any] | int | None = None,
     na_rm: bool = True,
     min_n: int | None = None,
     min_score: float | None = None,
@@ -3258,25 +3202,31 @@ def _gtrack_liftover_2d(
     """Lift a 2D source track (RECTS or POINTS) to the current target DB.
 
     Routed to from ``gtrack_liftover`` whenever the source-track directory
-    contains 2D quadtree files. Mirrors R ``GTrackLiftover.cpp:843-984``.
-    Overlapping mapped rectangles are aggregated into disjoint cells via
-    ``multi_target_agg`` before insertion (R 5.11.8).
+    holds a 2D track. The lift streams through C++ (``pm_liftover_track_2d``),
+    as R misha 5.12.1's: both ends of every source object are mapped into a
+    buffer file per target chromosome pair, and the pairs are then written one
+    at a time. A POINTS source gives a POINTS track, points landing on one
+    target point merged by ``multi_target_agg``, and a pair of at least
+    4 x ``CONFIG['max_data_size']`` points is written in parts (subtrees);
+    overlapping mapped rectangles are cut into disjoint cells aggregated by
+    ``multi_target_agg``.
     """
     from .tracks import (
-        _load_track_attributes,
-        _save_track_attributes,
+        _atomic_track_create,
+        _db_is_indexed,
         _set_created_attrs,
         _target_root,
-        _track_dir_for_create,
         _track_exists,
         _validate_track_name,
-        gtrack_2d_create,
+        gtrack_2d_convert_to_indexed,
+        gtrack_create_empty_indexed,
     )
 
     _checkroot()
     _validate_track_name(track)
     if _track_exists(track):
         raise ValueError(f"Track '{track}' already exists")
+    nth_index = _nth_param(multi_target_agg, params)
 
     if isinstance(chain, str):
         chain = gintervals_load_chain(
@@ -3287,92 +3237,46 @@ def _gtrack_liftover_2d(
         )
     elif not isinstance(chain, pd.DataFrame):
         raise TypeError("chain must be a file path string or a chain DataFrame")
+    else:
+        chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+    _refuse_cluster_policy(chain, tgt_overlap_policy)
 
+    effective_tgt_policy = chain.attrs.get("tgt_overlap_policy", tgt_overlap_policy)
     chain_dict = {
-        "chrom":     chain["chrom"].to_numpy(dtype=object),
+        "chrom":     chain["chrom"].astype(str).to_numpy(dtype=object),
         "start":     chain["start"].to_numpy(dtype=np.int64),
         "end":       chain["end"].to_numpy(dtype=np.int64),
         "strand":    chain["strand"].to_numpy(dtype=np.int64),
-        "chromsrc":  chain["chromsrc"].to_numpy(dtype=object),
+        "chromsrc":  chain["chromsrc"].astype(str).to_numpy(dtype=object),
         "startsrc":  chain["startsrc"].to_numpy(dtype=np.int64),
         "endsrc":    chain["endsrc"].to_numpy(dtype=np.int64),
-        "strandsrc": chain["strandsrc"].to_numpy(dtype=np.int64),
         "chain_id":  chain["chain_id"].to_numpy(dtype=np.int64),
         "score":     chain["score"].to_numpy(dtype=np.float64),
     }
+    tgt_chrom_sizes = _get_db_chrom_sizes()
+    src_db_chroms = _indexed_source_db_chroms(str(src_track_dir))
 
-    if multi_target_agg not in _AGG_FUNCS:
-        raise ValueError(
-            f"Unsupported aggregation: {multi_target_agg}. "
-            f"Supported: {', '.join(sorted(_AGG_FUNCS))}"
+    with _atomic_track_create(track) as track_dir:
+        with _shared._with_umask():
+            track_dir.mkdir(parents=True, exist_ok=True)
+        _pymisha.pm_liftover_track_2d(
+            str(src_track_dir), chain_dict, str(track_dir),
+            list(tgt_chrom_sizes.keys()), list(tgt_chrom_sizes.values()),
+            str(effective_tgt_policy), multi_target_agg, bool(na_rm),
+            int(-1 if min_n is None else min_n), int(nth_index),
+            src_db_chroms,
         )
-    nth_index = int((params or {}).get("n", 0)) if multi_target_agg == "nth" else 0
+        has_pairs = any(not name.startswith(".") for name in os.listdir(track_dir))
 
-    result = _pymisha.pm_liftover_track_2d(str(src_track_dir), chain_dict)
-
-    created_by = f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)'
-
-    def _empty_track() -> None:
-        track_dir = _track_dir_for_create(track)
-        track_dir.mkdir(parents=True, exist_ok=True)
-        _pm_dbreload(_target_root())
-        _set_created_attrs(track, description, created_by)
-
-    if len(result["chrom1"]) == 0:
-        # No target rectangles produced - create an empty track directory.
-        _empty_track()
-        return
-
-    # Aggregate possibly-overlapping mapped rectangles into disjoint cells per
-    # target chrom-pair before insertion (the quadtree forbids overlapping
-    # objects; overlapping inserts corrupt read-back and double-count). R 5.11.8.
-    rects_df = pd.DataFrame({
-        "chrom1": result["chrom1"],
-        "chrom2": result["chrom2"],
-        "x1": np.asarray(result["x1"], dtype=np.int64),
-        "y1": np.asarray(result["y1"], dtype=np.int64),
-        "x2": np.asarray(result["x2"], dtype=np.int64),
-        "y2": np.asarray(result["y2"], dtype=np.int64),
-        "value": np.asarray(result["value"], dtype=np.float64),
-    })
-
-    out_c1: list = []
-    out_c2: list = []
-    out_x1: list = []
-    out_y1: list = []
-    out_x2: list = []
-    out_y2: list = []
-    out_v: list = []
-    for (c1, c2), grp in rects_df.groupby(["chrom1", "chrom2"], sort=False):
-        cells = _aggregate_2d_rects(
-            grp["x1"].to_numpy(), grp["y1"].to_numpy(),
-            grp["x2"].to_numpy(), grp["y2"].to_numpy(),
-            grp["value"].to_numpy(),
-            multi_target_agg, na_rm, min_n, nth_index,
-        )
-        for (cx1, cy1, cx2, cy2, cv) in cells:
-            out_c1.append(c1)
-            out_c2.append(c2)
-            out_x1.append(cx1)
-            out_y1.append(cy1)
-            out_x2.append(cx2)
-            out_y2.append(cy2)
-            out_v.append(cv)
-
-    if len(out_c1) == 0:
-        _empty_track()
-        return
-
-    target_df = pd.DataFrame({
-        "chrom1": out_c1,
-        "start1": out_x1,
-        "end1":   out_x2,
-        "chrom2": out_c2,
-        "start2": out_y1,
-        "end2":   out_y2,
-    })
-    gtrack_2d_create(track, description, target_df, np.asarray(out_v, dtype=np.float64))
-
-    attrs = _load_track_attributes(track)
-    attrs["created.by"] = created_by
-    _save_track_attributes(track, attrs)
+    _pm_dbreload(_target_root())
+    _set_created_attrs(
+        track, description,
+        f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)',
+    )
+    # In an indexed database the track is converted to indexed, as R does. A lift that
+    # maps nothing leaves no pair files: R writes the empty (1D) indexed track then.
+    if _db_is_indexed(_shared._GROOT):
+        if has_pairs:
+            gtrack_2d_convert_to_indexed(track, remove_old=True, force=False)
+        else:
+            gtrack_create_empty_indexed(track)

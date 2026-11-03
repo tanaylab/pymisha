@@ -105,13 +105,50 @@ def _find_vtracks_in_expr(expr: str) -> list[str]:
     return [name for name in _shared._VTRACKS if name in matched]
 
 
-def _expr_is_2d(exprs: str | list[str]) -> bool:
-    """True if any identifier in the expression(s) is a 2D physical track.
+def _expr_is_2d(exprs: str | list[str], iterator: Any = None) -> bool:
+    """True if the iterator R would use for the expression(s) is 2D.
 
-    Used to choose the implicit whole-genome scope (2D ``gintervals_2d_all`` vs
-    1D ``gintervals_all``) when no intervals are given - R parity.
+    That is an explicit 2D iterator - a ``(width, height)`` pair, 2D intervals,
+    a cartesian grid, a 2D track or 2D intervals-set name - or, without one,
+    a 2D physical track among the identifiers, or the 2D source of a virtual
+    track. Used to choose the implicit whole-genome scope (2D
+    ``gintervals_2d_all`` vs 1D ``gintervals_all``) when no intervals are
+    given: R passes both (.misha$ALLGENOME) and the iterator picks one.
     """
     from .tracks import gtrack_exists, gtrack_info
+
+    def _is_2d_track(name: str) -> bool:
+        try:
+            return bool(gtrack_exists(name) and int(gtrack_info(name).get("dimensions", 1) or 1) == 2)
+        except (_pymisha.error, ValueError):
+            # The token is not a track name - the common case for any
+            # identifier in an expression.
+            _logger.debug("%r is not a resolvable track name", name, exc_info=True)
+            return False
+
+    if iterator is not None:
+        import pandas as pd
+
+        from ._iterator_policy import CartesianGridSpec
+
+        if isinstance(iterator, CartesianGridSpec):
+            return True
+        if isinstance(iterator, (tuple, list)) and len(iterator) == 2:
+            return True
+        if isinstance(iterator, pd.DataFrame):
+            return "chrom1" in iterator.columns
+        if isinstance(iterator, str):
+            if _is_2d_track(iterator):
+                return True
+            from .intervals import gintervals_exists, gintervals_load
+
+            try:
+                if gintervals_exists(iterator):
+                    loaded = gintervals_load(iterator)
+                    return isinstance(loaded, pd.DataFrame) and "chrom1" in loaded.columns
+            except (_pymisha.error, ValueError):
+                _logger.debug("%r is not a loadable intervals set", iterator, exc_info=True)
+        return False
 
     names = exprs if isinstance(exprs, (list, tuple)) else [exprs]
     checked: set[str] = set()
@@ -125,13 +162,14 @@ def _expr_is_2d(exprs: str | list[str]) -> bool:
                 if cand in checked:
                     continue
                 checked.add(cand)
-                try:
-                    if gtrack_exists(cand) and int(gtrack_info(cand).get("dimensions", 1) or 1) == 2:
+                vt = _shared._VTRACKS.get(cand)
+                if vt is not None:
+                    src = vt.get("src")
+                    if vt.get("dim") is None and isinstance(src, str) and _is_2d_track(src):
                         return True
-                except (_pymisha.error, ValueError):
-                    # The token is not a track name - the common case for any
-                    # identifier in an expression.
-                    _logger.debug("%r is not a resolvable track name", cand, exc_info=True)
+                    continue
+                if _is_2d_track(cand):
+                    return True
     return False
 
 

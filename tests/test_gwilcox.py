@@ -175,10 +175,10 @@ class TestGwilcoxRParity:
         assert len(result) == 16
         assert set(result.columns) >= {"chrom", "start", "end", "pval"}
         # Verify first and last rows
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 32300
         assert result.iloc[0]["end"] == 35300
-        assert result.iloc[-1]["chrom"] == "2"
+        assert result.iloc[-1]["chrom"] == "chr2"
         assert result.iloc[-1]["start"] == 288650
         assert result.iloc[-1]["end"] == 290500
         # All pvals below threshold
@@ -208,7 +208,7 @@ class TestGwilcoxRParity:
         )
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 3150
         assert result.iloc[0]["end"] == 4550
 

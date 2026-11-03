@@ -42,7 +42,7 @@ class TestGextractIntervalsIteratorCore:
         result = pm.gextract("dense_track", scope, iterator=itr, progress=False)
         assert result is not None
         assert len(result) == 2
-        assert list(result["chrom"]) == ["1", "1"]
+        assert list(result["chrom"]) == ["chr1", "chr1"]
         assert list(result["start"]) == [0, 400]
         assert list(result["end"]) == [400, 800]
         assert "dense_track" in result.columns
@@ -286,11 +286,11 @@ class TestIntervalsIteratorEdgeCases:
         assert result is not None
         assert len(result) == 2
         chroms = list(result["chrom"])
-        assert "1" in chroms
-        assert "2" in chroms
+        assert "chr1" in chroms
+        assert "chr2" in chroms
         # intervalID should reference the correct scope intervals
-        row_chr1 = result[result["chrom"] == "1"].iloc[0]
-        row_chr2 = result[result["chrom"] == "2"].iloc[0]
+        row_chr1 = result[result["chrom"] == "chr1"].iloc[0]
+        row_chr2 = result[result["chrom"] == "chr2"].iloc[0]
         assert row_chr1["intervalID"] == 1
         assert row_chr2["intervalID"] == 2
 

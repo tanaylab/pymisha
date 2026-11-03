@@ -77,10 +77,11 @@ for the same purpose, so it ports directly.
 
 ## Not yet implemented
 
-- **C++ `gtrack.import` for WIG / BedGraph / BigWig / BED / tab.** These formats
-  are parsed in pure Python today; results match R but the throughput gap shows
-  on multi-GB inputs. (Liftover, SAM `gtrack.import_mappedseq`, 2D extraction
-  and the array/virtual-track paths already run in C++.)
+- **C++ `gtrack.import` for BED / tab.** These are parsed in pure Python
+  today; results match R but the throughput gap shows on multi-GB inputs.
+  (BigWig, with misha's own reader, WIG / BedGraph, liftover, SAM
+  `gtrack.import_mappedseq`, 2D extraction and the array/virtual-track paths
+  already run in C++.)
 
 - **R `gtrack.var` ASCII serialize variants** (`A\n`, `B\n`). PyMisha reads R's
   XDR binary and gzip-RDS variable formats via its native reader; the rare ASCII

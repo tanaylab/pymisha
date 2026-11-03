@@ -15,6 +15,7 @@
 #include <string>
 #include <algorithm>
 #include <map>
+#include <memory>
 
 #include <Python.h>
 
@@ -32,7 +33,7 @@ static bool copy_file_contents_2d(const string &src, FILE *dest, uint64_t &bytes
 {
     FILE *src_fp = fopen(src.c_str(), "rb");
     if (!src_fp)
-        return false;
+        TGLError<GenomeTrack>("Failed to open %s: %s", src.c_str(), strerror(errno));
 
     if (fseek(src_fp, 0, SEEK_END) != 0) {
         fclose(src_fp);
@@ -73,63 +74,36 @@ static bool copy_file_contents_2d(const string &src, FILE *dest, uint64_t &bytes
 
 // Helper: parse a chrom-pair filename like "1-2" or "chr1-chr2"
 // Returns true if filename matches pattern, fills chrom1_name and chrom2_name
-static bool parse_pair_filename(const string &filename, string &chrom1_name, string &chrom2_name)
+// The old index and data of an indexed track set aside by a forced conversion, put back when
+// the conversion fails
+static void restore_old_index(const string &old_idx_path, const string &old_dat_path)
 {
-    // Find the last dash that separates the two chrom names
-    // Since chrom names can contain digits but not dashes, find '-' as separator
-    // Pattern: name1-name2 where name1 and name2 don't contain '-'
-    // But chrom names can look like "chr1", "1", "X", "chr10", etc.
-    // We need to find the right '-' separator.
-    // For simplicity: try splitting on each '-' and see if both parts look like chrom names
-
-    // Skip files that are obviously not pair files
-    if (filename == "track.idx" || filename == "track.dat" ||
-        filename == "track.idx.tmp" || filename == "track.dat.tmp" ||
-        filename == ".attributes") {
-        return false;
-    }
-
-    // Find the separator dash
-    // Strategy: the filename is "c1-c2" where c1 and c2 are chrom names.
-    // Chrom names don't contain dashes in standard genomes, so split on first dash.
-    size_t dash_pos = filename.find('-');
-    if (dash_pos == string::npos || dash_pos == 0 || dash_pos == filename.size() - 1) {
-        return false;
-    }
-
-    chrom1_name = filename.substr(0, dash_pos);
-    chrom2_name = filename.substr(dash_pos + 1);
-
-    // Both parts must be non-empty
-    if (chrom1_name.empty() || chrom2_name.empty()) {
-        return false;
-    }
-
-    return true;
-}
-
-// Helper: strip "chr" prefix if present
-static string strip_chr_prefix(const string &name)
-{
-    if (name.size() > 3 && name.substr(0, 3) == "chr") {
-        return name.substr(3);
-    }
-    return name;
+    if (old_idx_path.empty())
+        return;
+    string dir = old_idx_path.substr(0, old_idx_path.rfind('/'));
+    rename(old_dat_path.c_str(), (dir + "/track.dat").c_str());
+    rename(old_idx_path.c_str(), (dir + "/track.idx").c_str());
+    TrackIndex2D::clear_cache();
 }
 
 PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
 {
     string dat_path_tmp;
     string idx_path_tmp;
+    // the index and data of an indexed track, set aside until the new ones are in place
+    string old_idx_path;
+    string old_dat_path;
 
     try {
         PyMisha pymisha(true);
 
         const char *track_dir_cstr = nullptr;
         int track_type_int = 0;
-        if (!PyArg_ParseTuple(args, "si", &track_dir_cstr, &track_type_int)) {
+        int remove_old = 1;
+        int force = 0;
+        if (!PyArg_ParseTuple(args, "si|pp", &track_dir_cstr, &track_type_int, &remove_old, &force)) {
             verror("Invalid arguments to pm_track2d_convert_to_indexed. "
-                   "Expected (track_dir: str, track_type: int)");
+                   "Expected (track_dir: str, track_type: int, remove_old: bool, force: bool)");
         }
 
         if (track_type_int != 0 && track_type_int != 1) {
@@ -145,86 +119,104 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
             verror("Track directory does not exist: %s", track_dir.c_str());
         }
 
-        // Check if already indexed
-        string idx_path = track_dir + "/track.idx";
-        if (access(idx_path.c_str(), F_OK) == 0) {
-            // Already indexed, return 0
-            return PyLong_FromLong(0);
-        }
-
         if (!g_pmdb || !g_pmdb->is_initialized()) {
             verror("Database not initialized. Call gdb_init() first.");
         }
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
 
-        // Enumerate all files in track_dir that look like per-pair files
-        DIR *dir = opendir(track_dir.c_str());
-        if (!dir) {
-            verror("Failed to open track directory %s: %s", track_dir.c_str(), strerror(errno));
+        // Check if already indexed
+        string idx_path = track_dir + "/track.idx";
+        string dat_path = track_dir + "/track.dat";
+        if (access(idx_path.c_str(), F_OK) == 0) {
+            if (!force)
+                return PyLong_FromLong(0);  // already indexed
+
+            // Forced (R's gtrack.2d.convert_to_indexed): when no per-pair files are left (removed
+            // by an earlier conversion), they are extracted from track.dat, and the pairs are packed
+            // again
+            string extract_error;
+            vector<string> extracted;
+            try {
+                auto old_idx = TrackIndex2D::get_track_index_2d(track_dir);
+                if (old_idx && old_idx->is_loaded()) {
+                    bool have_pair_files = false;
+                    for (const auto &entry : old_idx->entries()) {
+                        string pair_file = track_dir + "/" + GenomeTrack::get_2d_filename(chromkey, entry.chrom1_id, entry.chrom2_id);
+                        struct stat pst;
+                        if (stat(pair_file.c_str(), &pst) == 0) {
+                            have_pair_files = true;
+                            break;
+                        }
+                    }
+
+                    if (!have_pair_files) {
+                        unique_ptr<FILE, int (*)(FILE *)> dat_fp(fopen(dat_path.c_str(), "rb"), fclose);
+                        if (dat_fp) {
+                            for (const auto &entry : old_idx->entries()) {
+                                string pair_file = track_dir + "/" + GenomeTrack::get_2d_filename(chromkey, entry.chrom1_id, entry.chrom2_id);
+                                vector<char> buf(entry.length);
+                                if (fseek(dat_fp.get(), entry.offset, SEEK_SET) || fread(buf.data(), 1, entry.length, dat_fp.get()) != entry.length) {
+                                    extract_error = "Failed to read " + dat_path;
+                                    break;
+                                }
+                                FILE *pf = fopen(pair_file.c_str(), "wb");
+                                if (pf)
+                                    extracted.push_back(pair_file);
+                                bool written = pf && fwrite(buf.data(), 1, entry.length, pf) == entry.length;
+                                if ((pf && fclose(pf)) || !written) {
+                                    extract_error = "Failed to write " + pair_file + ": " + strerror(errno);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (const bad_alloc &) {
+                extract_error = "Out of memory extracting the pairs of " + dat_path;
+            } catch (...) {
+                // If index is corrupted, just proceed - per-pair files might still exist
+                if (!extracted.empty())
+                    extract_error = "Failed to extract the pairs of " + dat_path;
+            }
+            // Pairs cut short or missing would be packed as they are and the old data removed
+            if (!extract_error.empty()) {
+                for (const string &file : extracted)
+                    unlink(file.c_str());
+                TGLError<GenomeTrack>("%s", extract_error.c_str());
+            }
+
+            // Set the old index and data aside, hidden from the listing; they are put back if the
+            // conversion fails
+            if (rename(idx_path.c_str(), (track_dir + "/.track.idx.old").c_str()))
+                TGLError<GenomeTrack>("Failed to rename %s: %s", idx_path.c_str(), strerror(errno));
+            old_idx_path = track_dir + "/.track.idx.old";
+            old_dat_path = track_dir + "/.track.dat.old";
+            rename(dat_path.c_str(), old_dat_path.c_str());
+            TrackIndex2D::clear_cache();
         }
 
-        // Collect pair files: map from (chrom1_id, chrom2_id) -> filepath
-        struct PairFile {
-            uint32_t chrom1_id;
-            uint32_t chrom2_id;
-            string filepath;
-        };
-        vector<PairFile> pair_files;
-
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_name[0] == '.') continue;
-
-            string filename(entry->d_name);
-            string chrom1_name, chrom2_name;
-
-            if (!parse_pair_filename(filename, chrom1_name, chrom2_name)) {
-                continue;
-            }
-
-            // Try to resolve chrom names to IDs
-            // Try as-is first, then strip chr prefix
-            int chrom1_id = chromkey.chrom2id(chrom1_name.c_str());
-            if (chrom1_id < 0) {
-                string stripped = strip_chr_prefix(chrom1_name);
-                chrom1_id = chromkey.chrom2id(stripped.c_str());
-            }
-
-            int chrom2_id = chromkey.chrom2id(chrom2_name.c_str());
-            if (chrom2_id < 0) {
-                string stripped = strip_chr_prefix(chrom2_name);
-                chrom2_id = chromkey.chrom2id(stripped.c_str());
-            }
-
-            if (chrom1_id < 0 || chrom2_id < 0) {
-                continue;  // Skip files with unrecognizable chrom names
-            }
-
-            PairFile pf;
-            pf.chrom1_id = (uint32_t)chrom1_id;
-            pf.chrom2_id = (uint32_t)chrom2_id;
-            pf.filepath = track_dir + "/" + filename;
-            pair_files.push_back(pf);
+        // The per-pair files, listed once (GenomeTrack::ChromFiles), by the canonical names or by
+        // aliases. Not the call's listing: the conversion writes into the directory.
+        const GenomeTrack::ChromFiles files(chromkey, track_dir);
+        for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+            if (!file.link && file.chromid1 < 0)
+                verror("Track %s: file %s is not named by a chromosome pair", track_dir.c_str(), file.name.c_str());
         }
-        closedir(dir);
 
-        if (pair_files.empty()) {
+        // Sorted by (chromid1, chromid2) for deterministic output; two files of a pair are an error
+        const vector<pair<int, int>> chrom_pairs = files.chrom_pairs();
+
+        if (chrom_pairs.empty()) {
+            if (!old_idx_path.empty())
+                verror("No valid chromosome pair files found in track directory %s", track_dir.c_str());
             // No per-pair files found, return 0
             return PyLong_FromLong(0);
         }
 
-        // Sort by (chrom1_id, chrom2_id)
-        sort(pair_files.begin(), pair_files.end(),
-            [](const PairFile &a, const PairFile &b) {
-                if (a.chrom1_id != b.chrom1_id) return a.chrom1_id < b.chrom1_id;
-                return a.chrom2_id < b.chrom2_id;
-            });
-
         // Create tmp files
         dat_path_tmp = track_dir + "/track.dat.tmp";
         idx_path_tmp = track_dir + "/track.idx.tmp";
-        string dat_path = track_dir + "/track.dat";
 
         FILE *dat_fp = fopen(dat_path_tmp.c_str(), "wb");
         if (!dat_fp) {
@@ -233,23 +225,25 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
 
         // Build entries and concatenate file contents
         vector<Track2DPairEntry> entries;
-        vector<string> files_to_remove;
         uint64_t current_offset = 0;
 
-        for (const auto &pf : pair_files) {
+        for (const auto &chrom_pair : chrom_pairs) {
             Track2DPairEntry idx_entry;
-            idx_entry.chrom1_id = pf.chrom1_id;
-            idx_entry.chrom2_id = pf.chrom2_id;
+            idx_entry.chrom1_id = (uint32_t)chrom_pair.first;
+            idx_entry.chrom2_id = (uint32_t)chrom_pair.second;
             idx_entry.offset = current_offset;
             idx_entry.length = 0;
             idx_entry.reserved = 0;
 
             uint64_t bytes_written = 0;
-            if (copy_file_contents_2d(pf.filepath, dat_fp, bytes_written)) {
-                idx_entry.length = bytes_written;
-                current_offset += bytes_written;
-                files_to_remove.push_back(pf.filepath);
+            try {
+                copy_file_contents_2d(files.path(chrom_pair.first, chrom_pair.second), dat_fp, bytes_written);
+            } catch (...) {
+                fclose(dat_fp);
+                throw;
             }
+            idx_entry.length = bytes_written;
+            current_offset += bytes_written;
 
             entries.push_back(idx_entry);
         }
@@ -282,9 +276,17 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
                                   (unsigned long long)dat_stat.st_size);
         }
 
-        // Remove old per-pair files
-        for (const auto &f : files_to_remove) {
-            unlink(f.c_str());
+        // Remove old per-pair files if requested, also those that the packed ones hid
+        if (remove_old) {
+            for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+                if (!file.link || file.chromid1 >= 0)  // not a symlink the conversion ignored
+                    unlink((track_dir + "/" + file.name).c_str());
+            }
+        }
+
+        if (!old_idx_path.empty()) {
+            unlink(old_idx_path.c_str());
+            unlink(old_dat_path.c_str());
         }
 
         // Clear the 2D index cache so it reloads from disk
@@ -295,11 +297,13 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
     } catch (TGLException &e) {
         unlink(dat_path_tmp.c_str());
         unlink(idx_path_tmp.c_str());
+        restore_old_index(old_idx_path, old_dat_path);
         PyMisha::handle_error(e.msg());
         return NULL;
     } catch (const bad_alloc &) {
         unlink(dat_path_tmp.c_str());
         unlink(idx_path_tmp.c_str());
+        restore_old_index(old_idx_path, old_dat_path);
         PyMisha::handle_error("Out of memory");
         return NULL;
     }

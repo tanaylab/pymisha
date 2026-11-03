@@ -22,14 +22,8 @@ public:
     KmerCounter(const std::string &kmer, GenomeSeqFetch* shared_seqfetch,
                 CountMode mode = SUM, bool extend = true, char strand = 0);
 
-    // Constructor for string-only scoring (no genome database required)
-    KmerCounter(const std::string &kmer, CountMode mode = SUM, char strand = 0);
-
     // Implement the virtual function from the base class
     double score_interval(const GInterval &interval, const GenomeChromKey &chromkey) override;
-
-    // Score a raw string (no genome database needed)
-    double count_string(const char* seq, int seq_len);
 
     // Batch processing accessors
     const std::string &get_kmer() const { return m_kmer; }
@@ -43,9 +37,11 @@ public:
                                const GInterval &original_interval,
                                const GInterval &fetch_interval) const;
 
+protected:
+    int64_t pattern_length() const override { return (int64_t)m_kmer.length(); }
+
 private:
     std::string m_kmer;
-    std::string m_kmer_rc;  // reverse complement of m_kmer
     CountMode m_mode;
 
     // Helper method to count kmers in an interval with a specific strand

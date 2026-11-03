@@ -221,19 +221,30 @@ def gdb_set_readonly_attrs(attrs: list[str] | tuple[str, ...] | str | None) -> N
 
     rscript = _find_trusted_rscript()
     if rscript is not None:
+        # warn = 2: close() only warns when writing the last buffer fails, and
+        # Rscript would then exit 0 over a truncated file. Written under a
+        # temporary name: R may fail before it opens the file, and the old one
+        # must survive that.
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
         cmd = [
             rscript,
             "-e",
+            "options(warn = 2); "
             "args <- commandArgs(TRUE); "
             "f <- args[1]; "
             "attrs <- args[-1]; "
             "con <- file(f, 'wb'); "
             "serialize(attrs, con); "
             "close(con)",
-            str(path),
+            str(tmp),
             *attrs,
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         return
 
     warnings.warn(
@@ -243,5 +254,6 @@ def gdb_set_readonly_attrs(attrs: list[str] | tuple[str, ...] | str | None) -> N
         stacklevel=2,
     )
     payload = _PY_RO_MAGIC + "\n".join(attrs).encode("utf-8")
-    path.write_bytes(payload)
+    with _shared._write_file(path) as fh:
+        fh.write(payload)
     return

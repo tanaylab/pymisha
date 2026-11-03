@@ -57,7 +57,7 @@ class TestGintervalsMapply:
         assert "chrom" in result.columns
         assert "start" in result.columns
         assert "end" in result.columns
-        assert list(result["chrom"]) == ["1", "2"]
+        assert list(result["chrom"]) == ["chr1", "chr2"]
 
     def test_nan_values(self):
         """Function can return NaN."""
@@ -159,7 +159,7 @@ class TestGintervalsMapply:
         )
         assert len(seen) == 2
         assert set(seen[0]) >= {"chrom", "start", "end"}
-        assert seen[0]["chrom"] in ("1", "2")
+        assert seen[0]["chrom"] in ("chr1", "chr2")
 
 
 class TestGintervalsMapplyIntervalsSetOut:

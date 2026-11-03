@@ -140,6 +140,82 @@ bool apply_shift(const GInterval &in, int64_t sshift, int64_t eshift,
     return out.start < out.end;
 }
 
+// The scores the pwm and potts scorers keep from earlier reads are stale once
+// the sequence changes under them; the other sequence scorers keep none.
+inline void invalidate_scorer_cache(PWMScorer &s) { s.invalidate_cache(); }
+inline void invalidate_scorer_cache(PottsScorer &s) { s.invalidate_cache(); }
+inline void invalidate_scorer_cache(GenomeSeqScorer &) {}
+
+// A pwm.max.pos / potts.max.pos scorer that answers each interval with the
+// max score its position was chosen by (get_last_max_score()): the score R's
+// filter aggregation ranks the unmasked parts by, as vtracks.py does here.
+template <class Scorer>
+struct LastMaxScore {
+    Scorer &scorer;
+    double score_interval(const GInterval &interval, const GenomeChromKey &chromkey) {
+        scorer.score_interval(interval, chromkey);
+        return scorer.get_last_max_score();
+    }
+};
+template <class Scorer>
+inline void invalidate_scorer_cache(LastMaxScore<Scorer> &s) { s.scorer.invalidate_cache(); }
+
+// Per-interval substitutions for gextract_variants, from the spec's optional
+// sub_pos / sub_base arrays (aligned to `intervals`; base 0..3 = A, C, G, T,
+// -1 = none). Empty when the spec has none.
+std::vector<SeqSubstitution> parse_substitutions(PyObject *spec, const std::vector<GInterval> &intervals) {
+    std::vector<SeqSubstitution> subs;
+    PyObject *py_pos = PyDict_GetItemString(spec, "sub_pos");
+    PyObject *py_base = PyDict_GetItemString(spec, "sub_base");
+    if (!py_pos || !py_base || py_pos == Py_None || py_base == Py_None)
+        return subs;
+    PMPY pos_arr(PyArray_FROM_OTF(py_pos, NPY_INT64, NPY_ARRAY_IN_ARRAY), true);
+    PMPY base_arr(PyArray_FROM_OTF(py_base, NPY_INT64, NPY_ARRAY_IN_ARRAY), true);
+    if (!pos_arr || !base_arr || PyArray_NDIM((PyArrayObject *)*pos_arr) != 1 ||
+        PyArray_NDIM((PyArrayObject *)*base_arr) != 1 ||
+        (size_t)PyArray_DIM((PyArrayObject *)*pos_arr, 0) != intervals.size() ||
+        (size_t)PyArray_DIM((PyArrayObject *)*base_arr, 0) != intervals.size()) {
+        PyErr_Clear();
+        TGLError("sub_pos and sub_base must be integer arrays with one entry per interval");
+    }
+    const int64_t *pos = (const int64_t *)PyArray_DATA((PyArrayObject *)*pos_arr);
+    const int64_t *base = (const int64_t *)PyArray_DATA((PyArrayObject *)*base_arr);
+    static const char BASES[4] = {'A', 'C', 'G', 'T'};
+    subs.resize(intervals.size());
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        if (base[i] < -1 || base[i] > 3)
+            TGLError("Invalid substituted base code %lld", (long long)base[i]);
+        if (base[i] >= 0) {
+            subs[i].chromid = intervals[i].chromid;
+            subs[i].pos = pos[i];
+            subs[i].base = BASES[base[i]];
+        }
+    }
+    return subs;
+}
+
+// Score every interval, shifted, with subs[i] applied to the sequence while
+// interval i is scored (when subs is not empty).
+template <class Scorer>
+void score_intervals(Scorer &scorer, GenomeSeqFetch &seq, const std::vector<GInterval> &intervals,
+                     const std::vector<SeqSubstitution> &subs, int64_t sshift, int64_t eshift,
+                     const GenomeChromKey &chromkey, double *out) {
+    SeqSubstitution cur;
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        if (!subs.empty() && !(subs[i] == cur)) {
+            cur = subs[i];
+            seq.set_substitution(cur);
+            invalidate_scorer_cache(scorer);
+        }
+        GInterval eval;
+        if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
+            out[i] = std::numeric_limits<double>::quiet_NaN();
+            continue;
+        }
+        out[i] = scorer.score_interval(eval, chromkey);
+    }
+}
+
 bool interval_cmp_start(const GInterval &a, const GInterval &b) {
     if (a.chromid != b.chromid) return a.chromid < b.chromid;
     if (a.start != b.start) return a.start < b.start;
@@ -548,6 +624,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             if (py_src && py_src != Py_None) {
                 TGLError("Virtual track function %s expects src=None (sequence-based)", func.c_str());
             }
+            const std::vector<SeqSubstitution> subs = parse_substitutions(py_spec, intervals);
 
             if (func.rfind("pwm", 0) == 0) {
                 PyObject *py_pssm = dict_get(py_spec, "pssm");
@@ -597,14 +674,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                                                      max_edits, extend, strand, mode,
                                                      score_min_f, max_indels, score_max_f);
 
-                        for (size_t i = 0; i < intervals.size(); ++i) {
-                            GInterval eval;
-                            if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                                set_nan(i);
-                                continue;
-                            }
-                            out[i] = scorer.score_interval(eval, chromkey);
-                        }
+                        score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                     } else {
                         PWMLseEditDistanceScorer::Mode mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE;
                         if (func == "pwm.edit_distance.lse.pos") mode = PWMLseEditDistanceScorer::Mode::LSE_EDIT_DISTANCE_POS;
@@ -613,14 +683,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                                                         max_edits, extend, strand, mode,
                                                         score_min_f, score_max_f);
 
-                        for (size_t i = 0; i < intervals.size(); ++i) {
-                            GInterval eval;
-                            if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                                set_nan(i);
-                                continue;
-                            }
-                            out[i] = scorer.score_interval(eval, chromkey);
-                        }
+                        score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                     }
                     return_py(py_vals);
                 }
@@ -628,7 +691,6 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 // Standard PWM scoring functions (pwm, pwm.max, pwm.max.pos, pwm.count)
                 std::vector<float> spat_factor;
                 int spat_bin = (int)obj_to_int64(dict_get(py_spec, "spat_bin"), 1);
-                bool has_spat = false;
                 if (PyObject *spat = dict_get(py_spec, "spat_factor")) {
                     PMPY arr(PyArray_FROM_OTF(spat, NPY_DOUBLE, NPY_ARRAY_ALIGNED | NPY_ARRAY_FORCECAST), true);
                     if (arr && PyArray_NDIM((PyArrayObject *)*arr) == 1) {
@@ -638,13 +700,14 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                             double v = *(double *)PyArray_GETPTR1((PyArrayObject *)*arr, i);
                             spat_factor[i] = (float)v;
                         }
-                        has_spat = true;
                     }
                 }
 
-                int64_t spat_min = obj_to_int64(dict_get(py_spec, "spat_min"), 0);
-                int64_t spat_max = obj_to_int64(dict_get(py_spec, "spat_max"), 0);
-                if (has_spat && spat_max > spat_min) {
+                // Same rule as PMTrackExpressionVars::build_vtrack_scorer().
+                bool has_smin = false, has_smax = false;
+                int64_t spat_min = obj_to_int64(dict_get(py_spec, "spat_min"), 0, &has_smin);
+                int64_t spat_max = obj_to_int64(dict_get(py_spec, "spat_max"), DnaPSSM::NO_RANGE_CAP, &has_smax);
+                if (has_smin || has_smax) {
                     pssm.set_range((int)spat_min, (int)spat_max);
                 }
 
@@ -657,13 +720,12 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
                 PWMScorer scorer(pssm, &shared_seq, extend, pwm_mode, strand, spat_factor, spat_bin, (float)score_thresh);
 
-                for (size_t i = 0; i < intervals.size(); ++i) {
-                    GInterval eval;
-                    if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                        set_nan(i);
-                        continue;
-                    }
-                    out[i] = scorer.score_interval(eval, chromkey);
+                if (pwm_mode == PWMScorer::MAX_LIKELIHOOD_POS &&
+                    obj_to_int64(dict_get(py_spec, "last_max_score"), 0)) {
+                    LastMaxScore<PWMScorer> last_max{scorer};
+                    score_intervals(last_max, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
+                } else {
+                    score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                 }
                 return_py(py_vals);
             }
@@ -682,15 +744,15 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 GenomeSeqFetch shared_seq;
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
                 PottsScorer scorer(pp.model, &shared_seq, pp.extend_flag, potts_mode,
-                                   pp.bidirect, pp.strand_mode, pp.score_thresh);
+                                   pp.bidirect, pp.strand_mode, pp.score_thresh,
+                                   pp.max_edits);
 
-                for (size_t i = 0; i < intervals.size(); ++i) {
-                    GInterval eval;
-                    if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                        set_nan(i);
-                        continue;
-                    }
-                    out[i] = scorer.score_interval(eval, chromkey);
+                if (potts_mode == PottsScorer::MAX_LIKELIHOOD_POS &&
+                    obj_to_int64(dict_get(py_spec, "last_max_score"), 0)) {
+                    LastMaxScore<PottsScorer> last_max{scorer};
+                    score_intervals(last_max, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
+                } else {
+                    score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                 }
                 return_py(py_vals);
             }
@@ -710,14 +772,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 GenomeSeqFetch shared_seq;
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
                 KmerCounter counter(kmer, &shared_seq, mode, extend, strand);
-                for (size_t i = 0; i < intervals.size(); ++i) {
-                    GInterval eval;
-                    if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                        set_nan(i);
-                        continue;
-                    }
-                    out[i] = counter.score_interval(eval, chromkey);
-                }
+                score_intervals(counter, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                 return_py(py_vals);
             }
 
@@ -726,14 +781,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 GenomeSeqFetch shared_seq;
                 shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
                 MaskedBpCounter counter(&shared_seq, mode);
-                for (size_t i = 0; i < intervals.size(); ++i) {
-                    GInterval eval;
-                    if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                        set_nan(i);
-                        continue;
-                    }
-                    out[i] = counter.score_interval(eval, chromkey);
-                }
+                score_intervals(counter, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                 return_py(py_vals);
             }
         }
@@ -851,11 +899,9 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                    if (func == "neighbor.count" || func == "coverage") {
-                        out[i] = 0.0;
-                    } else {
-                        set_nan(i);
-                    }
+                    // A window shifted off the chromosome has no answer, for
+                    // every function (misha 5.12.x), not a count of 0.
+                    set_nan(i);
                     continue;
                 }
 
@@ -1153,7 +1199,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 }
 
                 if (cur_chromid != eval.chromid) {
-                    std::string chrom_file = GenomeTrack::find_existing_1d_filename(chromkey, track_path, eval.chromid);
+                    std::string chrom_file = g_pmdb->chrom_files(track_path).filename(eval.chromid);
                     std::string full_path = track_path + "/" + chrom_file;
                     // Indexed tracks have no per-chrom file; init_read reads
                     // through track.idx. Gating on the per-chrom file made
@@ -1261,7 +1307,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             }
 
             if (cur_chromid != eval.chromid) {
-                std::string chrom_file = GenomeTrack::find_existing_1d_filename(chromkey, track_path, eval.chromid);
+                std::string chrom_file = g_pmdb->chrom_files(track_path).filename(eval.chromid);
                 std::string full_path = track_path + "/" + chrom_file;
                 // Indexed tracks have no per-chrom file; init_read reads through
                 // track.idx. Gating on the per-chrom file made value-based

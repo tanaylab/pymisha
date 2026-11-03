@@ -36,39 +36,40 @@ public:
     // it to ~7 digits on the way in.
     PottsScorer(const PottsModel &model, const std::string &genome_root,
                 bool extend, ScoringMode mode, bool bidirect, char strand,
-                double score_thresh);
+                double score_thresh, int max_edits = 0);
 
     PottsScorer(const PottsModel &model, GenomeSeqFetch *shared_seqfetch,
                 bool extend, ScoringMode mode, bool bidirect, char strand,
-                double score_thresh);
+                double score_thresh, int max_edits = 0);
 
     double score_interval(const GInterval &interval, const GenomeChromKey &chromkey) override;
 
     void invalidate_cache();
 
     // The best per-anchor score from the last score_interval() call, or -inf if
-    // it scored nothing. pymisha aggregates a gvtrack_filter's unmasked parts in
-    // Python - vtracks.py scores each part twice, once with func = "potts.max"
-    // to rank the parts and once with the func asked for - so nothing in this
-    // tree reads this today. Kept so the file stays in step with misha's, whose
-    // SequenceVarProcessor potts branch does the aggregation in C++ and needs it:
-    // the position alone does not say which part's position to keep.
+    // it scored nothing. vtracks.py's filter aggregation ranks MAX_LIKELIHOOD_POS
+    // parts by it (pm_vtrack_compute() returns it under the spec key
+    // "last_max_score"), as misha's SequenceVarProcessor::score_potts_var() does
+    // - the position alone does not say which part's position to keep.
     //
     // On a call answered by a SLID window it comes out of the aggregator, so it
     // carries the float precision the aggregators store rather than the double
     // the direct reduction computes; the only current caller reads it under
-    // MAX_LIKELIHOOD_POS, so this could affect which of two nearly-tied parts a
-    // C++-side filter aggregation prefers, but not correctness beyond that. For
+    // MAX_LIKELIHOOD_POS, so this can affect which of two nearly-tied parts its
+    // filter aggregation prefers, but not correctness beyond that. For
     // MOTIF_COUNT - the one mode that keeps no running maximum - it is left at
     // -inf; not read there today, since a filtered potts.count sums scores, not
     // this.
     double get_last_max_score() const { return m_last_max_score; }
 
+protected:
+    int64_t pattern_length() const override { return (int64_t)m_model.width(); }
+
 private:
-    // The per-anchor value in the ORIGINAL genome's orientation. `union_max`
-    // picks the strand union: false is log-sum-exp (TOTAL_LIKELIHOOD,
-    // MAX_LIKELIHOOD, MOTIF_COUNT), true is the maximum (MAX_LIKELIHOOD_POS,
-    // which has to name a strand). Same asymmetry as the pwm family, and as
+    // The value of the anchor at m_codes[i], in the ORIGINAL genome's
+    // orientation. `union_max` picks the strand union: false is log-sum-exp
+    // (TOTAL_LIKELIHOOD, MAX_LIKELIHOOD, MOTIF_COUNT), true is the maximum
+    // (MAX_LIKELIHOOD_POS, which has to name a strand). Same asymmetry as the pwm family, and as
     // pm_gseq_potts, on purpose.
     //
     // Always finite for a scorable anchor: _coerce_potts_model() rejects a
@@ -76,7 +77,13 @@ private:
     // |intercept| - does not fit in a float, so no anchor can overflow the
     // float this returns through and -inf out of the aggregators below can
     // only mean "no scorable anchor".
-    double anchor_value(const int8_t *c, bool union_max, int &dir) const;
+    double anchor_value(size_t i, bool union_max, int &dir) const;
+
+    // max_edits = 1: the best anchor score reachable with at most one
+    // substitution. Max over substitutions and max over anchors commute, and a
+    // substitution outside an anchor's window leaves it unchanged, so each
+    // anchor is maximised on its own.
+    double score_one_edit(size_t i_min, size_t i_max, size_t motif_len);
 
     // 1-based position of `index`, in forward-strand orientation, signed by
     // `direction` when bidirect. Transliterated from
@@ -140,6 +147,10 @@ private:
         int hit_count = 0;
     };
 
+    // The largest window the sliding cache will materialise, in anchors.
+    // PWMScorer carries the same constant for the same reason; see the note
+    // there. Kept per-class rather than shared so neither scorer's tuning is
+    // hostage to the other's.
     static const size_t MAX_CACHED_WINDOW_ANCHORS = 1000000;
 
     double score_with_sliding_window(const GInterval &original_interval,
@@ -185,11 +196,13 @@ private:
     ScoringMode m_mode;
     bool m_bidirect;
     double m_score_thresh;
+    int m_max_edits;
     double m_last_max_score = -std::numeric_limits<double>::infinity();
 
     // Scratch, reused across calls so a per-bp iterator does not reallocate.
     std::vector<int8_t> m_codes;
     std::vector<int32_t> m_nbad;
+    std::vector<int8_t> m_block_codes;
 
     SlideCache m_slide;
     // Seed scratch in window-slot order: the value for every mode but

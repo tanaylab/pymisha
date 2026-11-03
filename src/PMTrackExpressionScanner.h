@@ -31,6 +31,11 @@ public:
                const std::vector<GInterval> &intervals, int64_t iterator_policy,
                PyObject *py_vtracks = nullptr);
 
+    // Apply (*subs)[i] to the sequence while the i-th iterator interval is
+    // computed (gextract_variants). Call before begin() with iterator policy
+    // -1, which walks the intervals as given.
+    void set_row_substitutions(const std::vector<SeqSubstitution> *subs) { m_row_subs = subs; }
+
     // Advance to next value
     bool next();
 
@@ -88,6 +93,7 @@ public:
 private:
     std::vector<std::string> m_track_exprs;
     PMTrackExpressionVars m_expr_vars;
+    const std::vector<SeqSubstitution> *m_row_subs{nullptr};
     std::unique_ptr<PMTrackExpressionIterator> m_itr;
     ValType m_valtype;
 

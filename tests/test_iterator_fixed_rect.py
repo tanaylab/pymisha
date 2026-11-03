@@ -60,7 +60,7 @@ def test_gextract_fixed_rect_matches_explicit_grid_extract():
 
     pm.gvtrack_create("v_avg_ref", "rects_track", func="avg")
     try:
-        ref_result = pm.gextract("v_avg_ref", intervals=grid_df)
+        ref_result = pm.gextract("v_avg_ref", intervals=grid_df, iterator=grid_df)
     finally:
         pm.gvtrack_rm("v_avg_ref")
 
@@ -229,8 +229,8 @@ def test_r_gextract3_rects_fixedrect_two_chrom_pairs():
     # chrom1='1', chrom2='2': 5 bins x 3 bins = 15 cells
     assert len(result) == 40
 
-    pair_11 = result[(result["chrom1"] == "1") & (result["chrom2"] == "1")]
-    pair_12 = result[(result["chrom1"] == "1") & (result["chrom2"] == "2")]
+    pair_11 = result[(result["chrom1"] == "chr1") & (result["chrom2"] == "chr1")]
+    pair_12 = result[(result["chrom1"] == "chr1") & (result["chrom2"] == "chr2")]
     assert len(pair_11) == 25
     assert len(pair_12) == 15
 
@@ -516,7 +516,7 @@ def test_giterator_intervals_2d_fixed_rect_grid():
     expected = []
     for y in range(0, 500_000, 100_000):
         for x in range(0, 500_000, 100_000):
-            expected.append(("1", x, x + 100_000, "1", y, y + 100_000))
+            expected.append(("chr1", x, x + 100_000, "chr1", y, y + 100_000))
     exp = pd.DataFrame(expected, columns=result.columns)
 
     key = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
@@ -547,8 +547,8 @@ def test_giterator_intervals_2d_fixed_rect_non_square_multipair():
     result = pm.giterator_intervals(None, scope, iterator=(100_000, 50_000))
     # Each pair: 3 bins (dim1) x 4 bins (dim2) = 12 cells -> 24 total.
     assert len(result) == 24
-    assert len(result[(result["chrom1"] == "1") & (result["chrom2"] == "1")]) == 12
-    assert len(result[(result["chrom1"] == "1") & (result["chrom2"] == "2")]) == 12
+    assert len(result[(result["chrom1"] == "chr1") & (result["chrom2"] == "chr1")]) == 12
+    assert len(result[(result["chrom1"] == "chr1") & (result["chrom2"] == "chr2")]) == 12
 
 
 def test_giterator_intervals_2d_fixed_rect_band():

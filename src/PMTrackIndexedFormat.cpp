@@ -22,6 +22,7 @@
 #include "TrackIndex.h"
 #include "CRC64.h"
 #include "BufferedFile.h"
+#include "IndexedTrackWriter.h"
 #include "TGLException.h"
 #include "pymisha.h"
 
@@ -66,7 +67,7 @@ static bool copy_file_contents(const string &src, FILE *dest, uint64_t &bytes_wr
 {
     FILE *src_fp = fopen(src.c_str(), "rb");
     if (!src_fp)
-        return false;
+        TGLError<GenomeTrack>("Failed to open %s: %s", src.c_str(), strerror(errno));
 
     if (fseek(src_fp, 0, SEEK_END) != 0) {
         fclose(src_fp);
@@ -151,7 +152,17 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
         }
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
-        GenomeTrack::Type track_type_enum = GenomeTrack::get_type(track_dir.c_str(), chromkey);
+
+        // The chromosome files, listed once (GenomeTrack::ChromFiles). Not the call's listing:
+        // the conversion writes into the directory.
+        const GenomeTrack::ChromFiles files(chromkey, track_dir);
+        for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+            if (!file.link && file.chromid < 0)
+                verror("Track %s: file %s is not named by a chromosome", track, file.name.c_str());
+        }
+        files.chromids();  // two files of a chromosome are an error
+
+        GenomeTrack::Type track_type_enum = GenomeTrack::get_type(files);
         MishaTrackType track_type = map_track_type(track_type_enum);
 
         dat_path_tmp = track_dir + "/track.dat.tmp";
@@ -172,47 +183,12 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
         write_index_header(idx_fp, track_type, chromkey.get_num_chroms(), 0);
 
         vector<TrackContigEntry> entries;
-        vector<string> chr_files_to_remove;
         uint64_t current_offset = 0;
-
-        unordered_set<string> existing_files;
-        DIR *dir = opendir(track_dir.c_str());
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (entry->d_name[0] != '.') {
-                    existing_files.insert(entry->d_name);
-                }
-            }
-            closedir(dir);
-        }
 
         for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); chromid++) {
             string chrom_name = chromkey.id2chrom(chromid);
-
-            string chr_file;
-            bool found = false;
-
-            if (existing_files.count(chrom_name)) {
-                chr_file = track_dir + "/" + chrom_name;
-                found = true;
-            } else if (chrom_name.substr(0, 3) != "chr" && existing_files.count("chr" + chrom_name)) {
-                chr_file = track_dir + "/chr" + chrom_name;
-                found = true;
-            } else if (chrom_name.substr(0, 3) == "chr" && existing_files.count(chrom_name.substr(3))) {
-                chr_file = track_dir + "/" + chrom_name.substr(3);
-                found = true;
-            } else {
-                vector<string> aliases;
-                chromkey.get_aliases(chromid, aliases);
-                for (const auto &alias : aliases) {
-                    if (existing_files.count(alias)) {
-                        chr_file = track_dir + "/" + alias;
-                        found = true;
-                        break;
-                    }
-                }
-            }
+            bool found = files.exists(chromid);
+            string chr_file = files.path(chromid);
 
             TrackContigEntry entry;
             entry.chrom_id = chromid;
@@ -221,10 +197,16 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
             entry.reserved = 0;
 
             uint64_t bytes_written = 0;
-            if (found && copy_file_contents(chr_file, dat_fp, bytes_written)) {
+            if (found) {
+                try {
+                    copy_file_contents(chr_file, dat_fp, bytes_written);
+                } catch (...) {
+                    fclose(dat_fp);
+                    fclose(idx_fp);
+                    throw;
+                }
                 entry.length = bytes_written;
                 current_offset += bytes_written;
-                chr_files_to_remove.push_back(chr_file);
             }
 
             // Write entry to index in one call (24 bytes)
@@ -274,13 +256,12 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
             TGLError<GenomeTrack>("Failed to update checksum in index");
         }
 
-        fflush(dat_fp);
-        fflush(idx_fp);
-        fsync(fileno(dat_fp));
-        fsync(fileno(idx_fp));
-
-        fclose(dat_fp);
-        fclose(idx_fp);
+        // Checked before the rename: a short track.dat must not be published as the track.
+        int dat_err = close_written(dat_fp);
+        int idx_err = close_written(idx_fp);
+        if (dat_err || idx_err)
+            TGLError<GenomeTrack>("Failed to write %s: %s", (dat_err ? dat_path : idx_path).c_str(),
+                                  strerror(dat_err ? dat_err : idx_err));
 
         if (rename(dat_path_tmp.c_str(), dat_path.c_str()) != 0) {
             TGLError<GenomeTrack>("Failed to rename %s to %s: %s",
@@ -300,9 +281,11 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
                                   (unsigned long long)current_offset, (unsigned long long)dat_stat.st_size);
         }
 
+        // Remove old per-chromosome files if requested, also those that the packed ones hid
         if (remove_old) {
-            for (const auto &chr_file : chr_files_to_remove) {
-                unlink(chr_file.c_str());
+            for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+                if (!file.link || file.chromid >= 0)  // not a symlink the conversion ignored
+                    unlink((track_dir + "/" + file.name).c_str());
             }
         }
 

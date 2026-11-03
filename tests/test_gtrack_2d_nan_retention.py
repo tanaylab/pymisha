@@ -3,9 +3,11 @@
 R's `gtrack.lookup` with `force.binning=FALSE` and equivalent pymisha paths
 build 2D RECTS tracks containing both finite and NaN values; the NaN rects
 must round-trip through `gtrack_2d_create` + `gextract`, and 2D virtual-track
-stat aggregations (avg / min / max / sum / weighted.sum) must skip NaN values
-exactly like R (`np.nanmean` / `np.nanmin` / etc. semantics over the finite
-subset; all-NaN window → NaN).
+stat aggregations (avg / min / max / weighted.sum / area) must count them as
+R misha 5.12.1 does: a NaN rect's area counts and makes the weighted sum and
+avg NaN, and min / max take the values after the last NaN met. The expected
+values are R's, on the very file gtrack_2d_create writes here (R writes the
+same bytes for these rects).
 """
 from __future__ import annotations
 
@@ -81,8 +83,8 @@ def test_2d_track_with_nan_rects_round_trips_all_rows():
         _cleanup_track(name)
 
 
-def test_2d_vtrack_avg_skips_nan():
-    """avg over a window covering 3 finite + 2 NaN rects matches np.nanmean."""
+def test_2d_vtrack_avg_is_nan_over_a_nan_rect():
+    """avg over a window covering 3 finite + 2 NaN rects is NaN, as in R."""
     name = "test.test_2d_nan_avg"
     _cleanup_track(name)
     try:
@@ -91,61 +93,53 @@ def test_2d_vtrack_avg_skips_nan():
         scope = pm.gintervals_2d([1], 0, 1000, [1], 0, 1000)
         result = pm.gextract("v_avg", scope, iterator=scope)
         assert result is not None
-        # All 5 rects (each 50bp x 50bp) inside the window;
-        # area-weighted avg of [10, 30, 50] (NaN excluded) = 30.0.
-        np.testing.assert_allclose(
-            float(result["v_avg"].iloc[0]), 30.0, rtol=1e-6
-        )
+        assert np.isnan(result["v_avg"].iloc[0])
     finally:
         _cleanup_track(name)
 
 
-def test_2d_vtrack_min_max_sum_skip_nan():
-    """min / max / sum over a NaN-bearing window match the finite-only stats."""
+def test_2d_vtrack_min_max_sum_area_with_nan():
+    """min / max / weighted.sum / area over a NaN-bearing window, as R gives them.
+
+    The rects are 10, NaN, 30, NaN, 50, each 50x50 and read in that order: the
+    area counts all five, the weighted sum is NaN, and min and max are both
+    50, the only value after the last NaN.
+    """
     name = "test.test_2d_nan_minmaxsum"
     _cleanup_track(name)
     try:
         _build_mixed_track(name)
-        # Finite values are 10, 30, 50 each over a 50x50 = 2500 area;
-        # area-weighted sum = (10+30+50)*2500 = 225000.
         for func, expected in [
-            ("min", 10.0),
+            ("min", 50.0),
             ("max", 50.0),
-            ("weighted.sum", 10.0 * 2500 + 30.0 * 2500 + 50.0 * 2500),
+            ("weighted.sum", np.nan),
+            ("area", 5 * 2500.0),
         ]:
             pm.gvtrack_clear()
             pm.gvtrack_create(f"v_{func}", name, func)
             scope = pm.gintervals_2d([1], 0, 1000, [1], 0, 1000)
             result = pm.gextract(f"v_{func}", scope, iterator=scope)
             assert result is not None, f"{func}: gextract returned None"
-            np.testing.assert_allclose(
-                float(result[f"v_{func}"].iloc[0]),
-                expected,
-                rtol=1e-6,
-                err_msg=(
-                    f"func={func}: expected {expected}, "
-                    f"got {float(result[f'v_{func}'].iloc[0])}"
-                ),
+            np.testing.assert_array_equal(
+                float(result[f"v_{func}"].iloc[0]), expected, err_msg=f"func={func}"
             )
     finally:
         _cleanup_track(name)
 
 
 def test_2d_vtrack_window_with_only_nan_rects_returns_nan():
-    """A window covering only NaN-valued rects must return NaN, not 0 or skip."""
+    """A window covering only a NaN rect gives NaN, and the rect's area, as R does."""
     name = "test.test_2d_nan_only"
     _cleanup_track(name)
     try:
         _build_mixed_track(name)
         pm.gvtrack_create("v_avg", name, "avg")
+        pm.gvtrack_create("v_area", name, "area")
         # Window [180,260) x [180,260) covers only the (200,250) rect, which is NaN.
         scope = pm.gintervals_2d([1], 180, 260, [1], 180, 260)
-        result = pm.gextract("v_avg", scope, iterator=scope)
-        # If gextract returned no iterator interval at all, that's acceptable
-        # (no R baseline to compare); only assert when a row is emitted.
-        if result is None or len(result) == 0:
-            return
-        val = result["v_avg"].iloc[0]
-        assert pd.isna(val), f"expected NaN, got {val}"
+        result = pm.gextract(["v_avg", "v_area"], scope, iterator=scope)
+        assert len(result) == 1
+        assert pd.isna(result["v_avg"].iloc[0])
+        assert result["v_area"].iloc[0] == 2500
     finally:
         _cleanup_track(name)

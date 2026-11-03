@@ -16,9 +16,7 @@ Findings / open gaps (all ``xfail(strict=True)``):
   intersection is correct). A faithful fix should match the C++
   ``pm_intervals_summary`` Total/NaN-bin semantics (best done in C++ so dense
   NaN bins are still counted), so it is deferred.
-* ``GAP_2D`` -- 2D ``gintervals.summary`` interval counts differ from R.
 * ``GAP_2D_ITER`` -- 2D track/set/DataFrame iterator combinations differ from R.
-* ``GAP_COMPUTED`` -- COMPUTED 2D Hi-C tracks (``test.computed2d``).
 """
 
 from __future__ import annotations
@@ -30,9 +28,7 @@ import pymisha as pm
 from .baseline import assert_matches_baseline
 
 GAP_SUMMARY_ITER = "track-name/DataFrame iterator: scope intersected (empty scope intervals dropped) instead of one summary row per scope interval"
-GAP_2D = "2D gintervals.summary interval count differs from R"
 GAP_2D_ITER = "2D track/set/DataFrame iterator combinations differ from R"
-GAP_COMPUTED = "COMPUTED 2D Hi-C tracks (test.computed2d) not supported"
 
 S = pm.gintervals_summary
 
@@ -57,12 +53,12 @@ def _comp_scope():
 _CASES: dict[str, tuple] = {
     "gintervals.summary_test.fixedbin": (lambda: S("test.fixedbin", _iv1()), None),
     "gintervals.summary_test.sparse": (lambda: S("test.sparse", _iv1()), None),
-    "gintervals.summary_test.rects": (lambda: S("test.rects", _rects_scope()), GAP_2D),
-    "gintervals.summary_test.computed2d": (lambda: S("test.computed2d", _comp_scope()), GAP_COMPUTED),
+    "gintervals.summary_test.rects": (lambda: S("test.rects", _rects_scope()), None),
+    "gintervals.summary_test.computed2d": (lambda: S("test.computed2d", _comp_scope()), None),
     "gintervals.summary_randomized_test.fixedbin": (lambda: S("test.fixedbin", pm.gscreen("test.fixedbin > 0.2", _iv1())), None),
     "gintervals.summary_filtered_test.sparse": (lambda: S("test.sparse", pm.gscreen("test.fixedbin > 0.2", _iv1())), None),
-    "gintervals.summary_randomized_test.rects": (lambda: S("test.rects", pm.gscreen("test.rects > 40", _rects_scope())), GAP_2D),
-    "gintervals.summary_filtered_test.computed2d": (lambda: S("test.computed2d", pm.gscreen("test.computed2d > 4000000", _comp_scope())), GAP_COMPUTED),
+    "gintervals.summary_randomized_test.rects": (lambda: S("test.rects", pm.gscreen("test.rects > 40", _rects_scope())), None),
+    "gintervals.summary_filtered_test.computed2d": (lambda: S("test.computed2d", pm.gscreen("test.computed2d > 4000000", _comp_scope())), None),
     "summary_test.generated_1d_1_case1": (lambda: S("test.generated_1d_1", _gi("test.generated_1d_2"), iterator=_gi("test.generated_1d_1")), None),
     "summary_test.generated_1d_1_case2": (lambda: S("test.generated_1d_1", _gi("test.generated_1d_2"), iterator="test.bigintervs_1d_1"), None),
     "summary_test.generated_1d_1_case3": (lambda: S("test.generated_1d_1", _gi("test.generated_1d_2"), iterator="test.generated_1d_1"), None),
@@ -92,7 +88,7 @@ _CASES: dict[str, tuple] = {
         "test.rects",
         pm.gscreen("test.rects > 40", pm.gintervals_2d([1, 2, 5, 8], 0, -1)),
         iterator=[1, 1],
-    ), GAP_2D),
+    ), None),
 }
 
 

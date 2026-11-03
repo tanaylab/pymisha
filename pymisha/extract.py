@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import collections.abc
+import contextlib
 import os
+import re
+import socket
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -28,7 +31,9 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
     _remap_interval_ids,
+    _sort_by_chrom,
     _track_names_set,
+    _with_canonical_chroms,
 )
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
@@ -319,15 +324,8 @@ def _infer_iterator_from_vtracks(vtrack_names: set[str] | list[str]) -> int | st
         info = gtrack_info(src)
         dims = int(info.get("dimensions", 1) or 1)
         if dims == 2:
-            # 2D-source vtracks intentionally leave the iterator unspecified:
-            # the legacy path produces one row per scope interval (the
-            # historical pymisha contract used by a large surface of local
-            # tests).  R's `gextract` over a no-iterator 2D vtrack does iterate
-            # the source's rects per-row for `weighted.sum`/`area` (see the
-            # K562 r_parity test, currently xfail), but inferring it here
-            # silently changed object/aggregation vtrack output shape for
-            # callers in the wild - too breaking without more R-parity tests
-            # to anchor the right behaviour per func.
+            # A 2D source is resolved by _gextract_2d instead, which iterates
+            # the source's objects as R does (_expr_2d_track_sources).
             return None
         if dims != 1:
             return None
@@ -434,9 +432,9 @@ def _maybe_load_intervals_set(intervals: pd.DataFrame | str) -> pd.DataFrame | s
     if gtrack_exists(intervals):
         info = gtrack_info(intervals)
         if int(info.get("dimensions", 1) or 1) == 2:
-            from .intervals import gintervals_2d_all
+            from .intervals import _gintervals_2d_all
 
-            res = gextract(intervals, gintervals_2d_all(mode="full"))
+            res = gextract(intervals, _gintervals_2d_all("full"))
             if res is None or len(res) == 0:
                 return intervals
             cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
@@ -453,15 +451,21 @@ def _maybe_load_intervals_set(intervals: pd.DataFrame | str) -> pd.DataFrame | s
 
 
 def _find_2d_track_file(track_path: str, c1: str, c2: str) -> str | None:
-    """Find a 2D track per-chrom-pair file, trying multiple naming conventions."""
-    # Try: c1-c2 (pymisha convention)
-    path = os.path.join(track_path, f"{c1}-{c2}")
-    if os.path.exists(path):
+    """The file of a 2D track's chromosome pair, or None, as every reader finds it
+    (GenomeTrack::ChromFiles): named by the canonical names, as R misha names it, or by
+    aliases, as pymisha 0.14 and earlier named it in a per-chromosome database ("1-2"
+    for chr1-chr2)."""
+    try:
+        n1, n2 = _pymisha.pm_normalize_chroms([c1, c2])   # c1, c2 may be aliases
+    except _pymisha.error:
+        return None
+    path = os.path.join(track_path, f"{n1}-{n2}")
+    if os.path.isfile(path):
         return path
-    # Try: chrc1-chrc2 (R misha convention)
-    path = os.path.join(track_path, f"chr{c1}-chr{c2}")
-    if os.path.exists(path):
-        return path
+    files = _pymisha.pm_chrom_files(track_path, True)
+    for f1, f2, name, used in zip(files["chrom1"], files["chrom2"], files["file"], files["used"], strict=True):
+        if used and (f1, f2) == (n1, n2):
+            return os.path.join(track_path, name)
     return None
 
 
@@ -524,6 +528,7 @@ def _gextract_2d_single_python(
     )
     from .tracks import gtrack_info
 
+    intervals = _with_canonical_chroms(intervals)   # the database's names, as the C++ path gives
     track_path = _pymisha.pm_track_path(track)
     info = gtrack_info(track)
     is_points = info.get("type") == "points"
@@ -611,7 +616,7 @@ def _gextract_2d_single_python(
             "intervalID",
         ],
     )
-    return result.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
+    return _sort_by_chrom(result, ["chrom1", "start1", "chrom2", "start2", "intervalID"])
 
 
 def _gextract_2d_single(
@@ -669,6 +674,8 @@ def _gextract_2d_single(
     if _is_computed:
         return _gextract_2d_single_python(track, col_name, intervals, band)
 
+    # chromosome ids by name, an alias (such as "1" for chr1) included
+    intervals = _with_canonical_chroms(intervals)
     cmap = _chrom_id_map()
     chrom1_ids = (
         _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
@@ -715,9 +722,7 @@ def _gextract_2d_single(
         col_name: result["value"],
         "intervalID": result["intervalID"],
     })
-    return out.sort_values(
-        ["chrom1", "start1", "chrom2", "start2", "intervalID"]
-    ).reset_index(drop=True)
+    return _sort_by_chrom(out, ["chrom1", "start1", "chrom2", "start2", "intervalID"])
 
 
 _2D_VTRACK_FUNCS = {
@@ -1009,7 +1014,10 @@ def _gextract_2d_vtrack_agg(
     track_path = _pymisha.pm_track_path(track)
 
     n = len(intervals)
-    values = _numpy.full(n, _numpy.nan, dtype=float)
+    # A rect that meets no cell, or a pair the track has no file for, has area 0
+    # and NaN for the rest, as in R (StatQuadTreeCached::get_stat and
+    # GenomeTrackRects::read_interval).
+    values = _numpy.full(n, 0.0 if func == "area" else _numpy.nan, dtype=float)
 
     # Group intervals by (chrom1, chrom2) to open each file only once.
     chrom_pair_intervals = _group_intervals_by_chrom_pair(intervals)
@@ -1017,7 +1025,7 @@ def _gextract_2d_vtrack_agg(
     for (c1, c2), interval_list in chrom_pair_intervals.items():
         pair = open_2d_pair(track_path, c1, c2)
         if pair is None:
-            # No data for this chrom pair — values stay NaN.
+            # No data for this chrom pair.
             continue
 
         file_is_points, num_objs, data, root_chunk_fpos, close_fn = pair
@@ -1090,6 +1098,7 @@ def _gextract_2d_vtrack_objects_python(
     from ._quadtree import open_2d_pair, query_2d_track_opened
     from .tracks import gtrack_info
 
+    intervals = _with_canonical_chroms(intervals)   # the database's names, as the C++ path gives
     track_path = _pymisha.pm_track_path(track)
     info = gtrack_info(track)
     is_points = info.get("type") == "points"
@@ -1191,6 +1200,8 @@ def _gextract_2d_vtrack_objects(
             }
         )
 
+    # chromosome ids by name, an alias (such as "1" for chr1) included
+    intervals = _with_canonical_chroms(intervals)
     cmap = _chrom_id_map()
     chrom1_ids = (
         _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
@@ -1293,8 +1304,9 @@ def _gextract_2d_via_scanner(
     colnames: list[str] | None,
     band: tuple[int, int] | None,
     resolved_vars: list[tuple[str, str, object, int, int, int, int]] | None = None,
+    iterator_intervals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Run a 2D extract through pm_extract_2d_scanner (FixedRect, TrackRects, or CartesianGrid).
+    """Run a 2D extract through pm_extract_2d_scanner (Intervals, FixedRect, TrackRects, or CartesianGrid).
 
     Supports bare 2D track names as expressions and, when ``resolved_vars`` is
     provided, reducing 2D vtracks.  Each bare track defaults to "avg".
@@ -1306,10 +1318,15 @@ def _gextract_2d_via_scanner(
         shifts are passed directly to the C++ scanner; params is currently unused.
         When None, all ``exprs`` are treated as bare physical track names with
         "avg" aggregation and zero shifts.
+    iterator_intervals : DataFrame or None
+        The 2D intervals of an intervals iterator (``IntervalsPolicy``), cut by
+        the scope as R cuts them. None makes the scope itself the iterator.
 
     Returns a DataFrame with chrom1, start1, end1, chrom2, start2, end2,
     <colname>, intervalID columns - matching the shape returned by the
-    regular _gextract_2d path.
+    regular _gextract_2d path. Rows come in the order R's 2D iterator walks
+    them, and intervalID is the 1-based row of the scope interval a row comes
+    from, as in R.
     """
     from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
     from .intervals import _chrom_id_map
@@ -1338,6 +1355,8 @@ def _gextract_2d_via_scanner(
     policy_dict: dict[str, Any]
     if isinstance(policy, IntervalsPolicy):
         policy_dict = {"kind": "intervals"}
+        if iterator_intervals is not None:
+            policy_dict["intervals"] = _2d_frame_to_scanner_dict(iterator_intervals)
     elif isinstance(policy, TrackRectsPolicy):
         policy_dict = {
             "kind": "track_rects",
@@ -1395,31 +1414,8 @@ def _gextract_2d_via_scanner(
     # (e.g. ``chr1 -> 1`` or vice versa), so callers passing the wrong prefix
     # don't end up with ``chromid=-1`` -- which combined with a registered
     # vtrack would crash the C++ scanner with ``std::bad_alloc``.
-    from .intervals import _normalize_chroms
-
     cmap = _chrom_id_map()
-    chrom1_ids = (
-        _pandas.Series(_normalize_chroms(intervals["chrom1"].astype(str).tolist()))
-        .map(cmap)
-        .fillna(-1)
-        .astype(_numpy.int32)
-        .to_numpy()
-    )
-    chrom2_ids = (
-        _pandas.Series(_normalize_chroms(intervals["chrom2"].astype(str).tolist()))
-        .map(cmap)
-        .fillna(-1)
-        .astype(_numpy.int32)
-        .to_numpy()
-    )
-    scope_dict = {
-        "chrom1": chrom1_ids,
-        "start1": intervals["start1"].to_numpy(dtype=_numpy.int64),
-        "end1":   intervals["end1"].to_numpy(dtype=_numpy.int64),
-        "chrom2": chrom2_ids,
-        "start2": intervals["start2"].to_numpy(dtype=_numpy.int64),
-        "end2":   intervals["end2"].to_numpy(dtype=_numpy.int64),
-    }
+    scope_dict = _2d_frame_to_scanner_dict(intervals)
 
     band_arg = (int(band[0]), int(band[1])) if band is not None else None
 
@@ -1436,7 +1432,6 @@ def _gextract_2d_via_scanner(
     c2_series = _pandas.Series(c2_arr).astype("int64")
     chrom2_names = c2_series.map(id2name).fillna(c2_series.astype(str)).to_numpy()
 
-    n = len(chrom1_names)
     out = _pandas.DataFrame({
         "chrom1": chrom1_names,
         "start1": result["_start1"],
@@ -1447,8 +1442,33 @@ def _gextract_2d_via_scanner(
     })
     for name in colnames_list:
         out[name] = result[name]
-    out["intervalID"] = _numpy.arange(n, dtype=int)
-    return out.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
+    out["intervalID"] = _numpy.asarray(result["_scope_idx"], dtype=int) + 1
+    return out
+
+
+def _2d_frame_to_scanner_dict(intervals: pd.DataFrame) -> dict[str, Any]:
+    """2D intervals as the six arrays pm_extract_2d_scanner takes (chrom ids, -1 if unknown)."""
+    from .intervals import _chrom_id_map, _normalize_chroms
+
+    cmap = _chrom_id_map()
+
+    def _ids(col: str) -> Any:
+        return (
+            _pandas.Series(_normalize_chroms(intervals[col].astype(str).tolist()))
+            .map(cmap)
+            .fillna(-1)
+            .astype(_numpy.int32)
+            .to_numpy()
+        )
+
+    return {
+        "chrom1": _ids("chrom1"),
+        "start1": intervals["start1"].to_numpy(dtype=_numpy.int64),
+        "end1": intervals["end1"].to_numpy(dtype=_numpy.int64),
+        "chrom2": _ids("chrom2"),
+        "start2": intervals["start2"].to_numpy(dtype=_numpy.int64),
+        "end2": intervals["end2"].to_numpy(dtype=_numpy.int64),
+    }
 
 
 def _gextract_2d_compound_via_scanner(
@@ -1460,6 +1480,7 @@ def _gextract_2d_compound_via_scanner(
     band: tuple[int, int] | None,
     eval_specs: list[tuple[str, dict[str, str]]],
     var_specs: list[tuple[str, tuple[str, str, object, int, int, int, int]]],
+    iterator_intervals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Run compound 2D expressions through the C++ scanner.
 
@@ -1476,6 +1497,7 @@ def _gextract_2d_compound_via_scanner(
         # Use safe names so the binding does not collide with user-facing names.
         safe_names, intervals, policy,
         colnames=safe_names, band=band, resolved_vars=resolved_vars,
+        iterator_intervals=iterator_intervals,
     )
 
     if colnames is None:
@@ -1517,6 +1539,31 @@ def ns_orig(var_map: dict[str, str], safe_expr: str) -> str:
     return s
 
 
+def _expr_2d_track_sources(exprs: list[str]) -> set[str]:
+    """The 2D tracks the expressions read: bare 2D tracks and the sources of 2D vtracks."""
+    from .tracks import gtrack_exists, gtrack_info
+
+    track_names = _track_names_set()
+    vtrack_names = set(_shared._VTRACKS.keys())
+    candidates: set[str] = set()
+    for e in exprs:
+        _, tracks, vtracks, _ = _parse_expr_vars(e, track_names, vtrack_names)
+        candidates.update(tracks)
+        for vt in vtracks:
+            cfg = _shared._VTRACKS.get(vt, {})
+            src = cfg.get("src")
+            if cfg.get("dim") is None and isinstance(src, str):
+                candidates.add(src)
+    sources = set()
+    for name in candidates:
+        try:
+            if gtrack_exists(name) and int(gtrack_info(name).get("dimensions", 1) or 1) == 2:
+                sources.add(name)
+        except (_pymisha.error, ValueError):
+            _logger.debug("no track info for %r; not a 2D track", name, exc_info=True)
+    return sources
+
+
 def _gextract_2d(
     exprs: list[str],
     intervals: pd.DataFrame,
@@ -1550,31 +1597,14 @@ def _gextract_2d(
     # covered by one check instead of repeating it in each branch.
     _verify_2d_intervals(intervals)
 
-    # R parity: a value-based 2D vtrack with no explicit iterator iterates its
-    # source 2D track's rects (the 2D analogue of the array-source default
-    # shipped in v0.6.0 via `_infer_iterator_from_vtracks`).  Resolve it to the
-    # source-track name before the TrackRects scanner branch picks it up.
-    if iterator is None:
-        _track_names_for_infer = _track_names_set()
-        _vtrack_names_for_infer = set(_shared._VTRACKS.keys())
-        _used_vtracks_for_infer: set[str] = set()
-        for _e in exprs:
-            _, _, _vt, _ = _parse_expr_vars(
-                _e, _track_names_for_infer, _vtrack_names_for_infer
-            )
-            _used_vtracks_for_infer.update(_vt)
-        if _used_vtracks_for_infer:
-            _inferred_iter = _infer_iterator_from_vtracks(_used_vtracks_for_infer)
-            if isinstance(_inferred_iter, str):
-                from .tracks import gtrack_exists
-                try:
-                    if gtrack_exists(_inferred_iter):
-                        _inf_info = gtrack_info(_inferred_iter)
-                        if int(_inf_info.get("dimensions", 1) or 1) == 2:
-                            iterator = _inferred_iter
-                except (_pymisha.error, ValueError):
-                    _logger.debug("could not infer a 2D iterator from %r", _inferred_iter,
-                                  exc_info=True)
+    # R parity: with no iterator R iterates the rects of the one 2D track the
+    # expressions read - a bare track or the source of a 2D virtual track
+    # (TrackExprScanner::create_expr_iterator): each object cut by the scope.
+    # More than one such track is an error, raised by the legacy path below.
+    if iterator is None and not _scanner_for_intervals_enabled():
+        _sources = _expr_2d_track_sources(exprs)
+        if len(_sources) == 1:
+            iterator = next(iter(_sources))
 
     # A 2D interval-set name used as the iterator (not a track) is loaded to its
     # rectangles so the DataFrame branch below routes it through the scalable
@@ -1592,66 +1622,38 @@ def _gextract_2d(
                     iterator = _loaded_iter
 
     # ── 2D intervals DataFrame iterator (K_INTERVALS over iterator ∩ scope) ─
-    # R's TrackExpressionIntervals2DIterator builds a quadtree over the scope and
-    # walks the iterator rects, evaluating the expression on each clipped
-    # intersection.  Mirror that: units = iterator ∩ scope, then run the
-    # K_INTERVALS scanner (one value per unit rect).  A whole-genome scope clips
-    # each iterator rect to itself, so the general intersect also covers it.
+    # R's TrackExpressionIntervals2DIterator walks the iterator rects in R's order
+    # and cuts each by a quadtree of the scope, evaluating the expression on each
+    # piece; the C++ scanner's intervals policy does the same.
     if (
         iterator is not None
         and isinstance(iterator, pd.DataFrame)
         and _is_2d_intervals(iterator)
     ):
         from ._iterator_policy import IntervalsPolicy
-        from .intervals import _intersect_2d_rects
 
         # A raw 2D DataFrame iterator (as opposed to a saved interval set or
-        # track name) reaches the intersect below un-validated otherwise.
+        # track name) reaches the scanner un-validated otherwise.
         _verify_2d_intervals(iterator)
-
-        def _remap_scope_ids(df: pd.DataFrame | None, b_idx: Any) -> pd.DataFrame | None:
-            # The scanner stamps intervalID = position of each unit in the units
-            # list it was handed (one row per unit, in order).  Re-stamp it as the
-            # 1-based index of the *scope* interval the unit came from, matching
-            # R's TrackExpressionIntervals2DIterator (and letting gintervals_summary
-            # group per scope interval).
-            if (
-                df is not None
-                and len(df) > 0
-                and "intervalID" in df.columns
-                and len(df) == len(b_idx)
-            ):
-                pos = df["intervalID"].to_numpy()
-                df = df.copy()
-                df["intervalID"] = b_idx[pos] + 1
-            return df
 
         resolved = _resolve_exprs_for_scanner(exprs)
         if resolved is not None:
-            units, b_idx = _intersect_2d_rects(iterator, intervals, return_b_index=True)
-            if len(units) == 0:
-                return None
-            return _remap_scope_ids(
-                _gextract_2d_via_scanner(
-                    exprs, units, IntervalsPolicy(),
-                    colnames=colnames, band=band, resolved_vars=resolved,
-                ),
-                b_idx,
+            df = _gextract_2d_via_scanner(
+                exprs, intervals, IntervalsPolicy(),
+                colnames=colnames, band=band, resolved_vars=resolved,
+                iterator_intervals=iterator,
             )
+            return df if len(df) else None
         compound = _resolve_2d_compound_for_scanner(exprs)
         if compound is not None:
-            units, b_idx = _intersect_2d_rects(iterator, intervals, return_b_index=True)
-            if len(units) == 0:
-                return None
             eval_specs, var_specs = compound
-            return _remap_scope_ids(
-                _gextract_2d_compound_via_scanner(
-                    exprs, units, IntervalsPolicy(),
-                    colnames=colnames, band=band,
-                    eval_specs=eval_specs, var_specs=var_specs,
-                ),
-                b_idx,
+            df = _gextract_2d_compound_via_scanner(
+                exprs, intervals, IntervalsPolicy(),
+                colnames=colnames, band=band,
+                eval_specs=eval_specs, var_specs=var_specs,
+                iterator_intervals=iterator,
             )
+            return df if len(df) else None
         # vtracks / non-routable expression: fall through to the legacy path.
 
     # ── FixedRect via C++ scanner (new in v0.1.75) ────────────────────────
@@ -1685,13 +1687,7 @@ def _gextract_2d(
                     exprs, intervals, policy, colnames=colnames, band=band,
                     eval_specs=eval_specs, var_specs=var_specs,
                 )
-            raise NotImplementedError(
-                "iterator=(N, M) FixedRect binning is not supported for "
-                "this expression. Supported: bare physical 2D track names, "
-                "single-source reducing vtracks "
-                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})}), or "
-                "compound expressions over those (e.g. \"v_a + v_b\")."
-            )
+            # Other expressions: the legacy path below, over the iterator's cells.
 
     # ── TrackRects via C++ scanner (new in v0.1.75) ───────────────────────
     # String iterator: validate then dispatch.
@@ -1739,39 +1735,29 @@ def _gextract_2d(
                     "name as iterator for 2D extraction."
                 )
 
-            # COMPUTED iterator: the C++ scanner can't see the Computer2D
-            # header.  Fall through to the legacy path so the iterator's
-            # rects are materialised via the Python reader.
-            _resolved_scanner_skip = _iter_type == "computed"
+            # 2D rects/points/computed track confirmed. Route if all expressions
+            # are bare physical tracks or supported reducing 2D vtracks (a
+            # computed track is read in Python, so it is not among them);
+            # otherwise fall through to the legacy path.
+            from ._iterator_policy import TrackRectsPolicy
 
-            # 2D rects/points track confirmed.
-            # Route if all expressions are bare physical tracks or supported
-            # reducing 2D vtracks; otherwise fall through to the legacy path.
-            # COMPUTED iterators bypass the scanner branches entirely (the
-            # scanner has no Computer2D port yet); the legacy path materializes
-            # the iterator's rects via the Python reader.
-            if not _resolved_scanner_skip:
-                resolved = _resolve_exprs_for_scanner(exprs)
-                if resolved is not None:
-                    from ._iterator_policy import TrackRectsPolicy
-
-                    policy = TrackRectsPolicy(track_name=iterator)
-                    return _gextract_2d_via_scanner(
-                        exprs, intervals, policy, colnames=colnames, band=band,
-                        resolved_vars=resolved,
-                    )
-                compound = _resolve_2d_compound_for_scanner(exprs)
-                if compound is not None:
-                    from ._iterator_policy import TrackRectsPolicy
-
-                    eval_specs, var_specs = compound
-                    policy = TrackRectsPolicy(track_name=iterator)
-                    return _gextract_2d_compound_via_scanner(
-                        exprs, intervals, policy, colnames=colnames, band=band,
-                        eval_specs=eval_specs, var_specs=var_specs,
-                    )
+            resolved = _resolve_exprs_for_scanner(exprs)
+            if resolved is not None:
+                policy = TrackRectsPolicy(track_name=iterator)
+                return _gextract_2d_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    resolved_vars=resolved,
+                )
+            compound = _resolve_2d_compound_for_scanner(exprs)
+            if compound is not None:
+                eval_specs, var_specs = compound
+                policy = TrackRectsPolicy(track_name=iterator)
+                return _gextract_2d_compound_via_scanner(
+                    exprs, intervals, policy, colnames=colnames, band=band,
+                    eval_specs=eval_specs, var_specs=var_specs,
+                )
             # Unsupported vtracks or non-routable compound: fall through to
-            # the legacy path which resolves vtracks via the original flow.
+            # the legacy path, which evaluates them over the iterator's cells.
 
     # ── CartesianGridSpec via C++ scanner (new in v0.1.76) ───────────────────
     # CartesianGridSpec passed as iterator= routes through the C++ scanner
@@ -1793,13 +1779,7 @@ def _gextract_2d(
                     exprs, intervals, iterator, colnames=colnames, band=band,
                     eval_specs=eval_specs, var_specs=var_specs,
                 )
-            raise NotImplementedError(
-                "iterator=CartesianGridSpec(...) is not supported for this "
-                "expression. Supported: bare physical 2D track names, "
-                "single-source reducing vtracks "
-                f"(func in {sorted(_SCANNER_2D_FUNCS - {'mean'})}), or "
-                "compound expressions over those (e.g. \"v_a + v_b\")."
-            )
+            # Other expressions: the legacy path below, over the iterator's cells.
 
     # ── Intervals iterator via C++ scanner (opt-in, release 4) ───────────────
     # When PYMISHA_USE_SCANNER_FOR_INTERVALS=1 and there is no explicit iterator
@@ -1863,38 +1843,6 @@ def _gextract_2d(
         else:
             twod_vtracks.add(vt_name)
 
-    # A 1D vtrack with a dim projection over an explicit 2D iterator iterates
-    # the iterator's cells, not the raw scope. The scanner branches above
-    # could not route it (1D-source vtrack), so enumerate the iterator cells
-    # here and use them as the iteration units; _compute_vtrack_values then
-    # projects each cell onto the vtrack's dimension (R parity).
-    #
-    # When no explicit iterator is given and a bare 2D track is also in the
-    # expression, R defaults the iterator to that 2D track's rects (the
-    # bare-track analogue of the value-based-vtrack default).  Default the
-    # iterator to the lone 2D source so each rect of the source drives a
-    # dim-projected vtrack evaluation, matching R.
-    if iterator is None and dim_vtracks and used_tracks:
-        _two_d_used = []
-        for _t in used_tracks:
-            try:
-                _info_t = gtrack_info(_t)
-            except (_pymisha.error, ValueError):
-                _logger.debug("no track info for %r; not a 2D iterator candidate", _t,
-                              exc_info=True)
-                continue
-            if int(_info_t.get("dimensions", 1) or 1) == 2:
-                _two_d_used.append(_t)
-        if len(_two_d_used) == 1:
-            iterator = _two_d_used[0]
-
-    if iterator is not None and dim_vtracks:
-        from .intervals import _enumerate_2d_iterator_intervals
-
-        _units = _enumerate_2d_iterator_intervals(iterator, intervals, band)
-        if _units is not None:
-            intervals = _units
-
     vtrack_to_track = {}
     vtrack_shifts = {}
     vtrack_funcs = {}
@@ -1904,230 +1852,64 @@ def _gextract_2d(
         vtrack_shifts[vt_name] = shifts
         vtrack_funcs[vt_name] = func
 
-    # Classify 2D vtracks: aggregation / object / percentile vs alias (passthrough).
-    _ONE_ROW_FUNCS = _2D_AGG_FUNCS | _2D_OBJECT_FUNCS | _2D_PERCENTILE_FUNCS
-    onerow_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _ONE_ROW_FUNCS}
+    # Classify 2D vtracks: aggregation / object / percentile; any other is the
+    # source's value, read as the avg over the cell.
     agg_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_AGG_FUNCS}
     obj_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_OBJECT_FUNCS}
     pct_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_PERCENTILE_FUNCS}
-    alias_vtracks = twod_vtracks - onerow_vtracks
 
-    has_raw = bool(used_tracks)
-    has_alias = bool(alias_vtracks)
-    has_onerow = bool(onerow_vtracks)
-    has_dim = bool(dim_vtracks)
-
-    # ── Pure one-row-per-interval / dim-projected path ────────────────
-    # Aggregation, object, percentile, and dim-projected vtracks all produce
-    # one value per interval.  This path is used when we have no raw tracks
-    # or alias vtracks.
-    if (has_onerow or has_dim) and not has_raw and not has_alias:
-        key_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
-        coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
-
-        n = len(intervals)
-
-        # Build the base result DataFrame from interval coordinates.
-        result = _pandas.DataFrame(
-            {
-                "chrom1": intervals["chrom1"].to_numpy(),
-                "start1": intervals["start1"].values,
-                "end1": intervals["end1"].values,
-                "chrom2": intervals["chrom2"].to_numpy(),
-                "start2": intervals["start2"].values,
-                "end2": intervals["end2"].values,
-                "intervalID": _numpy.arange(n, dtype=int),
-            }
-        )
-
-        # Compute 2D aggregation vtracks (area, weighted.sum, min, max, avg).
-        for vt_name in agg_vtracks:
-            src_track = vtrack_to_track[vt_name]
-            s = vtrack_shifts[vt_name]
-            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
-            safe_col = _expr_safe_name(vt_name)
-            agg_df = _gextract_2d_vtrack_agg(src_track, safe_col, shifted, band, vtrack_funcs[vt_name])
-            result[safe_col] = _scatter_shifted_values(agg_df[safe_col], kept, n)
-
-        # Compute 2D object-level vtracks (exists, size, first, last, sample).
-        for vt_name in obj_vtracks:
-            src_track = vtrack_to_track[vt_name]
-            s = vtrack_shifts[vt_name]
-            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
-            safe_col = _expr_safe_name(vt_name)
-            obj_df = _gextract_2d_vtrack_objects(src_track, safe_col, shifted, band, vtrack_funcs[vt_name])
-            result[safe_col] = _scatter_shifted_values(obj_df[safe_col], kept, n)
-
-        # Compute 2D global.percentile vtracks.
-        for vt_name in pct_vtracks:
-            src_track = vtrack_to_track[vt_name]
-            s = vtrack_shifts[vt_name]
-            shifted, kept = _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
-            safe_col = _expr_safe_name(vt_name)
-            pct_df = _gextract_2d_vtrack_global_percentile(src_track, safe_col, shifted, band)
-            result[safe_col] = _scatter_shifted_values(pct_df[safe_col], kept, n)
-
-        # Compute dim-projected vtracks (1D source, dim=1 or dim=2).
-        for vt_name in dim_vtracks:
-            safe_col = _expr_safe_name(vt_name)
-            vals = _compute_vtrack_values(vt_name, intervals)
-            result[safe_col] = _numpy.asarray(vals, dtype=float)
-
-        # Evaluate expressions.
-        out_cols = colnames if colnames is not None else exprs
-        out_data = {}
-        for out_col, (orig_expr, expr_eval, _expr_tracks, expr_vtracks) in zip(out_cols, parsed, strict=False):
-            user_vars = _resolve_user_vars(expr_eval, caller_ns) if caller_ns else {}
-            allowed_names = {
-                "np",
-                "numpy",
-                *(_expr_safe_name(vt) for vt in expr_vtracks),
-                *user_vars.keys(),
-            }
-            try:
-                code_obj = compile_safe_expression(expr_eval, allowed_names)
-            except UnsafeExpressionError as exc:
-                raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
-
-            local_ns = {"np": _numpy, "numpy": _numpy}
-            local_ns.update(user_vars)
-            for vt_name in expr_vtracks:
-                safe_col = _expr_safe_name(vt_name)
-                local_ns[safe_col] = result[safe_col].to_numpy(dtype=float, copy=False)
-
-            vals = eval(code_obj, {"__builtins__": {}}, local_ns)
-            if _numpy.isscalar(vals):
-                vals = _numpy.full(len(result), vals, dtype=float)
-            out_data[out_col] = _numpy.asarray(vals, dtype=float)
-
-        out_df = result[coord_cols].copy()
-        for out_col in out_cols:
-            out_df[out_col] = out_data[out_col]
-        out_df["intervalID"] = result["intervalID"].to_numpy(dtype=int, copy=False)
-        return out_df.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
-
-    # When one-row-per-interval vtracks are mixed with raw tracks or alias vtracks,
-    # treat them as alias (one row per object) so that the expression can
-    # combine them in a row-aligned manner.
-    if has_onerow:
-        alias_vtracks = alias_vtracks | onerow_vtracks
-        onerow_vtracks = set()
-        agg_vtracks = set()
-        obj_vtracks = set()
-        pct_vtracks = set()
-        has_alias = bool(alias_vtracks)
-        has_onerow = False
-
-    # ── Raw / alias path (existing behaviour) ─────────────────────────
-    required_tracks = []
-
-    def _add_required(track_name: str) -> None:
-        if track_name not in required_tracks:
-            required_tracks.append(track_name)
-
-    for _orig_expr, _expr_eval, expr_tracks, expr_vtracks in parsed:
-        for tname in expr_tracks:
-            _add_required(tname)
-        for vt_name in expr_vtracks:
-            if vt_name not in dim_vtracks:
-                _add_required(vtrack_to_track[vt_name])
-
-    if len(required_tracks) > 1 and iterator is None:
+    if iterator is None and len(set(used_tracks) | {vtrack_to_track[vt] for vt in twod_vtracks}) > 1:
         raise ValueError(
             "Cannot implicitly determine iterator policy: track expressions contain more than one 2D track."
         )
 
-    if not required_tracks and not dim_vtracks:
-        raise ValueError("Cannot implicitly determine iterator policy: track expressions do not contain any tracks.")
-
-    key_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
     coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
 
-    if required_tracks:
-        anchor_track = required_tracks[0]
-        if isinstance(iterator, str):
-            if iterator in required_tracks:
-                anchor_track = iterator
-            elif iterator in vtrack_to_track:
-                anchor_track = vtrack_to_track[iterator]
-
-        track_cols = {tname: _expr_safe_name(tname) for tname in required_tracks}
-
-        def _get_shifted_intervals(track_name: str) -> tuple[pd.DataFrame, Any]:
-            """Return intervals with shifts applied if track is accessed via a shifted vtrack."""
-            for vt_name, src in vtrack_to_track.items():
-                if src == track_name:
-                    s = vtrack_shifts[vt_name]
-                    return _apply_2d_shifts(intervals, s["sshift1"], s["eshift1"], s["sshift2"], s["eshift2"])
-            return intervals, None
-
-        def _extract_shifted(track_name: str) -> pd.DataFrame | None:
-            """_gextract_2d_single over this track's (possibly shifted) frame.
-
-            The scope was validated at the top of _gextract_2d and the shifted
-            frame is clamped by construction, so skip the re-validation.  Rows
-            the clamp collapsed are absent from the query frame, so restamp
-            intervalID (a position into that frame) back to a position into the
-            original scope.
-            """
-            frame, kept = _get_shifted_intervals(track_name)
-            df = _gextract_2d_single(track_name, track_cols[track_name], frame, band, _verified=True)
-            if df is not None and kept is not None and len(df) > 0:
-                df = df.copy()
-                df["intervalID"] = kept[df["intervalID"].to_numpy(dtype=int)]
-            return df
-
-        result = _extract_shifted(anchor_track)
-        if result is None:
+    # The iterator cells, in the order R's 2D iterator walks them, each with the
+    # 1-based row of the scope interval it comes from. R evaluates every track
+    # and virtual track of the expressions over each cell. With no 2D track to
+    # iterate (only dim-projected 1D vtracks) the cells are the scope rows.
+    if iterator is not None:
+        units = _gextract_2d_units(intervals, iterator, band)
+        if units is None or len(units) == 0:
             return None
-
-        for tname in required_tracks:
-            if tname == anchor_track:
-                continue
-            cur = _extract_shifted(tname)
-            if cur is None:
-                result[track_cols[tname]] = _numpy.nan
-                continue
-            cur = cur[key_cols + [track_cols[tname]]]
-            if cur.duplicated(key_cols).any():
-                cur = cur.drop_duplicates(key_cols, keep="first")
-            result = result.merge(cur, on=key_cols, how="left")
     else:
-        track_cols = {}
-        # No 2D raw tracks — only dim-projected vtracks mixed with something
-        # that forced us into the raw/alias path. Build a base result from
-        # the input intervals.
-        n = len(intervals)
-        result = _pandas.DataFrame(
-            {
-                "chrom1": intervals["chrom1"].to_numpy(),
-                "start1": intervals["start1"].values,
-                "end1": intervals["end1"].values,
-                "chrom2": intervals["chrom2"].to_numpy(),
-                "start2": intervals["start2"].values,
-                "end2": intervals["end2"].values,
-                "intervalID": _numpy.arange(n, dtype=int),
-            }
-        )
+        units = intervals[coord_cols].reset_index(drop=True).copy()
+        units["intervalID"] = _numpy.arange(1, len(units) + 1, dtype=int)
+    cells = units[coord_cols]
+    n = len(units)
+    values: dict[str, Any] = {}
 
-    # Compute dim-projected vtracks for the raw/alias path result rows.
-    # For each result row, we map back to the original 2D interval via
-    # intervalID and then project to 1D for the vtrack computation.
-    dim_vtrack_arrays = {}
-    if dim_vtracks:
-        # Pre-compute vtrack values per original interval.
-        dim_vals_per_interval = {}
-        for vt_name in dim_vtracks:
-            vals = _compute_vtrack_values(vt_name, intervals)
-            dim_vals_per_interval[vt_name] = _numpy.asarray(vals, dtype=float)
+    def _shifted_cells(shifts: dict[str, int] | None) -> tuple[pd.DataFrame, Any]:
+        if not shifts:
+            return cells, None
+        return _apply_2d_shifts(cells, shifts["sshift1"], shifts["eshift1"], shifts["sshift2"], shifts["eshift2"])
 
-        # Map result rows to original intervals via intervalID.
-        interval_ids = result["intervalID"].to_numpy(dtype=int, copy=False)
-        for vt_name in dim_vtracks:
-            dim_vtrack_arrays[vt_name] = dim_vals_per_interval[vt_name][interval_ids]
+    # Bare 2D tracks: the track's value over the cell, its avg, as R reads it.
+    for tname in used_tracks:
+        agg_df = _gextract_2d_vtrack_agg(tname, "v", cells, band, "avg")
+        values[_expr_safe_name(tname)] = agg_df["v"].to_numpy(dtype=float)
+
+    for vt_name in twod_vtracks:
+        src_track = vtrack_to_track[vt_name]
+        shifted, kept = _shifted_cells(vtrack_shifts[vt_name])
+        func = vtrack_funcs[vt_name]
+        if vt_name in agg_vtracks:
+            vdf = _gextract_2d_vtrack_agg(src_track, "v", shifted, band, func)
+        elif vt_name in obj_vtracks:
+            vdf = _gextract_2d_vtrack_objects(src_track, "v", shifted, band, func)
+        elif vt_name in pct_vtracks:
+            vdf = _gextract_2d_vtrack_global_percentile(src_track, "v", shifted, band)
+        else:
+            vdf = _gextract_2d_vtrack_agg(src_track, "v", shifted, band, "avg")
+        values[_expr_safe_name(vt_name)] = _numpy.asarray(_scatter_shifted_values(vdf["v"], kept, n), dtype=float)
+
+    # Dim-projected vtracks (1D source, dim=1 or dim=2): each cell projected onto the dimension.
+    for vt_name in dim_vtracks:
+        values[_expr_safe_name(vt_name)] = _numpy.asarray(_compute_vtrack_values(vt_name, cells), dtype=float)
 
     out_cols = colnames if colnames is not None else exprs
-    out_data = {}
+    out_df = cells.copy()
     for out_col, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in zip(out_cols, parsed, strict=False):
         user_vars = _resolve_user_vars(expr_eval, caller_ns) if caller_ns else {}
         allowed_names = {
@@ -2142,27 +1924,58 @@ def _gextract_2d(
         except UnsafeExpressionError as exc:
             raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
 
-        local_ns = {"np": _numpy, "numpy": _numpy}
+        local_ns: dict[str, Any] = {"np": _numpy, "numpy": _numpy}
         local_ns.update(user_vars)
-        for tname in expr_tracks:
-            local_ns[_expr_safe_name(tname)] = result[track_cols[tname]].to_numpy(dtype=float, copy=False)
-        for vt_name in expr_vtracks:
-            if vt_name in dim_vtracks:
-                local_ns[_expr_safe_name(vt_name)] = dim_vtrack_arrays[vt_name]
-            else:
-                src_track = vtrack_to_track[vt_name]
-                local_ns[_expr_safe_name(vt_name)] = result[track_cols[src_track]].to_numpy(dtype=float, copy=False)
+        for name in (*expr_tracks, *expr_vtracks):
+            local_ns[_expr_safe_name(name)] = values[_expr_safe_name(name)]
 
         vals = eval(code_obj, {"__builtins__": {}}, local_ns)
         if _numpy.isscalar(vals):
-            vals = _numpy.full(len(result), vals, dtype=float)
-        out_data[out_col] = _numpy.asarray(vals, dtype=float)
+            vals = _numpy.full(n, vals, dtype=float)
+        out_df[out_col] = _numpy.asarray(vals, dtype=float)
 
-    out_df = result[coord_cols].copy()
-    for out_col in out_cols:
-        out_df[out_col] = out_data[out_col]
-    out_df["intervalID"] = result["intervalID"].to_numpy(dtype=int, copy=False)
-    return out_df.sort_values(["chrom1", "start1", "chrom2", "start2", "intervalID"]).reset_index(drop=True)
+    out_df["intervalID"] = units["intervalID"].to_numpy(dtype=int)
+    return out_df.reset_index(drop=True)
+
+
+def _gextract_2d_units(
+    intervals: pd.DataFrame,
+    iterator: Any,
+    band: tuple[int, int] | None,
+) -> pd.DataFrame | None:
+    """The cells of a 2D iterator over a 2D scope, as R's 2D iterator walks them.
+
+    Returns the cell coordinates and, as ``intervalID``, the 1-based row of the
+    scope interval each cell comes from. ``iterator`` is a 2D track name, a 2D
+    interval-set name, a 2D intervals DataFrame, a ``(width, height)`` pair or
+    a :class:`CartesianGridSpec`.
+    """
+    from ._iterator_policy import CartesianGridSpec, FixedRectPolicy, IntervalsPolicy, TrackRectsPolicy
+    from .tracks import gtrack_exists
+
+    policy: Any
+    iterator_intervals = None
+    if isinstance(iterator, CartesianGridSpec):
+        policy = iterator
+    elif isinstance(iterator, (tuple, list)) and len(iterator) == 2:
+        policy = FixedRectPolicy(width=int(float(iterator[0])), height=int(float(iterator[1])))
+    elif isinstance(iterator, pd.DataFrame):
+        policy = IntervalsPolicy()
+        iterator_intervals = iterator
+    elif isinstance(iterator, str) and gtrack_exists(iterator):
+        policy = TrackRectsPolicy(track_name=iterator)
+    elif isinstance(iterator, str):
+        loaded = _maybe_load_intervals_set(iterator)
+        if not (isinstance(loaded, pd.DataFrame) and _is_2d_intervals(loaded)):
+            raise ValueError(f"Invalid iterator: {iterator!r} is not a 2D track or a 2D intervals set.")
+        policy = IntervalsPolicy()
+        iterator_intervals = loaded
+    else:
+        raise ValueError(f"Invalid 2D iterator: {iterator!r}")
+    return _gextract_2d_via_scanner(
+        [], intervals, policy, colnames=None, band=band, resolved_vars=[],
+        iterator_intervals=iterator_intervals,
+    )
 
 
 def giterator_intervals_2d(
@@ -2191,7 +2004,8 @@ def giterator_intervals_2d(
     intervals : DataFrame or str, optional
         2D genomic scope (``chrom1/start1/end1/chrom2/start2/end2``
         DataFrame, or a named interval-set string).  If ``None``, defaults
-        to :func:`gintervals_2d_all`.
+        to the intra-chromosomal pairs,
+        ``gintervals_2d_all(mode="diagonal")``.
     iterator : int or str, optional
         Track expression iterator.  Passed through to the underlying
         extraction engine.
@@ -2225,9 +2039,11 @@ def giterator_intervals_2d(
     exprs = [expr] if isinstance(expr, str) else list(expr)
 
     if intervals is None:
-        from .intervals import gintervals_2d_all
+        from .intervals import _gintervals_2d_all
 
-        intervals = gintervals_2d_all()
+        # Intra-chromosomal pairs, as when gintervals_2d_all() defaulted to
+        # them. This function has no R counterpart to follow.
+        intervals = _gintervals_2d_all("diagonal")
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
@@ -2337,6 +2153,8 @@ def _apply_extract_output(
     is_2d: bool = False,
     intervals_join: str = "id",
     input_intervals: pd.DataFrame | None = None,
+    value_names: list[str] | None = None,
+    int64_coords: bool = False,
 ) -> pd.DataFrame | None:
     """Apply file-writing, intervals_set_out, and intervals_join post-processing to an extraction result.
 
@@ -2345,11 +2163,12 @@ def _apply_extract_output(
     df : DataFrame or None
         The extraction result.
     file : str or None
-        If given, write *df* to this path as tab-separated values and return
-        ``None`` instead of the DataFrame.
+        If given, write *df* to this path and return ``None`` instead of the
+        DataFrame: as Parquet if the name ends in ``.parquet`` (in any case),
+        as tab-separated values otherwise.
     intervals_set_out : str or None
-        If given, save the coordinate columns of *df* as a named interval
-        set via :func:`gintervals_save`.
+        If given, save *df* as a named interval set via :func:`gintervals_save`
+        and return ``None`` instead of the DataFrame.
     is_2d : bool
         Whether the extraction was 2D (affects which coordinate columns are
         used for ``intervals_set_out``).
@@ -2358,15 +2177,20 @@ def _apply_extract_output(
     input_intervals : DataFrame or None
         Resolved input intervals used for the ``intervals_join="intervals"``
         attach (not used here for ``"id"``/``"none"``).
+    value_names : list of str or None
+        Parquet output only: the names of the value columns.
+    int64_coords : bool
+        Parquet output only: write start and end as INT64 instead of INT32.
 
     Returns
     -------
     DataFrame or None
     """
     if df is None:
-        # Nothing to write; still honour the file contract (return None).
-        if file is not None:
-            return None
+        # A Parquet output is written even with no rows (R parity); return None
+        # either way.
+        if _is_parquet_path(file):
+            _write_parquet(None, file, value_names, int64_coords)
         return None
 
     # Apply intervals_join FIRST, before file/intervals_set_out which read
@@ -2384,15 +2208,133 @@ def _apply_extract_output(
         to_save = df.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
         gintervals_save(to_save, intervals_set_out)
 
-    # -- file: write TSV and return None --
+    # -- file: write Parquet or TSV and return None --
     if file is not None:
+        if _is_parquet_path(file):
+            _write_parquet(df, file, value_names, int64_coords)
+            return None
         # R parity: gextract(file=) writes only the iterator coordinate columns
         # and the expression columns (no intervalID; see R
-        # GenomeTrackExtract.cpp).
-        df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
+        # GenomeTrackExtract.cpp), with the file mode R's C++ writer gives it.
+        with _shared._with_cpp_umask():
+            df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
         return None
 
-    return df
+    # R parity: with intervals.set.out R misha returns no result (an invisible 0)
+    return None if intervals_set_out is not None else df
+
+
+def _is_parquet_path(file: Any) -> bool:
+    return file is not None and str(file).lower().endswith(".parquet")
+
+
+def _parquet_int64_coords(scope: Any) -> bool:
+    """Whether start and end are INT64: only if a chromosome of the scope does not fit INT32."""
+    from .intervals import gintervals_all
+
+    genome = gintervals_all()
+    big = set(genome.loc[genome["end"] > 2**31 - 1, "chrom"].astype(str))
+    if not big or not isinstance(scope, pd.DataFrame) or "chrom" not in scope.columns:
+        return False
+    chroms = list(pd.unique(scope["chrom"].astype(str)))
+    try:
+        chroms = _pymisha.pm_normalize_chroms(chroms)
+    except _pymisha.error:
+        _logger.debug("scope chromosomes do not all normalize; comparing them as given", exc_info=True)
+    return any(c in big for c in chroms)
+
+
+def _host_tag() -> str:
+    """This host as temporary names carry it, as R misha's .gdb.host_tag() writes it."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", socket.gethostname().split(".", 1)[0]) or "unknown"
+
+
+def _resolve_symlinks(filename: str) -> str:
+    """The file a write to *filename* replaces: *filename*, or where its chain of symlinks
+    leads, whether that file exists or not."""
+    path = filename
+    for _ in range(40):
+        if not os.path.islink(path):
+            return path
+        text = os.readlink(path)
+        # a relative link is relative to the directory of the link
+        path = text if text.startswith("/") else path[: path.rfind("/") + 1] + text
+    if os.path.islink(path):
+        raise OSError(f"Failed to write {filename}: too many levels of symbolic links")
+    return path
+
+
+def _is_decimal(s: str) -> bool:
+    """A number as str() writes it, small enough for a pid."""
+    return 0 < len(s) <= 9 and s.isascii() and s.isdigit() and (s[0] != "0" or len(s) == 1)
+
+
+def _write_parquet(
+    df: pd.DataFrame | None, file: Any, value_names: list[str] | None, int64_coords: bool
+) -> None:
+    """Write a gextract result to a Parquet file, as R misha's gextract(file = "x.parquet") does.
+
+    The rows go to a hidden temporary file next to the target (where its symlinks lead),
+    named for this host and process, which is renamed onto the target once complete: an
+    error or an interrupt leaves an existing target as it was. A replaced target passes on
+    its permission bits. Leftovers of killed writers of the same target on this host are
+    removed first.
+    """
+    from . import __version__
+
+    assert value_names is not None
+    name = str(file)
+    target = _resolve_symlinks(name)
+    directory = target[: target.rfind("/") + 1]
+    prefix = f".{target[len(directory):]}.tmp.{_host_tag()}."
+    tmp = f"{directory}{prefix}{os.getpid()}"
+
+    try:
+        entries = os.listdir(directory or ".")
+    except OSError:
+        entries = []  # writing tmp fails with the reason
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        # <pid>, or <pid>.<kid>: the parts R misha's multitasking writers add
+        pid, dot, kid = entry[len(prefix):].partition(".")
+        if not _is_decimal(pid) or (dot and not _is_decimal(kid)):
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            try:
+                os.unlink(directory + entry)
+            except OSError:
+                _logger.debug("could not remove %s", directory + entry, exc_info=True)
+        except OSError:
+            pass  # alive, as another user's process
+
+    if df is None:
+        chroms: Any = []
+        starts = ends = _numpy.empty(0, dtype=_numpy.int64)
+        values = _numpy.empty((0, len(value_names)))
+    else:
+        # by position: chrom, start, end, then the value columns, whose names may repeat
+        # (an error the writer reports) or be one of the coordinates'
+        chroms = df.iloc[:, 0].astype(str).to_numpy(dtype=object)
+        starts = df.iloc[:, 1].to_numpy(dtype=_numpy.int64)
+        ends = df.iloc[:, 2].to_numpy(dtype=_numpy.int64)
+        values = _numpy.ascontiguousarray(df.iloc[:, 3 : 3 + len(value_names)].to_numpy(dtype=_numpy.float64))
+
+    try:
+        _pymisha.pm_parquet_write(
+            tmp, name, chroms, starts, ends, values, list(value_names), int64_coords,
+            f"pymisha version {__version__}",
+        )
+        with contextlib.suppress(OSError):  # a new target keeps the permissions tmp was created with
+            os.chmod(tmp, os.stat(target).st_mode & 0o777)
+        os.rename(tmp, target)
+    except BaseException:
+        # BaseException: an interrupt must not leave the temporary file behind either
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _worker_extract_chunk(args: tuple[Any, ...]) -> pd.DataFrame | None:
@@ -2803,12 +2745,25 @@ def gextract(
     **kwargs
         Additional keyword arguments:
 
-        - **file** (*str, optional*) -- Path to write extraction results as
-          a tab-separated file. When provided, the result is written to the
-          file and ``None`` is returned instead of a DataFrame.
+        - **file** (*str, optional*) -- Path to write extraction results
+          to. When provided, the result is written to the file and ``None``
+          is returned instead of a DataFrame. A name ending in ``.parquet``
+          (in any case) writes a GZIP-compressed Parquet file: columns
+          ``chrom``, ``start`` and ``end``, then one float32 column per
+          expression, named as in the DataFrame, all nullable (NaN values
+          are written as NaN). ``start`` and ``end`` are 32-bit integers
+          unless a chromosome of the scope is 2^31 bp or longer. Only 1D
+          intervals are supported, and the column names must be unique and
+          other than ``chrom``, ``start`` and ``end``. The file is written
+          under a temporary name in its directory (a symbolic link is
+          followed, and the file it points to is replaced) and renamed when
+          complete, so an error or an interrupt leaves an existing file as
+          it was. Any other name writes a tab-separated file. A new file of
+          either kind is created with mode 0660 (umask 007), whatever the
+          caller's umask; a file it replaces keeps its permission bits.
         - **intervals_set_out** (*str, optional*) -- Name of an interval set
-          to save the result coordinate columns to. The interval set is
-          created via :func:`gintervals_save`.
+          to save the result to (created via :func:`gintervals_save`). When
+          provided, ``None`` is returned instead of a DataFrame.
         - **progress** (*bool or str, optional*) -- Whether to show a
           progress bar.
         - **progress_desc** (*str, optional*) -- Description for the
@@ -2818,8 +2773,8 @@ def gextract(
     -------
     DataFrame or None
         DataFrame with columns: chrom, start, end, <expr1>, ..., intervalID.
-        Returns None if the iterator produces no intervals, or if *file* is
-        specified.
+        Returns None if the iterator produces no intervals, or if *file* or
+        *intervals_set_out* is specified.
 
     See Also
     --------
@@ -2879,6 +2834,15 @@ def gextract(
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
 
+    parquet_kw: dict[str, Any] = {}
+    if _is_parquet_path(file):
+        if _is_2d_intervals(intervals):
+            raise ValueError("Parquet output does not support 2D iterators")
+        parquet_kw = {
+            "value_names": list(colnames) if colnames is not None else exprs,
+            "int64_coords": _parquet_int64_coords(intervals),
+        }
+
     # Capture for intervals_join post-processing. _preprocess_intervals_iterator
     # may mutate intervals, but the row order / column set we want for attach
     # is the post-loader, pre-iterator-preprocess state.
@@ -2899,6 +2863,8 @@ def gextract(
             band=band,
             caller_ns=caller_ns,
         )
+        if df is not None and len(df) == 0 and file is None and intervals_set_out is None:
+            df = None  # R returns NULL when the iterator gives no interval
         return _apply_extract_output(
             df, file, intervals_set_out, is_2d=True,
             intervals_join=intervals_join,
@@ -3031,6 +2997,7 @@ def gextract(
             df, file, intervals_set_out, is_2d=False,
             intervals_join=intervals_join,
             input_intervals=input_intervals_for_join,
+            **parquet_kw,
         )
 
     track_arrays = {}
@@ -3085,6 +3052,7 @@ def gextract(
             None, file, intervals_set_out, is_2d=False,
             intervals_join=intervals_join,
             input_intervals=input_intervals_for_join,
+            **parquet_kw,
         )
 
     n_rows = len(iter_df)
@@ -3179,6 +3147,7 @@ def gextract(
         result_df, file, intervals_set_out, is_2d=False,
         intervals_join=intervals_join,
         input_intervals=input_intervals_for_join,
+        **parquet_kw,
     )
 
 
@@ -3239,18 +3208,18 @@ def gscreen(
 
     _check_computed_tracks(expr)
 
-    if intervals is None:
-        from .expr import _expr_is_2d
-        from .intervals import gintervals_2d_all, gintervals_all
-
-        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
-
-    intervals = _maybe_load_intervals_set(intervals)
-
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gscreen")
     iterator = kwargs.get("iterator")
     band = kwargs.get("band")
+
+    if intervals is None:
+        from .expr import _expr_is_2d
+        from .intervals import _gintervals_2d_all, gintervals_all
+
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+
+    intervals = _maybe_load_intervals_set(intervals)
 
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
     if _is_2d_intervals(intervals):

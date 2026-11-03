@@ -39,9 +39,10 @@ class TestGseqKmer:
 
     def test_both_strands(self):
         """Count on both strands."""
-        # R misha counts both strands even for palindromic kmers.
+        # As in R misha, a position counts once when the k-mer matches on
+        # either strand, so the palindrome CG counts once.
         result = pm.gseq_kmer(["AACGTT"], "CG", mode="count", strand=0)
-        assert result[0] == 2
+        assert result[0] == 1
 
     def test_non_palindrome_both_strands(self):
         """Non-palindromic k-mer counted on both strands."""
@@ -130,9 +131,9 @@ class TestGseqKmer:
     def test_many_sequences_both_strands(self):
         """Batch fast path with both-strand counting."""
         seqs = ["ACGTACGTACGTACGT"] * 50
-        # CG appears 4 times forward; CG is palindrome, so 4 times reverse too
+        # CG appears 4 times; a palindrome counts once per position
         result = pm.gseq_kmer(seqs, "CG", mode="count", strand=0)
-        assert all(r == 8 for r in result)
+        assert all(r == 4 for r in result)
 
     def test_many_sequences_fraction(self):
         """Batch fast path fraction mode."""
@@ -181,43 +182,15 @@ class TestGseqKmer:
         assert result[2] == 0   # too short
 
     def test_palindromic_kmer_both_strands(self):
-        """Palindromic k-mers (e.g., AATT) counted on both strands."""
-        # AATT is palindromic (revcomp = AATT)
-        # In "AATTCC", AATT appears at pos 0 forward, and revcomp(AATT)=AATT also at pos 0
+        """A palindromic k-mer (AATT) counts once per position on both strands."""
         result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
-        assert result[0] == 2  # counted once per strand
+        assert result[0] == 1
 
     def test_empty_list(self):
         """Empty input list returns empty array."""
         result = pm.gseq_kmer([], "CG")
         assert len(result) == 0
         assert isinstance(result, np.ndarray)
-
-    def test_fast_path_parity_with_slow_path(self):
-        """Fast and slow path produce identical results for the same input."""
-        from pymisha.sequence import _gseq_kmer_fast, _count_kmer_in_seq
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"] * 10
-        kmer = "ACG"
-        k = 3
-        for strand in (-1, 0, 1):
-            for mode in ("count", "frac"):
-                fast = _gseq_kmer_fast(seqs, kmer.upper(), mode, strand, k)
-                slow = np.zeros(len(seqs), dtype=float)
-                for i, seq in enumerate(seqs):
-                    count = _count_kmer_in_seq(seq, kmer.upper(), strand,
-                                               None, None, False, False, [])
-                    if mode == "frac":
-                        possible = max(0, len(seq) - k + 1)
-                        if strand == 0:
-                            possible *= 2
-                        slow[i] = count / possible if possible > 0 else 0.0
-                    else:
-                        slow[i] = count
-                np.testing.assert_array_equal(
-                    fast, slow,
-                    err_msg=f"Mismatch for strand={strand}, mode={mode}"
-                )
 
 
 class TestGseqKmerDist:
@@ -340,91 +313,44 @@ class TestGseqKmerDist:
         assert list(table) == ["A", "C", "G", "T"]
 
 
+def _ref_gseq_kmer(seq, kmer, mode, strand):
+    """R misha's gseq.kmer over a whole gap-free sequence, written out."""
+    seq, kmer = seq.upper(), kmer.upper()
+    rc = pm.grevcomp(kmer)
+    starts = len(seq) - len(kmer) + 1
+    if starts <= 0:
+        return 0.0
+    count = sum(
+        1 for p in range(starts)
+        if (strand >= 0 and seq[p:p + len(kmer)] == kmer)
+        or (strand <= 0 and seq[p:p + len(kmer)] == rc)
+    )
+    return count / starts if mode == "frac" else float(count)
+
+
 class TestGseqKmerCpp:
-    """Tests for C++ kmer counting dispatch."""
+    """Tests for the C++ k-mer engine behind gseq_kmer."""
 
     def test_cpp_dispatch_is_used(self):
-        """Verify the C++ path is available and callable directly."""
+        """The C++ engine is callable directly."""
         from pymisha._shared import _pymisha
-        result = _pymisha.pm_kmer_count_strings(["ACGTACGT"], "ACG", "count", 1)
+        result = _pymisha.pm_kmer_count_strings(
+            ["ACGTACGT"], "ACG", "count", 1, np.array([1]), np.array([8]), 0, True, "-.")
         assert isinstance(result, np.ndarray)
         assert result[0] == 2.0
 
-    def test_cpp_parity_count_forward(self):
-        """C++ matches Python for mode=count, strand=1."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=1)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", 1, len(kmer))
-        np.testing.assert_array_equal(cpp, py)
-
-    def test_cpp_parity_count_reverse(self):
-        """C++ matches Python for mode=count, strand=-1."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=-1)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", -1, len(kmer))
-        np.testing.assert_array_equal(cpp, py)
-
-    def test_cpp_parity_count_both(self):
-        """C++ matches Python for mode=count, strand=0."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="count", strand=0)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "count", 0, len(kmer))
-        np.testing.assert_array_equal(cpp, py)
-
-    def test_cpp_parity_frac_forward(self):
-        """C++ matches Python for mode=frac, strand=1."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=1)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", 1, len(kmer))
-        np.testing.assert_allclose(cpp, py, rtol=1e-4)
-
-    def test_cpp_parity_frac_reverse(self):
-        """C++ matches Python for mode=frac, strand=-1."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=-1)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", -1, len(kmer))
-        np.testing.assert_allclose(cpp, py, rtol=1e-4)
-
-    def test_cpp_parity_frac_both(self):
-        """C++ matches Python for mode=frac, strand=0."""
-        from pymisha.sequence import _gseq_kmer_fast
-        seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
-                "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC"]
-        kmer = "ACG"
-        cpp = pm.gseq_kmer(seqs, kmer, mode="frac", strand=0)
-        py = _gseq_kmer_fast(seqs, kmer.upper(), "frac", 0, len(kmer))
-        np.testing.assert_allclose(cpp, py, rtol=1e-4)
-
-    def test_cpp_parity_all_combos(self):
-        """Comprehensive parity test across all strand/mode combinations."""
-        from pymisha.sequence import _gseq_kmer_fast
+    def test_matches_the_written_out_rule_for_all_combos(self):
+        """Every strand/mode combination against _ref_gseq_kmer."""
         seqs = ["ACGTACGT", "GGCCTTAA", "CGCGCGCG", "AAAAGGGG",
                 "TTTTTTT", "ACACACAC", "GTGTGTGT", "CCCCCCCC",
                 "ATCGATCGATCG", "GCGCGCGCGCGC"]
         for kmer in ["CG", "ACG", "ACGT", "A", "AATT"]:
-            k = len(kmer)
             for strand in (-1, 0, 1):
                 for mode in ("count", "frac"):
-                    cpp = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand)
-                    py = _gseq_kmer_fast(seqs, kmer.upper(), mode, strand, k)
-                    tol = 1e-4 if mode == "frac" else 0
+                    got = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand)
+                    want = [_ref_gseq_kmer(x, kmer, mode, strand) for x in seqs]
                     np.testing.assert_allclose(
-                        cpp, py, rtol=tol, atol=1e-15,
+                        got, want, rtol=1e-12, atol=0,
                         err_msg=f"Mismatch: kmer={kmer}, strand={strand}, mode={mode}"
                     )
 
@@ -440,15 +366,12 @@ class TestGseqKmerCpp:
         np.testing.assert_array_equal(result, [0.0, 0.0, 0.0])
 
     def test_cpp_palindromic_kmer(self):
-        """Palindromic k-mer counted correctly on both strands."""
-        # AATT is palindromic (revcomp = AATT)
+        """A palindromic k-mer counts once per position on both strands."""
         result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
-        assert result[0] == 2  # counted once forward + once reverse (same positions)
-
-        # CG is palindromic (revcomp = CG)
-        # "CGCGCG": CG at positions 0,2,4 = 3 fwd matches + 3 rev matches = 6
+        assert result[0] == 1
+        # "CGCGCG": CG at positions 0, 2, 4
         result2 = pm.gseq_kmer(["CGCGCG"], "CG", mode="count", strand=0)
-        assert result2[0] == 6
+        assert result2[0] == 3
 
     def test_cpp_n_characters(self):
         """N characters in sequences do not match any kmer."""
@@ -460,7 +383,7 @@ class TestGseqKmerCpp:
         from pymisha._shared import _pymisha
         # Forward only: ACG at positions 0 and 4
         result = _pymisha.pm_kmer_count_strings(
-            ["ACGTACGT", "TTTT"], "ACG", "count", 1
+            ["ACGTACGT", "TTTT"], "ACG", "count", 1, np.array([1, 1]), np.array([8, 4]), 0, False, ""
         )
         np.testing.assert_array_equal(result, [2.0, 0.0])
 
@@ -469,7 +392,7 @@ class TestGseqKmerCpp:
         from pymisha._shared import _pymisha
         # "ACGTACGT" has 8 chars, k=3, 6 positions, 2 matches -> 2/6
         result = _pymisha.pm_kmer_count_strings(
-            ["ACGTACGT"], "ACG", "frac", 1
+            ["ACGTACGT"], "ACG", "frac", 1, np.array([1]), np.array([8]), 0, False, ""
         )
         np.testing.assert_allclose(result, [2.0 / 6.0], rtol=1e-4)
 
@@ -478,3 +401,361 @@ class TestGseqKmerCpp:
         result1 = pm.gseq_kmer(["acgtacgt"], "ACG", mode="count", strand=1)
         result2 = pm.gseq_kmer(["ACGTACGT"], "ACG", mode="count", strand=1)
         np.testing.assert_array_equal(result1, result2)
+
+
+# ---------------------------------------------------------------------------
+# Ported from R misha's tests/testthat/test-sequence.R: every test_that block
+# that calls gseq.kmer or gseq.kmer.dist, in R's order.
+# ---------------------------------------------------------------------------
+
+
+class TestGseqKmerRParity:
+    """gseq.kmer blocks of test-sequence.R."""
+
+    def test_validates_inputs_correctly(self):
+        seqs = "ACGTACGT"
+        pm.gseq_kmer(seqs, "AC", mode="count")
+        with pytest.raises(ValueError, match="single character"):
+            pm.gseq_kmer(seqs, ["AC", "GT"], mode="count")
+        with pytest.raises(ValueError, match="only A, C, G, T"):
+            pm.gseq_kmer(seqs, "ACN", mode="count")
+        with pytest.raises(ValueError, match="strand must be"):
+            pm.gseq_kmer(seqs, "AC", mode="count", strand=5)
+        with pytest.raises(ValueError, match="extend must be"):
+            pm.gseq_kmer(seqs, "AC", mode="count", extend=-5)
+
+    def test_mode_count_counts_exact_matches(self):
+        seq = "CGCGCGCG"
+        assert pm.gseq_kmer(seq, "CG", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 4
+        assert pm.gseq_kmer(seq, "GC", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 3
+        assert pm.gseq_kmer(seq, "AA", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 0
+
+    def test_mode_frac_computes_correct_fractions(self):
+        seq = "AAACCCGGG"
+        kw = {"mode": "frac", "strand": 1, "start_pos": 1, "end_pos": 9, "extend": False}
+        assert pm.gseq_kmer(seq, "A", **kw)[0] == pytest.approx(3 / 9)
+        assert pm.gseq_kmer(seq, "C", **kw)[0] == pytest.approx(3 / 9)
+        assert pm.gseq_kmer(seq, "AA", **kw)[0] == pytest.approx(2 / 8)
+
+    def test_handles_roi_bounds_correctly(self):
+        seq = "GGGGACGGGG"
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=5, end_pos=6, extend=False)[0] == 1
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=1, end_pos=4, extend=False)[0] == 0
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=7, end_pos=10, extend=False)[0] == 0
+
+    def test_extend_parameter_works_correctly(self):
+        seq = "GGGGACGGGG"
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=False)[0] == 0
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=True)[0] == 1
+        # extend=1 (explicit k - 1): same as extend=True
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=1)[0] == 1
+
+    def test_strand_parameter_works(self):
+        seq = "ACGTACGT"
+        assert pm.gseq_kmer(seq, "AC", mode="count", strand=1, start_pos=1, end_pos=8)[0] == 2
+        assert pm.gseq_kmer(seq, "AC", mode="count", strand=-1, start_pos=1, end_pos=8)[0] == 2
+        assert pm.gseq_kmer(seq, "AC", mode="count", strand=0, start_pos=1, end_pos=8)[0] == 4
+
+    def test_handles_edge_case_sequence_too_short(self):
+        assert pm.gseq_kmer("AC", "ACGTA", mode="count")[0] == 0
+        assert pm.gseq_kmer("AC", "ACGTA", mode="frac")[0] == 0
+
+    def test_handles_edge_case_empty_roi(self):
+        seq = "ACGTACGT"
+        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=5, end_pos=3)[0] == 0
+        assert pm.gseq_kmer(seq, "AC", mode="frac", start_pos=5, end_pos=3)[0] == 0
+
+    def test_vectorization_works(self):
+        result = pm.gseq_kmer(["ACACAC", "GGGGGG", "CGCGCG"], "AC", mode="count",
+                              start_pos=1, end_pos=6, extend=False)
+        assert len(result) == 3
+        assert result.tolist() == [3, 0, 0]
+
+    def test_handles_vectorized_start_pos_and_end_pos(self):
+        result = pm.gseq_kmer(["ACACAC", "ACACAC"], "AC", mode="count",
+                              start_pos=[1, 3], end_pos=[4, 6], extend=False)
+        assert result[0] == 2  # AC at 1-2, 3-4
+        assert result[1] == 2  # AC at 3-4, 5-6
+
+    def test_frac_denominator_is_computed_correctly(self):
+        seq = "ACGTACGT"
+        assert pm.gseq_kmer(seq, "AC", mode="frac", strand=1, start_pos=1, end_pos=8,
+                            extend=False)[0] == pytest.approx(2 / 7)
+        assert pm.gseq_kmer(seq, "AC", mode="frac", strand=1, start_pos=1, end_pos=4,
+                            extend=False)[0] == pytest.approx(1 / 3)
+
+    # -- gseq.kmer against kmer virtual tracks --------------------------------
+
+    @staticmethod
+    def _seq_and_vtracks(specs):
+        pm.gvtrack_clear()
+        iv = pm.gintervals("chr1", 200, 240)
+        seq = pm.gseq_extract(iv)[0].upper()
+        for name, kw in specs.items():
+            pm.gvtrack_create(name, None, kw.pop("func"), **kw)
+        res = pm.gextract(list(specs), iv, iterator=iv)
+        pm.gvtrack_clear()
+        return seq, res
+
+    def test_matches_gextract_kmer_count_vtrack(self):
+        seq, res = self._seq_and_vtracks({"count_ta": {"func": "kmer.count", "kmer": "TA", "strand": 1}})
+        got = pm.gseq_kmer(seq, "TA", mode="count", strand=1, start_pos=1, end_pos=len(seq), extend=False)
+        assert got[0] == res["count_ta"].iloc[0]
+
+    def test_matches_gextract_kmer_frac_vtrack(self):
+        seq, res = self._seq_and_vtracks({"frac_ta": {"func": "kmer.frac", "kmer": "TA", "strand": 1}})
+        got = pm.gseq_kmer(seq, "TA", mode="frac", strand=1, start_pos=1, end_pos=len(seq), extend=False)
+        assert got[0] == pytest.approx(res["frac_ta"].iloc[0], rel=1e-6)
+
+    def test_matches_gextract_kmer_vtrack_with_longer_kmer(self):
+        seq, res = self._seq_and_vtracks({
+            "count_ccc": {"func": "kmer.count", "kmer": "CCC", "strand": 1},
+            "frac_ccc": {"func": "kmer.frac", "kmer": "CCC", "strand": 1},
+        })
+        kw = {"strand": 1, "start_pos": 1, "end_pos": len(seq), "extend": False}
+        assert pm.gseq_kmer(seq, "CCC", mode="count", **kw)[0] == res["count_ccc"].iloc[0]
+        assert pm.gseq_kmer(seq, "CCC", mode="frac", **kw)[0] == pytest.approx(
+            res["frac_ccc"].iloc[0], rel=1e-6)
+
+    def test_matches_gextract_kmer_vtrack_both_strands(self):
+        seq, res = self._seq_and_vtracks({
+            "count_both": {"func": "kmer.count", "kmer": "AC", "strand": 0},
+            "count_fwd": {"func": "kmer.count", "kmer": "AC", "strand": 1},
+            "count_rev": {"func": "kmer.count", "kmer": "AC", "strand": -1},
+        })
+        kw = {"mode": "count", "start_pos": 1, "end_pos": len(seq), "extend": False, "skip_gaps": False}
+        assert pm.gseq_kmer(seq, "AC", strand=0, **kw)[0] == res["count_both"].iloc[0]
+        assert pm.gseq_kmer(seq, "AC", strand=1, **kw)[0] == res["count_fwd"].iloc[0]
+        assert pm.gseq_kmer(seq, "AC", strand=-1, **kw)[0] == res["count_rev"].iloc[0]
+
+    # -- gaps ------------------------------------------------------------------
+
+    def test_with_gaps_basic_matching(self):
+        kw = {"mode": "count", "strand": 1, "start_pos": 1, "end_pos": 6, "extend": False}
+        assert pm.gseq_kmer("A-CG-A", "ACG", skip_gaps=True, **kw)[0] == 1
+        assert pm.gseq_kmer("A-CG-A", "ACG", skip_gaps=False, **kw)[0] == 0
+
+    def test_with_gaps_fraction_mode(self):
+        got = pm.gseq_kmer("A-A-A-GGG", "A", mode="frac", strand=1, start_pos=1, end_pos=9,
+                           extend=False, skip_gaps=True)
+        assert got[0] == pytest.approx(3 / 6)
+
+    def test_with_gaps_fraction_mode_for_k_above_1(self):
+        got = pm.gseq_kmer("A-AC-AC", "AC", mode="frac", strand=1, start_pos=1, end_pos=7,
+                           extend=False, skip_gaps=True)
+        assert got[0] == pytest.approx(2 / 4)
+
+    def test_with_gaps_roi_handling(self):
+        seq = "GGG-A-C-GGG"
+        kw = {"mode": "count", "strand": 1, "extend": False, "skip_gaps": True}
+        assert pm.gseq_kmer(seq, "AC", start_pos=5, end_pos=7, **kw)[0] == 1
+        assert pm.gseq_kmer(seq, "AC", start_pos=1, end_pos=3, **kw)[0] == 0
+
+    def test_with_gaps_reverse_strand(self):
+        assert pm.gseq_kmer("G--T-GGG", "AC", mode="count", strand=-1, start_pos=1, end_pos=8,
+                            extend=False, skip_gaps=True)[0] == 1
+
+    def test_with_gaps_both_strands(self):
+        assert pm.gseq_kmer("A-CG-G-T", "AC", mode="count", strand=0, start_pos=1, end_pos=8,
+                            extend=False, skip_gaps=True)[0] == 2
+
+    def test_with_gaps_empty_sequence(self):
+        assert pm.gseq_kmer("-----", "AC", mode="count", skip_gaps=True)[0] == 0
+        assert pm.gseq_kmer("-----", "AC", mode="frac", skip_gaps=True)[0] == 0
+
+    def test_with_gaps_custom_gap_characters(self):
+        got = pm.gseq_kmer("A_C.A*C", "AC", mode="count", strand=1, skip_gaps=True,
+                           gap_chars=["-", ".", "_", "*"])
+        assert got[0] == 2
+
+    def test_skip_gaps_false_preserves_original_behavior(self):
+        # R's block also checks gseq.pwm (covered in test_gseq_pwm*.py); this is
+        # its k-mer half.
+        seq = "ACGTACGT"
+        assert pm.gseq_kmer(seq, "AC", mode="count", skip_gaps=False)[0] == \
+            pm.gseq_kmer(seq, "AC", mode="count", skip_gaps=True)[0]
+
+
+class TestGseqKmerDistRParity:
+    """gseq.kmer.dist blocks of test-sequence.R. R runs them on
+    gdb.init_examples(); pymisha's example database is the test database."""
+
+    @pytest.fixture(autouse=True)
+    def _examples(self):
+        pm.gdb_init_examples()
+
+    @staticmethod
+    def _iv(chroms, starts, ends):
+        return pd.DataFrame({"chrom": chroms, "start": starts, "end": ends})
+
+    def _one(self, start, end, chrom="chr1"):
+        return self._iv([chrom], [start], [end])
+
+    def test_counts_kmers_correctly(self):
+        iv = self._one(0, 1000)
+        r = pm.gseq_kmer_dist(iv, k=1)
+        assert len(r) == 4
+        assert r["count"].sum() == 1000
+        assert {"A", "C", "G", "T"} <= set(r["kmer"])
+        r = pm.gseq_kmer_dist(iv, k=2)
+        assert len(r) == 16
+        assert r["count"].sum() == 999
+        assert pm.gseq_kmer_dist(iv, k=3)["count"].sum() == 998
+
+    def test_validates_k_parameter(self):
+        iv = self._one(0, 1000)
+        for k in (0, 11, -1):
+            with pytest.raises(ValueError, match="k must be an integer between 1 and 10"):
+                pm.gseq_kmer_dist(iv, k=k)
+
+    def test_mask_excludes_positions_correctly(self):
+        iv = self._one(0, 1000)
+        total = pm.gseq_kmer_dist(iv, k=3)["count"].sum()
+        masked = pm.gseq_kmer_dist(iv, k=3, mask=self._one(500, 600))["count"].sum()
+        assert total - masked == 100
+
+    def test_handles_multiple_intervals(self):
+        iv = self._iv(["chr1", "chr1"], [0, 2000], [1000, 3000])
+        assert pm.gseq_kmer_dist(iv, k=2)["count"].sum() == 1998
+
+    def test_handles_multiple_chromosomes(self):
+        iv = self._iv(["chr1", "chr2"], [0, 0], [1000, 1000])
+        assert pm.gseq_kmer_dist(iv, k=1)["count"].sum() == 2000
+
+    def test_returns_correct_data_frame_structure(self):
+        r = pm.gseq_kmer_dist(self._one(0, 1000), k=4)
+        assert isinstance(r, pd.DataFrame)
+        assert list(r.columns) == ["kmer", "count"]
+        assert all(isinstance(x, str) for x in r["kmer"])
+        assert pd.api.types.is_numeric_dtype(r["count"])
+        assert (r["kmer"].str.len() == 4).all()
+
+    def test_only_returns_non_zero_counts(self):
+        r = pm.gseq_kmer_dist(self._one(0, 100), k=5)
+        assert len(r) < 1024
+        assert (r["count"] > 0).all()
+
+    def test_handles_interval_shorter_than_k(self):
+        r = pm.gseq_kmer_dist(self._one(0, 3), k=6)
+        assert len(r) == 0
+        assert r["count"].sum() == 0
+        assert len(pm.gseq_kmer_dist(self._one(0, 5), k=6)) == 0
+        assert pm.gseq_kmer_dist(self._one(0, 6), k=6)["count"].sum() == 1
+
+    def test_matches_manual_counting_from_gseq_extract(self):
+        iv = self._one(0, 500)
+        seq = pm.gseq_extract(iv)[0].upper()
+        manual: dict[str, int] = {}
+        for i in range(len(seq) - 1):
+            d = seq[i:i + 2]
+            if "N" not in d:
+                manual[d] = manual.get(d, 0) + 1
+        r = pm.gseq_kmer_dist(iv, k=2)
+        got = dict(zip(r["kmer"], r["count"], strict=True))
+        for kmer, n in manual.items():
+            assert got.get(kmer) == n, f"Mismatch for k-mer {kmer}"
+
+    def test_handles_mask_at_interval_boundaries(self):
+        iv = self._one(100, 200)
+        start = pm.gseq_kmer_dist(iv, k=2, mask=self._one(100, 120))["count"].sum()
+        end = pm.gseq_kmer_dist(iv, k=2, mask=self._one(180, 200))["count"].sum()
+        none = pm.gseq_kmer_dist(iv, k=2)["count"].sum()
+        assert none == 99
+        assert none - start == 20
+        assert none - end == 19
+
+    def test_handles_overlapping_intervals_correctly(self):
+        iv = self._iv(["chr1", "chr1"], [0, 500], [1000, 1500])
+        assert pm.gseq_kmer_dist(iv, k=2)["count"].sum() == 1998
+
+    def test_handles_multiple_mask_intervals(self):
+        iv = self._one(0, 1000)
+        mask = self._iv(["chr1"] * 3, [100, 300, 700], [150, 400, 800])
+        diff = pm.gseq_kmer_dist(iv, k=3)["count"].sum() - pm.gseq_kmer_dist(iv, k=3, mask=mask)["count"].sum()
+        assert diff == 250
+
+    def test_with_k_10_works(self):
+        r = pm.gseq_kmer_dist(self._one(0, 1000), k=10)
+        assert r["count"].sum() == 991
+        assert (r["kmer"].str.len() == 10).all()
+
+    def test_with_gintervals_all_works(self):
+        r = pm.gseq_kmer_dist(pm.gintervals_all(), k=2)
+        assert len(r) == 16
+        all_iv = pm.gintervals_all()
+        max_possible = (all_iv["end"] - all_iv["start"] - 1).sum()
+        assert r["count"].sum() > 0
+        assert r["count"].sum() <= max_possible
+
+    def test_kmer_strings_are_sorted_alphabetically(self):
+        r = pm.gseq_kmer_dist(self._one(0, 10000), k=3)
+        assert r["kmer"].tolist() == sorted(r["kmer"])
+
+    def test_handles_mask_on_different_chromosome(self):
+        iv = self._one(0, 1000)
+        assert pm.gseq_kmer_dist(iv, k=2)["count"].sum() == \
+            pm.gseq_kmer_dist(iv, k=2, mask=self._one(0, 500, "chr2"))["count"].sum()
+
+    def test_is_deterministic(self):
+        iv = self._one(0, 5000)
+        pd.testing.assert_frame_equal(pm.gseq_kmer_dist(iv, k=4), pm.gseq_kmer_dist(iv, k=4))
+
+    def test_handles_adjacent_intervals(self):
+        adjacent = self._iv(["chr1", "chr1"], [0, 1000], [1000, 2000])
+        continuous = self._one(0, 2000)
+        diff = pm.gseq_kmer_dist(continuous, k=3)["count"].sum() - pm.gseq_kmer_dist(adjacent, k=3)["count"].sum()
+        assert diff == 2
+
+    def test_with_mask_covering_entire_interval_returns_empty(self):
+        r = pm.gseq_kmer_dist(self._one(100, 200), k=2, mask=self._one(0, 500))
+        assert len(r) == 0
+        assert r["count"].sum() == 0
+
+    def test_kmer_counts_are_consistent_across_k_values(self):
+        iv = self._one(0, 1000)
+        assert pm.gseq_kmer_dist(iv, k=1)["count"].sum() == 1000
+        for k in range(2, 7):
+            assert pm.gseq_kmer_dist(iv, k=k)["count"].sum() == 1000 - k + 1, f"Failed for k={k}"
+
+    def test_frequencies_sum_correctly(self):
+        r = pm.gseq_kmer_dist(self._one(0, 10000), k=3)
+        assert (r["count"] / r["count"].sum()).sum() == pytest.approx(1, abs=1e-10)
+
+    def test_handles_very_small_intervals(self):
+        r = pm.gseq_kmer_dist(self._one(100, 101), k=2)
+        assert len(r) == 0
+        assert r["count"].sum() == 0
+
+    def test_reverse_complement_kmers_are_counted_separately(self):
+        r = pm.gseq_kmer_dist(self._one(0, 10000), k=2)
+        assert r.loc[r["kmer"] == "AA", "count"].iloc[0] > 0
+        assert r.loc[r["kmer"] == "TT", "count"].iloc[0] > 0
+
+    def test_handles_unsorted_intervals(self):
+        unsorted = self._iv(["chr1", "chr1"], [2000, 0], [3000, 1000])
+        ordered = self._iv(["chr1", "chr1"], [0, 2000], [1000, 3000])
+        assert pm.gseq_kmer_dist(unsorted, k=2)["count"].sum() == pm.gseq_kmer_dist(ordered, k=2)["count"].sum()
+
+    def test_handles_mask_larger_than_interval(self):
+        assert len(pm.gseq_kmer_dist(self._one(500, 600), k=2, mask=self._one(0, 1000))) == 0
+
+    def test_handles_partial_mask_overlap(self):
+        iv = self._one(0, 100)
+        masked = pm.gseq_kmer_dist(iv, k=2, mask=self._one(50, 150))["count"].sum()
+        diff = pm.gseq_kmer_dist(iv, k=2)["count"].sum() - masked
+        assert diff == 49
+
+    def test_with_all_possible_k_values(self):
+        iv = self._one(0, 100)
+        for k in range(1, 11):
+            r = pm.gseq_kmer_dist(iv, k=k)
+            assert (r["kmer"].str.len() == k).all(), f"k={k} has wrong k-mer lengths"
+            assert r["count"].sum() == max(0, 100 - k + 1), f"k={k} has wrong total count"
+
+    def test_gc_content_matches_monomer_frequencies(self):
+        iv = self._one(0, 10000)
+        r = pm.gseq_kmer_dist(iv, k=1)
+        gc = (r.loc[r["kmer"] == "G", "count"].iloc[0] + r.loc[r["kmer"] == "C", "count"].iloc[0]) / r["count"].sum()
+        seq = pm.gseq_extract(iv)[0].upper()
+        gc_from_seq = sum(1 for c in seq if c in "GC") / len(seq)
+        assert gc == pytest.approx(gc_from_seq, abs=1e-10)

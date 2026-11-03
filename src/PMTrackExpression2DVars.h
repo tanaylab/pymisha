@@ -107,8 +107,8 @@ private:
 
     // Apply `func` to a quadtree::BatchQueryStats slice (n entries),
     // writing `values[indices[j]] = applied(j)` for j in [0, n).
-    // Slots whose occupied_area == 0 are left untouched (caller must
-    // pre-fill them with NaN).
+    // Slots whose occupied_area == 0 get 0 for area and are left untouched
+    // otherwise (caller must pre-fill them with NaN).
     void apply_agg(AggFunc func,
                    const quadtree::BatchQueryStats &batch,
                    const std::vector<unsigned> &indices,

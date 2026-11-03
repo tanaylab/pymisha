@@ -159,7 +159,7 @@ class TestGintervalsRbind:
         res = pm.gintervals_rbind(i1, i2)
         assert res is not None
         assert len(res) == 3
-        assert list(res["chrom"]) == ["1", "1", "2"]
+        assert list(res["chrom"]) == ["chr1", "chr1", "chr2"]
         assert list(res["score"]) == [1.0, 2.0, 3.0]
 
     def test_accepts_named_interval_sets(self):
@@ -175,7 +175,7 @@ class TestGintervalsRbind:
             res = pm.gintervals_rbind(i1, set_name)
             assert res is not None
             assert len(res) == 3
-            assert list(res["chrom"]) == ["1", "1", "2"]
+            assert list(res["chrom"]) == ["chr1", "chr1", "chr2"]
         finally:
             pm.gintervals_rm(set_name, force=True)
 
@@ -619,7 +619,7 @@ class TestGintervalsRandom:
         # The single valid start position is `dist_from_edge`.
         assert (result["start"] == 150_000).all()
         assert (result["end"] == 350_000).all()
-        assert (result["chrom"] == "1").all()
+        assert (result["chrom"] == "chr1").all()
 
     def test_size_equals_chrom_length_dist_zero(self):
         """Regression for R misha 5.6.30 #1b41bceb: gintervals_random(L, n,

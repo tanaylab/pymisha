@@ -64,7 +64,7 @@ class TestGdirCd:
             pm.gdir_cd("..")
 
     def test_cd_clears_vtracks(self):
-        """gdir_cd should clear all virtual tracks."""
+        """gdir_cd hides the virtual tracks of the directory left (R keeps them by directory)."""
         pm.gvtrack_create("test_vt", "dense_track", func="avg")
         try:
             assert "test_vt" in pm.gvtrack_ls()
@@ -188,6 +188,22 @@ class TestGdirRm:
             pm.gdir_cd("..")
             if full_path.exists():
                 shutil.rmtree(full_path)
+
+
+    def test_rm_refuses_the_working_directory(self):
+        """gdir_rm does not remove the working directory or a directory holding it."""
+        full_path = TEST_DB / "tracks" / "test_gdir_rm_gwd" / "inner"
+        full_path.mkdir(parents=True, exist_ok=True)
+        pm.gdir_cd("test_gdir_rm_gwd/inner")
+        try:
+            with pytest.raises(ValueError, match="working directory"):
+                pm.gdir_rm(".", recursive=True, force=True)
+            with pytest.raises(ValueError, match="working directory"):
+                pm.gdir_rm("..", recursive=True, force=True)
+            assert full_path.is_dir()
+        finally:
+            pm.gdir_cd("../..")
+            shutil.rmtree(full_path.parent)
 
 
 class TestGtrackCreateDirs:

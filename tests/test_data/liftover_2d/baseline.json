@@ -1,0 +1,1051 @@
+{
+  "misha": "5.12.1",
+  "cases": [
+    {
+      "name": "pts_main",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "main.chain",
+      "policy": "auto",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 91212,
+          "sha256": "a28fa81c2c50d268f3225822effecd02af46b972164bfdeefdcee252873c9468"
+        },
+        "chrT1-chrT2": {
+          "size": 22964,
+          "sha256": "c54100e0157014fa24b2f22cca847170f0a0251ee5fc05bf968535dcd00cd43d"
+        },
+        "chrT2-chrT1": {
+          "size": 22964,
+          "sha256": "3041145ef3fa149077bbb3547f376a9740e94586036368f5bdfdbb2773b7e72d"
+        },
+        "chrT2-chrT2": {
+          "size": 23900,
+          "sha256": "42c569bd93d600626bb8c625e44b7288c5c3a9cdf7a689c96488288b79799d38"
+        }
+      }
+    },
+    {
+      "name": "pts_main_indexed",
+      "track": "pts",
+      "src": "indexed",
+      "tgt": "indexed",
+      "chain": "main.chain",
+      "policy": "auto",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "track.dat": {
+          "size": 161040,
+          "sha256": "c22226ff2460d04c2b3de850774c23e3c00b85572bf8a469978af3a10c1742d7"
+        },
+        "track.idx": {
+          "size": 156,
+          "sha256": "b2c1266ace2b9577597b25012bd857c17118155c48805257df67608e6765e72b"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_mean",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "9b83c78bbcc90b26fd39f56c14584374e085610d58f946651dceb3f448bc534a"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_median",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "median",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "ae72314c2613aa8677feb4e7ad28aa2ff8fcb09ed8a32f02158d12f13f51c7a0"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_sum",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "sum",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "ae3fffef1045b85e80be3acba71374a1d54bf55b3a3b6f116fc0f512d8b198db"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_min",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "1bbe97e853c44c513845785f79a57e696eb495a6a434dc43078d25ee1ab7f6e5"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_max",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "a41d4a25c9886bbf9d7b84f9be4bfcd2b931be219d671d08ee3a0523eca11620"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_count",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "count",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "b5c2a0047c59a5b4fcc4fc49d712eb13605536e662ada503554af92a316679b7"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_first",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "first",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "11935865b81d6bdafa37bbe55aba79f3fc10fcf95594bb5dc7f46472700fd42e"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_last",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "last",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "2110b447f2b3d971bdff1c6a213a4c7d8ff91fec92b1f1593b90d5b60269b24f"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_nth",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "nth",
+      "nth": 2,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "86616e7edb5e9ae0fae9a49912045130fdc67554eb004beb93c6f9c4324d9e6f"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_max_coverage_len",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max.coverage_len",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "a41d4a25c9886bbf9d7b84f9be4bfcd2b931be219d671d08ee3a0523eca11620"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_min_coverage_len",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min.coverage_len",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "a41d4a25c9886bbf9d7b84f9be4bfcd2b931be219d671d08ee3a0523eca11620"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_max_coverage_frac",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max.coverage_frac",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "a41d4a25c9886bbf9d7b84f9be4bfcd2b931be219d671d08ee3a0523eca11620"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_min_coverage_frac",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min.coverage_frac",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "a41d4a25c9886bbf9d7b84f9be4bfcd2b931be219d671d08ee3a0523eca11620"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_nth3",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "nth",
+      "nth": 3,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "9c6ad99728250b12b8473bf893446d4241405d22e9221cca96fe49450fee9ff7"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_min_n",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "mean",
+      "nth": null,
+      "min_n": 2,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "687297c57334f52dffdcfb741ccf7d2fd0bba01514397989e3df7fbdabb4c03d"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_na_rm_false",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "sum",
+      "nth": null,
+      "min_n": null,
+      "na_rm": false,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "c790df0f2358a15742dc7e261552588f1b113c67d3358ec93646bbace94e5d07"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_indexed",
+      "track": "pts",
+      "src": "indexed",
+      "tgt": "indexed",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "last",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "track.dat": {
+          "size": 335900,
+          "sha256": "2110b447f2b3d971bdff1c6a213a4c7d8ff91fec92b1f1593b90d5b60269b24f"
+        },
+        "track.idx": {
+          "size": 72,
+          "sha256": "f2798b95ddd444e77a469a1319a9deca3667aefc1f07ace0fc120aeb347459f2"
+        }
+      }
+    },
+    {
+      "name": "rct_main",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "main.chain",
+      "policy": "auto",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 2092,
+          "sha256": "20b22d80113a285067568647018ec45454f65c4677bfeedbaefe89a2dcab152c"
+        },
+        "chrT1-chrT2": {
+          "size": 9212,
+          "sha256": "5b32fb51cc0f405d0b7cb4e875749fbe1a2b5fc846a5d66f07291be023adbbde"
+        },
+        "chrT2-chrT1": {
+          "size": 5396,
+          "sha256": "8d3ea0d555bf305b8161ace20d2d042b219d97b37a2e653a76f0450f0b8ca52f"
+        },
+        "chrT2-chrT2": {
+          "size": 44860,
+          "sha256": "68c6a46f56d3dbeaf8bb77f8e29fe262c9e998cfa2eb511356a45ea99de510c1"
+        }
+      }
+    },
+    {
+      "name": "rct_main_indexed",
+      "track": "rct",
+      "src": "indexed",
+      "tgt": "indexed",
+      "chain": "main.chain",
+      "policy": "auto",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "track.dat": {
+          "size": 61560,
+          "sha256": "b9423071650bceced1b04a0f16c8f7b002237e18b5f480fbb008f3cd129b4a64"
+        },
+        "track.idx": {
+          "size": 156,
+          "sha256": "40e51420761230612b7ed01c77fd19e67ba2370530036eb18ec8c51d31882a0a"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_mean",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "22e6852cce6610613c419226a3dff19d2e4ca0ca35f375bdac74db162d596d15"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "9690b14363e2e8a709d825f5608481c7f5cdd0dcd45c544dcf367295ecc47e7b"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_median",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "median",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "bfe551dce61a4c537ff80a1abeb065f561c7097e8557beca3b464eb649d0eb8f"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "9690b14363e2e8a709d825f5608481c7f5cdd0dcd45c544dcf367295ecc47e7b"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_sum",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "sum",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "c0da6ee360995c178693617258263c34deca1c4a5707825a8f0907a996daf7a0"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "4b862b66a5b58782b1ba9919556ca96cfe2db926eda3ef308a30f68156bbd72f"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_min",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "7abeae908f4fb96678815132e0f64179ecd9d8613a30557d2ebda127a58e52ea"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "bffb3944d32c80674d8c6ec79fff7cc14a00284126c4b6c9b375f3d5437f8440"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_max",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "f9b3cc11bede4edc58c0fc8b71d081c6325565b7b5f7a54035f5ba4b7255aa9c"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_count",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "count",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "9f5703147a65cbe8127ce8f62f6d9dd825caf09ae7706035b7fc6f2025698006"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "76f7997dfd9196544805fae60cc2eab5206de2bc70a358227f173bce46dfe551"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "a51d0e26cb0be6b722e9149b59179bf5f0211eb8a47b6b3a5ffbf4e8b4f1e5e0"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "1cdcc2f0649a720e07c2a8e03b66d6cb22c1d39a19705098736923d3cf45f3e6"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_first",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "first",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "57ed6ee84f485522d237a78d15897ec74d61dbe9227d003e9c2219d9b798572a"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "bffb3944d32c80674d8c6ec79fff7cc14a00284126c4b6c9b375f3d5437f8440"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_last",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "last",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "36415e08abd3c2afb8ec5078e9d854a0d234ea0c43f2594d5c27a234a6f842aa"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_nth",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "nth",
+      "nth": 2,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "5a28a3d7017295f9c1f6838ded134a3ea6c345f7f81f1c65dff1c05d55044752"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "cf5b8ca3a89669996fac2472d33211acc1493abea6f1e2c4590fd678251e8d58"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "9335eb37c209a0453f63d28b56091fe997d4cf6a45b1bf486476ccd00b2d6a17"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "8887fbb2bfcfad1a91fb6a88b49d7acaf7c3b391c57f5374f42ab45086ded7af"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_max_coverage_len",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max.coverage_len",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "f9b3cc11bede4edc58c0fc8b71d081c6325565b7b5f7a54035f5ba4b7255aa9c"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_min_coverage_len",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min.coverage_len",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "f9b3cc11bede4edc58c0fc8b71d081c6325565b7b5f7a54035f5ba4b7255aa9c"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_max_coverage_frac",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "max.coverage_frac",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "f9b3cc11bede4edc58c0fc8b71d081c6325565b7b5f7a54035f5ba4b7255aa9c"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_min_coverage_frac",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "min.coverage_frac",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "f9b3cc11bede4edc58c0fc8b71d081c6325565b7b5f7a54035f5ba4b7255aa9c"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "7c29c0b32556ae8f4a1d3ac730b0eeea95dabf34440da9b9f47844b6c9c4b065"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "859a0bedf75d59a1d4586aa18eff4864e12069d305b1de031014b2ccf6723df6"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_nth3",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "nth",
+      "nth": 3,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "bb294886620daf59ef1c3d779f4e5e4f717e777d25cd83677e93578f02517717"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "cf5b8ca3a89669996fac2472d33211acc1493abea6f1e2c4590fd678251e8d58"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "610492c8600e56ea603f823f3def187d4c237c0bfafe71ae892070b2a43253cf"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "8887fbb2bfcfad1a91fb6a88b49d7acaf7c3b391c57f5374f42ab45086ded7af"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_min_n",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "mean",
+      "nth": null,
+      "min_n": 2,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "1d9c10397451d683b5879d1bb88979867a51390c5b6795787a9ab0096cb0d6d9"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "cf5b8ca3a89669996fac2472d33211acc1493abea6f1e2c4590fd678251e8d58"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "b4544cc71a93b15386b80f0984e190aae2c045bca38255f3617eeb3db45719b0"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "8887fbb2bfcfad1a91fb6a88b49d7acaf7c3b391c57f5374f42ab45086ded7af"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_na_rm_false",
+      "track": "rct",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "sum",
+      "nth": null,
+      "min_n": null,
+      "na_rm": false,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 197516,
+          "sha256": "7c33d7465e66a978dcfad7f881e8b6c7eda983173c1874c9d5b7763e8caad737"
+        },
+        "chrT1-chrT2": {
+          "size": 29268,
+          "sha256": "b564e92b0afa2383f91929b15cd8f7adf6d839fa026081aee1db1edcfa6bbf41"
+        },
+        "chrT2-chrT1": {
+          "size": 4380,
+          "sha256": "4b862b66a5b58782b1ba9919556ca96cfe2db926eda3ef308a30f68156bbd72f"
+        },
+        "chrT2-chrT2": {
+          "size": 308,
+          "sha256": "775e8dd9b2c031a2fa682d563e748e6c8da971d5acc4ed7fd4477511141ca3e0"
+        }
+      }
+    },
+    {
+      "name": "rct_keep_indexed",
+      "track": "rct",
+      "src": "indexed",
+      "tgt": "indexed",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "last",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "track.dat": {
+          "size": 231472,
+          "sha256": "0a784c34c097e442afab6ef55ab899515bddc5b9039487ffa4df1e9f9aea9268"
+        },
+        "track.idx": {
+          "size": 156,
+          "sha256": "99319950b71253e059c53f90680a3c9704d40de86b3ddb5cacb3dc5198d59be8"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_agg_policy",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "agg",
+      "agg": "first",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 10000000,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 335900,
+          "sha256": "11935865b81d6bdafa37bbe55aba79f3fc10fcf95594bb5dc7f46472700fd42e"
+        }
+      }
+    },
+    {
+      "name": "pts_main_split",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "main.chain",
+      "policy": "auto",
+      "agg": "mean",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 100,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 91468,
+          "sha256": "40efb49fffc81ec061ea995bbe68364a1cfd03d0f893fadcc406761c0e8e6003"
+        },
+        "chrT1-chrT2": {
+          "size": 22964,
+          "sha256": "c54100e0157014fa24b2f22cca847170f0a0251ee5fc05bf968535dcd00cd43d"
+        },
+        "chrT2-chrT1": {
+          "size": 22964,
+          "sha256": "3041145ef3fa149077bbb3547f376a9740e94586036368f5bdfdbb2773b7e72d"
+        },
+        "chrT2-chrT2": {
+          "size": 23900,
+          "sha256": "42c569bd93d600626bb8c625e44b7288c5c3a9cdf7a689c96488288b79799d38"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_split",
+      "track": "pts",
+      "src": "per-chromosome",
+      "tgt": "per-chromosome",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "first",
+      "nth": null,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 300,
+      "files": {
+        "chrT1-chrT1": {
+          "size": 337172,
+          "sha256": "0983a067e29c1c1b876d39dfb189626b4bc349eee853e8f3832dbe7d5549dccf"
+        }
+      }
+    },
+    {
+      "name": "pts_keep_split_indexed",
+      "track": "pts",
+      "src": "indexed",
+      "tgt": "indexed",
+      "chain": "keep.chain",
+      "policy": "keep",
+      "agg": "nth",
+      "nth": 2,
+      "min_n": null,
+      "na_rm": true,
+      "max_data_size": 300,
+      "files": {
+        "track.dat": {
+          "size": 337172,
+          "sha256": "ca73b467752446bb04749f766e1bcde2797fadb780314e1ca1b1a96a0c96eaec"
+        },
+        "track.idx": {
+          "size": 72,
+          "sha256": "5e747b6caf3e7c11ededede1ab468b10557460e640d79650ea444802826e5fb1"
+        }
+      }
+    }
+  ]
+}

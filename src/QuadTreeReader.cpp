@@ -42,43 +42,40 @@ static inline const NodeBase *read_node_base(const char *buf, int64_t abs_offset
 }
 
 // -------------------------------------------------------------------
-// Helper: update stat from a rectangle object intersection (no band)
+// Stat updates, as R's StatQuadTreeCached::update_stat makes them.
 //
-// NaN-valued objects are stored on disk (R parity: gtrack.lookup with
-// force_binning=FALSE can produce NaN rects) but are skipped from stat
-// aggregates - avg/min/max/sum/weighted.sum exclude them, matching R
-// and the writer-side invariant in pymisha/_quadtree.py.
+// A NaN object is added like any other: its area counts, the weighted sum
+// becomes NaN, and min / max are std::min / std::max with R's argument order,
+// so a NaN takes over min and max until a later value replaces it. The result
+// therefore depends on the order of the objects and on the node stats the
+// writer stored, which hold NaN objects the same way.
 // -------------------------------------------------------------------
-static inline void update_stat_rect(float val, int64_t inter_area, QueryStat &stat) {
-    if (std::isnan(val)) return;
+static inline void update_stat_obj(float val, int64_t area, QueryStat &stat) {
     double dval = static_cast<double>(val);
-    stat.occupied_area += inter_area;
-    stat.weighted_sum += dval * inter_area;
-    if (dval < stat.min_val) stat.min_val = dval;
-    if (dval > stat.max_val) stat.max_val = dval;
+    stat.weighted_sum += dval * area;
+    stat.min_val = std::min(dval, stat.min_val);
+    stat.max_val = std::max(dval, stat.max_val);
+    stat.occupied_area += area;
 }
 
-// -------------------------------------------------------------------
-// Helper: update stat from a point object (no band)
-// -------------------------------------------------------------------
-static inline void update_stat_point(float val, QueryStat &stat) {
-    if (std::isnan(val)) return;
-    double dval = static_cast<double>(val);
-    stat.occupied_area += 1;
-    stat.weighted_sum += dval;
-    if (dval < stat.min_val) stat.min_val = dval;
-    if (dval > stat.max_val) stat.max_val = dval;
+static inline void update_stat_node(const Stat &ns, QueryStat &stat) {
+    stat.weighted_sum += ns.weighted_sum;
+    stat.min_val = std::min(ns.min_val, stat.min_val);
+    stat.max_val = std::max(ns.max_val, stat.max_val);
+    stat.occupied_area += ns.occupied_area;
 }
 
-// -------------------------------------------------------------------
-// Helper: merge pre-computed node stat into query stat
-// -------------------------------------------------------------------
-static inline void merge_node_stat(const Stat &ns, QueryStat &stat) {
-    if (ns.occupied_area > 0) {
-        stat.occupied_area += ns.occupied_area;
-        stat.weighted_sum += ns.weighted_sum;
-        if (ns.min_val < stat.min_val) stat.min_val = ns.min_val;
-        if (ns.max_val > stat.max_val) stat.max_val = ns.max_val;
+// A query no object touches gives NaN, as in R. R reads min and max into
+// GenomeTrack2D's float m_last_min / m_last_max, so a DBL_MAX / -DBL_MAX left
+// from Stat::reset() (a node merged after a NaN can leave one) reads as Inf / -Inf.
+static inline void finish_stat(QueryStat &stat) {
+    if (stat.occupied_area == 0) {
+        stat.weighted_sum = std::numeric_limits<double>::quiet_NaN();
+        stat.min_val = std::numeric_limits<double>::quiet_NaN();
+        stat.max_val = std::numeric_limits<double>::quiet_NaN();
+    } else {
+        stat.min_val = static_cast<double>(static_cast<float>(stat.min_val));
+        stat.max_val = static_cast<double>(static_cast<float>(stat.max_val));
     }
 }
 
@@ -114,7 +111,7 @@ void query_stats_node(const char *buf, size_t len,
                 int64_t eqy2 = std::min(query.y2, nb->arena.y2);
                 if (obj->x >= eqx1 && obj->x < eqx2 &&
                     obj->y >= eqy1 && obj->y < eqy2) {
-                    update_stat_point(obj->val, stat);
+                    update_stat_obj(obj->val, 1, stat);
                 }
             }
         } else {
@@ -134,7 +131,7 @@ void query_stats_node(const char *buf, size_t len,
                 int64_t iy2 = std::min(eqy2, obj->y2);
                 if (ix1 < ix2 && iy1 < iy2) {
                     int64_t area = (ix2 - ix1) * (iy2 - iy1);
-                    update_stat_rect(obj->val, area, stat);
+                    update_stat_obj(obj->val, area, stat);
                 }
             }
         }
@@ -153,8 +150,11 @@ void query_stats_node(const char *buf, size_t len,
             if (!kid_nb->arena.do_intersect(query)) continue;
 
             // Fast path: child fully inside query -> use pre-computed stats
+            // (R skips a child with no occupied area here, but not in the
+            // band traversal below)
             if (kid_nb->arena.is_inside(query)) {
-                merge_node_stat(kid_nb->stat, stat);
+                if (kid_nb->stat.occupied_area)
+                    update_stat_node(kid_nb->stat, stat);
             } else {
                 // Partial overlap: recurse
                 query_stats_node(buf, len, kid_chunk, kid_offset,
@@ -198,7 +198,7 @@ void query_stats_node_band(const char *buf, size_t len,
                 if (obj->x >= eqx1 && obj->x < eqx2 &&
                     obj->y >= eqy1 && obj->y < eqy2 &&
                     band.contains_point(obj->x, obj->y)) {
-                    update_stat_point(obj->val, stat);
+                    update_stat_obj(obj->val, 1, stat);
                 }
             }
         } else {
@@ -218,14 +218,10 @@ void query_stats_node_band(const char *buf, size_t len,
                 if (intersection.is_non_empty_area()) {
                     // Check band intersection
                     if (band.do_contain(intersection)) {
-                        int64_t area = intersection.area();
-                        update_stat_rect(obj->val, area, stat);
+                        update_stat_obj(obj->val, intersection.area(), stat);
                     } else if (band.do_intersect(intersection)) {
                         band.shrink2intersected(intersection);
-                        int64_t area = band.intersected_area(intersection);
-                        if (area > 0) {
-                            update_stat_rect(obj->val, area, stat);
-                        }
+                        update_stat_obj(obj->val, band.intersected_area(intersection), stat);
                     }
                 }
             }
@@ -246,8 +242,9 @@ void query_stats_node_band(const char *buf, size_t len,
             if (kid_nb->arena.is_inside(query)) {
                 // Child fully inside query
                 if (band.do_contain(kid_nb->arena)) {
-                    // Also fully inside band: use pre-computed stats
-                    merge_node_stat(kid_nb->stat, stat);
+                    // Also fully inside band: use pre-computed stats, even
+                    // those of an empty child (as R does)
+                    update_stat_node(kid_nb->stat, stat);
                 } else if (band.do_intersect(kid_nb->arena)) {
                     // Partially overlaps band: shrink and recurse
                     Rectangle r = kid_nb->arena;
@@ -340,8 +337,8 @@ void query_objects_node(const char *buf, size_t len,
             const NodeBase *kid_nb = read_node_base(buf, kid_abs);
 
             // Object queries must reach every spatially-overlapping subtree
-            // that holds objects, even subtrees with only NaN-valued rects
-            // (occupied_area == 0 after the writer excludes NaN from stats).
+            // that holds objects, whatever its stored stats say (a file
+            // written by an older pymisha left NaN objects out of them).
             // Use num_objs > 0 as the "has any objects" signal for leaves
             // (cheap, already serialized); internal kids always carry
             // objects by writer invariant (a node only splits when a leaf
@@ -435,7 +432,7 @@ void query_objects_node_band(const char *buf, size_t len,
             const NodeBase *kid_nb = read_node_base(buf, kid_abs);
 
             // See query_objects_node: prune on num_objs (cheap, on disk)
-            // for leaves rather than occupied_area (which now excludes NaN).
+            // for leaves rather than occupied_area.
             if (!kid_nb->arena.do_intersect(query)) continue;
             if (kid_nb->is_leaf) {
                 const Leaf *kid_leaf = reinterpret_cast<const Leaf *>(buf + kid_abs);
@@ -474,13 +471,7 @@ QueryStat query_stats(const char *buf, size_t len,
                          is_points, query, stat, 0);
     }
 
-    // Match R misha: when no objects contribute, set all to NaN
-    if (stat.occupied_area == 0) {
-        stat.weighted_sum = std::numeric_limits<double>::quiet_NaN();
-        stat.min_val = std::numeric_limits<double>::quiet_NaN();
-        stat.max_val = std::numeric_limits<double>::quiet_NaN();
-    }
-
+    finish_stat(stat);
     return stat;
 }
 
@@ -538,16 +529,11 @@ BatchQueryStats query_stats_batch(const char *buf, size_t len,
                              is_points, query, stat, 0);
         }
 
+        finish_stat(stat);
         result.occupied_area[i] = stat.occupied_area;
-        if (stat.occupied_area == 0) {
-            result.weighted_sum[i] = std::numeric_limits<double>::quiet_NaN();
-            result.min_val[i] = std::numeric_limits<double>::quiet_NaN();
-            result.max_val[i] = std::numeric_limits<double>::quiet_NaN();
-        } else {
-            result.weighted_sum[i] = stat.weighted_sum;
-            result.min_val[i] = stat.min_val;
-            result.max_val[i] = stat.max_val;
-        }
+        result.weighted_sum[i] = stat.weighted_sum;
+        result.min_val[i] = stat.min_val;
+        result.max_val[i] = stat.max_val;
     }
 
     return result;

@@ -19,7 +19,7 @@ def _copy_db(tmp_path: Path) -> Path:
 
 def test_chrom_alias_chr_prefix():
     intervals = pm.gintervals("chr1", 0, 100)
-    assert intervals.iloc[0]["chrom"] == "1"
+    assert intervals.iloc[0]["chrom"] == "chr1"
 
 
 def _make_synthetic_groot(tmp_path: Path, names: list[str], size: int = 1000) -> Path:

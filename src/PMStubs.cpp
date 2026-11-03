@@ -405,6 +405,10 @@ PyObject *pm_dbinit(PyObject *self, PyObject *args)
                uroot ? uroot : "(null)",
                (unsigned long)g_pmdb->chromkey().get_num_chroms());
 
+        // the warning gsetroot gives for the database's seq/genome.idx, if any
+        if (!g_pmdb->init_warning().empty())
+            return PyUnicode_FromString(g_pmdb->init_warning().c_str());
+
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());
         return NULL;
@@ -415,6 +419,203 @@ PyObject *pm_dbinit(PyObject *self, PyObject *args)
 
     Py_INCREF(Py_None);
     return Py_None;
+}
+
+// The per-chromosome files of a track or intervals set directory (GenomeTrack::ChromFiles), as R's
+// gchrom_files gives them: one row per file named by a chromosome (by a pair if is_2d): chrom
+// (chrom1, chrom2), its canonical name(s); file; used, whether it is the file that the readers open.
+// converting: the files next to an intervals set's index count as without it, as a conversion packs
+// them.
+PyObject *pm_chrom_files(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        const char *dir = NULL;
+        int is_2d = 0;
+        int converting = 0;
+        if (!PyArg_ParseTuple(args, "sp|p", &dir, &is_2d, &converting)) {
+            verror("Invalid arguments to pm_chrom_files");
+        }
+
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        std::unique_ptr<GenomeTrack::ChromFiles> own;
+        if (converting)
+            own.reset(new GenomeTrack::ChromFiles(chromkey, dir, true));
+        const GenomeTrack::ChromFiles &files = converting ? *own : g_pmdb->chrom_files(dir);
+
+        PMPY chroms1(PyList_New(0), true);
+        PMPY chroms2(PyList_New(0), true);
+        PMPY names(PyList_New(0), true);
+        PMPY used(PyList_New(0), true);
+        PMPY unnamed(PyList_New(0), true);
+        auto append = [](PMPY &list, PyObject *item) {
+            if (!item || PyList_Append((PyObject *)list, item)) {
+                Py_XDECREF(item);
+                verror("Out of memory");
+            }
+            Py_DECREF(item);
+        };
+        for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+            if (is_2d ? file.chromid1 < 0 : file.chromid < 0) {
+                // a file of the directory not named by a chromosome (pair); not a symlink, which
+                // counts only when it is
+                if (!file.link)
+                    append(unnamed, PyUnicode_FromString(file.name.c_str()));
+                continue;
+            }
+            // used: the file read for its chromosome (pair); none in a dimension whose files the
+            // readers stop at (a conflict, a file that cannot be reached)
+            bool is_used = false;
+            try {
+                is_used = is_2d ? files.filename(file.chromid1, file.chromid2) == file.name
+                                : files.filename(file.chromid) == file.name;
+            } catch (TGLException &) {
+            }
+            if (is_2d) {
+                append(chroms1, PyUnicode_FromString(chromkey.id2chrom(file.chromid1).c_str()));
+                append(chroms2, PyUnicode_FromString(chromkey.id2chrom(file.chromid2).c_str()));
+            } else
+                append(chroms1, PyUnicode_FromString(chromkey.id2chrom(file.chromid).c_str()));
+            append(names, PyUnicode_FromString(file.name.c_str()));
+            PyObject *flag = is_used ? Py_True : Py_False;
+            Py_INCREF(flag);
+            append(used, flag);
+        }
+
+        PMPY res(PyDict_New(), true);
+        if (is_2d) {
+            PyDict_SetItemString(res, "chrom1", chroms1);
+            PyDict_SetItemString(res, "chrom2", chroms2);
+        } else
+            PyDict_SetItemString(res, "chrom", chroms1);
+        PyDict_SetItemString(res, "file", names);
+        PyDict_SetItemString(res, "used", used);
+        PyDict_SetItemString(res, "unnamed", unnamed);
+        res.to_be_stolen();
+        return (PyObject *)res;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+}
+
+// R misha's .gdb.check_genome_idx for the database at groot: raises where gsetroot stops for
+// its seq/genome.idx, and returns gsetroot's warning (None if none). The chromosomes are those
+// gdb_init gives the database (gdb_chrom_order), or the given names and sizes by chrom id.
+PyObject *pm_gdb_check_genome_idx(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(false);
+
+        const char *groot = NULL;
+        PyObject *py_names = NULL;
+        PyObject *py_sizes = NULL;
+        if (!PyArg_ParseTuple(args, "s|OO", &groot, &py_names, &py_sizes)) {
+            verror("Invalid arguments to pm_gdb_check_genome_idx");
+        }
+
+        std::vector<std::string> names;
+        std::vector<uint64_t> sizes;
+        if (py_names && py_names != Py_None) {
+            parse_string_list(py_names, names, "names");
+            PMPY seq(PySequence_Fast(py_sizes, "sizes must be a sequence"), true);
+            if (!seq || (size_t)PySequence_Fast_GET_SIZE((PyObject *)seq) != names.size())
+                verror("pm_gdb_check_genome_idx: names and sizes differ in length");
+            for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE((PyObject *)seq); ++i) {
+                PyObject *item = PySequence_Fast_GET_ITEM((PyObject *)seq, i);
+                double v = PyFloat_AsDouble(item);
+                if (v == -1.0 && PyErr_Occurred()) {
+                    PyErr_Clear();
+                    verror("pm_gdb_check_genome_idx: sizes must be numbers");
+                }
+                sizes.push_back((uint64_t)v);
+            }
+        } else {
+            std::vector<std::string> file_names;
+            std::vector<uint64_t> file_sizes;
+            read_chrom_sizes(groot, file_names, file_sizes);
+            GdbChromOrder order = gdb_chrom_order(groot, file_names);
+            for (size_t idx : order.id_order) {
+                names.push_back(order.names[idx]);
+                sizes.push_back(file_sizes[idx]);
+            }
+        }
+
+        std::string warning = check_genome_idx(groot, names, sizes);
+        if (!warning.empty())
+            return PyUnicode_FromString(warning.c_str());
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+// The chromosomes of the database at groot by chrom id, as gdb_init gives them
+// (gdb_chrom_order): (canonical names, sizes, chrom_sizes.txt names, per-chromosome flag).
+// Needs no initialized database.
+PyObject *pm_gdb_chrom_order(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(false);
+
+        const char *groot = NULL;
+        if (!PyArg_ParseTuple(args, "s", &groot)) {
+            verror("Invalid arguments to pm_gdb_chrom_order");
+        }
+
+        std::vector<std::string> file_names;
+        std::vector<uint64_t> file_sizes;
+        read_chrom_sizes(groot, file_names, file_sizes);
+        GdbChromOrder order = gdb_chrom_order(groot, file_names);
+
+        const size_t n = order.id_order.size();
+        PMPY names(PyList_New(n), true);
+        PMPY sizes(PyList_New(n), true);
+        PMPY orig(PyList_New(n), true);
+        if (!names || !sizes || !orig) {
+            verror("Out of memory");
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const size_t idx = order.id_order[i];
+            PyObject *name = PyUnicode_FromString(order.names[idx].c_str());
+            PyObject *size = PyLong_FromUnsignedLongLong(file_sizes[idx]);
+            PyObject *orig_name = PyUnicode_FromString(file_names[idx].c_str());
+            if (!name || !size || !orig_name) {
+                Py_XDECREF(name);
+                Py_XDECREF(size);
+                Py_XDECREF(orig_name);
+                verror("Invalid chromosome name in %s/chrom_sizes.txt", groot);
+            }
+            PyList_SET_ITEM((PyObject *)names, i, name);
+            PyList_SET_ITEM((PyObject *)sizes, i, size);
+            PyList_SET_ITEM((PyObject *)orig, i, orig_name);
+        }
+        PyObject *res = Py_BuildValue("(OOOO)", (PyObject *)names, (PyObject *)sizes, (PyObject *)orig,
+                                      order.per_chromosome ? Py_True : Py_False);
+        if (!res) {
+            verror("Out of memory");
+        }
+        return res;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
 }
 
 PyObject *pm_dbsetdatasets(PyObject *self, PyObject *args)
@@ -446,6 +647,81 @@ PyObject *pm_dbsetdatasets(PyObject *self, PyObject *args)
 
     Py_INCREF(Py_None);
     return Py_None;
+}
+
+// Set the working directory (gdir_cd); the track list follows at the next pm_dbreload
+PyObject *pm_dbsetgwd(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        const char *gwd = NULL;
+        if (!PyArg_ParseTuple(args, "s", &gwd)) {
+            verror("Invalid arguments to pm_dbsetgwd");
+        }
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        g_pmdb->set_gwd(gwd);
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+// Whether the working directory is a subdirectory, where names are relative to it
+PyObject *pm_gwd_is_subdir(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        if (g_pmdb->gwd_is_subdir()) {
+            Py_RETURN_TRUE;
+        }
+        Py_RETURN_FALSE;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+}
+
+// The directory a new track of this name is created in
+PyObject *pm_new_track_path(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        const char *track_name = NULL;
+        if (!PyArg_ParseTuple(args, "s", &track_name)) {
+            verror("Invalid arguments to pm_new_track_path");
+        }
+        if (!g_pmdb) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        std::string path = g_pmdb->new_track_path(track_name);
+        PMPY result(PyUnicode_FromString(path.c_str()), true);
+        result.to_be_stolen();
+        return (PyObject *)result;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
 }
 
 PyObject *pm_dbgetdatasets(PyObject *self, PyObject *args)
@@ -501,6 +777,52 @@ PyObject *pm_track_dataset(PyObject *self, PyObject *args)
         PMPY result(PyUnicode_FromString(root.c_str()), true);
         result.to_be_stolen();
         return (PyObject *)result;
+
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+}
+
+// The chrom id of each chromosome name (any of its names), -1 for a name the database
+// does not know.
+PyObject *pm_chrom_ids(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        PyObject *py_chroms = NULL;
+        if (!PyArg_ParseTuple(args, "O", &py_chroms)) {
+            verror("Invalid arguments to pm_chrom_ids");
+        }
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+
+        std::vector<std::string> chroms;
+        parse_string_list(py_chroms, chroms, "chroms must be a sequence of strings");
+        PMPY out(PyList_New(chroms.size()), true);
+        if (!out) {
+            verror("Out of memory");
+        }
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        for (size_t i = 0; i < chroms.size(); ++i) {
+            long chromid = -1;
+            try {
+                chromid = chromkey.chrom2id(chroms[i]);
+            } catch (TGLException &) {
+            }
+            PyObject *id = PyLong_FromLong(chromid);
+            if (!id) {
+                verror("Out of memory");
+            }
+            PyList_SET_ITEM((PyObject *)out, i, id);
+        }
+        out.to_be_stolen();
+        return (PyObject *)out;
 
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());
@@ -2927,7 +3249,8 @@ PyObject *pm_track_info(PyObject *self, PyObject *args)
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
 
         // Get track type
-        GenomeTrack::Type track_type = GenomeTrack::get_type(track_path.c_str(), chromkey, false);
+        const GenomeTrack::ChromFiles &files = g_pmdb->chrom_files(track_path);
+        GenomeTrack::Type track_type = GenomeTrack::get_type(files, false);
 
         // Map type to user-friendly name
         const char *type_name;
@@ -2968,15 +3291,24 @@ PyObject *pm_track_info(PyObject *self, PyObject *args)
                 total_size += st.st_size;
             }
         } else {
-            for (uint64_t chromid = 0; chromid < chromkey.get_num_chroms(); ++chromid) {
-                std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-                    chromkey, track_path, chromid);
-                if (!chrom_file.empty()) {
-                    std::string full_path = track_path + "/" + chrom_file;
-                    if (stat(full_path.c_str(), &st) == 0) {
-                        total_size += st.st_size;
-                    }
+            // For per-chromosome tracks, sum the per-chromosome files that are not symlinks (R's
+            // gtrackinfo). The files read are checked as the readers check them (a conflict, a
+            // symlink to a file that cannot be reached); a symlink that cannot be reached and is
+            // not read is passed over, and any other file that cannot be stat'ed stops (gtrack_copy
+            // relies on that before it sets an existing destination aside).
+            if (GenomeTrack::is_1d(track_type))
+                files.chromids();
+            else
+                files.chrom_pairs();
+            for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+                std::string full_path = track_path + "/" + file.name;
+                if (stat(full_path.c_str(), &st)) {
+                    if (file.link)
+                        continue;
+                    verror("Cannot stat %s: %s", full_path.c_str(), strerror(errno));
                 }
+                if (!file.link)
+                    total_size += st.st_size;
             }
         }
 
@@ -2989,21 +3321,14 @@ PyObject *pm_track_info(PyObject *self, PyObject *args)
         // For dense tracks, get bin size (invariant across chromosomes).
         if (track_type == GenomeTrack::FIXED_BIN) {
             for (uint64_t chromid = 0; chromid < chromkey.get_num_chroms(); ++chromid) {
-                std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-                    chromkey, track_path, chromid);
-                if (chrom_file.empty())
+                // A per-chrom track may have no file for a chromosome (a legitimately
+                // empty leading scaffold, or a partial track): skip to the first chrom
+                // that has one. Indexed tracks have no per-chrom files and read bin_size
+                // from track.dat via the index inside init_read (which back-fills an empty
+                // leading chrom), so probe the first chrom directly.
+                if (!is_indexed && !files.exists(chromid))
                     continue;
-                std::string full_path = track_path + "/" + chrom_file;
-                // For per-chrom tracks, find_existing_1d_filename returns the
-                // canonical base name even when no file exists for that chrom
-                // (a legitimately empty leading scaffold, or a partial track).
-                // Probing it with init_read would error "No such file or
-                // directory". Skip to the first chrom that actually has a file.
-                // Indexed tracks have no per-chrom files and read bin_size from
-                // track.dat via the index inside init_read (which back-fills an
-                // empty leading chrom), so probe the first chrom directly.
-                if (!is_indexed && access(full_path.c_str(), F_OK) != 0)
-                    continue;
+                std::string full_path = files.path(chromid);
                 GenomeTrackFixedBin track;
                 track.init_read(full_path.c_str(), chromid);
                 int64_t bin_size = track.get_bin_size();
@@ -6847,8 +7172,20 @@ PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args)
         policy.min_band_idx     = min_band_idx;
         policy.max_band_idx     = max_band_idx;
     } else if (kind == "intervals") {
-        // No additional fields needed — the scope dict IS the iteration source.
+        // Optional "intervals": the iterator intervals (a scope-like dict). Without
+        // them the scope itself is the iterator.
+        if (!g_pmdb) {
+            PyErr_SetString(PyExc_RuntimeError, "Database not initialized");
+            return nullptr;
+        }
         policy.kind = PMTrackExpression2DIteratorPolicy::K_INTERVALS;
+        policy.chromkey = &g_pmdb->chromkey();
+        PyObject *ivd = PyDict_GetItemString(policy_dict, "intervals");
+        if (ivd && ivd != Py_None) {
+            if (_parse_scope_dict(ivd, policy.intervals) < 0)
+                return nullptr;
+            policy.has_intervals = true;
+        }
     } else {
         PyErr_SetString(PyExc_RuntimeError,
                         ("Unknown iterator kind: " + kind).c_str());
@@ -6917,7 +7254,7 @@ PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args)
 
     // Guard against user colnames colliding with the internal coord keys:
     static const char *RESERVED_COLNAMES[] = {
-        "_chrom1", "_start1", "_end1", "_chrom2", "_start2", "_end2"
+        "_chrom1", "_start1", "_end1", "_chrom2", "_start2", "_end2", "_scope_idx"
     };
     for (Py_ssize_t i = 0; i < nc; ++i) {
         PyObject *name = PyList_GetItem(colnames_list, i);
@@ -7009,6 +7346,17 @@ PyObject *pm_extract_2d_scanner(PyObject *self, PyObject *args)
         PyDict_SetItemString(result, "_chrom2", c2); Py_DECREF(c2);
         PyDict_SetItemString(result, "_start2", s2); Py_DECREF(s2);
         PyDict_SetItemString(result, "_end2",   e2); Py_DECREF(e2);
+
+        // _scope_idx: 0-based index into the scope of the scope interval of each row.
+        PyObject *sidx = PyArray_SimpleNew(1, ed, NPY_INT64);
+        if (!sidx) {
+            Py_DECREF(result);
+            return nullptr;
+        }
+        const std::vector<int64_t> &scope_idx = scanner.emitted_scope_idx();
+        for (size_t k = 0; k < n; ++k)
+            *((int64_t *)PyArray_GETPTR1((PyArrayObject *)sidx, k)) = scope_idx[k];
+        PyDict_SetItemString(result, "_scope_idx", sidx); Py_DECREF(sidx);
 
         return result;
     } catch (const TGLException &e) {
@@ -7737,6 +8085,7 @@ PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args)
             min_band_idx,
             max_band_idx,
             std::move(scope),
+            chromkey,
             band_ptr.get());
         it.begin();
 

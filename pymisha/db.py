@@ -9,6 +9,7 @@ import os
 import shutil
 import struct
 import tempfile
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -70,11 +71,16 @@ def gdb_init(path: str, userpath: str | None = None):
     db_path = Path(path).expanduser()
     if not db_path.exists():
         raise FileNotFoundError(f"Database path does not exist: {path}")
+    # The database is read and checked first (its chromosomes, and its seq/genome.idx
+    # against them, as R's gsetroot does): one that fails leaves the loaded one loaded.
+    warning = _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _shared._GROOT = str(db_path)
     _shared._UROOT = userpath
     _shared._GWD = str(db_path / "tracks")
     _shared._GDATASETS = []
+    _shared._GDATASET_CHROMS = {}
     _shared._VTRACKS = {}
+    _shared._GVTRACKS = {}
 
     # Clear interval scan cache from previous session
     from .dataset import _clear_dataset_scan_cache
@@ -90,8 +96,9 @@ def gdb_init(path: str, userpath: str | None = None):
     from .intervals import _clear_chrom_sizes_cache
     _clear_chrom_sizes_cache()
 
-    _pymisha.pm_dbinit(str(db_path), userpath or "", CONFIG)
     _pymisha.pm_dbsetdatasets([])
+    if warning:
+        warnings.warn(warning, stacklevel=2)
 
     from pymisha._db_trash import _gdb_trash_sweep_old
     tracks_dir = db_path / "tracks"
@@ -144,6 +151,13 @@ def gdb_reload():
     _clear_track_names_cache()
     from .intervals import _clear_chrom_sizes_cache
     _clear_chrom_sizes_cache()
+
+
+def _set_gwd(path: str) -> None:
+    """Make path the working directory (gdir_cd) and list the names under it."""
+    _pymisha.pm_dbsetgwd(path)
+    _shared._GWD = path
+    gdb_reload()
 
 
 def gdb_mark_cache_dirty():
@@ -215,7 +229,9 @@ def gdb_unload():
     _shared._UROOT = None
     _shared._GWD = None
     _shared._GDATASETS = []
+    _shared._GDATASET_CHROMS = {}
     _shared._VTRACKS = {}
+    _shared._GVTRACKS = {}
 
     from .dataset import _clear_dataset_scan_cache
     _clear_dataset_scan_cache()
@@ -658,7 +674,9 @@ def _temporary_db_root(groot):
     old_user = _shared._UROOT
     old_gwd = _shared._GWD
     old_datasets = list(_shared._GDATASETS)
+    old_dataset_chroms = dict(_shared._GDATASET_CHROMS)
     old_vtracks = copy.deepcopy(_shared._VTRACKS)
+    old_gvtracks = copy.deepcopy(_shared._GVTRACKS)
 
     old_root_resolved = (
         str(Path(old_root).expanduser().resolve(strict=False))
@@ -678,9 +696,11 @@ def _temporary_db_root(groot):
         else:
             gdb_init(old_root, old_user)
             _shared._GDATASETS = list(old_datasets)
+            _shared._GDATASET_CHROMS = dict(old_dataset_chroms)
             _shared._pymisha.pm_dbsetdatasets(old_datasets)
+            _set_gwd(old_gwd)
             _shared._VTRACKS = old_vtracks
-            _shared._GWD = old_gwd
+            _shared._GVTRACKS = old_gvtracks
 
 
 def gdb_export_fasta(
@@ -790,11 +810,12 @@ def gdb_export_fasta(
                                 chunk_size,
                             )
                 else:
-                    chrom_rows = _read_chrom_sizes_rows(chrom_sizes_path)
-                    if not chrom_rows:
+                    if not _read_chrom_sizes_rows(chrom_sizes_path):
                         raise ValueError("No chromosomes found in the database")
-                    for chrom, length in chrom_rows:
-                        seq_path = _resolve_seq_file(seq_dir, chrom)
+                    # the chromosomes as gintervals_all gives them: canonical names, by id
+                    names, sizes, file_names, _ = _pymisha.pm_gdb_chrom_order(str(db_root))
+                    for chrom, length, file_name in zip(names, sizes, file_names, strict=True):
+                        seq_path = _resolve_seq_file(seq_dir, file_name)
                         if verbose:
                             print(f"Exporting {chrom} ({length} bp)")
                         out_fh.write(f">{chrom}\n".encode())

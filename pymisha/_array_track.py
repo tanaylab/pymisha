@@ -31,6 +31,7 @@ import numpy as _numpy
 import pandas as _pd
 
 from ._r_serialize import read as _r_read
+from ._shared import _write_file
 
 _ARRAYS_SIGNATURE = -8
 _RECORD_SIZE = 24  # 2*int64 + int64
@@ -83,7 +84,7 @@ def write_colnames(track_dir: Path | str, names: list[str]) -> None:
 
     cn_path = Path(track_dir) / ".colnames"
     payload = _serialize_named_int_vector(names)
-    with open(cn_path, "wb") as fh:
+    with _write_file(cn_path) as fh:
         fh.write(payload)
 
 
@@ -134,20 +135,22 @@ _NIL_FLAGS = 0x000000FE  # NILVALUE_SXP = 254
 
 
 def _resolve_chrom_file(track_dir: Path, chrom: str) -> Path | None:
-    """Return the per-chromosome data file for *chrom*, or ``None``.
+    """Return the per-chromosome data file for *chrom*, or ``None``, as every reader
+    finds it (GenomeTrack::ChromFiles): by the chromosome's canonical name, else by an
+    alias (such as "1" for chr1, as pymisha 0.14 and earlier named it)."""
+    from . import _pymisha
 
-    Tries ``<chrom>`` and ``chr<chrom>`` to match the misha convention.
-    """
-    candidate = track_dir / chrom
-    if candidate.exists():
+    try:
+        canonical = str(_pymisha.pm_normalize_chroms([chrom])[0])
+    except _pymisha.error:
+        return None
+    candidate = Path(track_dir) / canonical
+    if candidate.is_file():
         return candidate
-    candidate = track_dir / f"chr{chrom}"
-    if candidate.exists():
-        return candidate
-    if chrom.startswith("chr"):
-        candidate = track_dir / chrom[3:]
-        if candidate.exists():
-            return candidate
+    files = _pymisha.pm_chrom_files(str(track_dir), False)
+    for name, file, used in zip(files["chrom"], files["file"], files["used"], strict=True):
+        if used and name == canonical:
+            return Path(track_dir) / str(file)
     return None
 
 
@@ -237,22 +240,19 @@ def chrom_id_map_from_order(chrom_order: list[str]) -> dict[str, int]:
 
 
 def _chrom_name_to_id(track_dir: Path) -> dict[str, int]:
-    """Fallback chrom name -> chrom_id from ``seq/genome.idx`` (indexed genome).
+    """Fallback chrom name -> chrom_id for the database that holds the track.
 
-    Used only when the caller does not supply the genome chrom order. Returns
-    ``{}`` if the genome index is unavailable (e.g. a per-chromosome genome whose
-    track alone was converted to indexed).
+    Used only when the caller does not supply the genome chrom order. The ids are the
+    ones gdb_init gives that database (``pm_gdb_chrom_order``), by which an indexed
+    track is keyed. Returns ``{}`` if no database holds the track.
     """
     groot = _groot_from_track_dir(track_dir)
-    if groot is None:
+    if groot is None or not (groot / "chrom_sizes.txt").exists():
         return {}
-    genome_idx = groot / "seq" / "genome.idx"
-    if not genome_idx.exists():
-        return {}
-    from .db import _iter_genome_idx_entries
+    from . import _pymisha
 
     mapping: dict[str, int] = {}
-    for chrom_id, name, _offset, _length in _iter_genome_idx_entries(str(genome_idx)):
+    for chrom_id, name in enumerate(_pymisha.pm_gdb_chrom_order(str(groot))[0]):
         _add_chrom_aliases(mapping, name, chrom_id)
     return mapping
 
@@ -540,6 +540,18 @@ class _CSVSource:
                 f"chrom\\tstart\\tend; got {cols[:3]!r})"
             )
         self.colnames: list[str] = cols[3:]
+        # Rows by chromosome, a chromosome given by any of its names (as R's chrom2id
+        # resolves them); a name the database does not know keeps its rows unread.
+        from . import _pymisha
+
+        df["chrom"] = df["chrom"].astype(str)
+        canonical: dict[str, str] = {}
+        for name in df["chrom"].unique():
+            try:
+                canonical[name] = _pymisha.pm_normalize_chroms([name])[0]
+            except _pymisha.error:
+                canonical[name] = name
+        df["chrom"] = df["chrom"].map(canonical)
         self._by_chrom: dict[str, _pd.DataFrame] = {
             str(c): g.reset_index(drop=True) for c, g in df.groupby("chrom", sort=False)
         }

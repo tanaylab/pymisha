@@ -14,12 +14,13 @@ PMTrackExpression2DIteratorPolicy::make_iterator(
 {
     switch (kind) {
     case K_INTERVALS:
-        // R parity: the iterator itself shrinks emitted rects to the band-
-        // intersected bounding box and skips inter-chrom rects under an active
-        // band (mirrors FixedRect's per-scope-rect shrink). Without this the
-        // scanner emits raw scope coords even when a diagonal band is applied,
-        // diverging from R on near-diagonal gextract / weighted.sum / marginal.
-        return std::make_unique<PMTrackExpressionIntervals2DIterator>(scope, band);
+        // R's TrackExpressionIntervals2DIterator: the iterator intervals cut by
+        // the scope (the scope itself when no intervals are given), shrunk to
+        // the band, with inter-chrom intervals skipped under a band.
+        if (!chromkey)
+            throw std::runtime_error("Intervals policy: chromkey not set");
+        return std::make_unique<PMTrackExpressionIntervals2DIterator>(
+            has_intervals ? intervals : scope, scope, *chromkey, band);
 
     case K_FIXED_RECT:
         return std::make_unique<PMTrackExpressionFixedRectIterator>(
@@ -38,7 +39,7 @@ PMTrackExpression2DIteratorPolicy::make_iterator(
             grid_points_axis0, grid_points_axis1,
             expansion0, expansion1,
             use_band_idx, min_band_idx, max_band_idx,
-            std::move(scope), band);
+            std::move(scope), *chromkey, band);
     }
     throw std::runtime_error("Unknown iterator policy kind");
 }

@@ -8,6 +8,10 @@
 
 #include "TrackIndex.h"
 
+// Flushes, syncs and closes a file opened for writing. Returns 0, or the errno of the first
+// failure: fflush() and fclose() write the last buffer, so a failure there leaves a short file.
+int close_written(FILE *fp);
+
 // Indexed 1D-track direct writer (track.dat + track.idx).
 //
 // The .dat contents are a chromid-ordered concatenation of the per-chrom

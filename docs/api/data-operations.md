@@ -7,6 +7,11 @@ Functions for extracting, summarizing, and analyzing track data across genomic i
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gextract_variants
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gscreen
     options:
       show_root_heading: true

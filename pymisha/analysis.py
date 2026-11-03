@@ -483,15 +483,16 @@ def gcis_decay(
         Domain intervals (chrom, start, end). Must be non-overlapping.
         Used to classify contacts as intra- or inter-domain.
     intervals : DataFrame, optional
-        Genomic scope (1D intervals). Defaults to all genome intervals.
-        Only cis contacts (chrom1 == chrom2) within these chromosomes
-        are considered.
+        Genomic scope: 2D intervals, as in R, whose intra-chromosomal ones
+        are used, each contact cut by the scope intervals it meets; or 1D
+        intervals, which select the whole contacts of their chromosomes.
+        Defaults to the whole 2D genome, as R's ``.misha$ALLGENOME``.
     include_lowest : bool, default False
         If True, the lowest break value is included in the first bin:
         ``[x1, x2]`` instead of ``(x1, x2]``.
     iterator : str, optional
-        2D iterator specification. Currently unused (extraction uses the
-        track's native resolution).
+        2D iterator over a 2D scope, as in :func:`gextract`; by default the
+        objects of the track. Not used with a 1D scope.
     band : tuple of (int, int), optional
         Diagonal band filter ``(d1, d2)``. Only contacts where the
         diagonal offset falls within the band are considered.
@@ -533,7 +534,7 @@ def gcis_decay(
         query_2d_track_opened_arrays,
     )
     from .extract import _find_2d_track_file, _validate_band
-    from .intervals import _normalize_chroms, gintervals_all
+    from .intervals import _normalize_chroms
 
     breaks = [float(b) for b in breaks]
     if len(breaks) < 2:
@@ -566,72 +567,82 @@ def gcis_decay(
     track_for_iter = _resolve_cis_decay_track(expr)
     track_path = _pymisha.pm_track_path(track_for_iter)
 
-    # Determine which chromosomes to iterate over
+    # The scope. As in R the default is the 2D genome (.misha$ALLGENOME), and a 2D
+    # scope is walked by R's 2D iterator: each contact cut by the scope intervals
+    # (and shrunk to the band) it meets, its coordinates those of the cut. A 1D
+    # scope (a pymisha extension) reads the whole contacts of each of its
+    # chromosomes, up to the end of its last interval there.
     if intervals is None:
-        intervals = gintervals_all()
+        from .intervals import _gintervals_2d_all
+
+        # only its intra-chromosomal pairs are used
+        intervals = _gintervals_2d_all("diagonal")
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    if isinstance(intervals, pd.DataFrame) and "chrom" in intervals.columns:
-        intervals_df: pd.DataFrame = intervals.copy()
-        intervals_df["chrom"] = _normalize_chroms(
-            intervals_df["chrom"].astype(str).tolist()
-        )
-        intervals = intervals_df
+    def _cis_contacts() -> Any:
+        """(chrom, start1, end1, start2, end2) of the cis contacts, per chromosome."""
+        from .extract import _is_2d_intervals, gextract
 
-    # Build chrom -> max_end mapping from intervals (ALLGENOME gives full chrom sizes)
-    chrom_sizes: dict[str, int] = {}
-    if isinstance(intervals, pd.DataFrame) and len(intervals) > 0:
-        chrom_sizes = intervals.groupby("chrom")["end"].max().to_dict()
+        if isinstance(intervals, pd.DataFrame) and _is_2d_intervals(intervals):
+            scope = intervals.copy()
+            scope["chrom1"] = _normalize_chroms(scope["chrom1"].astype(str).tolist())
+            scope["chrom2"] = _normalize_chroms(scope["chrom2"].astype(str).tolist())
+            scope = scope[scope["chrom1"] == scope["chrom2"]]
+            if len(scope) == 0:
+                return
+            res = gextract(track_for_iter, scope, iterator=iterator, band=band, colnames=["_v"])
+            if res is None:
+                return
+            for chrom, g in res.groupby("chrom1", sort=False):
+                yield (str(chrom), g["start1"].to_numpy(dtype=_numpy.int64), g["end1"].to_numpy(dtype=_numpy.int64),
+                       g["start2"].to_numpy(dtype=_numpy.int64), g["end2"].to_numpy(dtype=_numpy.int64))
+            return
 
-    chroms = list(chrom_sizes.keys())
+        if not isinstance(intervals, pd.DataFrame):
+            raise ValueError(f"Invalid intervals: {intervals!r}")
+        intervals_df = intervals.copy()
+        intervals_df["chrom"] = _normalize_chroms(intervals_df["chrom"].astype(str).tolist())
+        # chrom -> max end of the intervals
+        chrom_sizes: dict[str, int] = {}
+        if len(intervals_df) > 0:
+            chrom_sizes = intervals_df.groupby("chrom")["end"].max().to_dict()
 
-    # Iterate over cis chromosome pairs — vectorized inner loop
-    for chrom in chroms:
-        filepath = _find_2d_track_file(track_path, chrom, chrom)
-        if filepath is None:
-            continue
+        for chrom, csize in chrom_sizes.items():
+            filepath = _find_2d_track_file(track_path, chrom, chrom)
+            if filepath is None:
+                continue
 
+            # Open file once, query all objects as numpy arrays
+            file_is_points, num_objs, data = _read_file_header(filepath)
+            try:
+                if num_objs == 0:
+                    continue
+                import struct as _struct
+
+                from ._quadtree import _payload_offset
+
+                payload_offset = _payload_offset(data)
+                root_chunk_fpos = _struct.unpack_from("<q", data, payload_offset + 8)[0]
+                arrays = query_2d_track_opened_arrays(
+                    data, file_is_points, num_objs, root_chunk_fpos,
+                    0, 0, csize, csize, band=band,
+                )
+            finally:
+                data.close()
+            # I1 = (x1, x2), I2 = (y1, y2) - contact coordinates
+            yield str(chrom), arrays["x1"], arrays["x2"], arrays["y1"], arrays["y2"]
+
+    for chrom, s1, e1, s2, e2 in _cis_contacts():
         src_intervals = src_per_chrom.get(str(chrom), [])
         if not src_intervals:
             continue
 
         domain_intervals = domain_per_chrom.get(str(chrom), [])
 
-        csize = chrom_sizes[chrom]
-
-        # Open file once, query all objects as numpy arrays
-        file_is_points, num_objs, data = _read_file_header(filepath)
-        try:
-            if num_objs == 0:
-                continue
-            import struct as _struct
-
-            from ._quadtree import _payload_offset
-
-            payload_offset = _payload_offset(data)
-            root_chunk_fpos = _struct.unpack_from("<q", data, payload_offset + 8)[0]
-            arrays = query_2d_track_opened_arrays(
-                data, file_is_points, num_objs, root_chunk_fpos,
-                0, 0, csize, csize, band=band,
-            )
-        finally:
-            data.close()
-
-        x1 = arrays["x1"]  # int64 arrays
-        y1 = arrays["y1"]
-        x2 = arrays["x2"]
-        y2 = arrays["y2"]
-
-        n_objs = len(x1)
+        n_objs = len(s1)
         if n_objs == 0:
             continue
-
-        # I1 = (x1, x2), I2 = (y1, y2) — contact coordinates
-        s1 = x1   # start1
-        e1 = x2   # end1
-        s2 = y1   # start2
-        e2 = y2   # end2
 
         # --- Vectorized src containment check ---
         src_starts = _numpy.array([iv[0] for iv in src_intervals], dtype=_numpy.int64)

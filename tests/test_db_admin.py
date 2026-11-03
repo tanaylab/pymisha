@@ -103,7 +103,10 @@ def _build_mock_genome_tar(tmp_path, genome):
     (root / "tracks").mkdir()
     (root / "pssms").mkdir()
     (root / "seq" / "genome.seq").write_bytes(b"ACGT")
-    (root / "seq" / "genome.idx").write_bytes(b"MISHAIDX")
+    # a valid index: gdb_init checks it against chrom_sizes.txt, as R's gsetroot does
+    db_create_mod._write_index_file(
+        str(root / "seq" / "genome.idx"), [{"chromid": 0, "name": "chr1", "offset": 0, "length": 4}]
+    )
     (root / "chrom_sizes.txt").write_text("chr1\t4\n", encoding="utf-8")
 
     tar_path = tmp_path / f"{genome}.tar.gz"

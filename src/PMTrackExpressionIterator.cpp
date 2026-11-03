@@ -211,8 +211,7 @@ bool PMSparseIterator::load_chrom(size_t chrom_order_idx)
 
     while (chrom_order_idx < m_chrom_order.size()) {
         int chromid = m_chrom_order[chrom_order_idx];
-        std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-            g_pmdb->chromkey(), m_track_dir, chromid);
+        std::string chrom_file = g_pmdb->chrom_files(m_track_dir).filename(chromid);
         std::string full_path = m_track_dir + "/" + chrom_file;
 
         if (indexed || access(full_path.c_str(), F_OK) == 0) {
@@ -359,8 +358,7 @@ bool PMArrayIterator::load_chrom(size_t chrom_order_idx)
 
     while (chrom_order_idx < m_chrom_order.size()) {
         int chromid = m_chrom_order[chrom_order_idx];
-        std::string chrom_file = GenomeTrack::find_existing_1d_filename(
-            g_pmdb->chromkey(), m_track_dir, chromid);
+        std::string chrom_file = g_pmdb->chrom_files(m_track_dir).filename(chromid);
         std::string full_path = m_track_dir + "/" + chrom_file;
 
         if (indexed || access(full_path.c_str(), F_OK) == 0) {

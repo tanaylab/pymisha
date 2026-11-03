@@ -208,40 +208,28 @@ class TestGvtrackIterator2dExtraction:
         assert len(result) == 1
         assert np.isnan(result["vt_off"].to_numpy(dtype=float)).all()
 
-    def test_collapsed_rectangle_keeps_values_on_the_right_scope_row(self, rects_track):
-        """The raw/alias path restamps intervalID after a collapse.
+    def test_collapsed_rectangle_is_nan_on_its_own_cell(self, rects_track):
+        """A shift that collapses an iterator cell makes the vtrack NaN on that cell only.
 
-        ``_apply_2d_shifts`` drops a rectangle the clamp collapsed, so the frame
-        handed to the extractor is shorter than the scope and the intervalID it
-        stamps is a position into *that* frame. ``_extract_shifted`` maps it back
-        through ``kept``. The scope below is built so the collapsed rectangle
-        comes first: without the remap the surviving row's value would be stamped
-        intervalID 0 and land on the rectangle that produced nothing.
-
-        (``test_boundary_crossing_shift_on_raw_track_path`` uses a shift that
-        clamps without collapsing, so ``kept`` is None there and this branch
-        never runs.)
+        With no iterator R iterates the bare track's objects, and the vtrack's
+        shift moves each object's cell: +250 on start1 inverts the two small
+        objects (x 100..300 and 500..700) and leaves the wide one alone, so the
+        expression is NaN, NaN and 3 + 3 (R 5.12.1 gives the same on these rects).
         """
         pm.gvtrack_create("vt_collapse", rects_track)
-        # +150 on start1 only: it inverts the 100..200 rectangle (250 >= 200)
-        # and leaves the wide one alone (150 < 200000).
-        pm.gvtrack_iterator_2d("vt_collapse", sshift1=150)
+        pm.gvtrack_iterator_2d("vt_collapse", sshift1=250)
 
-        # A bare track in the expression is what selects the raw/alias path;
-        # a lone reducing vtrack would be aggregated elsewhere.
         scope = pd.DataFrame({
-            "chrom1": ["1", "1"], "start1": [100, 0], "end1": [200, 200_000],
-            "chrom2": ["1", "1"], "start2": [0, 0], "end2": [1000, 200_000],
+            "chrom1": ["1"], "start1": [0], "end1": [500_000],
+            "chrom2": ["1"], "start2": [0], "end2": [500_000],
         })
         result = pm.gextract(f"{rects_track} + vt_collapse", scope)
         assert result is not None
-
-        # One row per object of the surviving rectangle, all pointing at scope
-        # row 1. Without the remap they would carry intervalID 0 - the
-        # rectangle the clamp collapsed, which returned nothing.
-        assert len(result) == 3
-        assert set(result["intervalID"].astype(int)) == {1}
-        assert sorted(result["start1"].astype(int)) == [100, 500, 50_000]
+        assert result["start1"].astype(int).tolist() == [100, 500, 50_000]
+        vals = result[f"{rects_track} + vt_collapse"].to_numpy(dtype=float)
+        assert np.isnan(vals[0]) and np.isnan(vals[1])
+        assert vals[2] == 6.0
+        assert (result["intervalID"] == 1).all()
 
     def test_apply_2d_shifts_clamps_like_r(self):
         """Unit-level pin on the clamp itself and on the row realignment.

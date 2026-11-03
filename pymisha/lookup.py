@@ -23,7 +23,7 @@ from ._shared import (
 from ._types import Iterator
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
 from .extract import _is_2d_intervals, _maybe_load_intervals_set, gextract
-from .intervals import gintervals_2d_all, gintervals_all
+from .intervals import _gintervals_2d_all, gintervals_all
 
 
 def glookup(
@@ -513,7 +513,7 @@ def gtrack_lookup(
     # mode would omit off-diagonal cells entirely and return None for an
     # off-diagonal query.
     scope_intervals = (
-        gintervals_2d_all(mode="full") if use_2d_scope else gintervals_all()
+        _gintervals_2d_all("full") if use_2d_scope else gintervals_all()
     )
 
     # Compute lookup values using glookup over the whole genome

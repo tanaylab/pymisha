@@ -1,3 +1,4 @@
+#include <cctype>
 #include <errno.h>
 #include <memory>
 #include <sys/stat.h>
@@ -21,11 +22,14 @@ void GenomeSeqFetch::set_seqdir(const std::string &dir) {
     if (m_bfile.opened())
         m_bfile.close();
 
-    // Check for indexed format (genome.idx exists)
+    // Indexed format: genome.idx and genome.seq both, as R (.is_per_chromosome_db,
+    // gdb.convert_to_indexed) and rdb::is_db_indexed count it; a genome.idx left alone by an
+    // interrupted conversion is not
     std::string idx_path = m_seqdir + "/genome.idx";
+    std::string genome_seq_path = m_seqdir + "/genome.seq";
     struct stat st;
 
-    if (stat(idx_path.c_str(), &st) == 0) {
+    if (stat(idx_path.c_str(), &st) == 0 && stat(genome_seq_path.c_str(), &st) == 0) {
         // Indexed mode: load index and open main genome.seq file
         m_indexed_mode = true;
         m_index = std::make_unique<GenomeIndex>();
@@ -45,6 +49,14 @@ void GenomeSeqFetch::set_seqdir(const std::string &dir) {
         // Per-chromosome mode
         m_indexed_mode = false;
     }
+}
+
+void GenomeSeqFetch::set_substitution(const SeqSubstitution &sub)
+{
+	if (sub == m_sub)
+		return;
+	m_sub = sub;
+	m_cache_valid = false;  // the cached read may carry the previous substitution
 }
 
 void GenomeSeqFetch::read_interval(const GInterval &interval, const GenomeChromKey &chromkey, vector<char> &result)
@@ -148,6 +160,15 @@ void GenomeSeqFetch::read_interval(const GInterval &interval, const GenomeChromK
 
 			TGLError<GenomeSeqFetch>(FILE_READ_FAILED, "Reading sequence file %s failed", m_bfile.file_name().c_str());
 		}
+	}
+
+	// The substituted base takes the case of the base it replaces, so masked.*
+	// sees the same mask. Applied before the reverse complement, in genome
+	// coordinates; the read starts at interval.start in both modes.
+	if (m_sub.chromid == interval.chromid && m_sub.pos >= interval.start &&
+	    m_sub.pos < interval.start + (int64_t)result.size()) {
+		char &c = result[m_sub.pos - interval.start];
+		c = islower((unsigned char)c) ? (char)tolower(m_sub.base) : m_sub.base;
 	}
 
 	// Apply reverse-complement if needed (same for both modes)

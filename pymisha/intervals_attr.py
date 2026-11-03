@@ -11,25 +11,24 @@ from pathlib import Path
 
 import pandas as pd
 
-from ._shared import _checkroot
+from ._shared import _checkroot, _write_file
 
 
 def _iattr_path(intervals_set: str) -> Path:
     """Resolve the filesystem path of the ``.iattr`` file for an interval set."""
-    from .intervals import gintervals_dataset
+    from .intervals import _interv_file, _intervals_dir
 
-    db_root = gintervals_dataset(intervals_set)
-    if db_root is None:
+    if _interv_file(intervals_set) is None:
         raise ValueError(f"Intervals set {intervals_set} does not exist")
 
-    path_part = intervals_set.replace(".", "/")
-    interv_path = Path(db_root) / "tracks" / f"{path_part}.interv"
+    # in the database this interval set belongs to, or under the working directory (gdir_cd)
+    interv_path = _intervals_dir(intervals_set)
 
     if interv_path.is_dir():
         # Big set: store inside the directory
         return interv_path / ".iattr"
     # Small set: sibling .iattr file
-    return Path(db_root) / "tracks" / f"{path_part}.iattr"
+    return interv_path.with_suffix(".iattr")
 
 
 def _iattr_read(path: Path | str) -> dict[str, str]:
@@ -72,7 +71,8 @@ def _iattr_write(path: Path | str, attrs: dict[str, str]) -> None:
         chunks.append(b"\x00")
         chunks.append(str(value).encode("utf-8"))
         chunks.append(b"\x00")
-    path.write_bytes(b"".join(chunks))
+    with _write_file(path) as fh:
+        fh.write(b"".join(chunks))
 
 
 def _check_writable(intervals_set: str) -> None:
@@ -80,8 +80,14 @@ def _check_writable(intervals_set: str) -> None:
     from . import _shared
     from .intervals import gintervals_dataset
 
-    db_root = gintervals_dataset(intervals_set)
-    if db_root is not None and db_root != _shared._GROOT:
+    # in a subdirectory (gdir_cd) the set is in the database holding it
+    if _shared._gwd_is_subdir():
+        db_root = _shared._gwd_db()
+        if db_root is None:
+            raise ValueError(f"Intervals set {intervals_set} is in no loaded database and cannot be modified")
+    else:
+        db_root = gintervals_dataset(intervals_set)
+    if db_root is not None and not _shared._same_path(db_root, _shared._GROOT):
         raise ValueError(
             f"Intervals set {intervals_set} belongs to a read-only dataset and cannot be modified"
         )

@@ -142,19 +142,19 @@ class TestGsegmentRParity:
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 32
         # Verify first/last rows on chrom 1
-        chr1 = result[result["chrom"] == "1"]
+        chr1 = result[result["chrom"] == "chr1"]
         assert len(chr1) == 16
         assert chr1.iloc[0]["start"] == 0
         assert chr1.iloc[0]["end"] == 31200
         assert chr1.iloc[-1]["start"] == 389150
         assert chr1.iloc[-1]["end"] == 500000
         # Verify chrom 2
-        chr2 = result[result["chrom"] == "2"]
+        chr2 = result[result["chrom"] == "chr2"]
         assert len(chr2) == 10
         assert chr2.iloc[0]["start"] == 0
         assert chr2.iloc[-1]["end"] == 300000
         # Verify chrom X
-        chrx = result[result["chrom"] == "X"]
+        chrx = result[result["chrom"] == "chrX"]
         assert len(chrx) == 6
         assert chrx.iloc[0]["start"] == 0
         assert chrx.iloc[-1]["end"] == 200000
@@ -175,10 +175,10 @@ class TestGsegmentRParity:
         result = pm.gsegment("dense_track*2", 10000, maxpval=0.000001, intervals=intervs)
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 2
-        assert result.iloc[0]["chrom"] == "1"
+        assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 250
         assert result.iloc[0]["end"] == 460850
-        assert result.iloc[1]["chrom"] == "2"
+        assert result.iloc[1]["chrom"] == "chr2"
         assert result.iloc[1]["start"] == 2100
         assert result.iloc[1]["end"] == 299900
 
@@ -196,7 +196,7 @@ class TestGsegmentRParity:
             assert len(loaded) >= 1
             # Segments should cover the full genome scope
             chroms = sorted(loaded["chrom"].unique())
-            assert chroms == ["1", "2", "X"]
+            assert chroms == ["chr1", "chr2", "chrX"]
         finally:
             with contextlib.suppress(Exception):
                 pm.gintervals_rm(set_name)

@@ -8,17 +8,17 @@
 
 PottsScorer::PottsScorer(const PottsModel &model, const std::string &genome_root,
                          bool extend, ScoringMode mode, bool bidirect, char strand,
-                         double score_thresh)
+                         double score_thresh, int max_edits)
     : GenomeSeqScorer(genome_root, extend, strand), m_model(model), m_rc(model.rc()),
-      m_mode(mode), m_bidirect(bidirect), m_score_thresh(score_thresh)
+      m_mode(mode), m_bidirect(bidirect), m_score_thresh(score_thresh), m_max_edits(max_edits)
 {
 }
 
 PottsScorer::PottsScorer(const PottsModel &model, GenomeSeqFetch *shared_seqfetch,
                          bool extend, ScoringMode mode, bool bidirect, char strand,
-                         double score_thresh)
+                         double score_thresh, int max_edits)
     : GenomeSeqScorer(shared_seqfetch, extend, strand), m_model(model), m_rc(model.rc()),
-      m_mode(mode), m_bidirect(bidirect), m_score_thresh(score_thresh)
+      m_mode(mode), m_bidirect(bidirect), m_score_thresh(score_thresh), m_max_edits(max_edits)
 {
 }
 
@@ -46,8 +46,10 @@ void PottsScorer::invalidate_cache()
     std::vector<uint8_t>().swap(m_win_hit);
 }
 
-double PottsScorer::anchor_value(const int8_t *c, bool union_max, int &dir) const
+double PottsScorer::anchor_value(size_t i, bool union_max, int &dir) const
 {
+    const int8_t *c = &m_codes[i];
+    const int8_t *bc = &m_block_codes[i];
     // When m_strand == -1 the fetched target is already reverse-complemented,
     // so the ORIGINAL forward strand is what the twin reads off it, and vice
     // versa. Same inversion as PWMScorer's score_{forward,reverse}_original().
@@ -57,9 +59,9 @@ double PottsScorer::anchor_value(const int8_t *c, bool union_max, int &dir) cons
     double f = -std::numeric_limits<double>::infinity();
     double r = -std::numeric_limits<double>::infinity();
     if (check_fwd)
-        f = (m_strand == -1) ? m_rc.score_codes(c) : m_model.score_codes(c);
+        f = (m_strand == -1) ? m_rc.score_codes(c, bc) : m_model.score_codes(c, bc);
     if (check_rev)
-        r = (m_strand == -1) ? m_model.score_codes(c) : m_rc.score_codes(c);
+        r = (m_strand == -1) ? m_model.score_codes(c, bc) : m_rc.score_codes(c, bc);
 
     dir = 1;
     if (check_fwd && check_rev) {
@@ -88,8 +90,9 @@ double PottsScorer::compute_position_result(size_t index, size_t target_length,
 
     // double, not float: a position is an exact integer only up to 2^24 in
     // binary32, so on an interval longer than ~16.7 Mb a reported position was
-    // rounded to an even neighbour. Scores are still accumulated in float, so
-    // widening the return type alone leaves every score bit-identical.
+    // rounded to an even neighbour - 16777216 where 16777218 was right. Scores
+    // are still accumulated in float, so widening the return type alone leaves
+    // every score bit-identical.
     double pos_result = double(index) + 1.0; // 1-based
 
     if (m_strand == -1) {
@@ -112,6 +115,8 @@ double PottsScorer::compute_position_result(size_t index, size_t target_length,
 double PottsScorer::score_direct(size_t i_min, size_t i_max, size_t motif_len, size_t tlen,
                                 bool fill_window)
 {
+    // The block codes of every window scored below.
+    potts_block_codes(m_codes, m_block_codes, i_min, i_max + motif_len);
     const bool union_max = (m_mode == MAX_LIKELIHOOD_POS);
     double acc = -std::numeric_limits<double>::infinity();
     bool have_acc = false;
@@ -170,7 +175,7 @@ double PottsScorer::score_direct(size_t i_min, size_t i_max, size_t motif_len, s
         if (m_nbad[i + motif_len] - m_nbad[i] != 0)
             continue;
         int dir = 1;
-        const double u = anchor_value(&m_codes[i], union_max, dir);
+        const double u = anchor_value(i, union_max, dir);
         const size_t s = (m_strand == -1) ? (i_max - i) : (i - i_min);
         if (u > best)
             best = u;
@@ -231,6 +236,55 @@ double PottsScorer::score_direct(size_t i_min, size_t i_max, size_t motif_len, s
                    : std::numeric_limits<float>::quiet_NaN();
     }
     return std::numeric_limits<float>::quiet_NaN();
+}
+
+double PottsScorer::score_one_edit(size_t i_min, size_t i_max, size_t motif_len)
+{
+    // Same strand handling as anchor_value(): with strand -1 the target is
+    // already reverse-complemented, so the twin reads the original forward
+    // strand. Under bidirect one base changes both strands, so both are
+    // recomputed for the same substitution before they are combined.
+    const bool check_fwd = m_bidirect || m_strand != -1;
+    const bool check_rev = m_bidirect || m_strand == -1;
+    const PottsModel &mf = (m_strand == -1) ? m_rc : m_model;
+    const PottsModel &mr = (m_strand == -1) ? m_model : m_rc;
+    auto combine = [&](double f, double r) {
+        if (check_fwd && check_rev) {
+            double u = f;
+            log_sum_log(u, r);
+            return u;
+        }
+        return check_fwd ? f : r;
+    };
+
+    potts_block_codes(m_codes, m_block_codes, i_min, i_max + motif_len);
+    const int W = (int)motif_len;
+    double best = -std::numeric_limits<double>::infinity();
+    bool any = false;
+    for (size_t i = i_min; i <= i_max; ++i) {
+        if (m_nbad[i + motif_len] - m_nbad[i] != 0)
+            continue;
+        const int8_t *c = &m_codes[i];
+        const int8_t *bc = &m_block_codes[i];
+        const double f = check_fwd ? mf.score_codes(c, bc) : 0.0;
+        const double r = check_rev ? mr.score_codes(c, bc) : 0.0;
+        double a = combine(f, r);
+        for (int j = 0; j < W; ++j)
+            for (int b = 0; b < 4; ++b) {
+                if (b == c[j])
+                    continue;
+                const double u = combine(check_fwd ? f + mf.delta_codes(c, j, b) : 0.0,
+                                         check_rev ? r + mr.delta_codes(c, j, b) : 0.0);
+                if (u > a)
+                    a = u;
+            }
+        if (a > best)
+            best = a;
+        any = true;
+    }
+    if (any)
+        m_last_max_score = best;
+    return any ? (float)best : std::numeric_limits<float>::quiet_NaN();
 }
 
 double PottsScorer::slid_answer(const GInterval &expanded_interval, size_t motif_len,
@@ -381,6 +435,12 @@ double PottsScorer::try_slide_window(const GInterval &original_interval,
     // the ones just above i_min.
     const bool union_max = (m_mode == MAX_LIKELIHOOD_POS);
 
+    // The block codes of the `stride` arriving anchors' windows only.
+    const size_t first = slot_index(W - stride, i_min, i_max);
+    const size_t last = slot_index(W - 1, i_min, i_max);
+    const size_t lo = std::min(first, last);
+    potts_block_codes(m_codes, m_block_codes, lo, std::max(first, last) + motif_len);
+
     switch (m_mode) {
     case TOTAL_LIKELIHOOD: {
         // Decided BEFORE the first pop, so the guarantee stated above holds:
@@ -424,7 +484,7 @@ double PottsScorer::try_slide_window(const GInterval &original_interval,
             int dir = 1;
             const bool bad = (m_nbad[i + motif_len] - m_nbad[i] != 0);
             m_slide.rlse.push(bad ? -std::numeric_limits<float>::infinity()
-                                  : (float)anchor_value(&m_codes[i], union_max, dir));
+                                  : (float)anchor_value(i, union_max, dir));
         }
         break;
     }
@@ -437,7 +497,7 @@ double PottsScorer::try_slide_window(const GInterval &original_interval,
             int dir = 1;
             const bool bad = (m_nbad[i + motif_len] - m_nbad[i] != 0);
             const float v = bad ? -std::numeric_limits<float>::infinity()
-                                : (float)anchor_value(&m_codes[i], union_max, dir);
+                                : (float)anchor_value(i, union_max, dir);
             m_slide.rmax.push(v, dir, m_slide.win_lo_key + int64_t(W) + int64_t(k));
         }
         break;
@@ -455,7 +515,7 @@ double PottsScorer::try_slide_window(const GInterval &original_interval,
             // score_direct(), so a cached count and a re-seeded one cannot
             // differ over an anchor sitting on the threshold.
             const uint8_t hit =
-                (!bad && anchor_value(&m_codes[i], union_max, dir) >= m_score_thresh) ? 1
+                (!bad && anchor_value(i, union_max, dir) >= m_score_thresh) ? 1
                                                                                      : 0;
             m_slide.hits.push_back(hit);
             m_slide.hit_count += hit;
@@ -524,13 +584,18 @@ double PottsScorer::score_with_sliding_window(const GInterval &original_interval
     // added. stride == 0 means "no usable history yet" (the first call of a
     // scan, or a non-monotone step), where there is nothing to predict from and
     // the window has to be built to have a chance of paying.
-    // The size bound is PWMScorer::MAX_CACHED_WINDOW_ANCHORS's twin, needed by
-    // the `stride == 0` arm: the first call of a scan has no history, so
-    // without it a whole-chromosome iterator populates one anchor per base
-    // before discovering nothing will slide onto it.
+    // The size bound is PWMScorer::MAX_CACHED_WINDOW_ANCHORS's twin, and it is
+    // the `stride == 0` arm that needs it: the first call of a scan has no
+    // history to predict from, so without it a whole-chromosome iterator
+    // populates a window of one anchor per base before discovering that
+    // nothing will ever slide onto it. Measured at +276 MB for a 40 Mb
+    // interval. Past this size no iterator that also fits in memory can start
+    // its next interval inside the window, so the cache cannot pay.
+    // Same rule as PWMScorer::score_with_sliding_window(); see the note there.
+    // The size bound gates only the no-history arm.
     const size_t W = i_max - i_min + 1;
-    const bool populate = ((stride == 0) || (stride < W)) &&
-                          W <= MAX_CACHED_WINDOW_ANCHORS;
+    const bool populate = (stride == 0) ? (W <= MAX_CACHED_WINDOW_ANCHORS)
+                                        : (stride < W);
     return seed_sliding_window(original_interval, expanded_interval, i_min, i_max,
                                motif_len, tlen, populate);
 }
@@ -614,6 +679,13 @@ double PottsScorer::score_interval(const GInterval &interval, const GenomeChromK
             i_min = 0;
 
         potts_encode(target, m_codes, m_nbad);
+
+        if (m_max_edits == 1) {
+            // Not slid: an anchor's best edit depends on its whole window, and
+            // with 1 bp bins the cache never populates anyway.
+            invalidate_cache();
+            return score_one_edit(i_min, i_max, motif_len);
+        }
 
         return score_with_sliding_window(interval, expanded, i_min, i_max, motif_len, tlen);
     } catch (TGLException &e) {

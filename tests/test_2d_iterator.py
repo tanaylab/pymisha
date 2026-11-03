@@ -358,7 +358,7 @@ class TestVirtualTrackAggregation:
             "end2":   [700, 3000],
         })
 
-        chunks = list(pm.giterator_intervals_2d("vt_area", intervals))
+        chunks = list(pm.giterator_intervals_2d("vt_area", intervals, iterator=intervals))
         # Aggregation produces one row per interval
         assert len(chunks) == 2
         for chunk in chunks:
@@ -395,7 +395,7 @@ class TestVirtualTrackAggregation:
         intervals = pm.gintervals_2d("1", 0, 3000, "1", 0, 3000)
 
         chunks = list(pm.giterator_intervals_2d(
-            ["vt_min", "vt_max"], intervals
+            ["vt_min", "vt_max"], intervals, iterator=intervals
         ))
         assert len(chunks) == 1
         chunk = chunks[0]

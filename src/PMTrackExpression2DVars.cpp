@@ -11,6 +11,7 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
 
+#include "PMDb.h"
 #include "TGLException.h"
 
 PMTrackExpression2DVars::PMTrackExpression2DVars()
@@ -141,19 +142,54 @@ void PMTrackExpression2DVars::set_vars_batch(
     // For each pair: build (optionally shifted) rects per var, run batch
     // stats, scatter results. Each var may carry independent 2D shifts.
     std::vector<int64_t> rects;
+    std::vector<unsigned> in_range;
     for (auto &kv : by_pair) {
         const PairKey &key = kv.first;
         const std::vector<unsigned> &idxs = kv.second;
 
         for (auto &v : m_vars) {
+            // A stats func reads the rect shifted and clamped to the chromosomes, as R's
+            // Iterator_modifier2D::transform does; a rect the clamp collapses is out of
+            // range and every func of it is NaN, area included (TrackVarProcessor).
+            in_range.clear();
+            rects.clear();
+            if (!is_object_func(v.func)) {
+                bool shifted = v.sshift1 || v.eshift1 || v.sshift2 || v.eshift2;
+                int64_t size1 = shifted && g_pmdb ? (int64_t)g_pmdb->chromkey().get_chrom_size(key.c1) : 0;
+                int64_t size2 = shifted && g_pmdb ? (int64_t)g_pmdb->chromkey().get_chrom_size(key.c2) : 0;
+                rects.reserve(idxs.size() * 4);
+                for (unsigned global_idx : idxs) {
+                    const GInterval2D &iv = intervals[global_idx];
+                    int64_t x1 = iv.start1 + v.sshift1, y1 = iv.start2 + v.sshift2;
+                    int64_t x2 = iv.end1 + v.eshift1, y2 = iv.end2 + v.eshift2;
+                    if (shifted && g_pmdb) {
+                        x1 = std::max(x1, (int64_t)0);
+                        y1 = std::max(y1, (int64_t)0);
+                        x2 = std::min(x2, size1);
+                        y2 = std::min(y2, size2);
+                        if (x1 >= x2 || y1 >= y2)
+                            continue;
+                    }
+                    in_range.push_back(global_idx);
+                    rects.push_back(x1);
+                    rects.push_back(y1);
+                    rects.push_back(x2);
+                    rects.push_back(y2);
+                }
+            }
+
             bool have_data = v.track->set_chrom_pair(key.c1, key.c2);
             if (!have_data) {
                 // For exists/size: no data means 0, not NaN (R parity).
-                // All other funcs (stats, first/last/sample) correctly stay NaN.
+                // area is 0 too, as R's read_interval gives for a pair with no file;
+                // the other funcs stay NaN.
                 if (v.func == AGG_EXISTS || v.func == AGG_SIZE) {
                     for (unsigned global_idx : idxs) {
                         v.values[global_idx] = 0.0;
                     }
+                } else if (v.func == AGG_AREA) {
+                    for (unsigned global_idx : in_range)
+                        v.values[global_idx] = 0.0;
                 }
                 continue;
             }
@@ -161,21 +197,11 @@ void PMTrackExpression2DVars::set_vars_batch(
             if (is_object_func(v.func)) {
                 // Object-level funcs: query_objects per cell (shifts applied inside).
                 apply_agg_objects(v, v.func, intervals, idxs, band);
-            } else {
+            } else if (!in_range.empty()) {
                 // Stats-level funcs: one batch query per (var, chrom-pair).
-                // Build rects for this var, applying its 2D shifts.
-                rects.clear();
-                rects.reserve(idxs.size() * 4);
-                for (unsigned global_idx : idxs) {
-                    const GInterval2D &iv = intervals[global_idx];
-                    rects.push_back(iv.start1 + v.sshift1);
-                    rects.push_back(iv.start2 + v.sshift2);
-                    rects.push_back(iv.end1   + v.eshift1);
-                    rects.push_back(iv.end2   + v.eshift2);
-                }
                 quadtree::BatchQueryStats batch =
-                    v.track->query_stats_batch(rects.data(), idxs.size(), band);
-                apply_agg(v.func, batch, idxs, v.values);
+                    v.track->query_stats_batch(rects.data(), in_range.size(), band);
+                apply_agg(v.func, batch, in_range, v.values);
             }
         }
     }
@@ -198,8 +224,14 @@ void PMTrackExpression2DVars::apply_agg(AggFunc func,
     const size_t n = indices.size();
     for (size_t j = 0; j < n; ++j) {
         int64_t occ = batch.occupied_area[j];
-        if (occ == 0) continue;
         unsigned idx = indices[j];
+        // A rect that meets no cell has area 0 and NaN for the rest, as in R
+        // (StatQuadTreeCached::get_stat).
+        if (occ == 0) {
+            if (func == AGG_AREA)
+                values[idx] = 0.0;
+            continue;
+        }
         switch (func) {
             case AGG_AREA:         values[idx] = static_cast<double>(occ);             break;
             case AGG_WEIGHTED_SUM: values[idx] = batch.weighted_sum[j];                 break;

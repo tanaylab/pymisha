@@ -124,7 +124,8 @@ class TestDensePerChrom:
         np.testing.assert_array_equal(df["end"], [100, 200, 300])
         np.testing.assert_array_almost_equal(df["value"], [0.5, 1.0, -2.5])
 
-    def test_drops_nan_and_inf(self, tmp_path):
+    def test_keeps_nan_reads_inf_as_nan(self, tmp_path):
+        """Every bin is read, an infinite value as NaN, as R's GenomeTrackFixedBin reads it."""
         track_dir = tmp_path / "t"
         track_dir.mkdir()
         (track_dir / "1").write_bytes(
@@ -134,10 +135,9 @@ class TestDensePerChrom:
         track_type, df = _call(track_dir)
 
         assert track_type == "dense"
-        assert len(df["chrom"]) == 3
-        np.testing.assert_array_equal(df["start"], [0, 200, 400])
-        np.testing.assert_array_equal(df["end"], [100, 300, 500])
-        np.testing.assert_array_almost_equal(df["value"], [0.5, 1.0, 2.0])
+        np.testing.assert_array_equal(df["start"], [0, 100, 200, 300, 400])
+        np.testing.assert_array_equal(df["end"], [100, 200, 300, 400, 500])
+        np.testing.assert_array_equal(df["value"], [0.5, np.nan, 1.0, np.nan, 2.0])
 
     def test_dtypes(self, tmp_path):
         track_dir = tmp_path / "t"
@@ -217,15 +217,16 @@ class TestSparsePerChrom:
         np.testing.assert_array_equal(df["end"], [100, 300, 500])
         np.testing.assert_array_almost_equal(df["value"], [0.5, 1.0, 1.5])
 
-    def test_drops_nan_records(self, tmp_path):
+    def test_keeps_nan_records(self, tmp_path):
+        """A NaN interval is read, and an infinite value as NaN, as R's GenomeTrackSparse reads them."""
         track_dir = tmp_path / "t"
         track_dir.mkdir()
-        records = [(100, 200, 0.5), (300, 400, float("nan")), (500, 600, 1.5)]
+        records = [(100, 200, 0.5), (300, 400, float("nan")), (500, 600, 1.5), (700, 800, float("-inf"))]
         (track_dir / "1").write_bytes(_make_sparse_payload_64(records))
 
         _, df = _call(track_dir)
-        assert len(df["chrom"]) == 2
-        np.testing.assert_array_equal(df["start"], [100, 500])
+        np.testing.assert_array_equal(df["start"], [100, 300, 500, 700])
+        np.testing.assert_array_equal(df["value"], [0.5, np.nan, 1.5, np.nan])
 
     def test_corrupt_length_raises(self, tmp_path):
         track_dir = tmp_path / "t"

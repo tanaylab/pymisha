@@ -12,9 +12,6 @@ Open gaps marked ``xfail(strict=True)``:
 * ``GAP_2D_CREATE`` -- creating a 2D track from a track *expression*
   (``test.rects+10``): the scanner can't iterate a rectangles track in the
   track-create path yet.
-* ``GAP_2D_ITER`` -- ``gtrack.2d.create`` stores the supplied values in input
-  row order; pymisha's 2D ``gscreen`` row order differs from R's, so the
-  position-encoded ``1:nrow`` values land on different rectangles.
 """
 
 from __future__ import annotations
@@ -30,7 +27,6 @@ from .baseline import assert_matches_baseline
 
 GAP_ARRAY = "array iterator yields an array track; gextract array-track read not supported"
 GAP_2D_CREATE = "2D track creation from a track expression not supported (scanner can't iterate rects in create path)"
-GAP_2D_ITER = "gtrack.2d.create values follow input row order; pymisha 2D gscreen order differs from R"
 
 
 def _iv12():
@@ -98,7 +94,7 @@ def _create_2d_11(namer):
 
 
 _CASES["gtrack.create.9"] = (_create_sparse_9, None)
-_CASES["gtrack.create.11"] = (_create_2d_11, GAP_2D_ITER)
+_CASES["gtrack.create.11"] = (_create_2d_11, None)
 
 
 @pytest.mark.parametrize("baseline_id", list(_CASES))

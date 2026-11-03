@@ -81,8 +81,8 @@ def test_gextract_track_rects_chrom_pair_filter(rects_track):
     result = pm.gextract(rects_track, intervals=intervals, iterator=rects_track)
     assert result is not None
     assert len(result) == 1
-    assert result.iloc[0]["chrom1"] == "1"
-    assert result.iloc[0]["chrom2"] == "2"
+    assert result.iloc[0]["chrom1"] == "chr1"
+    assert result.iloc[0]["chrom2"] == "chr2"
 
 
 def test_gextract_track_rects_two_scope_pairs(rects_track):
@@ -100,8 +100,8 @@ def test_gextract_track_rects_two_scope_pairs(rects_track):
 def test_gextract_track_rects_has_intervalID(rects_track):
     """Output includes intervalID column.
 
-    In TrackRects mode the intervalID tracks the index of each iterator object
-    (track rect) across the full result, not the scope-interval index.
+    As in R, the intervalID is the 1-based row of the scope interval each
+    object (track rect) was cut by.
     """
     intervals = pd.DataFrame({
         "chrom1": ["1", "1"], "start1": [0, 0], "end1": [500_000, 500_000],
@@ -109,8 +109,8 @@ def test_gextract_track_rects_has_intervalID(rects_track):
     })
     result = pm.gextract(rects_track, intervals=intervals, iterator=rects_track)
     assert "intervalID" in result.columns
-    # There are 4 objects total (3 on 1-1, 1 on 1-2); intervalIDs are 0..3.
-    assert set(result["intervalID"].unique()) == {0, 1, 2, 3}
+    # There are 4 objects total (3 on 1-1, 1 on 1-2).
+    assert sorted(result["intervalID"].tolist()) == [1, 1, 1, 2]
     # Each object appears exactly once.
     assert len(result) == 4
 

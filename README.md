@@ -124,7 +124,6 @@ See the [Creating Genome Databases](https://tanaylab.github.io/pymisha/tutorials
 
 ## Optional dependencies
 
-- `pyBigWig`: For BigWig import in `gtrack_import`.
 - `pyreadr` + `Rscript`: For loading R-serialized big interval sets.
 - `PyYAML`: For richer `gdataset_info` metadata parsing.
 

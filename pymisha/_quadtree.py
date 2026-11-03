@@ -17,6 +17,7 @@ from __future__ import annotations
 import mmap
 import os
 import struct
+import sys
 from typing import Any
 
 import numpy as np
@@ -41,6 +42,9 @@ NW, NE, SE, SW = 0, 1, 2, 3
 
 _MAX_DEPTH = 20
 _MAX_NODE_OBJS = 20
+
+# R's Stat::reset() sets min / max to DBL_MAX / -DBL_MAX, not +-inf.
+_DBL_MAX = sys.float_info.max
 
 
 def _pack_stat(occupied_area: int, weighted_sum: float, min_val: float, max_val: float) -> bytes:
@@ -85,8 +89,9 @@ class _QuadNode:
     def __init__(self, arena: tuple[int, int, int, int]) -> None:
         self.is_leaf = True
         self.arena = arena  # (x1, y1, x2, y2)
+        # R's Stat(): DBL_MAX / -DBL_MAX, which an empty node keeps on disk
         self.stat: dict[str, Any] = {"occupied_area": 0, "weighted_sum": 0.0,
-                                     "min_val": float("inf"), "max_val": float("-inf")}
+                                     "min_val": _DBL_MAX, "max_val": -_DBL_MAX}
         self.kids: list[_QuadNode | None] = [None, None, None, None]  # NW, NE, SE, SW
         self.obj_indices: list[int] = []
 
@@ -138,27 +143,23 @@ class QuadTree:
     def insert(self, obj: tuple[Any, ...]) -> None:
         """Insert an object. For rects: (x1,y1,x2,y2,value). For points: (x,y,value).
 
-        NaN-valued objects are stored in ``self.objs`` and spatially indexed
-        (so coordinate queries return them) but are excluded from per-node
-        stat aggregates (weighted_sum / min_val / max_val / occupied_area),
-        matching R: 2D tracks may contain NaN rects (e.g. from
-        ``gtrack.lookup`` with ``force_binning=False``), and stat queries
-        like 2D vtrack avg/min/max/sum/weighted.sum must skip them.
+        The value is kept as the float the file stores, and every node on the
+        object's path adds it to its stat as R's StatQuadTree::insert does,
+        NaN included (see ``_stat_add_obj``).
         """
         if self.is_points:
             x, y, v = obj
             obj_rect = (x, y, x + 1, y + 1)
+            obj = (x, y, float(np.float32(v)))
         else:
-            v = obj[4]
             obj_rect = (obj[0], obj[1], obj[2], obj[3])
+            obj = (*obj_rect, float(np.float32(obj[4])))
         inter = _rect_intersect(obj_rect, self.root.arena)
         if inter is None:
             return
         obj_idx = len(self.objs)
         self.objs.append(obj)
-        # `v != v` is a scalar NaN test ~50-100x cheaper than np.isnan() on a
-        # Python/NumPy scalar (no array dispatch), called once per inserted object.
-        self._insert(self.root, inter, 0, obj_idx, obj_rect, is_nan=bool(v != v))
+        self._insert(self.root, inter, 0, obj_idx, obj_rect)
 
     def _get_value(self, obj_idx: int) -> float:
         if self.is_points:
@@ -178,19 +179,15 @@ class QuadTree:
         depth: int,
         obj_idx: int,
         obj_rect: tuple[Any, ...],
-        is_nan: bool = False,
     ) -> None:
-        # Update stats only for finite values: NaN rects are spatially indexed
-        # but excluded from value aggregates (matching R). The invariant
-        # "node.stat aggregates contain only finite values" is preserved, so
-        # existing 2D-vtrack stat queries are unchanged on non-NaN tracks.
-        if not is_nan:
-            area = _rect_area(intersection)
-            val = self._get_value(obj_idx)
-            node.stat["weighted_sum"] += val * area
-            node.stat["min_val"] = min(val, node.stat["min_val"])
-            node.stat["max_val"] = max(val, node.stat["max_val"])
-            node.stat["occupied_area"] += area
+        # R's update_stat: min(val, min_val) / max(val, max_val) resolve a NaN
+        # as std::min / std::max do (see _stat_add_obj)
+        area = _rect_area(intersection)
+        val = self._get_value(obj_idx)
+        node.stat["weighted_sum"] += val * area
+        node.stat["min_val"] = min(val, node.stat["min_val"])
+        node.stat["max_val"] = max(val, node.stat["max_val"])
+        node.stat["occupied_area"] += area
 
         if node.is_leaf:
             arena = node.arena
@@ -209,7 +206,7 @@ class QuadTree:
             assert kid is not None
             inter = _rect_intersect(obj_rect, kid.arena)
             if inter is not None:
-                self._insert(kid, inter, depth + 1, obj_idx, obj_rect, is_nan=is_nan)
+                self._insert(kid, inter, depth + 1, obj_idx, obj_rect)
 
     def _split_leaf(self, node: _QuadNode, depth: int) -> None:
         """Convert a leaf to an internal node with 4 children."""
@@ -231,16 +228,12 @@ class QuadTree:
 
         for oi in old_indices:
             obj_rect = self._get_rect(oi)
-            # Preserve NaN-vs-finite status when re-inserting after a split
-            # so the new children's stat aggregates remain finite-only.
-            v = self._get_value(oi)
-            oi_is_nan = bool(v != v)
             for iquad in range(4):
                 kid = node.kids[iquad]
                 assert kid is not None
                 inter = _rect_intersect(obj_rect, kid.arena)
                 if inter is not None:
-                    self._insert(kid, inter, depth + 1, oi, obj_rect, is_nan=oi_is_nan)
+                    self._insert(kid, inter, depth + 1, oi, obj_rect)
 
     def query(self, qx1: int, qy1: int, qx2: int, qy2: int) -> list[int]:
         """Return indices of inserted objects that strictly overlap the query rect.
@@ -959,122 +952,217 @@ def query_2d_track_opened(
     return result
 
 
-def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offset: int, is_points: bool,
-                      qx1: int, qy1: int, qx2: int, qy2: int, stat: list[float | int],
-                      _visited: set[tuple[int, int]] | None = None, _depth: int = 0) -> None:
-    """Hybrid quad-tree stat traversal matching R misha's ``get_stat``.
+def _new_stat() -> list[Any]:
+    """A fresh ``[occupied_area, weighted_sum, min_val, max_val]``, as R's Stat::reset()."""
+    return [0, 0.0, _DBL_MAX, -_DBL_MAX]
 
-    For internal nodes whose arena is *fully contained* by the query rectangle,
-    the pre-computed node stats are used directly (O(1) per subtree).  For
-    partially overlapping nodes, recursion continues.  Leaf nodes enumerate
-    objects and compute intersection-based stats **clamped to the leaf's arena**
-    so that each node only accounts for the portion of objects within its own
-    bounding box (avoiding double-counting of objects that span siblings).
 
-    This matches R misha's ``obj.intersect(rect, leaf->arena)`` 3-way
-    intersection approach.
+def _stat_add_obj(stat: list[Any], val: float, area: int) -> None:
+    """Add an object's intersection to *stat*, as R's StatQuadTreeCached::update_stat.
 
-    *stat* is a 4-element list ``[occupied_area, weighted_sum, min_val, max_val]``
-    that is updated in-place.
+    A NaN value is added like any other: its area counts, the weighted sum
+    becomes NaN, and min / max are R's ``std::min(val, min_val)`` /
+    ``std::max(val, max_val)``. Python's ``min`` / ``max`` with the same
+    argument order resolve a NaN the same way: a NaN takes over until a later
+    value replaces it.
     """
-    if _visited is None:
-        _visited = set()
-    key = (chunk_data_offset, node_offset)
-    if key in _visited:
-        raise RecursionError("Corrupt 2D track file: cyclic quad-tree node reference")
-    if _depth > 100000:
+    stat[1] += val * area
+    stat[2] = min(val, stat[2])
+    stat[3] = max(val, stat[3])
+    stat[0] += area
+
+
+def _stat_add_node(stat: list[Any], node_stat: tuple[int, float, float, float]) -> None:
+    """Add a node's stored stat to *stat*, as R's StatQuadTreeCached::update_stat."""
+    occ, ws, mn, mx = node_stat
+    stat[1] += ws
+    stat[2] = min(mn, stat[2])
+    stat[3] = max(mx, stat[3])
+    stat[0] += occ
+
+
+def _finish_stat(stat: list[Any]) -> dict[str, Any]:
+    """The stat dict R reports for *stat*.
+
+    A query no object touches gives NaN. R reads min and max into float
+    members (GenomeTrack2D::m_last_min / m_last_max), so a DBL_MAX left from
+    Stat::reset() reads as Inf.
+    """
+    if stat[0] == 0:
+        return {"occupied_area": 0, "weighted_sum": float("nan"),
+                "min_val": float("nan"), "max_val": float("nan")}
+    return {"occupied_area": stat[0], "weighted_sum": stat[1],
+            "min_val": float(np.float32(stat[2])), "max_val": float(np.float32(stat[3]))}
+
+
+def _kid_nodes(data: bytes | mmap.mmap, chunk_data_offset: int, abs_offset: int) -> list[tuple[int, int]]:
+    """The (chunk_data_offset, node_offset) of the four kids of the node at *abs_offset*."""
+    kids = []
+    for kid_off in struct.unpack_from("<qqqq", data, abs_offset + _NODEBASE_SIZE):
+        if kid_off >= 0:
+            kids.append((chunk_data_offset, kid_off))
+        else:
+            kids.append(_resolve_chunk_node(data, -kid_off))
+    return kids
+
+
+def _check_depth(depth: int) -> None:
+    if depth > 100000:
         raise RecursionError("Corrupt 2D track file: excessive quad-tree recursion depth")
-    _visited.add(key)
 
+
+def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offset: int, is_points: bool,
+                      qx1: int, qy1: int, qx2: int, qy2: int, stat: list[Any],
+                      _depth: int = 0, computer: Any = None) -> None:
+    """Add the stats of the objects under a node within a query rectangle to *stat*.
+
+    A port of R's ``StatQuadTreeCached::get_stat`` (no band): a kid that lies
+    inside the query contributes its stored stat, unless its occupied area is
+    0; a leaf adds each object's intersection with the query and its own arena,
+    so an object stored in several leaves is counted once. *stat* is
+    ``[occupied_area, weighted_sum, min_val, max_val]`` (see ``_new_stat``),
+    updated in place. *computer*, for a COMPUTED track, gives the value of an
+    intersection that is not the whole object, as R's ``Computed_val::val``.
+    """
+    _check_depth(_depth)
     abs_offset = chunk_data_offset + node_offset
-    is_leaf, arena = _unpack_node_base(data, abs_offset)
-    ax1, ay1, ax2, ay2 = arena
+    is_leaf, (ax1, ay1, ax2, ay2) = _unpack_node_base(data, abs_offset)
 
-    # Prune: no intersection with query
-    if ax1 >= qx2 or ax2 <= qx1 or ay1 >= qy2 or ay2 <= qy1:
-        _visited.discard(key)
+    if is_leaf:
+        # the query clipped to the leaf's arena
+        ex1, ey1, ex2, ey2 = max(qx1, ax1), max(qy1, ay1), min(qx2, ax2), min(qy2, ay2)
+        num_objs = struct.unpack_from("<I", data, abs_offset + _NODEBASE_SIZE)[0]
+        for obj in _read_leaf_objects(data, abs_offset + _LEAF_SIZE, num_objs, is_points):
+            if is_points:
+                _, ox, oy, val = obj
+                if ex1 <= ox < ex2 and ey1 <= oy < ey2:
+                    _stat_add_obj(stat, val, 1)
+            else:
+                _, ox1, oy1, ox2, oy2, val = obj
+                ix1, iy1, ix2, iy2 = max(ex1, ox1), max(ey1, oy1), min(ex2, ox2), min(ey2, oy2)
+                if ix1 < ix2 and iy1 < iy2:
+                    if computer is not None:
+                        val = _computed_val((ox1, oy1, ox2, oy2), val, (ix1, iy1, ix2, iy2), computer, None)
+                    _stat_add_obj(stat, val, (ix2 - ix1) * (iy2 - iy1))
         return
 
-    # Effective query rect clamped to this node's arena — ensures each node
-    # only accounts for the portion of objects within its own bounding box.
-    eqx1 = max(qx1, ax1)
-    eqy1 = max(qy1, ay1)
-    eqx2 = min(qx2, ax2)
-    eqy2 = min(qy2, ay2)
-
-    try:
-        if is_leaf:
-            # Enumerate objects and compute intersection stats, clamped to arena.
-            num_objs = struct.unpack_from("<I", data, abs_offset + _NODEBASE_SIZE)[0]
-            raw_objs = _read_leaf_objects(data, abs_offset + _LEAF_SIZE, num_objs, is_points)
-            for obj in raw_objs:
-                if is_points:
-                    _, ox, oy, val = obj
-                    # NaN-valued objects are stored on disk and returned by
-                    # spatial queries, but must be skipped from stat aggregates
-                    # (matching R: 2D tracks may contain NaN rects, and
-                    # avg/min/max/sum/weighted.sum skip them).
-                    if np.isnan(val):
-                        continue
-                    # Point inside both query and arena?
-                    if (eqx1 <= ox < eqx2 and eqy1 <= oy < eqy2):
-                        stat[0] += 1           # occupied_area
-                        stat[1] += val         # weighted_sum
-                        if val < stat[2]:
-                            stat[2] = val      # min_val
-                        if val > stat[3]:
-                            stat[3] = val      # max_val
-                else:
-                    _, ox1, oy1, ox2, oy2, val = obj
-                    if np.isnan(val):
-                        continue  # NaN-rect: stored on disk, skipped from stats
-                    # Intersection clamped to effective query (query ∩ arena)
-                    inter = (max(0, min(eqx2, ox2) - max(eqx1, ox1))
-                             * max(0, min(eqy2, oy2) - max(eqy1, oy1)))
-                    if inter > 0:
-                        stat[0] += inter           # occupied_area
-                        stat[1] += val * inter     # weighted_sum
-                        if val < stat[2]:
-                            stat[2] = val
-                        if val > stat[3]:
-                            stat[3] = val
+    for kid_chunk, kid_node in _kid_nodes(data, chunk_data_offset, abs_offset):
+        kid_abs = kid_chunk + kid_node
+        _, (cx1, cy1, cx2, cy2) = _unpack_node_base(data, kid_abs)
+        if not (max(cx1, qx1) < min(cx2, qx2) and max(cy1, qy1) < min(cy2, qy2)):
+            continue
+        if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
+            kid_stat = _unpack_stat(data, kid_abs)
+            if kid_stat[0]:
+                _stat_add_node(stat, kid_stat)
         else:
-            # Internal node: check each child quadrant
-            kid_offsets = struct.unpack_from("<qqqq", data, abs_offset + _NODEBASE_SIZE)
-            for kid_off in kid_offsets:
-                if kid_off >= 0:
-                    child_abs = chunk_data_offset + kid_off
-                    child_chunk = chunk_data_offset
-                    child_node = kid_off
-                else:
-                    child_chunk, child_node = _resolve_chunk_node(data, -kid_off)
-                    child_abs = child_chunk + child_node
+            _query_node_stats(data, kid_chunk, kid_node, is_points, qx1, qy1, qx2, qy2,
+                              stat, _depth + 1, computer)
 
-                _, child_arena = _unpack_node_base(data, child_abs)
-                cx1, cy1, cx2, cy2 = child_arena
 
-                # Skip if child doesn't intersect query
-                if cx1 >= qx2 or cx2 <= qx1 or cy1 >= qy2 or cy2 <= qy1:
-                    continue
+def _computed_val(obj_rect: tuple[int, ...], cached: float, rect: tuple[int, ...], computer: Any,
+                  band: tuple[int, int] | None) -> float:
+    """R's ``Computed_val::val``: the stored value of the whole object, else the computer's."""
+    from ._computer2d import DiagonalBand, Rectangle, recompute_or_cached
 
-                # Fast path: child fully inside query -> use pre-computed stats
-                if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
-                    c_occ, c_ws, c_min, c_max = _unpack_stat(data, child_abs)
-                    if c_occ > 0:
-                        stat[0] += c_occ
-                        stat[1] += c_ws
-                        if c_min < stat[2]:
-                            stat[2] = c_min
-                        if c_max > stat[3]:
-                            stat[3] = c_max
-                    continue
+    return recompute_or_cached(Rectangle(*obj_rect), cached, Rectangle(*rect), computer,
+                               None if band is None else DiagonalBand(int(band[0]), int(band[1])))
 
-                # Partial overlap: recurse
-                _query_node_stats(data, child_chunk, child_node, is_points,
-                                  qx1, qy1, qx2, qy2, stat,
-                                  _visited, _depth + 1)
-    finally:
-        _visited.discard(key)
+
+def _band_do_intersect(r: tuple[int, int, int, int], d1: int, d2: int) -> bool:
+    return r[2] - r[1] > d1 and r[0] - r[3] + 1 < d2
+
+
+def _band_do_contain(r: tuple[int, int, int, int], d1: int, d2: int) -> bool:
+    return r[0] - r[3] + 1 >= d1 and r[2] - r[1] <= d2
+
+
+def _band_shrink(r: tuple[int, int, int, int], d1: int, d2: int) -> tuple[int, int, int, int]:
+    """R's DiagonalBand::shrink2intersected."""
+    x1, y1, x2, y2 = r
+    if x1 - y1 < d1:
+        x1 = y1 + d1
+    elif x1 - y1 > d2:
+        y1 = x1 - d2
+    if x2 - y2 < d1:
+        y2 = x2 - d1
+    elif x2 - y2 > d2:
+        x2 = y2 + d2
+    return x1, y1, x2, y2
+
+
+def _band_intersected_area(r: tuple[int, int, int, int], d1: int, d2: int) -> int:
+    """R's DiagonalBand::intersected_area of a shrunk rectangle."""
+    x1, y1, x2, y2 = r
+    area = (x2 - x1) * (y2 - y1)
+    if x1 - y2 + 1 < d1:
+        n = y2 + d1 - x1
+        area -= (n * n - n) >> 1
+    if x2 - y1 > d2:
+        n = x2 - (y1 + d2)
+        area -= (n * n + n) >> 1
+    return area
+
+
+def _query_node_stats_band(data: bytes | mmap.mmap, chunk_data_offset: int, node_offset: int,
+                           is_points: bool, rect: tuple[int, int, int, int], d1: int, d2: int,
+                           stat: list[Any], _depth: int = 0, computer: Any = None) -> None:
+    """``_query_node_stats`` within the diagonal band ``[d1, d2)``.
+
+    A port of R's ``StatQuadTreeCached::get_stat`` with a band: a kid inside
+    both the query and the band contributes its stored stat (even an empty
+    one, as in R), a kid the band cuts is searched with the query shrunk to
+    the band, and a leaf object the band cuts counts the area of its
+    intersection inside the band.
+    """
+    _check_depth(_depth)
+    abs_offset = chunk_data_offset + node_offset
+    is_leaf, (ax1, ay1, ax2, ay2) = _unpack_node_base(data, abs_offset)
+    qx1, qy1, qx2, qy2 = rect
+
+    if is_leaf:
+        ex1, ey1, ex2, ey2 = max(qx1, ax1), max(qy1, ay1), min(qx2, ax2), min(qy2, ay2)
+        num_objs = struct.unpack_from("<I", data, abs_offset + _NODEBASE_SIZE)[0]
+        for obj in _read_leaf_objects(data, abs_offset + _LEAF_SIZE, num_objs, is_points):
+            if is_points:
+                _, ox, oy, val = obj
+                inter = (max(ex1, ox), max(ey1, oy), min(ex2, ox + 1), min(ey2, oy + 1))
+            else:
+                _, ox1, oy1, ox2, oy2, val = obj
+                inter = (max(ex1, ox1), max(ey1, oy1), min(ex2, ox2), min(ey2, oy2))
+            if not (inter[0] < inter[2] and inter[1] < inter[3]):
+                continue
+            if _band_do_contain(inter, d1, d2):
+                if computer is not None:
+                    val = _computed_val(obj[1:5], val, inter, computer, None)
+                _stat_add_obj(stat, val, (inter[2] - inter[0]) * (inter[3] - inter[1]))
+            elif _band_do_intersect(inter, d1, d2):
+                shrunk = _band_shrink(inter, d1, d2)
+                if computer is not None:
+                    val = _computed_val(obj[1:5], val, shrunk, computer, (d1, d2))
+                _stat_add_obj(stat, val, _band_intersected_area(shrunk, d1, d2))
+        return
+
+    for kid_chunk, kid_node in _kid_nodes(data, chunk_data_offset, abs_offset):
+        kid_abs = kid_chunk + kid_node
+        _, kid_arena = _unpack_node_base(data, kid_abs)
+        cx1, cy1, cx2, cy2 = kid_arena
+        if not (max(cx1, qx1) < min(cx2, qx2) and max(cy1, qy1) < min(cy2, qy2)):
+            continue
+        if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
+            if _band_do_contain(kid_arena, d1, d2):
+                _stat_add_node(stat, _unpack_stat(data, kid_abs))
+            elif _band_do_intersect(kid_arena, d1, d2):
+                _query_node_stats_band(data, kid_chunk, kid_node, is_points,
+                                       _band_shrink(kid_arena, d1, d2), d1, d2, stat, _depth + 1, computer)
+        else:
+            inter = (max(cx1, qx1), max(cy1, qy1), min(cx2, qx2), min(cy2, qy2))
+            if _band_do_contain(inter, d1, d2):
+                _query_node_stats(data, kid_chunk, kid_node, is_points, qx1, qy1, qx2, qy2,
+                                  stat, _depth + 1, computer)
+            elif _band_do_intersect(inter, d1, d2):
+                _query_node_stats_band(data, kid_chunk, kid_node, is_points, inter, d1, d2,
+                                       stat, _depth + 1, computer)
 
 
 def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
@@ -1082,9 +1170,9 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
     """
     Query a pre-opened 2D track mmap and return aggregated stats for a query rectangle.
 
-    Uses a hybrid quad-tree traversal matching R misha's ``get_stat`` algorithm:
-    for subtrees fully contained by the query, pre-computed node statistics are
-    used directly (O(1) per subtree), avoiding object enumeration.
+    Follows R misha's ``get_stat``: for subtrees fully contained by the query,
+    pre-computed node statistics are used directly (O(1) per subtree), avoiding
+    object enumeration. NaN values count as R counts them (see ``_stat_add_obj``).
 
     Parameters
     ----------
@@ -1099,20 +1187,18 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
     qx1, qy1, qx2, qy2 : int
         Query rectangle bounds.
     band : tuple of (int, int) or None
-        If not None, ``(d1, d2)`` diagonal band filter. When a band is
-        specified, the fast node-stats path cannot be used and a full
-        object-level enumeration is performed instead.
+        If not None, ``(d1, d2)`` diagonal band filter.
 
     Returns
     -------
     dict
         ``{"occupied_area": int, "weighted_sum": float,
         "min_val": float, "max_val": float}``.
-        When no objects contribute, *min_val* and *max_val* are ``float("nan")``.
+        When no objects contribute, *weighted_sum*, *min_val* and *max_val*
+        are ``float("nan")``.
     """
     if num_objs == 0:
-        return {"occupied_area": 0, "weighted_sum": 0.0,
-                "min_val": float("nan"), "max_val": float("nan")}
+        return _finish_stat(_new_stat())
 
     # C++ fast path — gated on RECTS / POINTS signature (the binding
     # assumes the standard header layout and would seg-fault on COMPUTED).
@@ -1133,27 +1219,23 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
             _logger.warning("the C++ quad-tree stats query failed; falling back to the Python "
                             "implementation", exc_info=True)
 
+    # A COMPUTED track recomputes the value of an intersection that is not a whole object
+    computer = None
+    if _sig == SIGNATURE_COMPUTED:
+        from ._computer2d import load_computer_from_header
+
+        computer = load_computer_from_header(data)
+
     if band is not None:
-        # Band filtering requires per-object inspection -- fall back to object
-        # enumeration.  The node-level stats don't account for band constraints.
         return _query_2d_track_stats_with_band(
             data, is_points, num_objs, root_chunk_fpos,
-            qx1, qy1, qx2, qy2, band)
+            qx1, qy1, qx2, qy2, band, computer)
 
     top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
-
-    # stat = [occupied_area, weighted_sum, min_val, max_val]
-    stat = [0, 0.0, float("inf"), float("-inf")]
-
+    stat = _new_stat()
     _query_node_stats(data, root_chunk_fpos, top_node_offset, is_points,
-                      qx1, qy1, qx2, qy2, stat)
-
-    if stat[0] == 0:
-        return {"occupied_area": 0, "weighted_sum": 0.0,
-                "min_val": float("nan"), "max_val": float("nan")}
-
-    return {"occupied_area": stat[0], "weighted_sum": stat[1],
-            "min_val": stat[2], "max_val": stat[3]}
+                      qx1, qy1, qx2, qy2, stat, computer=computer)
+    return _finish_stat(stat)
 
 
 def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
@@ -1232,55 +1314,16 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
 
 
 def _query_2d_track_stats_with_band(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,
-                                     qx1: int, qy1: int, qx2: int, qy2: int, band: tuple[int, int]) -> dict[str, Any]:
-    """Fall-back stat query when a diagonal band filter is active.
-
-    Band filtering cannot leverage node-level stats (the stored stats don't
-    account for band constraints), so we enumerate objects via
-    ``query_2d_track_opened`` and compute stats per-object.
-    """
-    objs = query_2d_track_opened(data, is_points, num_objs, root_chunk_fpos,
-                                 qx1, qy1, qx2, qy2)
-    d1, d2 = band
-    occupied_area = 0
-    weighted_sum = 0.0
-    min_val = float("inf")
-    max_val = float("-inf")
-
-    if is_points:
-        for x, y, val in objs:
-            if np.isnan(val):
-                continue  # NaN-rect: spatially returned, excluded from stats
-            if not (d1 <= (x - y) < d2):
-                continue
-            occupied_area += 1
-            weighted_sum += val
-            if val < min_val:
-                min_val = val
-            if val > max_val:
-                max_val = val
-    else:
-        for ox1, oy1, ox2, oy2, val in objs:
-            if np.isnan(val):
-                continue  # NaN-rect: spatially returned, excluded from stats
-            if not ((ox2 - oy1 > d1) and (ox1 - oy2 + 1 < d2)):
-                continue
-            inter = (max(0, min(qx2, ox2) - max(qx1, ox1))
-                     * max(0, min(qy2, oy2) - max(qy1, oy1)))
-            if inter > 0:
-                occupied_area += inter
-                weighted_sum += val * inter
-            if val < min_val:
-                min_val = val
-            if val > max_val:
-                max_val = val
-
-    if occupied_area == 0 and min_val == float("inf"):
-        return {"occupied_area": 0, "weighted_sum": 0.0,
-                "min_val": float("nan"), "max_val": float("nan")}
-
-    return {"occupied_area": occupied_area, "weighted_sum": weighted_sum,
-            "min_val": min_val, "max_val": max_val}
+                                     qx1: int, qy1: int, qx2: int, qy2: int, band: tuple[int, int],
+                                     computer: Any = None) -> dict[str, Any]:
+    """``query_2d_track_stats`` within the diagonal band ``(d1, d2)``, in Python."""
+    if num_objs == 0:
+        return _finish_stat(_new_stat())
+    top_node_offset = struct.unpack_from("<q", data, root_chunk_fpos + 8)[0]
+    stat = _new_stat()
+    _query_node_stats_band(data, root_chunk_fpos, top_node_offset, is_points,
+                           (qx1, qy1, qx2, qy2), int(band[0]), int(band[1]), stat, computer=computer)
+    return _finish_stat(stat)
 
 
 def query_2d_track_opened_arrays(

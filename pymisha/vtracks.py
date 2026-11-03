@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math as _math
 import warnings as _warnings
 from typing import Any
 
@@ -13,6 +14,7 @@ from . import _shared
 from ._log import get_logger
 from ._shared import (
     CONFIG,
+    _check_spat_bounds,
     _checkroot,
     _coerce_score_thresh,
     _df2pymisha,
@@ -55,8 +57,8 @@ _FILTER_GLOBAL_PERCENTILE_FUNCS = {
     "global.percentile.max",
 }
 # Each of these picks the position from the unmasked part carrying the best
-# score, so each needs the matching *.max func to rank the parts by.
-_FILTER_MAX_POS_BY_SCORE_FUNCS = {"pwm.max.pos": "pwm.max", "potts.max.pos": "potts.max"}
+# score (see _compute_filtered_max_pos_by_score).
+_FILTER_MAX_POS_BY_SCORE_FUNCS = {"pwm.max.pos", "potts.max.pos"}
 _FILTER_EDIT_DISTANCE_FUNCS = {
     "pwm.edit_distance",
     "pwm.edit_distance.pos",
@@ -87,9 +89,10 @@ _N_MUTATIONS_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_edits", "max_indels"}
 # _coerce_potts_model() cross-checks `width` against the row count of `e`.
 _POTTS_PARAMS = {
     "e", "J", "pairs", "intercept", "bidirect", "extend", "strand",
-    "score_thresh", "width", "pair_strength", "attr", "link",
+    "score_thresh", "width", "pair_strength", "attr", "link", "max_edits",
 }
 _POTTS_FUNCS = ("potts", "potts.max", "potts.max.pos", "potts.count")
+_PWM_FUNCS = ("pwm", "pwm.max", "pwm.max.pos", "pwm.count")
 _ACCEPTED_VTRACK_PARAMS = {
     "pwm": _PWM_PARAMS,
     "pwm.max": _PWM_PARAMS,
@@ -113,6 +116,61 @@ _DOTTED_PARAM_ALIASES = {"score.thresh": "score_thresh", "score.min": "score_min
                          "score.max": "score_max"}
 # masked.count / masked.frac warn rather than raise, as R misha does.
 _WARN_ON_PARAMS_FUNCS = {"masked.count", "masked.frac"}
+
+
+def _check_params_dots_collision(func: str, params: Any, kwargs: dict[str, Any]) -> None:
+    """Port of R misha's ``.vtrack_check_params_dots_collision``: ``params``
+    and keyword arguments are two spellings of the same parameter set, and
+    the keyword arguments would be ignored, so a call may not use both."""
+    dots = sorted(k for k in kwargs if k != "filter")
+    if params is None or not dots:
+        return
+    raise ValueError(
+        f"function '{func}': parameters supplied both via 'params' and as named "
+        f"argument{'s' if len(dots) > 1 else ''} {', '.join(repr(k) for k in dots)}. These "
+        "are two alternative ways of passing the same parameters - the named arguments "
+        "would be ignored, so supply either 'params' or the named arguments, not both."
+    )
+
+
+def _kmer_params(func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Port of R misha's ``.vtrack_params_kmer``: the ``kmer``, ``extend`` and
+    ``strand`` of a kmer.count / kmer.frac vtrack, given as ``params`` (a dict,
+    R's list) or as keyword arguments."""
+    from .sequence import gseq_revcomp
+
+    _check_params_dots_collision(func, params, kwargs)
+    dots = {k: v for k, v in kwargs.items() if k != "filter"}
+    if params is not None:
+        if isinstance(params, str):
+            # pymisha also takes the k-mer itself as params.
+            params = {"kmer": params}
+        if not isinstance(params, dict) or "kmer" not in params:
+            raise ValueError("kmer function requires a dict with at least 'kmer' parameter")
+        kp = dict(params)
+    elif "kmer" in dots:
+        kp = dots
+    else:
+        raise ValueError("kmer functions require a 'kmer' parameter")
+
+    _check_vtrack_params(func, kp)
+    if kp.get("extend") is None:
+        kp["extend"] = True
+    if kp.get("strand") is None:
+        kp["strand"] = 0
+
+    kmer = kp.get("kmer")
+    if not isinstance(kmer, str):
+        raise ValueError("kmer parameter must be a single string")
+    if not kmer:
+        raise ValueError("kmer sequence cannot be empty")
+    if kmer == gseq_revcomp(kmer) and kp["strand"] == 0:
+        _warnings.warn(
+            f"kmer sequence '{kmer}' is palindromic, please set strand to 1 or -1 to "
+            "avoid double counting",
+            stacklevel=3,
+        )
+    return kp
 
 
 def _check_vtrack_params(func: str | None, kwargs: dict) -> None:
@@ -153,6 +211,29 @@ def _check_vtrack_params(func: str | None, kwargs: dict) -> None:
         f"function {func!r} does not accept parameter{plural} {keylist}; "
         f"accepted parameters are: {', '.join(sorted(accepted))}"
     )
+
+
+def _convert_spat_range(config: dict) -> None:
+    """R misha's .vtrack_params_pwm conversion of spat_min/spat_max, in place.
+
+    Both are 1-based positions in the scanned window (checked by
+    _check_spat_bounds). The scorer takes the 0-based first and last anchor
+    START, so spat_min becomes spat_min - 1 and spat_max becomes
+    (spat_max - 1) - motif_length + 1: the last anchor whose motif still ends at
+    spat_max. Either may be given alone - the C++ side then leaves the other end
+    open - and neither needs spat_factor.
+    """
+    if config.get("spat_min") is None and config.get("spat_max") is None:
+        return
+    pssm = config.get("pssm")
+    if pssm is None:
+        raise ValueError("pwm function requires a 'pssm' matrix parameter")
+    smin, smax = _check_spat_bounds(config.get("spat_min"), config.get("spat_max"), len(pssm))
+    # R's arithmetic, in R's order, truncated toward zero like as.integer().
+    if smin is not None:
+        config["spat_min"] = int(smin - 1)
+    if smax is not None:
+        config["spat_max"] = int((smax - 1) - len(pssm) + 1)
 
 
 _DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
@@ -217,7 +298,7 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_SAMPLE_POS_ABS_FUNCS
     | _FILTER_SAMPLE_POS_REL_FUNCS
     | _FILTER_LOGSUMEXP_FUNCS
-    | set(_FILTER_MAX_POS_BY_SCORE_FUNCS)
+    | _FILTER_MAX_POS_BY_SCORE_FUNCS
     | _FILTER_GLOBAL_PERCENTILE_FUNCS
     | _FILTER_EDIT_DISTANCE_FUNCS
 )
@@ -968,6 +1049,23 @@ def _compute_filtered_lse(
     return out
 
 
+def _with_row_subs(payload: dict[str, Any], seg_df: pd.DataFrame) -> dict[str, Any]:
+    """*payload* for scoring the parts in *seg_df*.
+
+    gextract_variants hands a sequence vtrack one substitution per iterator
+    interval (``row_subs``: positions and base codes); each unmasked part is
+    scored with its interval's substitution.
+    """
+    row_subs = payload.get("row_subs")
+    if row_subs is None:
+        return payload
+    out = {k: v for k, v in payload.items() if k != "row_subs"}
+    idx = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
+    out["sub_pos"] = row_subs[0][idx]
+    out["sub_base"] = row_subs[1][idx]
+    return out
+
+
 def _compute_filtered_segment_logsumexp(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
@@ -979,7 +1077,7 @@ def _compute_filtered_segment_logsumexp(
     if seg_df is None or len(seg_df) == 0:
         return out
 
-    payload_seg = dict(payload_eval)
+    payload_seg = _with_row_subs(dict(payload_eval), seg_df)
     payload_seg["sshift"] = 0
     payload_seg["eshift"] = 0
     seg_vals = _numpy.asarray(
@@ -996,73 +1094,68 @@ def _compute_filtered_segment_logsumexp(
         per_vals[int(orig_idx)].append(float(seg_val))
 
     for i, vals in enumerate(per_vals):
-        if vals:
-            out[i] = _logsumexp(vals)
+        out[i] = _log_sum_parts(vals)
     return out
+
+
+def _log_sum_parts(vals: list[float]) -> float:
+    """R's SequenceVarProcessor reduction of a pwm / potts filter's parts.
+
+    Pairwise log_sum_log() in part order, seeded from the first scorable
+    (non-NaN) part, skipping -inf: the same steps R takes, so the same last
+    bit. A vectorised log-sum-exp lands up to an ulp away. NaN when no part
+    was scorable.
+    """
+    lse = _numpy.nan
+    for v in vals:
+        if _math.isnan(v):
+            continue
+        if _math.isnan(lse) or not _math.isfinite(lse):
+            lse = v
+        elif _math.isfinite(v):
+            if lse > v:
+                lse += _math.log(1 + _math.exp(v - lse))
+            else:
+                lse = v + _math.log(1 + _math.exp(lse - v))
+    return lse
 
 
 def _compute_filtered_max_pos_by_score(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
-    pos_func: str,
-    score_func: str,
 ) -> np.ndarray:
-    """A ``*.max.pos`` func under a filter.
+    """A ``*.max.pos`` func under a filter, as R's SequenceVarProcessor does it.
 
     The position alone cannot be compared between two unmasked parts, so each
-    part is scored to rank the parts, and again with *pos_func* for the answer;
-    the winning part's position is then offset into the iterator interval's own
-    coordinate frame, re-signed so the offset moves it away from zero in
-    whichever direction it already points. Serves ``pwm.max.pos`` and
-    ``potts.max.pos``, which differ only in those two names.
+    part is also asked for the score its position was chosen by - the
+    scorer's ``get_last_max_score()``, returned by ``pm_vtrack_compute`` under
+    the spec key ``last_max_score`` - and the part with the highest one wins,
+    the first on a tie. Its position is then offset into the iterator
+    interval's own coordinate frame, re-signed so the offset moves it away from
+    zero in whichever direction it already points. Serves ``pwm.max.pos`` and
+    ``potts.max.pos``.
 
-    Ranking uses the max over anchors of the max over STRANDS, which is what
-    the ``*.max.pos`` scorer itself maximises - it has to name a strand, so it
-    does not combine them. *score_func* (``pwm.max`` / ``potts.max``) instead
-    log-sum-exps the two, and ranking by that picked a different part whenever
-    a part's strand bonus, ``log1p(exp(-|f-r|))`` in ``(0, log 2]``, outranked
-    a genuine strand-max gap below 0.693 nats: on one mm10 interval R answered
-    -7618 from the strand-max winner and this answered 1.0 from the union
-    winner, with every per-part value agreeing exactly. R reads the same
-    quantity off ``PWMScorer::get_last_max_score()``; there is no such side
-    channel through ``pm_vtrack_compute``, so it is rebuilt here as the
-    elementwise max of the two single-strand scans, which is the same number.
+    That score includes the spatial weight. The ranking used to be rebuilt
+    from two single-strand ``*.max`` scans, which is the same number without
+    ``spat_factor``; with it, the reverse-strand scan read the reverse
+    complement, whose spatial bins count from the 3' end, so the parts were
+    ranked by weights the position was never chosen by.
     """
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     if seg_df is None or len(seg_df) == 0:
         return out
 
-    base_payload = dict(payload_eval)
-    base_payload["sshift"] = 0
-    base_payload["eshift"] = 0
-    payload_score = dict(base_payload)
-    payload_score["func"] = score_func
-    payload_pos = dict(base_payload)
-    payload_pos["func"] = pos_func
-
+    payload_pos = _with_row_subs(dict(payload_eval), seg_df)
+    payload_pos["sshift"] = 0
+    payload_pos["eshift"] = 0
     seg_intervals = _df2pymisha(seg_df[["chrom", "start", "end"]])
-
-    def _scan(payload: dict[str, Any]) -> _numpy.ndarray:
-        return _numpy.asarray(
-            _pymisha.pm_vtrack_compute(payload, seg_intervals, CONFIG), dtype=float
-        )
-
-    if bool(base_payload.get("bidirect", True)):
-        # max over strands, not their union: score each strand on its own and
-        # take the larger. A single-strand model needs no such split - its
-        # score_func result is already a strand maximum.
-        fwd = dict(payload_score)
-        fwd["bidirect"] = False
-        fwd["strand"] = 1
-        rev = dict(payload_score)
-        rev["bidirect"] = False
-        rev["strand"] = -1
-        seg_scores = _numpy.fmax(_scan(fwd), _scan(rev))
-    else:
-        seg_scores = _scan(payload_score)
     seg_pos = _numpy.asarray(_pymisha.pm_vtrack_compute(payload_pos, seg_intervals, CONFIG), dtype=float)
+    seg_scores = _numpy.asarray(
+        _pymisha.pm_vtrack_compute(dict(payload_pos, last_max_score=1), seg_intervals, CONFIG),
+        dtype=float,
+    )
 
     best_score = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     for orig_idx, seg_start, base_start, score, pos in zip(
@@ -1336,7 +1429,11 @@ def _compute_array_slice_vtrack(
     return reduce_array_extract(extracted, val_cols, func, n_intervals)
 
 
-def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
+def _compute_vtrack_values(
+    vtrack_name: str,
+    intervals: pd.DataFrame,
+    subs: tuple[np.ndarray, np.ndarray] | None = None,
+) -> Any:
     """
     Compute values for a virtual track.
 
@@ -1345,6 +1442,11 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     2. Extracting source track values for shifted intervals
     3. Applying aggregation function
     4. Mapping results back to original intervals
+
+    *subs* (gextract_variants) gives one substitution per interval, as
+    positions and base codes (0..3 = A, C, G, T; -1 = none), applied to the
+    sequence while a sequence vtrack scores that interval. Other vtracks do
+    not read the sequence and ignore it.
 
     Returns numpy array of computed values (one per interval).
     """
@@ -1372,6 +1474,9 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
         payload['pssm'] = payload['pssm'].to_numpy(dtype=float, copy=False)
 
     func = str(payload.get("func", "avg")).lower()
+    row_subs = None
+    if subs is not None and payload.get("src") is None:
+        row_subs = (_numpy.asarray(subs[0], dtype=_numpy.int64), _numpy.asarray(subs[1], dtype=_numpy.int64))
 
     # Functions that the C++ value-based vtrack path handles efficiently
     _VALUE_CPP_FUNCS = {
@@ -1394,6 +1499,8 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
             payload_eval.pop("filter_key", None)
             payload_eval.pop("filter_stats", None)
             return _compute_global_percentile_unfiltered(intervals, payload_eval, func)
+        if row_subs is not None:
+            payload["sub_pos"], payload["sub_base"] = row_subs
         return _pymisha.pm_vtrack_compute(
             payload,
             _df2pymisha(intervals),
@@ -1404,6 +1511,8 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     payload_eval.pop("filter", None)
     payload_eval.pop("filter_key", None)
     payload_eval.pop("filter_stats", None)
+    if row_subs is not None:
+        payload_eval["row_subs"] = row_subs
 
     if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS:
         return _compute_value_df_vtrack(intervals, payload_eval, filter_df)
@@ -1443,10 +1552,7 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     # --- pwm.max.pos / potts.max.pos: the position from the segment holding
     # the highest score, in the interval's own coordinates ---
     if func in _FILTER_MAX_POS_BY_SCORE_FUNCS:
-        return _compute_filtered_max_pos_by_score(
-            intervals, payload_eval, filter_df, func,
-            _FILTER_MAX_POS_BY_SCORE_FUNCS[func],
-        )
+        return _compute_filtered_max_pos_by_score(intervals, payload_eval, filter_df)
 
     # --- max.pos.* / min.pos.*: find position of extremum across unmasked bins ---
     if func in _FILTER_MAX_POS_ABS_FUNCS:
@@ -1463,6 +1569,7 @@ def _compute_vtrack_values(vtrack_name: str, intervals: pd.DataFrame) -> Any:
     if seg_df is None or len(seg_df) == 0:
         return out
 
+    payload_eval = _with_row_subs(payload_eval, seg_df)
     payload_eval["sshift"] = 0
     payload_eval["eshift"] = 0
     seg_vals = _numpy.asarray(
@@ -1562,7 +1669,7 @@ def gvtrack_create(
     vtrack_name: str,
     src: pd.DataFrame | str | None,
     func: str | None = None,
-    params: float | str | None = None,
+    params: float | str | dict[str, Any] | None = None,
     sshift: int = 0,
     eshift: int = 0,
     **kwargs: Any,
@@ -1637,11 +1744,13 @@ def gvtrack_create(
         - **K-mer** (src=None): ``'kmer.count'``, ``'kmer.frac'``
         - **Masked sequence** (src=None): ``'masked.count'``,
           ``'masked.frac'``
-    params : float, str, or None, optional
+    params : float, str, dict, or None, optional
         Function-specific parameter. For example, a percentile in [0, 1]
         for ``'quantile'`` or a max-distance integer for
-        ``'neighbor.count'``. PWM functions take their threshold via
-        ``score_thresh``, not here.
+        ``'neighbor.count'``. For the pwm, edit distance, potts and kmer
+        functions, a dict of the keyword arguments below (R's ``params``
+        list), as an alternative to passing them as keyword arguments; a
+        call may not use both.
     sshift : int, default 0
         Shift added to the start coordinate of each iterator interval
         before the virtual track function is evaluated.
@@ -1673,7 +1782,14 @@ def gvtrack_create(
           ``'pwm.count'`` (PWM scores are log-likelihoods, so no default
           suits every PSSM); also used by the edit distance functions.
         - ``max_edits`` (int or None) -- Maximum number of edits for edit
-          distance functions. None (default) uses exact computation.
+          distance functions. None (default) uses exact computation. For
+          ``'potts.max'`` it is 0 (default) or 1: with 1, each anchor scores
+          the best of its own window and every window one substitution away,
+          and the vtrack returns the best anchor. Exact; costs about 4 to 30
+          times a plain ``'potts.max'`` (more for wide models and with
+          ``bidirect=True``), and is meant as a genome-wide bound before
+          :func:`gextract_variants`. A window with a non-ACGT base is still
+          not scored. Any other potts function rejects it.
         - ``direction``/``score_min``/``score_max`` also apply to
           ``'pwm.n_mutations'``, which counts the single-base substitutions
           that each independently bring a window across ``score_thresh``
@@ -1696,8 +1812,11 @@ def gvtrack_create(
         - ``spat_factor`` (list of float) -- Spatial weighting factors
           for PWM functions.
         - ``spat_bin`` (int) -- Bin width for spatial weighting.
-        - ``spat_min`` (int) -- Minimum scan position (1-based).
-        - ``spat_max`` (int) -- Maximum scan position (1-based).
+        - ``spat_min`` (int) -- First scanned position (1-based, >= 1) of
+          the window: anchors start no earlier than this.
+        - ``spat_max`` (int) -- Last scanned position (1-based) of the
+          window: the last anchor is the one whose motif ends here. Either
+          bound may be given alone, with or without ``spat_factor``.
         - ``filter`` (pandas.DataFrame, str, list, or None) -- Genomic mask
           filter. See ``gvtrack_filter`` for details.
 
@@ -1902,6 +2021,21 @@ def gvtrack_create(
             score_thresh=score_thresh,
             what=f"virtual track function '{func}'",
         )
+        # Only potts.max: for a log-sum-exp, a count or a position the best
+        # single substitution does not decompose by anchor. Left out of the
+        # spec at 0, so existing potts vtracks keep their spec unchanged.
+        max_edits = dots.get("max_edits")
+        if max_edits is not None:
+            if func_lc != "potts.max":
+                raise ValueError(f"max_edits is supported by potts.max only, not by '{func}'")
+            if (
+                isinstance(max_edits, (bool, _numpy.bool_))
+                or not isinstance(max_edits, (int, float, _numpy.number))
+                or max_edits not in (0, 1)
+            ):
+                raise ValueError(f"virtual track function '{func}': max_edits must be 0 or 1")
+            if max_edits == 1:
+                payload["max_edits"] = 1
         config.update(payload)
         # The model now lives in the spec's own fields; leaving it under
         # `params` as well would hand the C++ side a dict where it reads a
@@ -1909,7 +2043,21 @@ def gvtrack_create(
         config["params"] = None
         if "filter" in kwargs:
             config["filter"] = kwargs["filter"]
+    elif func_lc in ("kmer.count", "kmer.frac"):
+        config.update(_kmer_params(func, params, kwargs))
+        # The k-mer now lives in the spec's own fields.
+        config["params"] = None
+        if "filter" in kwargs:
+            config["filter"] = kwargs["filter"]
     else:
+        if params is not None and (func_lc in _PWM_FUNCS or func_lc in _FILTER_EDIT_DISTANCE_FUNCS):
+            # R's pwm handlers take the parameters as one list, like the
+            # keyword arguments.
+            _check_params_dots_collision(func, params, kwargs)
+            if not isinstance(params, dict) or "pssm" not in params:
+                raise ValueError(f"{func} requires a dict with at least 'pssm' matrix parameter")
+            kwargs = {**params, **kwargs}
+            config["params"] = None
         _check_vtrack_params(func, kwargs)
         config.update(kwargs)
 
@@ -1964,6 +2112,8 @@ def gvtrack_create(
             if spat_bin <= 0:
                 raise ValueError("spat_bin must be a positive integer")
             config["spat_bin"] = spat_bin
+
+        _convert_spat_range(config)
 
     # Validate direction parameter for edit distance functions
     if func_lc in _FILTER_EDIT_DISTANCE_FUNCS:

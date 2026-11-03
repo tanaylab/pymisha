@@ -36,12 +36,12 @@ class TestGintervalsUpdate:
         pymisha.gintervals_update(_test_iset, new_intervals, chrom="1")
         result = pymisha.gintervals_load(_test_iset)
         # chrom 1 should now have only one interval [100, 200)
-        chrom1 = result[result["chrom"] == "1"]
+        chrom1 = result[result["chrom"] == "chr1"]
         assert len(chrom1) == 1
         assert chrom1.iloc[0]["start"] == 100.0
         assert chrom1.iloc[0]["end"] == 200.0
         # chrom 2 should be unchanged
-        chrom2 = result[result["chrom"] == "2"]
+        chrom2 = result[result["chrom"] == "chr2"]
         assert len(chrom2) == 1
 
     def test_delete_chrom_intervals(self, _test_iset):
@@ -49,7 +49,7 @@ class TestGintervalsUpdate:
         pymisha.gintervals_update(_test_iset, None, chrom="1")
         result = pymisha.gintervals_load(_test_iset)
         # Only chrom 2 should remain
-        assert all(result["chrom"] == "2")
+        assert all(result["chrom"] == "chr2")
 
     def test_no_chrom_raises(self, _test_iset):
         """Must specify chrom parameter."""
@@ -68,7 +68,7 @@ class TestGintervalsUpdate:
         new_intervals = pymisha.gintervals("X", 0, 1000)
         pymisha.gintervals_update(_test_iset, new_intervals, chrom="X")
         result = pymisha.gintervals_load(_test_iset)
-        chromx = result[result["chrom"] == "X"]
+        chromx = result[result["chrom"] == "chrX"]
         assert len(chromx) == 1
 
     def test_preserves_extra_columns(self, _test_iset):
@@ -77,7 +77,7 @@ class TestGintervalsUpdate:
         new_intervals["score"] = 42.0
         pymisha.gintervals_update(_test_iset, new_intervals, chrom="1")
         result = pymisha.gintervals_load(_test_iset)
-        chrom1 = result[result["chrom"] == "1"]
+        chrom1 = result[result["chrom"] == "chr1"]
         # The new intervals should have the score column (though other chroms may have NaN)
         assert "score" in result.columns
         assert chrom1.iloc[0]["score"] == 42.0
@@ -87,7 +87,7 @@ class TestGintervalsUpdate:
         new_intervals = pymisha.gintervals("chr1", 100, 200)
         pymisha.gintervals_update(_test_iset, new_intervals, chrom="chr1")
         result = pymisha.gintervals_load(_test_iset)
-        chrom1 = result[result["chrom"] == "1"]
+        chrom1 = result[result["chrom"] == "chr1"]
         assert len(chrom1) == 1
 
 
@@ -167,10 +167,10 @@ class TestGintervalsUpdate2d:
         )
         loaded = pymisha.gintervals_load(_iset_name)
         assert len(loaded) == 2
-        pair = loaded[(loaded["chrom1"] == "1") & (loaded["chrom2"] == "2")]
+        pair = loaded[(loaded["chrom1"] == "chr1") & (loaded["chrom2"] == "chr2")]
         assert len(pair) == 1
         assert int(pair.iloc[0]["start1"]) == 5000
-        untouched = loaded[(loaded["chrom1"] == "1") & (loaded["chrom2"] == "1")]
+        untouched = loaded[(loaded["chrom1"] == "chr1") & (loaded["chrom2"] == "chr1")]
         assert len(untouched) == 1
         assert int(untouched.iloc[0]["end1"]) == 1000
 
@@ -209,7 +209,7 @@ class TestGintervalsUpdate2d:
         assert pymisha.gintervals_exists(_iset_name), "the failed update deleted the set"
         loaded = pymisha.gintervals_load(_iset_name)
         assert len(loaded) == 2
-        assert int(loaded[loaded["chrom1"] == "2"].iloc[0]["end1"]) == 1_000_000_000
+        assert int(loaded[loaded["chrom1"] == "chr2"].iloc[0]["end1"]) == 1_000_000_000
 
     def test_successful_update_leaves_no_stray_temporary_set(self, _iset_name):
         """The temporary set the swap writes must not outlive the update."""

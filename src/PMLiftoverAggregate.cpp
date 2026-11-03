@@ -1,9 +1,8 @@
-// pm_liftover_aggregate: C++ port of liftover._aggregate_overlapping.
-// Segments overlapping intervals per chrom via sweep-line, applies the
-// named aggregator at each segment, merges adjacent equal-value segments.
-//
-// Also exposes aggregate_overlapping_cpp and aggregate_per_bin_cpp helpers
-// for use by the pm_liftover_track orchestrator (Task 6).
+// The aggregation of gtrack_liftover, as R's GTrackLiftover.cpp: a sparse
+// target merges every run of overlapping lifted intervals into one interval
+// (aggregate_overlapping_cpp), a dense target aggregates what lands in each bin
+// (aggregate_per_bin_cpp), both through R's aggregate_values
+// (aggregate_value_for_bin). pm_liftover_aggregate exposes the sparse one.
 
 #include "PMLiftoverAggregate.h"
 #include "pymisha.h"
@@ -13,8 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -35,6 +34,10 @@ AggType parse_agg_type_str(const std::string &s)
     if (s == "first")  return AggType::FIRST;
     if (s == "last")   return AggType::LAST;
     if (s == "nth")    return AggType::NTH;
+    if (s == "max.coverage_len")  return AggType::MAX_COV_LEN;
+    if (s == "min.coverage_len")  return AggType::MIN_COV_LEN;
+    if (s == "max.coverage_frac") return AggType::MAX_COV_FRAC;
+    if (s == "min.coverage_frac") return AggType::MIN_COV_FRAC;
     throw std::invalid_argument("Unknown agg_type: " + s);
 }
 
@@ -59,31 +62,19 @@ PyObject *get_array(PyObject *df_dict, const char *key, int dtype)
     return arr;
 }
 
+} // namespace
+
 // ---------------------------------------------------------------------------
-// Per-bin aggregation internals
+// Per-bin aggregation
 // ---------------------------------------------------------------------------
 
-struct BinContribution {
-    double value;
-    double overlap_len;
-    int64_t start;
-    int64_t end;
-    bool is_na;
-    int64_t chain_id;
-};
-
-// Mirrors AggregationHelpers.h::aggregate_values for the 9 supported agg types.
-// Contributions sharing the same chain_id are merged before the reduce step.
+// Mirrors AggregationHelpers.h::aggregate_values. Contributions sharing the same
+// chain_id are merged before the reduce step.
 double aggregate_value_for_bin(
     const std::vector<BinContribution> &state,
     AggType agg, bool na_rm,
     int64_t min_n_or_negative, int64_t nth_index)
 {
-    if (state.empty()) {
-        if (agg == AggType::COUNT) return 0.0;
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-
     // Under na_rm = false, any NaN contribution makes the whole locus NaN
     // (checked on the raw contributions, before the per-chain merge). R 5.11.5.
     if (!na_rm) {
@@ -104,6 +95,7 @@ double aggregate_value_for_bin(
         for (auto &m : merged) {
             if (m.chain_id == c.chain_id) {
                 m.overlap_len += c.overlap_len;
+                m.coverage_frac += c.coverage_frac;
                 m.start = std::min(m.start, c.start);
                 m.end   = std::max(m.end,   c.end);
                 found = true;
@@ -121,7 +113,8 @@ double aggregate_value_for_bin(
     if (min_n_or_negative >= 0 && (int64_t)valid.size() < min_n_or_negative)
         return std::numeric_limits<double>::quiet_NaN();
 
-    // Step 3: COUNT is special - defined even when no valid contribs.
+    // Step 3: COUNT is special - defined even when no valid contribs (but after
+    // min_n, as in R: a bin with no value and min_n >= 1 is NaN, not 0).
     if (agg == AggType::COUNT)
         return (double)valid.size();
     if (valid.empty())
@@ -191,6 +184,41 @@ double aggregate_value_for_bin(
                 return std::numeric_limits<double>::quiet_NaN();
             return sorted_v[idx]->value;
         }
+        case AggType::MAX_COV_LEN:
+        case AggType::MIN_COV_LEN:
+        case AggType::MAX_COV_FRAC:
+        case AggType::MIN_COV_FRAC: {
+            // The contribution covering the most (least) of the locus, by length or
+            // by fraction; a tie goes to the higher value.
+            const BinContribution *best = valid.front();
+            for (size_t i = 1; i < valid.size(); ++i) {
+                const BinContribution *curr = valid[i];
+                bool better = false;
+                switch (agg) {
+                    case AggType::MAX_COV_LEN:
+                        better = curr->overlap_len > best->overlap_len ||
+                                 (curr->overlap_len == best->overlap_len && curr->value > best->value);
+                        break;
+                    case AggType::MIN_COV_LEN:
+                        better = curr->overlap_len < best->overlap_len ||
+                                 (curr->overlap_len == best->overlap_len && curr->value > best->value);
+                        break;
+                    case AggType::MAX_COV_FRAC:
+                        better = curr->coverage_frac > best->coverage_frac ||
+                                 (curr->coverage_frac == best->coverage_frac && curr->value > best->value);
+                        break;
+                    case AggType::MIN_COV_FRAC:
+                        better = curr->coverage_frac < best->coverage_frac ||
+                                 (curr->coverage_frac == best->coverage_frac && curr->value > best->value);
+                        break;
+                    default:
+                        break;
+                }
+                if (better)
+                    best = curr;
+            }
+            return best->value;
+        }
         case AggType::COUNT:
             // handled above
             break;
@@ -198,17 +226,33 @@ double aggregate_value_for_bin(
     return std::numeric_limits<double>::quiet_NaN();  // unreachable
 }
 
-} // namespace
-
 // ---------------------------------------------------------------------------
 // Public: aggregate_overlapping_cpp
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// R's GIntervalVal::operator<: start, end, key, value. Rows equal in the first
+// three are pieces of one source interval through one chain, so of one value.
+struct LiftedOrder {
+    const std::vector<std::int64_t> &start, &end, &key;
+    const std::vector<double> &value;
+    bool operator()(size_t a, size_t b) const {
+        if (start[a] != start[b]) return start[a] < start[b];
+        if (end[a] != end[b]) return end[a] < end[b];
+        if (key[a] != key[b]) return key[a] < key[b];
+        return value[a] < value[b];
+    }
+};
+
+}  // namespace
 
 void aggregate_overlapping_cpp(
     const std::vector<std::string> &in_chrom,
     const std::vector<std::int64_t> &in_start,
     const std::vector<std::int64_t> &in_end,
     const std::vector<double> &in_value,
+    const std::vector<std::int64_t> &in_key,
     AggType agg,
     bool na_rm,
     std::int64_t min_n_or_negative,
@@ -219,199 +263,47 @@ void aggregate_overlapping_cpp(
     std::vector<double> &out_value)
 {
     const size_t n = in_chrom.size();
-    if (in_start.size() != n || in_end.size() != n || in_value.size() != n)
+    if (in_start.size() != n || in_end.size() != n || in_value.size() != n || in_key.size() != n)
         throw std::invalid_argument("aggregate_overlapping_cpp: input vectors have mismatched lengths");
 
-    // Group rows by chrom, preserving first-seen order.
-    std::vector<std::string> chrom_order;
-    std::unordered_map<std::string, std::vector<size_t>> chrom_rows;
-    chrom_order.reserve(16);
+    std::map<std::string, std::vector<size_t>> by_chrom;
     for (size_t i = 0; i < n; ++i) {
-        const std::string &key = in_chrom[i];
-        auto it = chrom_rows.find(key);
-        if (it == chrom_rows.end()) {
-            chrom_order.push_back(key);
-            chrom_rows.emplace(key, std::vector<size_t>{i});
-        } else {
-            it->second.push_back(i);
-        }
+        if (in_start[i] < in_end[i])  // an empty interval overlaps nothing
+            by_chrom[in_chrom[i]].push_back(i);
     }
 
-    // Sort chrom_order alphabetically to mirror Python's groupby(sort=False)
-    // after sort_values(["chrom", "start", "end"]).
-    std::sort(chrom_order.begin(), chrom_order.end());
+    const LiftedOrder order{in_start, in_end, in_key, in_value};
+    std::vector<BinContribution> state;
+    for (auto &kv : by_chrom) {
+        std::vector<size_t> &rows = kv.second;
+        std::sort(rows.begin(), rows.end(), order);
 
-    for (const std::string &chrom : chrom_order) {
-        std::vector<size_t> &row_ids = chrom_rows[chrom];
-
-        // Sort by (start, end, original-row-order).
-        std::sort(row_ids.begin(), row_ids.end(),
-                  [&](size_t a, size_t b) {
-                      if (in_start[a] != in_start[b]) return in_start[a] < in_start[b];
-                      if (in_end[a] != in_end[b]) return in_end[a] < in_end[b];
-                      return a < b;
-                  });
-
-        const size_t m = row_ids.size();
-        if (m == 0) continue;
-
-        // Local copies indexed [0..m) in sorted order.
-        std::vector<int64_t> S(m), E(m);
-        std::vector<double> V(m);
-        for (size_t i = 0; i < m; ++i) {
-            S[i] = in_start[row_ids[i]];
-            E[i] = in_end[row_ids[i]];
-            V[i] = in_value[row_ids[i]];
-        }
-
-        // Collect breakpoints: sorted unique union of starts and ends.
-        std::vector<int64_t> points;
-        points.reserve(2 * m);
-        for (size_t i = 0; i < m; ++i) {
-            points.push_back(S[i]);
-            points.push_back(E[i]);
-        }
-        std::sort(points.begin(), points.end());
-        points.erase(std::unique(points.begin(), points.end()), points.end());
-        if (points.size() < 2) continue;
-
-        // Bucket rows by start and end coords.
-        std::unordered_map<int64_t, std::vector<size_t>> starts_at, ends_at;
-        for (size_t i = 0; i < m; ++i) {
-            starts_at[S[i]].push_back(i);
-            ends_at[E[i]].push_back(i);
-        }
-
-        // Active set kept ordered by row index (so iteration is row-order stable).
-        std::set<size_t> active;
-
-        // Used for adjacent-segment merge within this chrom run.
-        const size_t out_chrom_anchor = out_chrom.size();
-
-        for (size_t pi = 0; pi + 1 < points.size(); ++pi) {
-            int64_t coord = points[pi];
-            int64_t next_coord = points[pi + 1];
-
-            auto it_end = ends_at.find(coord);
-            if (it_end != ends_at.end()) {
-                for (size_t idx : it_end->second) active.erase(idx);
+        // GTrackLiftover.cpp, SPARSE: a run of intervals each starting before the
+        // run's end so far becomes one interval. An interval counts its whole
+        // length (coverage fraction 1), and the pieces sharing a key count once.
+        size_t i = 0;
+        while (i < rows.size()) {
+            const int64_t run_start = in_start[rows[i]];
+            int64_t run_end = in_end[rows[i]];
+            state.clear();
+            while (i < rows.size() && in_start[rows[i]] < run_end) {
+                const size_t r = rows[i];
+                run_end = std::max(run_end, in_end[r]);
+                BinContribution c;
+                c.value = in_value[r];
+                c.overlap_len = (double)(in_end[r] - in_start[r]);
+                c.coverage_frac = 1.0;
+                c.start = in_start[r];
+                c.end = in_end[r];
+                c.is_na = std::isnan(in_value[r]);
+                c.chain_id = in_key[r];
+                state.push_back(c);
+                ++i;
             }
-            auto it_start = starts_at.find(coord);
-            if (it_start != starts_at.end()) {
-                for (size_t idx : it_start->second) active.insert(idx);
-            }
-
-            if (next_coord <= coord || active.empty()) continue;
-
-            // Gather active values in row order.
-            std::vector<double> vals;
-            vals.reserve(active.size());
-            for (size_t idx : active) vals.push_back(V[idx]);
-
-            // NaN handling.
-            bool any_nan = false;
-            std::vector<double> vals_clean;
-            vals_clean.reserve(vals.size());
-            for (double x : vals) {
-                if (std::isnan(x)) any_nan = true;
-                else vals_clean.push_back(x);
-            }
-
-            if (!na_rm && any_nan) continue;
-            if (min_n_or_negative >= 0 && (int64_t)vals_clean.size() < min_n_or_negative) continue;
-            if (vals_clean.empty()) continue;
-
-            double seg_val;
-            switch (agg) {
-                case AggType::MEAN: {
-                    double s = 0.0;
-                    for (double x : vals_clean) s += x;
-                    seg_val = s / (double)vals_clean.size();
-                    break;
-                }
-                case AggType::MEDIAN: {
-                    std::vector<double> cp = vals_clean;
-                    std::sort(cp.begin(), cp.end());
-                    size_t k = cp.size();
-                    if (k % 2 == 1) seg_val = cp[k / 2];
-                    else seg_val = 0.5 * (cp[k / 2 - 1] + cp[k / 2]);
-                    break;
-                }
-                case AggType::SUM: {
-                    double s = 0.0;
-                    for (double x : vals_clean) s += x;
-                    seg_val = s;
-                    break;
-                }
-                case AggType::MIN: {
-                    double mn = vals_clean[0];
-                    for (size_t i = 1; i < vals_clean.size(); ++i)
-                        if (vals_clean[i] < mn) mn = vals_clean[i];
-                    seg_val = mn;
-                    break;
-                }
-                case AggType::MAX: {
-                    double mx = vals_clean[0];
-                    for (size_t i = 1; i < vals_clean.size(); ++i)
-                        if (vals_clean[i] > mx) mx = vals_clean[i];
-                    seg_val = mx;
-                    break;
-                }
-                case AggType::COUNT: {
-                    seg_val = (double)vals_clean.size();
-                    break;
-                }
-                case AggType::FIRST: {
-                    bool found = false;
-                    seg_val = 0.0;
-                    for (double x : vals) {
-                        if (!std::isnan(x)) { seg_val = x; found = true; break; }
-                    }
-                    if (!found) continue;
-                    break;
-                }
-                case AggType::LAST: {
-                    bool found = false;
-                    seg_val = 0.0;
-                    for (auto it = vals.rbegin(); it != vals.rend(); ++it) {
-                        if (!std::isnan(*it)) { seg_val = *it; found = true; break; }
-                    }
-                    if (!found) continue;
-                    break;
-                }
-                case AggType::NTH: {
-                    if (nth_index < 1) continue;
-                    int64_t k = 0;
-                    bool found = false;
-                    seg_val = 0.0;
-                    for (double x : vals) {
-                        if (!std::isnan(x)) {
-                            ++k;
-                            if (k == nth_index) { seg_val = x; found = true; break; }
-                        }
-                    }
-                    if (!found) continue;
-                    break;
-                }
-                default:
-                    continue;
-            }
-
-            // Adjacent-segment merge: only within this chrom's run, and only if
-            // the previous segment ends exactly at the current coord and shares
-            // the same value (relative tolerance 1e-12 to mirror np.isclose).
-            if (out_chrom.size() > out_chrom_anchor &&
-                out_end.back() == coord &&
-                std::fabs(out_value.back() - seg_val) <=
-                    1e-12 * std::max(1.0, std::fabs(seg_val)))
-            {
-                out_end.back() = next_coord;
-            } else {
-                out_chrom.push_back(chrom);
-                out_start.push_back(coord);
-                out_end.push_back(next_coord);
-                out_value.push_back(seg_val);
-            }
+            out_chrom.push_back(kv.first);
+            out_start.push_back(run_start);
+            out_end.push_back(run_end);
+            out_value.push_back(aggregate_value_for_bin(state, agg, na_rm, min_n_or_negative, nth_index));
         }
     }
 }
@@ -460,11 +352,9 @@ void aggregate_per_bin_cpp(
         std::vector<size_t> idxs;
         if (it != by_chrom.end()) {
             idxs = it->second;
-            std::sort(idxs.begin(), idxs.end(),
-                [&](size_t a, size_t b) {
-                    if (in_start[a] != in_start[b]) return in_start[a] < in_start[b];
-                    return in_end[a] < in_end[b];
-                });
+            // R's order (GIntervalVal::operator<), which is the order the bin's
+            // contributions are summed in
+            std::sort(idxs.begin(), idxs.end(), LiftedOrder{in_start, in_end, in_chain_id, in_value});
         }
 
         const int64_t end_bin = (chrom_size + bin_size - 1) / bin_size;  // ceil
@@ -495,6 +385,8 @@ void aggregate_per_bin_cpp(
                     BinContribution c;
                     c.value      = in_value[i];
                     c.overlap_len = (double)(ovl_e - ovl_s);
+                    // the bin is clamped to the chromosome end, as R's locus_len
+                    c.coverage_frac = c.overlap_len / (double)(be - bs);
                     c.start      = ovl_s;
                     c.end        = ovl_e;
                     c.is_na      = std::isnan(in_value[i]);
@@ -503,8 +395,10 @@ void aggregate_per_bin_cpp(
                 }
             }
 
-            const double v = aggregate_value_for_bin(
-                state, agg, na_rm, min_n_or_negative, nth_index);
+            // A chrom no interval lands on is all NaN, as R writes it, even for
+            // "count", which gives 0 for an empty bin of a chrom that has some.
+            const double v = idxs.empty() ? std::numeric_limits<double>::quiet_NaN()
+                : aggregate_value_for_bin(state, agg, na_rm, min_n_or_negative, nth_index);
 
             out_chrom.push_back(chrom);
             out_start.push_back(bs);
@@ -522,15 +416,18 @@ void aggregate_per_bin_cpp(
  * pm_liftover_aggregate(df_dict, agg_type, na_rm, min_n, nth_index) -> dict
  *
  * df_dict:    dict with numpy arrays "chrom" (object/str), "start" (int64),
- *             "end" (int64), "value" (float64). All same length N.
- * agg_type:   str. One of mean, median, sum, min, max, count, first, last, nth.
- * na_rm:      bool. If False, any NaN in a segment's active set => NaN result.
+ *             "end" (int64), "value" (float64), and optionally "key" (int64):
+ *             rows sharing a key count once (default: every row its own key).
+ *             All same length N.
+ * agg_type:   str. One of mean, median, sum, min, max, count, first, last, nth,
+ *             max.coverage_len, min.coverage_len, max.coverage_frac, min.coverage_frac.
+ * na_rm:      bool. If False, any NaN in a run => NaN result.
  * min_n:      int. Minimum non-NaN count required; <0 means no minimum.
  * nth_index:  int. 1-based index for "nth" aggregation; ignored otherwise.
  *
  * Returns: dict with "chrom" (object/str), "start" (int64), "end" (int64),
- *          "value" (float64). NaN-valued segments are dropped, adjacent
- *          segments with equal values are merged.
+ *          "value" (float64): one row per run of overlapping intervals, as
+ *          aggregate_overlapping_cpp (NaN values included).
  *
  * Raises ValueError on malformed input.
  */
@@ -569,11 +466,17 @@ PyObject *pm_liftover_aggregate(PyObject *self, PyObject *args)
     if (!arr_end) return_err();
     PMPY arr_value(get_array(df_dict, "value", NPY_DOUBLE), true);
     if (!arr_value) return_err();
+    PMPY arr_key;
+    if (PyDict_GetItemString(df_dict, "key")) {
+        arr_key.assign(get_array(df_dict, "key", NPY_INT64), true);
+        if (!arr_key) return_err();
+    }
 
     const npy_intp n_rows = PyArray_DIM((PyArrayObject *)*arr_chrom, 0);
     if (PyArray_DIM((PyArrayObject *)*arr_start, 0) != n_rows ||
         PyArray_DIM((PyArrayObject *)*arr_end, 0) != n_rows ||
-        PyArray_DIM((PyArrayObject *)*arr_value, 0) != n_rows) {
+        PyArray_DIM((PyArrayObject *)*arr_value, 0) != n_rows ||
+        (arr_key && PyArray_DIM((PyArrayObject *)*arr_key, 0) != n_rows)) {
         PyErr_SetString(PyExc_ValueError,
                         "df_dict columns have mismatched lengths");
         return_err();
@@ -583,10 +486,11 @@ PyObject *pm_liftover_aggregate(PyObject *self, PyObject *args)
     const int64_t *start_in = (const int64_t *)PyArray_DATA((PyArrayObject *)*arr_start);
     const int64_t *end_in = (const int64_t *)PyArray_DATA((PyArrayObject *)*arr_end);
     const double *value_in = (const double *)PyArray_DATA((PyArrayObject *)*arr_value);
+    const int64_t *key_in = arr_key ? (const int64_t *)PyArray_DATA((PyArrayObject *)*arr_key) : nullptr;
 
     // Extract numpy arrays into std::vectors.
     std::vector<std::string> v_chrom(n_rows);
-    std::vector<int64_t> v_start(n_rows), v_end(n_rows);
+    std::vector<int64_t> v_start(n_rows), v_end(n_rows), v_key(n_rows);
     std::vector<double> v_value(n_rows);
 
     for (npy_intp i = 0; i < n_rows; ++i) {
@@ -604,6 +508,7 @@ PyObject *pm_liftover_aggregate(PyObject *self, PyObject *args)
         v_start[i] = start_in[i];
         v_end[i]   = end_in[i];
         v_value[i] = value_in[i];
+        v_key[i]   = key_in ? key_in[i] : (int64_t)i;
     }
 
     // Call the helper.
@@ -613,7 +518,7 @@ PyObject *pm_liftover_aggregate(PyObject *self, PyObject *args)
 
     try {
         aggregate_overlapping_cpp(
-            v_chrom, v_start, v_end, v_value,
+            v_chrom, v_start, v_end, v_value, v_key,
             agg, (bool)na_rm_int, (int64_t)min_n_ll, (int64_t)nth_index_ll,
             out_chrom, out_start, out_end, out_value);
     } catch (const std::invalid_argument &e) {

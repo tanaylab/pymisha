@@ -81,7 +81,15 @@ def test_gtrack_modify_still_modifies(indexed_test_db):
     assert (after["mod_ok"] == before["mod_ok"] * 2).all()
     # No staging directory left behind.
     track_dir = pm._shared._os.path.dirname(pm._pymisha.pm_track_path("mod_ok"))
-    leftovers = [n for n in os.listdir(track_dir) if ".tmp." in n and n.startswith(".")]
+    # Trashing is async: _gdb_trash renames the staging dir to .trash.<name>
+    # and spawns rm -rf, so a .trash.* entry that still embeds the former
+    # ".tmp." basename can be observed for a moment. That is the cleanup
+    # working, not a leak. misha's test-track-atomic-create.R excludes them
+    # the same way; this test did not, and flaked under xdist.
+    leftovers = [
+        n for n in os.listdir(track_dir)
+        if ".tmp." in n and n.startswith(".") and not n.startswith(".trash.")
+    ]
     assert leftovers == [], leftovers
 
 

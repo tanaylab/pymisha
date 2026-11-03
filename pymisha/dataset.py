@@ -7,6 +7,7 @@ import getpass as _getpass
 import hashlib
 import os
 import shutil
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,17 @@ def _sync_dataset_scan_cache() -> None:
         _DATASET_SCAN_CACHE.pop(path, None)
 
 
+def _set_datasets() -> None:
+    """Hand the loaded datasets to the C++ side, which rescans the track list (the names a
+    working directory that is a subdirectory lists may change too), and drop the Python views
+    of the old list."""
+    from .tracks import _clear_computed_track_cache
+
+    _pymisha.pm_dbsetdatasets(_shared._GDATASETS)
+    _shared._clear_track_names_cache()
+    _clear_computed_track_cache()
+
+
 def _yaml_scalar(value: Any) -> str:
     if value is None:
         return "null"
@@ -196,6 +208,76 @@ def _copy_or_link(src: Path, dst: Path, symlinks: bool) -> None:
         shutil.copy2(src, dst)
 
 
+def _strip_chr(name: str) -> str:
+    return name[3:] if name.startswith("chr") else name
+
+
+def _session_chroms() -> list[str]:
+    """The working database's chromosome names by chrom id."""
+    return [str(c) for c in _pymisha.pm_intervals_all()[1]]
+
+
+def _dataset_chrom_order(
+    path_norm: str, groot: str, cs_path: Path, dataset_hash: str
+) -> tuple[list[str] | None, bool, str | None]:
+    """The chromosome order of a dataset with the working database's chrom_sizes.txt,
+    when it differs from the session's (R's gdataset.load): (names by chrom id or None,
+    whether its seq/genome.idx does not match its chrom_sizes.txt, the error of an
+    indexed seq/ of its own whose index cannot be read or None).
+
+    The same chrom_sizes.txt can number the chromosomes differently: by the sorted
+    names in a per-chromosome database whose names lack "chr" and whose .seq files have
+    it, in file order otherwise. The dataset's order, from its chrom_sizes.txt and its
+    seq/ as gdb_init would read them, is compared with the session's. They are equal by
+    construction when the dataset's seq/ is the working database's, or when both are
+    indexed and the dataset's seq/ is a directory of its own, or a link into a database
+    whose chrom_sizes.txt is the dataset's. A dataset whose order cannot be read (no
+    sequence, the unreadable index of a linked seq/) is taken to be in the session's
+    order; one with an indexed seq/ of its own whose index cannot be read, in
+    chrom_sizes.txt order, as an indexed database numbers its chromosomes; one whose
+    index does not match its chrom_sizes.txt (a seq/ linked to a database converted
+    since), in chrom_sizes.txt order too.
+    """
+    dataset_seq = os.path.join(path_norm, "seq")
+    groot_seq = os.path.join(groot, "seq")
+    genome_files = ("genome.idx", "genome.seq")
+    seq_owner_cs = Path(os.path.dirname(os.path.realpath(dataset_seq))) / "chrom_sizes.txt"
+    both_indexed = (
+        all(os.path.exists(os.path.join(dataset_seq, f)) for f in genome_files)
+        and all(os.path.exists(os.path.join(groot_seq, f)) for f in genome_files)
+        and (
+            not os.path.islink(dataset_seq)
+            or (seq_owner_cs.exists() and seq_owner_cs.stat().st_size == cs_path.stat().st_size
+                and _chrom_sizes_hash(str(seq_owner_cs.parent)) == dataset_hash)
+        )
+    )
+    if os.path.realpath(dataset_seq) == os.path.realpath(groot_seq) or both_indexed:
+        return None, False, None
+
+    error: str | None = None
+    dataset_chroms: list[str] | None = None
+    try:
+        # without the warning gdb_init gives for index names other than chrom_sizes.txt's
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dataset_chroms = _shared._gdb_chrom_names_at(path_norm, from_disk=True)
+    except Exception as exc:
+        error = str(exc)
+    index_mismatch = error is not None and "genome.idx does not match chrom_sizes.txt" in error
+    index_unreadable = None
+    if (error is not None and not index_mismatch and not os.path.islink(dataset_seq)
+            and all(os.path.exists(os.path.join(dataset_seq, f)) for f in genome_files)):
+        index_unreadable = error
+    if index_mismatch or index_unreadable is not None:
+        dataset_chroms = _shared._chrom_sizes_names_at(path_norm)
+    if not index_mismatch and (
+        dataset_chroms is None
+        or [_strip_chr(c) for c in dataset_chroms] == [_strip_chr(c) for c in _session_chroms()]
+    ):
+        dataset_chroms = None
+    return dataset_chroms, index_mismatch, index_unreadable
+
+
 def gdataset_ls() -> list[str]:
     """
     List currently loaded datasets.
@@ -258,7 +340,11 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     ------
     ValueError
         If the dataset path does not exist, lacks a ``tracks/`` directory,
-        has a mismatched genome, or has collisions without ``force=True``.
+        has a mismatched genome, or has collisions without ``force=True``;
+        or if it numbers its chromosomes differently from the working
+        database (the same chrom_sizes.txt can, by its seq/) and holds
+        indexed tracks or interval sets, which would read other
+        chromosomes. Without those it loads, and keeps its own order.
 
     See Also
     --------
@@ -296,11 +382,49 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     if not cs_path.exists():
         raise ValueError(f"Path '{path}' does not contain a chrom_sizes.txt file")
 
-    if _chrom_sizes_hash(path_norm) != _chrom_sizes_hash(groot):
+    dataset_hash = _chrom_sizes_hash(path_norm)
+    if dataset_hash != _chrom_sizes_hash(groot):
         raise ValueError(f"Cannot load dataset '{path}': genome does not match working database")
+
+    dataset_chroms, index_mismatch, index_unreadable = _dataset_chrom_order(
+        path_norm, groot, cs_path, dataset_hash
+    )
 
     dataset_tracks = _scan_tracks(path_norm)
     dataset_intervals = _scan_intervals(path_norm)
+
+    # In another order: files keyed by chrom id, which would read other chromosomes
+    if dataset_chroms is not None:
+        keyed = [tracks_dir / f"{t.replace('.', '/')}.track" / "track.idx" for t in dataset_tracks]
+        for name in dataset_intervals:
+            keyed += [tracks_dir / f"{name.replace('.', '/')}.interv" / f for f in ("intervals.idx", "intervals2d.idx")]
+        if any(p.exists() for p in keyed):
+            if index_mismatch:
+                raise ValueError(
+                    f"Cannot load dataset '{path}': its seq/genome.idx does not match its chrom_sizes.txt, "
+                    "so the chrom ids of its indexed tracks and interval sets cannot be checked"
+                )
+            groot_chroms = _session_chroms()
+            i = next(
+                k for k in range(max(len(dataset_chroms), len(groot_chroms)))
+                if k >= len(dataset_chroms) or k >= len(groot_chroms)
+                or _strip_chr(dataset_chroms[k]) != _strip_chr(groot_chroms[k])
+            )
+            ds_name = dataset_chroms[i] if i < len(dataset_chroms) else "NA"
+            groot_name = groot_chroms[i] if i < len(groot_chroms) else "NA"
+            if index_unreadable is not None:
+                raise ValueError(
+                    f"Cannot load dataset '{path}': its seq/genome.idx could not be read ({index_unreadable}), "
+                    "so the chrom ids of its indexed tracks and interval sets cannot be checked; an indexed "
+                    "database numbers its chromosomes in chrom_sizes.txt order, which differs from the working "
+                    f"database's (chrom id {i} is {ds_name} in the dataset and {groot_name} in the working database)"
+                )
+            raise ValueError(
+                f"Cannot load dataset '{path}': it numbers the chromosomes differently from the working "
+                f"database, though its chrom_sizes.txt is the same (chrom id {i} is {ds_name} in the dataset "
+                f"and {groot_name} in the working database), so its indexed tracks and interval sets would "
+                "read other chromosomes"
+            )
 
     # Use C++ track cache for existing tracks (avoids redundant Python
     # filesystem scans of the working db, user root, and loaded datasets).
@@ -330,7 +454,9 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
 
     # Update datasets list (load order)
     _shared._GDATASETS.append(path_norm)
-    _pymisha.pm_dbsetdatasets(_shared._GDATASETS)
+    if dataset_chroms is not None:
+        _shared._GDATASET_CHROMS[path_norm] = dataset_chroms
+    _set_datasets()
     _DATASET_SCAN_CACHE[path_norm] = (dataset_tracks, dataset_intervals)
 
     # Visible/shadowed counts (working db always wins)
@@ -398,7 +524,8 @@ def gdataset_unload(path: str, validate: bool = False):
         return
 
     _shared._GDATASETS = [p for p in _shared._GDATASETS if p != path_norm]
-    _pymisha.pm_dbsetdatasets(_shared._GDATASETS)
+    _shared._GDATASET_CHROMS.pop(path_norm, None)
+    _set_datasets()
     _DATASET_SCAN_CACHE.pop(path_norm, None)
     return
 
@@ -470,31 +597,27 @@ def gdataset_save(
     if out_path.exists():
         raise ValueError(f"Path '{path}' already exists")
 
-    from .intervals import gintervals_dataset
-    from .tracks import gtrack_dataset
+    from .intervals import _interv_file
 
     track_pairs: list[tuple[Path, Path]] = []
     interval_pairs: list[tuple[Path, Path]] = []
 
     for track in track_names:
-        source_db = gtrack_dataset(track)
-        if not source_db:
+        # where the session finds it (under the working directory after gdir_cd)
+        track_path = _pymisha.pm_track_path(track)
+        if not track_path:
             raise ValueError(f"Track '{track}' does not exist")
-        src = _resource_path(source_db, track, ".track")
+        src = Path(track_path)
         if not src.exists():
             raise ValueError(f"Track '{track}' path does not exist: {src}")
         dst = _resource_path(str(out_path), track, ".track")
         track_pairs.append((src, dst))
 
     for interval in interval_names:
-        source_db = gintervals_dataset(interval)
-        if not source_db:
+        interv_file = _interv_file(interval)
+        if interv_file is None:
             raise ValueError(f"Interval set '{interval}' does not exist")
-        src = _resource_path(source_db, interval, ".interv")
-        if not src.exists():
-            src = _resource_path(source_db, interval, ".interv2d")
-        if not src.exists():
-            raise ValueError(f"Interval set '{interval}' path does not exist")
+        src = interv_file
         suffix = ".interv2d" if src.name.endswith(".interv2d") else ".interv"
         dst = _resource_path(str(out_path), interval, suffix)
         interval_pairs.append((src, dst))

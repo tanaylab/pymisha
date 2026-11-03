@@ -7,8 +7,9 @@
  * expansion2_pair). Windows are clipped to chrom boundaries and adjusted
  * via R's overlap-correction to prevent neighbor-window overlap.
  *
- * Per chrom-pair: intersect each generated cell against the user's
- * 2D scope rect list (linear scan), emit clipped intersections.
+ * Per chrom-pair: intersect each generated cell with a quad tree of the
+ * pair's scope intervals, as R does, and emit the pieces in the order that
+ * tree returns them.
  *
  * Optional band_idx filter: when both axes share the same intervals
  * (intervals2=None semantics), filter cells where |idx0 - idx1| is
@@ -25,6 +26,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -72,6 +74,7 @@ public:
         int32_t                            min_band_idx,
         int32_t                            max_band_idx,
         std::vector<GInterval2D>           scope,
+        const GenomeChromKey              &chromkey,
         const quadtree::DiagonalBand      *band);
 
     virtual ~PMTrackExpressionCartesianGridIterator() {}
@@ -82,8 +85,8 @@ public:
     virtual bool isend() const override { return m_isend; }
     virtual const GInterval2D &last_interval() const override { return m_last; }
     virtual uint64_t idx() const override { return m_emitted; }
-    // 1-based index of the axis-0 grid point producing the current cell.
-    virtual uint64_t original_interval_idx() const override { return m_gp0_idx + 1; }
+    // 1-based index, into the scope as given, of the scope rect of the current cell.
+    virtual uint64_t original_interval_idx() const override { return m_scope_orig[m_scope_pos] + 1; }
 
 private:
     using GPVec   = std::vector<GridPoint>;
@@ -97,11 +100,13 @@ private:
     bool              m_use_band_idx;
     int32_t           m_min_band_idx;
     int32_t           m_max_band_idx;
-    std::vector<GInterval2D>  m_scope;
+    std::vector<GInterval2D>  m_scope;        // sorted by chromosome pair, as R walks it
+    std::vector<size_t>       m_scope_orig;   // index of each m_scope interval in the scope as given
+    const GenomeChromKey     &m_chromkey;
     quadtree::DiagonalBand    m_band;
     bool                      m_use_band;
 
-    // Per chrom-pair: indices into m_scope for that pair.
+    // Per chrom-pair: the range [first, last) of m_scope that holds it.
     // Built in constructor; key = (chromid1, chromid2).
     using PairKey = std::pair<int32_t, int32_t>;
     struct PairHash {
@@ -109,26 +114,32 @@ private:
             return std::hash<int64_t>()((int64_t)k.first << 32 | (uint32_t)k.second);
         }
     };
-    std::unordered_map<PairKey, std::vector<size_t>, PairHash> m_scope_index;
+    std::unordered_map<PairKey, std::pair<size_t, size_t>, PairHash> m_scope_index;
+
+    // The scope intervals of the current pair as R's quad tree holds them, and the
+    // pieces of the current cell (intersect_scope_qtree) still to emit.
+    RectsQuadTree             m_scope_qtree;
+    size_t                    m_scope_first;  // m_scope index of the tree's object 0
+    Rectangles                m_cell_inter;
+    std::vector<uint64_t>     m_cell_idx;
+    size_t                    m_cell_pos;
+    size_t                    m_scope_pos;    // m_scope index of the current emission
 
     // Iterator state (reset in begin()).
     GPIt    m_igp[2];         // current grid point iterators
     GPIt    m_igp_start[2];   // anchor for start of current chromosome subset
     ExpIt   m_iexp[2];        // current expansion iterators (point past the end of the window being built)
-    size_t  m_scope_rect_idx; // index into the current pair's scope rect list
 
     GInterval2D  m_last;
     uint64_t     m_emitted;
     size_t       m_gp0_idx;   // axis-0 gpoint index (for original_interval_idx)
     bool         m_isend;
 
-    // Current active chrom-pair scope rects (pointer into m_scope_index).
-    const std::vector<size_t> *m_cur_scope_rects;
     int32_t m_cur_chromid[2];
 
     // Internal helpers.
     void _reset_state();
-    // Load scope rects for (c1, c2). Returns true if any scope rects exist.
+    // Build m_scope_qtree of the scope rects of (c1, c2). Returns true if any exist.
     bool _load_scope_pair(int32_t c1, int32_t c2);
 };
 

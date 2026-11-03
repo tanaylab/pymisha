@@ -10,21 +10,16 @@ from ._name_validation import validate_dotted_name
 from ._shared import _checkroot, _with_umask
 
 
-def _tracks_root() -> Path:
-    assert _shared._GROOT is not None
-    return (Path(_shared._GROOT) / "tracks").resolve()
-
-
 def _resolve_within_tracks(base: Path, relpath: Path | str) -> tuple[Path, Path]:
+    """The path relpath names from base, and the tracks/ of the loaded database (the working
+    one, the user root or a dataset) it is in; it must be in one."""
     target = (base / relpath).resolve()
-    tracks_root = _tracks_root()
-    try:
-        target.relative_to(tracks_root)
-    except ValueError as exc:
-        raise ValueError(
-            f"Path escapes tracks tree: {relpath}"
-        ) from exc
-    return target, tracks_root
+    roots = [r for r in [_shared._GROOT, _shared._UROOT, *_shared._GDATASETS] if r]
+    for root in roots:
+        tracks_root = (Path(root) / "tracks").resolve()
+        if target == tracks_root or tracks_root in target.parents:
+            return target, tracks_root
+    raise ValueError(f"Path escapes tracks tree: {relpath}")
 
 
 def gdir_cwd() -> str:
@@ -63,17 +58,24 @@ def gdir_cd(dir: str) -> None:
     """
     Change the current working directory in the genomic database.
 
-    Changes the directory used for resolving track and interval set names.
-    The list of database objects (tracks, intervals) is rescanned
-    recursively under the new directory. Object names are updated relative
-    to the new working directory. For example, a track named
-    ``subdir.dense`` becomes ``dense`` once the working directory is set
-    to ``subdir``. All virtual tracks are cleared.
+    Changes the directory track and interval set names are relative to. The
+    list of database objects (tracks, intervals) is rescanned recursively
+    under the new directory, and names are relative to it: a track named
+    ``subdir.dense`` is referred to as ``dense`` once the working directory
+    is set to ``subdir``, and new tracks and interval sets are created there.
+    When the working directory is the ``tracks/`` directory of the working
+    database or of a loaded dataset, the names of all of them are listed, as
+    after :func:`gdb_init`.
+
+    Virtual tracks belong to the working directory they were created in:
+    they are hidden while another directory is the working directory and
+    come back on return to it.
 
     Parameters
     ----------
     dir : str
-        Directory path (relative to current working directory, or "..").
+        Directory path, relative to the current working directory (``".."``
+        is its parent), or absolute.
 
     Returns
     -------
@@ -90,33 +92,32 @@ def gdir_cd(dir: str) -> None:
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
     >>> pm.gdir_cd("subdir")
+    >>> pm.gtrack_ls()
+    ['dense_track2']
     >>> pm.gdir_cd("..")
     """
     if dir is None:
         raise ValueError("dir argument is required")
     _checkroot()
     assert _shared._GWD is not None
+    from .db import _set_gwd
 
+    _check_not_inside_track(str(dir))
     old_gwd = _shared._GWD
-
-    base = Path(old_gwd).resolve()
-    target, tracks_root = _resolve_within_tracks(base, dir)
-
+    target = (Path(old_gwd) / Path(dir).expanduser()).resolve()
     if not target.is_dir():
-        raise FileNotFoundError(f"Directory does not exist: {target}")
+        raise FileNotFoundError(f"Directory does not exist: {dir}")
 
-    _shared._GWD = str(target)
-
-    # Clear all virtual tracks (R parity)
-    _shared._VTRACKS.clear()
-
-    # Reload the database to rescan under new working directory
+    # the virtual tracks of a directory are kept for the return to it
+    old_vtracks, old_gvtracks = _shared._VTRACKS, dict(_shared._GVTRACKS)
+    # (by resolved path: gdb_init keeps the path it was given, gdir_cd resolves its target)
+    _shared._GVTRACKS[str(Path(old_gwd).resolve())] = old_vtracks
+    _shared._VTRACKS = _shared._GVTRACKS.pop(str(target), {})
     try:
-        from .db import gdb_reload
-        gdb_reload()
-    except Exception:
-        # Rollback on failure
-        _shared._GWD = old_gwd
+        _set_gwd(str(target))
+    except BaseException:
+        _shared._VTRACKS, _shared._GVTRACKS = old_vtracks, old_gvtracks
+        _set_gwd(old_gwd)
         raise
 
 
@@ -236,6 +237,9 @@ def gdir_rm(dir: str, recursive: bool = False, force: bool = False) -> None:
 
     if target == tracks_root:
         raise ValueError("Cannot remove the tracks root directory")
+    gwd = Path(_shared._GWD).resolve()
+    if target == gwd or target in gwd.parents:
+        raise ValueError(f"Cannot remove {dir}: it holds the working directory")
 
     if not target.exists():
         if force:
@@ -312,12 +316,11 @@ def gtrack_create_dirs(track: str, mode: str = "0777") -> None:
     # All parts except the last are namespace directories
     namespace_parts = parts[:-1]
     base = Path(_shared._GWD).resolve()
-    tracks_root = _tracks_root()
 
     current = base
     for part in namespace_parts:
         current = current / part
-        _resolve_within_tracks(base, current.relative_to(base))
+        _, tracks_root = _resolve_within_tracks(base, current.relative_to(base))
         _check_not_inside_track(str(current.relative_to(tracks_root)))
         if not current.exists():
             current.mkdir()

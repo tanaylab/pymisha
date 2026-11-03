@@ -177,7 +177,7 @@ class TestTSS:
         result = pm.gintervals_import_genes(simple_genes_file)
         tss = result["tss"]
         # gene1 is on chrom 1, + strand, txStart=1000
-        gene1_tss = tss[tss["chrom"] == "1"]
+        gene1_tss = tss[tss["chrom"] == "chr1"]
         assert len(gene1_tss) == 1
         assert gene1_tss.iloc[0]["start"] == 1000.0
         assert gene1_tss.iloc[0]["end"] == 1001.0
@@ -188,7 +188,7 @@ class TestTSS:
         result = pm.gintervals_import_genes(simple_genes_file)
         tss = result["tss"]
         # gene2 is on chrom 2, - strand, txEnd=8000
-        gene2_tss = tss[tss["chrom"] == "2"]
+        gene2_tss = tss[tss["chrom"] == "chr2"]
         assert len(gene2_tss) == 1
         assert gene2_tss.iloc[0]["start"] == 7999.0
         assert gene2_tss.iloc[0]["end"] == 8000.0
@@ -205,7 +205,7 @@ class TestExons:
         result = pm.gintervals_import_genes(simple_genes_file)
         exons = result["exons"]
         # gene1 has 1 exon: [1100, 1900)
-        gene1_exons = exons[exons["chrom"] == "1"]
+        gene1_exons = exons[exons["chrom"] == "chr1"]
         assert len(gene1_exons) >= 1
         row = gene1_exons.iloc[0]
         assert row["start"] == 1100.0
@@ -215,7 +215,7 @@ class TestExons:
         result = pm.gintervals_import_genes(simple_genes_file)
         exons = result["exons"]
         # gene2 has 2 exons on chrom 2
-        gene2_exons = exons[exons["chrom"] == "2"]
+        gene2_exons = exons[exons["chrom"] == "chr2"]
         assert len(gene2_exons) == 2
 
 
@@ -230,7 +230,7 @@ class TestUTR:
         result = pm.gintervals_import_genes(simple_genes_file)
         utr3 = result["utr3"]
         # gene1: + strand, lastExonEnd=1900, txEnd=2000
-        g1_utr3 = utr3[utr3["chrom"] == "1"]
+        g1_utr3 = utr3[utr3["chrom"] == "chr1"]
         assert len(g1_utr3) == 1
         assert g1_utr3.iloc[0]["start"] == 1899.0
         assert g1_utr3.iloc[0]["end"] == 2000.0
@@ -240,7 +240,7 @@ class TestUTR:
         result = pm.gintervals_import_genes(simple_genes_file)
         utr3 = result["utr3"]
         # gene2: - strand, txStart=5000, firstExonStart=5200
-        g2_utr3 = utr3[utr3["chrom"] == "2"]
+        g2_utr3 = utr3[utr3["chrom"] == "chr2"]
         assert len(g2_utr3) == 1
         assert g2_utr3.iloc[0]["start"] == 5000.0
         assert g2_utr3.iloc[0]["end"] == 5201.0
@@ -250,7 +250,7 @@ class TestUTR:
         result = pm.gintervals_import_genes(simple_genes_file)
         utr5 = result["utr5"]
         # gene1: + strand, txStart=1000, firstExonStart=1100
-        g1_utr5 = utr5[utr5["chrom"] == "1"]
+        g1_utr5 = utr5[utr5["chrom"] == "chr1"]
         assert len(g1_utr5) == 1
         assert g1_utr5.iloc[0]["start"] == 1000.0
         assert g1_utr5.iloc[0]["end"] == 1101.0
@@ -260,7 +260,7 @@ class TestUTR:
         result = pm.gintervals_import_genes(simple_genes_file)
         utr5 = result["utr5"]
         # gene2: - strand, lastExonEnd=7800, txEnd=8000
-        g2_utr5 = utr5[utr5["chrom"] == "2"]
+        g2_utr5 = utr5[utr5["chrom"] == "chr2"]
         assert len(g2_utr5) == 1
         assert g2_utr5.iloc[0]["start"] == 7799.0
         assert g2_utr5.iloc[0]["end"] == 8000.0
@@ -281,7 +281,7 @@ class TestOverlapping:
         # geneC TSS: [1999, 2000) -  (txEnd=2000, - strand)
         # geneA and geneB overlap => merge to [1000, 1001) but geneC at
         # [1999,2000) does not overlap
-        assert len(tss[tss["chrom"] == "1"]) == 2
+        assert len(tss[tss["chrom"] == "chr1"]) == 2
 
     def test_overlapping_different_strand_becomes_zero(self, overlapping_genes_file):
         """When overlapping intervals have different strands, merged strand is 0."""
@@ -289,7 +289,7 @@ class TestOverlapping:
         result = pm.gintervals_import_genes(overlapping_genes_file)
         tss = result["tss"]
         # geneA and geneB at [1000,1001) both + strand, merged strand=1
-        chr1_tss = tss[tss["chrom"] == "1"].sort_values("start").reset_index(drop=True)
+        chr1_tss = tss[tss["chrom"] == "chr1"].sort_values("start").reset_index(drop=True)
         # First merged TSS: [1000, 1001) from geneA + geneB, both +1
         assert chr1_tss.iloc[0]["strand"] == 1.0
         # geneC at [1999, 2000), alone, -1
@@ -315,7 +315,7 @@ class TestOverlappingMixedStrand:
 
         result = pm.gintervals_import_genes(str(p))
         tss = result["tss"]
-        chr1_tss = tss[tss["chrom"] == "1"]
+        chr1_tss = tss[tss["chrom"] == "chr1"]
         # g1 TSS: [1000, 1001) +
         # g2 TSS: [1000, 1001) -  (txEnd=1001, - strand => [1000, 1001))
         # These overlap => merged strand should be 0
@@ -348,7 +348,7 @@ class TestAnnotations:
         )
         tss = result["tss"]
         # gene1 on chrom 1
-        g1_row = tss[tss["chrom"] == "1"].iloc[0]
+        g1_row = tss[tss["chrom"] == "chr1"].iloc[0]
         assert g1_row["protein"] == "ProtA"
         assert g1_row["description"] == "DescA"
         assert g1_row["gene_id"] == "gene1"
@@ -378,7 +378,7 @@ class TestAnnotations:
             str(gf), annots_file=str(af), annots_names=["gene_id", "name"]
         )
         tss = result["tss"]
-        chr1_tss = tss[tss["chrom"] == "1"]
+        chr1_tss = tss[tss["chrom"] == "chr1"]
         # Both TSS at [1000,1001) => merged, annotations concatenated
         assert len(chr1_tss) == 1
         name_val = chr1_tss.iloc[0]["name"]
@@ -411,7 +411,7 @@ class TestAnnotations:
             str(gf), annots_file=str(af), annots_names=["gene_id", "name"]
         )
         tss = result["tss"]
-        chr1_tss = tss[tss["chrom"] == "1"]
+        chr1_tss = tss[tss["chrom"] == "chr1"]
         assert len(chr1_tss) == 1
         # Should be just "SameName", not "SameName;SameName"
         assert chr1_tss.iloc[0]["name"] == "SameName"
@@ -442,13 +442,13 @@ class TestChromosomeFiltering:
         tss = result["tss"]
         # Only gene_known should survive
         assert len(tss) == 1
-        assert tss.iloc[0]["chrom"] == "1"
+        assert tss.iloc[0]["chrom"] == "chr1"
 
     def test_chrx_normalized(self, simple_genes_file):
-        """chrX in the gene file should be normalized to 'X'."""
+        """chrX in the gene file should be normalized to 'chrX'."""
         result = pm.gintervals_import_genes(simple_genes_file)
         tss = result["tss"]
-        x_tss = tss[tss["chrom"] == "X"]
+        x_tss = tss[tss["chrom"] == "chrX"]
         assert len(x_tss) == 1
 
 

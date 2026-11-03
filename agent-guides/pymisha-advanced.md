@@ -383,7 +383,7 @@ pm.gtrack_import_mappedseq("atac.es",
                            remove_dups=True)
 ```
 
-BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). C++ fast-path since v0.1.95 (3-5x over the legacy Python loop). R-parity: chromosome names must match the DB's chromkey verbatim (no `chr1` → `1` rewrite). `PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ=1` selects the pure-Python fallback if you need it for debugging.
+BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). C++ fast-path since v0.1.95 (3-5x over the legacy Python loop). R-parity: chromosome names must match the DB's chromkey verbatim (no `chr1` → `1` rewrite). SAM / BAM `POS` is 1-based and each read is placed at its 0-based 5' base (a reverse read at its rightmost aligned base, from the CIGAR); unmapped, secondary, QC-failed and supplementary records are skipped, and `min_mapq` drops low-MAPQ records. `paired=True` with a `binsize` imports paired-end fragments: from the proper pairs of a SAM / BAM (`cols_order=None`), or from a fragment file (chrom, start, end in columns 1-3, e.g. a 10x `fragments.tsv.gz`). `file` may also be a named pipe carrying SAM or text.
 
 **Per-fragment 2D contacts → 2D track.**
 

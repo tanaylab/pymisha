@@ -86,10 +86,7 @@ static string track_name_to_dir(const string &track_name)
     if (!g_pmdb || !g_pmdb->is_initialized())
         TGLError("Database not initialized. Call gdb_init() first.");
 
-    const string &root = g_pmdb->uroot().empty() ? g_pmdb->groot() : g_pmdb->uroot();
-    string rel = track_name;
-    replace(rel.begin(), rel.end(), '.', '/');
-    return root + "/tracks/" + rel + ".track";
+    return g_pmdb->new_track_path(track_name);
 }
 
 static void ensure_track_dir(const string &track_dir)
@@ -113,18 +110,27 @@ static int col_idx(PMDataFrame &df, const char *name)
 // Write a 4-byte sparse-track signature to `path`. Used for empty per-chrom
 // files in non-indexed DBs. Uses low-level posix syscalls (open/write/close)
 // so we can dispatch many in parallel via std::thread without the libc
-// stdio FILE* mutex contention that fopen() introduces.
-static void write_empty_sparse_file_syscall(const string &path, int32_t sig)
+// stdio FILE* mutex contention that fopen() introduces. A failure is reported
+// back via `first_errno` so the caller can raise after all workers finish
+// (misha's write_empty_sparse_signature).
+static void write_empty_sparse_file_syscall(const string &path, int32_t sig,
+                                            std::atomic<int> &first_errno)
 {
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0664);
     if (fd < 0) {
-        // Save errno across close() in case caller wants it. Throw outside
-        // worker threads via a flag (callers check it post-join).
-        return;  // failure surfaced via post-join check on file_exists/size
+        int e = errno ? errno : EIO;
+        int expected = 0;
+        first_errno.compare_exchange_strong(expected, e);
+        return;
     }
     ssize_t n = ::write(fd, &sig, sizeof(sig));
-    (void)n;
-    ::close(fd);
+    int werr = (n != (ssize_t)sizeof(sig)) ? (errno ? errno : EIO) : 0;
+    if (::close(fd) && !werr)   // NFS reports a failed write here
+        werr = errno ? errno : EIO;
+    if (werr) {
+        int expected = 0;
+        first_errno.compare_exchange_strong(expected, werr);
+    }
 }
 
 // Create the empty per-chrom files for chroms not yet written. Dispatches
@@ -162,27 +168,32 @@ static void create_empty_sparse_files_parallel(const string &track_dir,
     if (requested > 16) requested = 16;
     unsigned nworkers = std::min<unsigned>((unsigned)requested,
                                            (unsigned)paths.size());
+    std::atomic<int> first_errno{0};
+
     if (nworkers <= 1) {
         for (const string &p : paths)
-            write_empty_sparse_file_syscall(p, sig);
-        return;
+            write_empty_sparse_file_syscall(p, sig, first_errno);
+    } else {
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            for (;;) {
+                size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= paths.size()) return;
+                write_empty_sparse_file_syscall(paths[i], sig, first_errno);
+            }
+        };
+
+        vector<std::thread> threads;
+        threads.reserve(nworkers - 1);
+        for (unsigned t = 0; t < nworkers - 1; ++t)
+            threads.emplace_back(worker);
+        worker();  // current thread does its share
+        for (auto &th : threads) th.join();
     }
 
-    std::atomic<size_t> next{0};
-    auto worker = [&]() {
-        for (;;) {
-            size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= paths.size()) return;
-            write_empty_sparse_file_syscall(paths[i], sig);
-        }
-    };
-
-    vector<std::thread> threads;
-    threads.reserve(nworkers - 1);
-    for (unsigned t = 0; t < nworkers - 1; ++t)
-        threads.emplace_back(worker);
-    worker();  // current thread does its share
-    for (auto &th : threads) th.join();
+    int e = first_errno.load();
+    if (e != 0)
+        TGLError("Failed to create empty chromosome track file: %s", strerror(e));
 }
 
 static void parse_track_data(PyObject *py_df, vector<TrackRec> &out)
@@ -543,8 +554,12 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         unsigned binsize = 0;
         double defval = std::numeric_limits<double>::quiet_NaN();
         const char *func_str = nullptr;
+        // gtrack.import's arithmetic: misha's import multiplies a record's float value by its
+        // overlap in float before adding it to the double sum; gtrack.create_dense multiplies
+        // in double. Only the weighted mean has an import counterpart.
+        int float_products = 0;
 
-        if (!PyArg_ParseTuple(args, "sOIds", &track, &py_data, &binsize, &defval, &func_str))
+        if (!PyArg_ParseTuple(args, "sOIds|p", &track, &py_data, &binsize, &defval, &func_str, &float_products))
             verror("Invalid arguments to pm_track_create_dense");
 
         if (binsize == 0)
@@ -639,7 +654,8 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
                         uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
                         if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
                             uint64_t ov = ov_end - ov_start;
-                            sum += (double)recs[j].value * (double)ov;
+                            sum += float_products ? (double)(recs[j].value * (float)ov)
+                                                  : (double)recs[j].value * (double)ov;
                             covered += ov;
                         }
                         ++j;
@@ -1017,23 +1033,25 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
         if (!fitr)
             verror("gtrack_modify requires a fixed-bin (dense) iterator");
 
-        const GenomeChromKey &chromkey = g_pmdb->chromkey();
         GenomeTrackFixedBin gtrack;
         int cur_chromid = -1;
         Stager stager(track_dir, stage_dir ? string(stage_dir) : string());
+        const GenomeTrack::ChromFiles &files = g_pmdb->chrom_files(track_dir);
+        std::set<int> modified;
 
         for (; !scanner.isend(); scanner.next()) {
             const GInterval &interv = scanner.last_interval();
 
             if (interv.chromid != cur_chromid) {
                 cur_chromid = interv.chromid;
-                string fname = GenomeTrack::find_existing_1d_filename(chromkey, track_dir, cur_chromid);
+                const string &fname = files.filename(cur_chromid);
                 string path = track_dir + "/" + fname;
                 // The values go to the staging copy; the live track keeps the old
                 // ones until commit() below.
-                if (stager.enabled())
+                if (stager.enabled()) {
                     gtrack.init_update(stager.stage(fname).c_str(), cur_chromid);
-                else
+                    modified.insert(cur_chromid);
+                } else
                     gtrack.init_update(path.c_str(), cur_chromid);
             }
 
@@ -1046,7 +1064,30 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
         // Everything is written and reported before anything is published: a
         // short write must fail here, not silently at fclose() after commit.
         gtrack.flush_writes();
+        // A chromosome's staged file is closed when the next one is opened, and a failure there
+        // is only recorded (BufferedFile::write_error): it must stop the commit too.
+        if (BufferedFile::write_error()[0])
+            verror("%s", BufferedFile::write_error());
         stager.commit();
+
+        // The commit replaced the file each modified chromosome was read from. Its other names (links to the
+        // same file, copies with the same bytes, or files the read one hid) become names of the committed file,
+        // so they do not differ from it and whatever links to them reads the new data (R's gtrack_modify).
+        for (const GenomeTrack::ChromFiles::File &file : files.files()) {
+            if (file.chromid < 0 || !modified.count(file.chromid))
+                continue;
+            const string &committed = files.filename(file.chromid);
+            string name = track_dir + "/" + file.name;
+            struct stat st1, st2;
+            // not one that leads to the committed file already (a symlink to it)
+            if (file.name != committed && (stat(name.c_str(), &st1) || stat((track_dir + "/" + committed).c_str(), &st2) ||
+                                           st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino)) {
+                string tmp = track_dir + "/." + file.name + ".link";  // hidden from the listing
+                unlink(tmp.c_str());
+                if (!link((track_dir + "/" + committed).c_str(), tmp.c_str()) && rename(tmp.c_str(), name.c_str()))
+                    unlink(tmp.c_str());
+            }
+        }
 
         return_none();
     } catch (TGLException &e) {

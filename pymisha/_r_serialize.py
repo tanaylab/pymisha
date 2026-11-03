@@ -34,7 +34,7 @@ from typing import Any, BinaryIO
 
 import numpy as _numpy
 
-from ._shared import _with_umask
+from ._shared import _with_umask, _write_file
 
 # Type codes (subset of R's SEXP type codes).
 _NILVALUE_SXP = 254
@@ -898,7 +898,7 @@ def write_dataframe(path: str | Path, df: Any) -> None:
     # R's behavior, which uses SYMSXP-typed entries.
     ref_table: dict[str, int] = {}
 
-    with open(path, "wb") as fh:
+    with _write_file(path) as fh:
         _write_header(fh)
 
         # data.frame is VECSXP of columns + attrs (names, class, row.names).
@@ -945,6 +945,6 @@ def write(path: str | Path, value: Any) -> None:
     if isinstance(value, _pd.DataFrame):
         write_dataframe(path, value)
         return
-    with open(path, "wb") as fh:
+    with _write_file(path) as fh:
         _write_header(fh)
         _write_value(fh, value)

@@ -70,7 +70,7 @@ class TestGtrackArrayExtract:
         ivs = pm.gintervals("1", 0, 5000)
         df = pm.gtrack_array_extract("array_track", intervals=ivs)
         assert len(df) > 0
-        assert (df["chrom"] == "1").all()
+        assert (df["chrom"] == "chr1").all()
         assert (df["start"] < df["end"]).all()
         # Each row corresponds to one track interval clipped to the query.
         assert (df["start"] >= 0).all() and (df["end"] <= 5000).all()

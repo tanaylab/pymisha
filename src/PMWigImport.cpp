@@ -1,10 +1,12 @@
 // pm_parse_wig_or_bedgraph: streaming C++ parser for UCSC WIG and BedGraph.
 //
-// Mirrors pymisha.tracks._parse_wig_or_bedgraph but bypasses the Python-level
-// line loop and per-row list appends. Plain-text only; the Python wrapper
-// handles gzipped paths by falling back to its pure-Python streamer.
+// Plain-text only: gtrack_import unzips a .gz / .zip file first, as misha does.
+//
+// pm_is_bigwig / pm_parse_bigwig: misha's native bigWig reader (BigWig.cpp).
 
 #include "pymisha.h"
+#include "BigWig.h"
+#include "PMDb.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -136,8 +138,10 @@ size_t split_ws(char *buf, char *out_tokens[], size_t max_tokens)
  *   - "start": numpy int64 array (0-based, inclusive)
  *   - "end":   numpy int64 array (exclusive)
  *   - "value": numpy float64 array
+ *   - "step":  numpy bool array, true for a fixedStep / variableStep record
+ *              (clipped at the chromosome end on import), false for bedGraph
  *
- * Raises pymisha.error on malformed input or empty file.
+ * A file with no records gives empty arrays. Raises pymisha.error on malformed input.
  */
 extern PyObject *s_pm_err;
 
@@ -160,12 +164,14 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     std::vector<int64_t> start;
     std::vector<int64_t> end;
     std::vector<double> value;
+    std::vector<char> step;
 
     // Reserve modestly; we'll grow as needed. Most real files are 10^5-10^7 rows.
     chrom.reserve(1u << 12);
     start.reserve(1u << 12);
     end.reserve(1u << 12);
     value.reserve(1u << 12);
+    step.reserve(1u << 12);
 
     Mode mode = MODE_NONE;
     std::string cur_chrom;
@@ -222,6 +228,28 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
             size_t ntok = split_ws(l, toks, 16);
             if (ntok == 0) continue;
 
+            if (ntok >= 4) {
+                // BedGraph: chrom start end value. As in misha, a bedGraph line is one whatever
+                // section it follows, and it ends that section.
+                char *endp = nullptr;
+                double s_f = strtod(toks[1], &endp);
+                if (*endp) verror("Cannot parse BedGraph start at %s:%ld - '%s'", path, lineno, toks[1]);
+                double e_f = strtod(toks[2], &endp);
+                if (*endp) verror("Cannot parse BedGraph end at %s:%ld - '%s'", path, lineno, toks[2]);
+                double v = strtod(toks[3], &endp);
+                if (*endp) verror("Cannot parse BedGraph value at %s:%ld - '%s'", path, lineno, toks[3]);
+                chrom.push_back(std::string(toks[0]));
+                start.push_back((int64_t)s_f);
+                end.push_back((int64_t)e_f);
+                value.push_back(v);
+                step.push_back(0);
+                mode = MODE_NONE;
+                continue;
+            }
+            if (ntok == 1 && mode != MODE_FIXED)
+                verror("Invalid format of WIG file %s, line %ld: value is not preceded by fixedStep header", path, lineno);
+            if (ntok == 2 && mode != MODE_VAR)
+                verror("Invalid format of WIG file %s, line %ld: value is not preceded by variableStep header", path, lineno);
             if (mode == MODE_FIXED && ntok == 1) {
                 char *endp = nullptr;
                 double v = strtod(toks[0], &endp);
@@ -230,6 +258,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 start.push_back(cur_pos0);
                 end.push_back(cur_pos0 + cur_span);
                 value.push_back(v);
+                step.push_back(1);
                 cur_pos0 += cur_step;
                 continue;
             }
@@ -244,21 +273,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 start.push_back(pos0);
                 end.push_back(pos0 + cur_span);
                 value.push_back(v);
-                continue;
-            }
-            if (ntok >= 4) {
-                // BedGraph: chrom start end value
-                char *endp = nullptr;
-                double s_f = strtod(toks[1], &endp);
-                if (*endp) verror("Cannot parse BedGraph start at %s:%ld - '%s'", path, lineno, toks[1]);
-                double e_f = strtod(toks[2], &endp);
-                if (*endp) verror("Cannot parse BedGraph end at %s:%ld - '%s'", path, lineno, toks[2]);
-                double v = strtod(toks[3], &endp);
-                if (*endp) verror("Cannot parse BedGraph value at %s:%ld - '%s'", path, lineno, toks[3]);
-                chrom.push_back(std::string(toks[0]));
-                start.push_back((int64_t)s_f);
-                end.push_back((int64_t)e_f);
-                value.push_back(v);
+                step.push_back(1);
                 continue;
             }
             verror("Cannot parse WIG/BedGraph line at %s:%ld - '%s'", path, lineno, l);
@@ -274,19 +289,15 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     free(line);
     fclose(fp);
 
-    if (chrom.empty()) {
-        PyErr_Format(PyExc_ValueError, "WIG/BedGraph file '%s' contains no intervals", path);
-        return nullptr;
-    }
-
     npy_intp n = (npy_intp)chrom.size();
 
     PMPY py_chrom(PyArray_SimpleNew(1, &n, NPY_OBJECT), true);
     PMPY py_start(PyArray_SimpleNew(1, &n, NPY_INT64), true);
     PMPY py_end(PyArray_SimpleNew(1, &n, NPY_INT64), true);
     PMPY py_value(PyArray_SimpleNew(1, &n, NPY_DOUBLE), true);
+    PMPY py_step(PyArray_SimpleNew(1, &n, NPY_BOOL), true);
 
-    if (!py_chrom || !py_start || !py_end || !py_value) {
+    if (!py_chrom || !py_start || !py_end || !py_value || !py_step) {
         return nullptr;
     }
 
@@ -294,6 +305,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     int64_t *start_data = (int64_t *)PyArray_DATA((PyArrayObject *)*py_start);
     int64_t *end_data = (int64_t *)PyArray_DATA((PyArrayObject *)*py_end);
     double *value_data = (double *)PyArray_DATA((PyArrayObject *)*py_value);
+    npy_bool *step_data = (npy_bool *)PyArray_DATA((PyArrayObject *)*py_step);
 
     for (npy_intp i = 0; i < n; ++i) {
         PyObject *s = PyUnicode_FromStringAndSize(chrom[i].data(), chrom[i].size());
@@ -302,6 +314,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
         start_data[i] = start[i];
         end_data[i] = end[i];
         value_data[i] = value[i];
+        step_data[i] = step[i];
     }
 
     PMPY result(PyDict_New(), true);
@@ -310,6 +323,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     PyDict_SetItemString(result, "start", py_start);
     PyDict_SetItemString(result, "end", py_end);
     PyDict_SetItemString(result, "value", py_value);
+    PyDict_SetItemString(result, "step", py_step);
 
     return_py(result);
 
@@ -325,4 +339,130 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     }
 
     return_none();
+}
+
+// pm_is_bigwig(path) -> bool: misha's test, the bigWig magic number or a .bw / .bigWig name.
+PyObject *pm_is_bigwig(PyObject *self, PyObject *args)
+{
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return nullptr;
+    return PyBool_FromLong(BigWig::is_bigwig(path));
+}
+
+static PyObject *string_list(const std::vector<std::string> &strs)
+{
+    PyObject *list = PyList_New(strs.size());
+    if (!list)
+        return nullptr;
+    for (size_t i = 0; i < strs.size(); ++i) {
+        PyObject *s = PyUnicode_FromStringAndSize(strs[i].data(), strs[i].size());
+        if (!s) {
+            Py_DECREF(list);
+            return nullptr;
+        }
+        PyList_SET_ITEM(list, i, s);
+    }
+    return list;
+}
+
+/*
+ * pm_parse_bigwig(path) -> dict
+ *
+ * Reads the full-resolution records of a bigWig with misha's reader (BigWig.cpp), with its checks:
+ * records are sorted, non-overlapping and within the chromosome (step records clipped at its end),
+ * zero-length records are skipped, a truncated or corrupt file is an error.
+ *
+ * Returns: dict with keys
+ *   - "chrom", "start", "end", "value": the records, chrom holding database chromosome names
+ *   - "unknown": up to 5 names of bigWig chromosomes with data that the database lacks
+ *   - "num_unknown": the number of such names
+ *   - "unknown_primary": up to 5 of them that look like a primary chromosome
+ *   - "num_matched": the number of database chromosomes the file has data for
+ */
+PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
+{
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return nullptr;
+
+    try {
+        PyMisha pymisha(true);
+
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        BigWig bigwig;
+        GIntervals data;
+        std::vector<int> chromids;
+        std::vector<int64_t> start;
+        std::vector<int64_t> end;
+        std::vector<float> value;
+
+        bigwig.init(chromkey, path);
+        for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+            for (uint64_t iblock = 0; bigwig.get_data(chromid, iblock, data); ++iblock) {
+                for (const GInterval &interv : data) {
+                    float v;
+                    memcpy(&v, &interv.udata, sizeof(v));
+                    chromids.push_back(chromid);
+                    start.push_back(interv.start);
+                    end.push_back(interv.end);
+                    value.push_back(v);
+                }
+                check_interrupt();
+            }
+        }
+
+        npy_intp n = (npy_intp)start.size();
+        PMPY py_chrom(PyArray_SimpleNew(1, &n, NPY_OBJECT), true);
+        PMPY py_start(PyArray_SimpleNew(1, &n, NPY_INT64), true);
+        PMPY py_end(PyArray_SimpleNew(1, &n, NPY_INT64), true);
+        PMPY py_value(PyArray_SimpleNew(1, &n, NPY_FLOAT32), true);
+        if (!py_chrom || !py_start || !py_end || !py_value)
+            return_err();
+
+        // one string object per chromosome, shared by its rows
+        std::vector<PMPY> names(chromkey.get_num_chroms());
+        PyObject **chrom_data = (PyObject **)PyArray_DATA((PyArrayObject *)*py_chrom);
+        for (npy_intp i = 0; i < n; ++i) {
+            PMPY &name = names[chromids[i]];
+            if (!name) {
+                const string &s = chromkey.id2chrom(chromids[i]);
+                name.assign(PyUnicode_FromStringAndSize(s.data(), s.size()), true);
+                if (!name)
+                    return_err();
+            }
+            Py_INCREF((PyObject *)name);
+            chrom_data[i] = name;
+        }
+        if (n) {
+            memcpy(PyArray_DATA((PyArrayObject *)*py_start), start.data(), n * sizeof(int64_t));
+            memcpy(PyArray_DATA((PyArrayObject *)*py_end), end.data(), n * sizeof(int64_t));
+            memcpy(PyArray_DATA((PyArrayObject *)*py_value), value.data(), n * sizeof(float));
+        }
+
+        const UnknownChroms &unknown = bigwig.get_unknown_chroms();
+        PMPY py_unknown(string_list(unknown.names()), true);
+        PMPY py_primary(string_list(unknown.primary_names()), true);
+        PMPY py_num_unknown(PyLong_FromUnsignedLongLong(unknown.num()), true);
+        PMPY py_num_matched(PyLong_FromUnsignedLongLong(bigwig.get_num_matched_chroms()), true);
+        PMPY result(PyDict_New(), true);
+        if (!py_unknown || !py_primary || !py_num_unknown || !py_num_matched || !result)
+            return_err();
+
+        PyDict_SetItemString(result, "chrom", py_chrom);
+        PyDict_SetItemString(result, "start", py_start);
+        PyDict_SetItemString(result, "end", py_end);
+        PyDict_SetItemString(result, "value", py_value);
+        PyDict_SetItemString(result, "unknown", py_unknown);
+        PyDict_SetItemString(result, "num_unknown", py_num_unknown);
+        PyDict_SetItemString(result, "unknown_primary", py_primary);
+        PyDict_SetItemString(result, "num_matched", py_num_matched);
+        return_py(result);
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return_err();
+    } catch (const std::bad_alloc &) {
+        PyMisha::handle_error("Out of memory");
+        return_err();
+    }
 }

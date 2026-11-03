@@ -107,7 +107,7 @@ def ggenome_implant(
 
     Replace a region with a literal sequence:
 
-    >>> intervs = pm.gintervals(["1"], [100], [110])
+    >>> intervs = pm.gintervals(["chr1"], [100], [110])
     >>> out = tempfile.mktemp(suffix=".fa")
     >>> _ = pm.ggenome_implant(intervs, ["T" * 10], out,
     ...                        genome_fasta=ref_fasta)
@@ -116,7 +116,7 @@ def ggenome_implant(
 
     >>> from pymisha.genome_edit import _read_fasta_chroms
     >>> seqs = _read_fasta_chroms(out)
-    >>> seqs["1"][100:110]
+    >>> seqs["chr1"][100:110]
     'TTTTTTTTTT'
     >>> os.unlink(ref_fasta); os.unlink(out); os.unlink(out + ".fai")
 
@@ -302,7 +302,7 @@ def ggenome_transplant(
 
     Transplant donor sequence into chr1:100-200:
 
-    >>> intervs = pm.gintervals(["1"], [100], [200])
+    >>> intervs = pm.gintervals(["chr1"], [100], [200])
     >>> out = tempfile.mktemp(suffix=".fa")
     >>> _ = pm.ggenome_transplant(intervs, donor_db, out,
     ...                           target_genome=ref_fasta)
@@ -311,7 +311,7 @@ def ggenome_transplant(
 
     >>> from pymisha.genome_edit import _read_fasta_chroms
     >>> seqs = _read_fasta_chroms(out)
-    >>> seqs["1"][100:200] == "G" * 100
+    >>> seqs["chr1"][100:200] == "G" * 100
     True
 
     >>> import shutil

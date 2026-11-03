@@ -539,7 +539,7 @@ class TestGextractBandVtrackObjects:
             "end2": [500000],
         })
         # Band (-200, 200) has Rect A -> exists = 1
-        result = pm.gextract("vt_band_exists", intervals, band=(-200, 200))
+        result = pm.gextract("vt_band_exists", intervals, band=(-200, 200), iterator=intervals)
         assert result["vt_band_exists"].iloc[0] == 1.0
 
     def test_exists_with_empty_band(self, band_rects_track):
@@ -553,7 +553,7 @@ class TestGextractBandVtrackObjects:
             "start2": [0],
             "end2": [500000],
         })
-        result = pm.gextract("vt_band_exists2", intervals, band=(10000, 20000))
+        result = pm.gextract("vt_band_exists2", intervals, band=(10000, 20000), iterator=intervals)
         assert result["vt_band_exists2"].iloc[0] == 0.0
 
     def test_size_with_band(self, band_rects_track):
@@ -568,7 +568,7 @@ class TestGextractBandVtrackObjects:
             "end2": [500000],
         })
         # Band (200, 700) should include Rect B and Rect C
-        result = pm.gextract("vt_band_size", intervals, band=(200, 700))
+        result = pm.gextract("vt_band_size", intervals, band=(200, 700), iterator=intervals)
         assert result["vt_band_size"].iloc[0] == 2.0
 
     def test_size_with_band_points(self, band_points_track):
@@ -583,7 +583,7 @@ class TestGextractBandVtrackObjects:
             "end2": [500000],
         })
         # Band (300, 600): P1(diff=400) and P2(diff=500) -> 2 points
-        result = pm.gextract("vt_band_psize", intervals, band=(300, 600))
+        result = pm.gextract("vt_band_psize", intervals, band=(300, 600), iterator=intervals)
         assert result["vt_band_psize"].iloc[0] == 2.0
 
 

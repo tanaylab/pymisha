@@ -70,11 +70,13 @@ def test_gdb_convert_to_indexed_resolves_chr_prefix_mismatch(tmp_path, restore_d
 
     pm.gdb_convert_to_indexed(groot=str(root), validate=True)
 
+    # the names and order of the chromosomes as R gives them for this per-chromosome
+    # database (chr-prefixed, sorted), so its chrom ids do not change
     rows = (root / "chrom_sizes.txt").read_text(encoding="utf-8").strip().splitlines()
     names = [row.split("\t")[0] for row in rows]
     sizes = [int(row.split("\t")[1]) for row in rows]
-    assert names == ["chr15", "chr10", "chr1"]
-    assert sizes == [15, 10, 20]
+    assert names == ["chr1", "chr10", "chr15"]
+    assert sizes == [20, 10, 15]
 
 
 def test_gdb_convert_to_indexed_remove_old_files(tmp_path, restore_db):

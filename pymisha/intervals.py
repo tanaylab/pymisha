@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import struct
 import tempfile
 import urllib.request
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Any, cast
@@ -38,7 +40,9 @@ from ._shared import (
     _progress_context,
     _pymisha,
     _pymisha2df,
+    _refuse_dataset_order,
     _remap_interval_ids,
+    _sort_by_chrom,
 )
 
 _logger = get_logger(__name__)
@@ -98,11 +102,54 @@ def gintervals_all() -> pd.DataFrame:
 
 
 def _intervset_path(intervals_set: str) -> Path:
-    root = gintervals_dataset(intervals_set)
-    if root is None:
+    if _interv_file(intervals_set) is None:
         raise ValueError(f"Intervals set '{intervals_set}' does not exist")
+    return _intervals_dir(intervals_set)
+
+
+def _refuse_subdir_order(set_name: str, interv_path: Path) -> None:
+    """In a subdirectory (gdir_cd), an interval set is written in the indexed format only in a
+    loaded database that uses the session's chrom ids, not in one reached through a link or a
+    dataset of unknown order (R's gintervals.convert_to_indexed)."""
+    from . import _shared
+
+    if _shared._gwd_is_subdir() and not _shared._same_order(_shared._path_db(interv_path)):
+        raise ValueError(
+            f"Interval set {set_name} is in a database that may number the chromosomes differently "
+            "from this session; convert it with gsetroot() on that database."
+        )
+
+
+def _intervals_dir(intervals_set: str, db: str | None = None) -> Path:
+    """R misha's ``.intervals_dir``: the ``.interv`` path of an interval set in database db
+    (default: the one it is found in), by a name relative to the database's tracks/, or to
+    the working directory when that is a subdirectory of it (gdir_cd). A name not found is
+    under the working directory."""
+    from . import _shared
+
+    if db is None and not _shared._gwd_is_subdir():
+        db = gintervals_dataset(intervals_set)
+    return Path(_shared._names_dir(db)) / f"{intervals_set.replace('.', '/')}.interv"
+
+
+def _interv_file(intervals_set: str) -> Path | None:
+    """The file or directory of an interval set (``.interv`` or ``.interv2d``), None if it
+    does not exist."""
+    from . import _shared
+
+    if _shared._gwd_is_subdir():
+        base = Path(_shared._names_dir())
+    else:
+        root = gintervals_dataset(intervals_set)
+        if root is None:
+            return None
+        base = Path(root) / "tracks"
     path_part = intervals_set.replace(".", "/")
-    return Path(root) / "tracks" / f"{path_part}.interv"
+    for suffix in (".interv", ".interv2d"):
+        p = base / f"{path_part}{suffix}"
+        if p.exists():
+            return p
+    return None
 
 
 def _decode_r_obj_to_bytes(obj_path: str | Path) -> pd.DataFrame:
@@ -401,7 +448,7 @@ def gintervals(
     if result_strands is not None:
         df['strand'] = result_strands
 
-    return df.sort_values(['chrom', 'start']).reset_index(drop=True)
+    return _sort_by_chrom(df, ['chrom', 'start'])
 
 
 def _make_1d_intervals(
@@ -568,15 +615,27 @@ def gintervals_2d(
     return df.sort_values(['chrom1', 'start1', 'chrom2', 'start2']).reset_index(drop=True)
 
 
-def gintervals_2d_all(mode: str = "diagonal") -> pd.DataFrame:
+def gintervals_2d_all(mode: str | None = None) -> pd.DataFrame:
     """
     Return 2D intervals covering the whole genome.
 
+    As R misha's ``gintervals.2d.all()``: one 2D interval per ordered pair
+    of chromosomes, each covering both chromosomes in full, ordered by
+    ``chrom1`` and then by ``chrom2``, both in the order of
+    :func:`gintervals_all`.
+
+    On a genome with more than ``CONFIG["multicontig_2d_threshold"]``
+    chromosomes (100 by default, R's ``gmulticontig.2d.threshold``) R
+    returns only the intra-chromosomal pairs, and so does the default here.
+
     Parameters
     ----------
-    mode : str, default "diagonal"
-        "diagonal" returns only intra-chromosomal pairs (chrom1 == chrom2).
-        "full" returns all NxN chromosome pairs.
+    mode : {None, "full", "diagonal"}, default None
+        ``None`` returns what R returns, as described above. ``"full"``
+        returns all pairs whatever the number of chromosomes, with a warning
+        above the threshold, as R does under
+        ``options(gmulticontig.2d.mode = "full")``. ``"diagonal"`` returns
+        only the intra-chromosomal pairs (``chrom1 == chrom2``).
 
     Returns
     -------
@@ -594,46 +653,61 @@ def gintervals_2d_all(mode: str = "diagonal") -> pd.DataFrame:
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
 
-    Diagonal mode (intra-chromosomal pairs only):
+    All chromosome pairs:
 
     >>> pm.gintervals_2d_all()  # doctest: +SKIP
 
-    Full NxN chromosome pairs:
+    Intra-chromosomal pairs only:
 
-    >>> pm.gintervals_2d_all(mode="full")  # doctest: +SKIP
+    >>> pm.gintervals_2d_all(mode="diagonal")  # doctest: +SKIP
     """
     _checkroot()
 
-    if mode not in ("diagonal", "full"):
-        raise ValueError(f"Unknown mode: {mode}. Must be 'diagonal' or 'full'")
+    if mode not in (None, "diagonal", "full"):
+        raise ValueError(f"Unknown mode: {mode}. Must be None, 'diagonal' or 'full'")
 
     intervals = gintervals_all()
+    n = len(intervals)
+    threshold = int(cast("int", CONFIG.get("multicontig_2d_threshold", 100)))
+    if mode is None:
+        mode = "full" if n <= threshold else "diagonal"
+    elif mode == "full" and n > threshold:
+        warnings.warn(
+            f"Generating full 2D genome with {n} contigs ({n * n} pairs). "
+            "This may take time and use significant memory.",
+            stacklevel=2,
+        )
+    return _gintervals_2d_all(mode, intervals)
 
-    if mode == "diagonal":
-        df = _pandas.DataFrame({
-            'chrom1': intervals['chrom'].to_numpy(),
-            'start1': intervals['start'].values,
-            'end1': intervals['end'].values,
-            'chrom2': intervals['chrom'].to_numpy(),
-            'start2': intervals['start'].values,
-            'end2': intervals['end'].values,
-        })
+
+def _gintervals_2d_all(mode: str, intervals: pd.DataFrame | None = None) -> pd.DataFrame:
+    """The whole-genome 2D intervals of *mode* ("full" or "diagonal").
+
+    For internal whole-genome 2D scopes: unlike :func:`gintervals_2d_all` it
+    has no default that depends on the number of chromosomes and never warns.
+    Rows follow R's order - ``chrom1`` then ``chrom2``, each in the order of
+    *intervals* (:func:`gintervals_all` when None).
+    """
+    if intervals is None:
+        _checkroot()
+        intervals = gintervals_all()
+    n = len(intervals)
+    idx = _numpy.arange(n)
+    if mode == "full":
+        idx1, idx2 = _numpy.repeat(idx, n), _numpy.tile(idx, n)
     else:
-        # Full cartesian product (vectorized)
-        chrom = intervals["chrom"].to_numpy()
-        start = intervals["start"].to_numpy(copy=False)
-        end = intervals["end"].to_numpy(copy=False)
-        n = len(intervals)
-        df = _pandas.DataFrame({
-            "chrom1": _numpy.repeat(chrom, n),
-            "start1": _numpy.repeat(start, n),
-            "end1": _numpy.repeat(end, n),
-            "chrom2": _numpy.tile(chrom, n),
-            "start2": _numpy.tile(start, n),
-            "end2": _numpy.tile(end, n),
-        })
-
-    return df.sort_values(['chrom1', 'start1', 'chrom2', 'start2']).reset_index(drop=True)
+        idx1 = idx2 = idx
+    chrom = intervals["chrom"].to_numpy()
+    start = intervals["start"].to_numpy()
+    end = intervals["end"].to_numpy()
+    return _pandas.DataFrame({
+        "chrom1": chrom[idx1],
+        "start1": start[idx1],
+        "end1": end[idx1],
+        "chrom2": chrom[idx2],
+        "start2": start[idx2],
+        "end2": end[idx2],
+    })
 
 
 def gintervals_2d_band_intersect(
@@ -760,10 +834,9 @@ def gintervals_2d_band_intersect(
 
 
 def _sort_2d_intervals(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort 2D intervals by (chrom1, start1, chrom2, start2) and reset index."""
-    return df.sort_values(
-        ['chrom1', 'start1', 'chrom2', 'start2']
-    ).reset_index(drop=True)
+    """Sort 2D intervals by (chrom1, start1, chrom2, start2), a chromosome by its id, and
+    reset index."""
+    return _sort_by_chrom(df, ['chrom1', 'start1', 'chrom2', 'start2'])
 
 
 def _validate_2d_intervals(intervals: pd.DataFrame, name: str = "intervals") -> None:
@@ -829,6 +902,9 @@ def _chrom_sizes_for_2d_verify() -> dict[str, int] | None:
             all_intervals['end'].astype(int).tolist(), strict=False,
         )
     )
+    # a chromosome named without or with the "chr" prefix ("1" for chr1) too
+    for name, size in list(sizes.items()):
+        sizes.setdefault(name[3:] if name.startswith("chr") else f"chr{name}", size)
     _chrom_sizes_cache = (root, sizes)
     return sizes
 
@@ -1859,19 +1935,12 @@ def gintervals_is_bigset(intervals_set: str) -> bool:
     _checkroot()
     if not isinstance(intervals_set, str) or not intervals_set.strip():
         raise ValueError("intervals_set must be a non-empty string")
-    dataset = gintervals_dataset(intervals_set)
-    if dataset is None:
-        return False
-    path_part = intervals_set.replace(".", "/")
-    for suffix in (".interv", ".interv2d"):
-        p = Path(dataset) / "tracks" / f"{path_part}{suffix}"
-        if p.exists():
-            return p.is_dir()
-    return False
+    p = _interv_file(intervals_set)
+    return p is not None and p.is_dir()
 
 
 def _sort_intervals(intervals: pd.DataFrame) -> pd.DataFrame:
-    return intervals.sort_values(['chrom', 'start', 'end']).reset_index(drop=True)
+    return _sort_by_chrom(intervals, ['chrom', 'start', 'end'])
 
 
 
@@ -2710,7 +2779,7 @@ def gintervals_neighbors(
         if int(info.get("dimensions", 1) or 1) != 2:
             return x
         from .extract import gextract
-        scope = gintervals_2d_all(mode="full")
+        scope = _gintervals_2d_all("full")
         df = gextract(x, scope)
         if df is None:
             return x
@@ -3135,14 +3204,16 @@ def gintervals_dbs(
     names = [intervals] if isinstance(intervals, str) else list(intervals)
 
     all_dbs: list[str] = [_shared._GROOT] + list(_shared._GDATASETS)
+    # in a subdirectory (gdir_cd), a name is the one under it, in the database holding it
+    if _shared._gwd_is_subdir():
+        all_dbs = [db for db in all_dbs if db == _shared._gwd_db()]
 
     result = {}
     for name in names:
-        rel_base = os.path.join("tracks", name.replace(".", os.sep))
         dbs = []
         for db in all_dbs:
-            if (os.path.exists(os.path.join(db, rel_base + ".interv"))
-                    or os.path.exists(os.path.join(db, rel_base + ".interv2d"))):
+            rel_base = os.path.join(_shared._names_dir(db), name.replace(".", os.sep))
+            if os.path.exists(rel_base + ".interv") or os.path.exists(rel_base + ".interv2d"):
                 dbs.append(db)
         result[name] = dbs
 
@@ -3188,7 +3259,7 @@ def gintervals_exists(name: str) -> bool:
     gintervals_rm : Remove a named interval set.
     """
     _checkroot()
-    return gintervals_dataset(name) is not None
+    return _interv_file(name) is not None
 
 
 def gintervals_path(name: str) -> str:
@@ -3227,16 +3298,10 @@ def gintervals_path(name: str) -> str:
     if name is None:
         raise ValueError("name cannot be None")
     _checkroot()
-    root = gintervals_dataset(name)
-    if root is None:
+    path = _interv_file(name)
+    if path is None:
         raise ValueError(f"Interval set '{name}' does not exist")
-    path_part = name.replace(".", "/")
-    for suffix in (".interv", ".interv2d"):
-        candidate = os.path.join(root, "tracks", f"{path_part}{suffix}")
-        if os.path.exists(candidate):
-            return candidate
-    # Should not happen if gintervals_dataset found it, but be safe
-    raise ValueError(f"Interval set '{name}' does not exist")
+    return str(path)
 
 
 def gintervals_dataset(intervals: str | None = None) -> str | None:
@@ -3280,6 +3345,10 @@ def gintervals_dataset(intervals: str | None = None) -> str | None:
     _checkroot()
     from . import _shared
     assert _shared._GROOT is not None
+
+    # in a subdirectory (gdir_cd), the names under it are the database's holding it
+    if _shared._gwd_is_subdir():
+        return _shared._gwd_db() if _interv_file(intervals) is not None else None
 
     roots: list[str] = []
     if _shared._UROOT:
@@ -3391,37 +3460,50 @@ def _load_serialized_dataframe(path: str | Path) -> pd.DataFrame:
     return _decode_r_obj_to_bytes(path)
 
 
-def _resolve_chrom_file(path: Path, chrom: str) -> Path | None:
-    candidate = path / chrom
-    if candidate.exists():
-        return candidate
-    if chrom.startswith("chr"):
-        candidate = path / chrom[3:]
-        if candidate.exists():
-            return candidate
-    else:
-        candidate = path / f"chr{chrom}"
-        if candidate.exists():
-            return candidate
-    return None
+@contextlib.contextmanager
+def _removed_on_error(*paths: Path):
+    """Removes the given (temporary) files when the block fails or is interrupted."""
+    try:
+        yield
+    except BaseException:
+        for path in paths:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        raise
 
 
-def _resolve_pair_file(path: Path, chrom1: str, chrom2: str) -> Path | None:
-    candidate = path / f"{chrom1}-{chrom2}"
-    if candidate.exists():
-        return candidate
-    chrom1_alt = chrom1[3:] if chrom1.startswith("chr") else f"chr{chrom1}"
-    chrom2_alt = chrom2[3:] if chrom2.startswith("chr") else f"chr{chrom2}"
-    candidate = path / f"{chrom1_alt}-{chrom2}"
-    if candidate.exists():
-        return candidate
-    candidate = path / f"{chrom1}-{chrom2_alt}"
-    if candidate.exists():
-        return candidate
-    candidate = path / f"{chrom1_alt}-{chrom2_alt}"
-    if candidate.exists():
-        return candidate
-    return None
+def _set_chrom_files(path: Path, chroms: list[str]) -> list[Path | None]:
+    """The files of the given chromosomes of a big intervals set, as the readers find them
+    (``pm_chrom_files``: by the canonical name, else by an alias), None where there is none
+    (R's .gintervals.big.chrom_files). Chromosomes that all have a canonically named file
+    are read from it with no listing of the directory; next to the set's index only the
+    canonically named file counts."""
+    canonical = [path / c for c in chroms]
+    if canonical and all(p.is_file() for p in canonical):
+        return list(canonical)
+    if (len(chroms) == 1 and not os.path.lexists(canonical[0])
+            and (path / "intervals.idx").exists()):
+        return [None]
+    files = _pymisha.pm_chrom_files(str(path), False)
+    used = {c: f for c, f, u in zip(files["chrom"], files["file"], files["used"], strict=True) if u}
+    return [path / used[c] if c in used else None for c in chroms]
+
+
+def _set_pair_files(path: Path, pairs: list[tuple[str, str]]) -> list[Path | None]:
+    """_set_chrom_files for the chromosome pairs of a 2D big intervals set."""
+    canonical = [path / f"{c1}-{c2}" for c1, c2 in pairs]
+    if canonical and all(p.is_file() for p in canonical):
+        return list(canonical)
+    if (len(pairs) == 1 and not os.path.lexists(canonical[0])
+            and (path / "intervals2d.idx").exists()):
+        return [None]
+    files = _pymisha.pm_chrom_files(str(path), True)
+    used = {
+        (c1, c2): f
+        for c1, c2, f, u in zip(files["chrom1"], files["chrom2"], files["file"], files["used"], strict=True)
+        if u
+    }
+    return [path / used[p] if p in used else None for p in pairs]
 
 
 def _chrom_id_map() -> dict[str, int]:
@@ -3542,7 +3624,7 @@ def _gintervals_load_track(
         else:
             # No chrom filter (or only one side) - load the whole 2D scope and
             # let gextract filter; matches R's bigset zeroline-by-chrom semantics.
-            scope = gintervals_2d_all(mode="full")
+            scope = _gintervals_2d_all("full")
     else:
         scope = gintervals_all() if chrom is None else gintervals(chrom)
 
@@ -3714,10 +3796,14 @@ def gintervals_load(
             indexed_fast = chrom is None and _intervset_is_indexed(interv_path)
             if indexed_fast:
                 idx_entries = _load_index_entries_1d(paths["idx1d"])
+                # the index keeps the entries of chromosomes deleted since
+                # (gintervals_update with None), .meta not
+                kept = set(stats["chrom"].astype(str))
+                kept_ids = {i for i, c in enumerate(gintervals_all()["chrom"].tolist()) if c in kept}
                 dfs = []
                 with _progress_context(progress, total=len(idx_entries), desc="Loading intervals") as cb:
-                    for idx, (_chrom_id, offset, length) in enumerate(idx_entries):
-                        if length == 0:
+                    for idx, (entry_chrom_id, offset, length) in enumerate(idx_entries):
+                        if length == 0 or entry_chrom_id not in kept_ids:
                             continue
                         df = _read_indexed_entry(paths["dat1d"], offset, length)
                         if df is not None:
@@ -3731,16 +3817,19 @@ def gintervals_load(
                 df = _pandas.concat(dfs, ignore_index=True)
                 return _normalize_interval_df(df)
 
+            # a chromosome without its own file is read from the set's index, if it has one
+            # (R's gbigintervs_load_chrom)
             idx_entries_map = None
-            if chrom is not None and paths["idx1d"].exists():
+            if paths["idx1d"].exists():
                 idx_entries_map = _indexed_entries_by_chrom(_load_index_entries_1d(paths["idx1d"]))
             dfs = []
+            chrom_names = stats["chrom"].astype(str).tolist()
+            chrom_files = _set_chrom_files(interv_path, chrom_names)
             with _progress_context(progress, total=len(stats), desc="Loading intervals") as cb:
-                for idx, chrom_name in enumerate(stats["chrom"].tolist()):
-                    chrom_file = _resolve_chrom_file(interv_path, chrom_name)
-                    if chrom_file and chrom_file.exists():
+                for idx, (chrom_name, chrom_file) in enumerate(zip(chrom_names, chrom_files, strict=True)):
+                    if chrom_file is not None:
                         dfs.append(_load_serialized_dataframe(chrom_file))
-                    elif chrom is not None and idx_entries_map is not None:
+                    elif idx_entries_map is not None:
                         chrom_map = _chrom_id_map()
                         chrom_id = _chrom_id_lookup(chrom_map, chrom_name)
                         if chrom_id is not None:
@@ -3781,10 +3870,15 @@ def gintervals_load(
         indexed_fast = chrom1 is None and chrom2 is None and _intervset_is_indexed(interv_path)
         if indexed_fast:
             idx_entries_2d = _load_index_entries_2d(paths["idx2d"])
+            # the index keeps the entries of pairs deleted since (gintervals_update with
+            # None), .meta not
+            all_chroms = gintervals_all()["chrom"].tolist()
+            kept_pairs = set(zip(stats["chrom1"].astype(str), stats["chrom2"].astype(str), strict=True))
             dfs = []
             with _progress_context(progress, total=len(idx_entries_2d), desc="Loading intervals") as cb:
-                for idx, (_chrom1_id, _chrom2_id, offset, length) in enumerate(idx_entries_2d):
-                    if length == 0:
+                for idx, (entry_id1, entry_id2, offset, length) in enumerate(idx_entries_2d):
+                    if (length == 0 or entry_id1 >= len(all_chroms) or entry_id2 >= len(all_chroms)
+                            or (all_chroms[entry_id1], all_chroms[entry_id2]) not in kept_pairs):
                         continue
                     df = _read_indexed_entry(paths["dat2d"], offset, length)
                     if df is not None:
@@ -3798,16 +3892,17 @@ def gintervals_load(
             df = _pandas.concat(dfs, ignore_index=True)
             return _normalize_interval_df(df)
 
+        # a pair without its own file is read from the set's index, if it has one
+        # (R's gbigintervs_load_chrom2d)
         idx_entries_map_2d: dict[tuple[int, int], tuple[int, int]] | None = None
-        if chrom1 is not None and chrom2 is not None and paths["idx2d"].exists():
+        if paths["idx2d"].exists():
             idx_entries_map_2d = _indexed_entries_by_pair(_load_index_entries_2d(paths["idx2d"]))
         dfs = []
+        pairs = list(zip(stats["chrom1"].astype(str), stats["chrom2"].astype(str), strict=True))
+        pair_files = _set_pair_files(interv_path, pairs)
         with _progress_context(progress, total=len(stats), desc="Loading intervals") as cb:
-            for idx, row in enumerate(stats.itertuples(index=False)):
-                chrom1_name = row.chrom1
-                chrom2_name = row.chrom2
-                pair_file = _resolve_pair_file(interv_path, chrom1_name, chrom2_name)
-                if pair_file and pair_file.exists():
+            for idx, ((chrom1_name, chrom2_name), pair_file) in enumerate(zip(pairs, pair_files, strict=True)):
+                if pair_file is not None:
                     dfs.append(_load_serialized_dataframe(pair_file))
                 elif idx_entries_map_2d is not None:
                     chrom_map = _chrom_id_map()
@@ -3914,9 +4009,9 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     if gintervals_exists(intervals_set):
         raise ValueError(f"Intervals set '{intervals_set}' already exists")
 
-    groot = _shared._GROOT
+    # written under the working directory (gdir_cd), as R misha does
     path_part = intervals_set.replace(".", "/")
-    interv_path = Path(groot) / "tracks" / f"{path_part}.interv"
+    interv_path = Path(_shared._names_dir()) / f"{path_part}.interv"
 
     # Ensure parent directory exists
     interv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3950,8 +4045,8 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
         # instead of raising at the point where the mistake was made. Runs on
         # the normalized labels so an aliased chrom still resolves to a size.
         _verify_2d_intervals(df)
-        # Sort by (chrom1, chrom2)
-        df = df.sort_values(["chrom1", "chrom2"]).reset_index(drop=True)
+        # Sort by (chrom1, chrom2), as R does (by chrom id)
+        df = _sort_by_chrom(df, ["chrom1", "chrom2"])
         # Convert chrom to categorical (R factor style)
         df["chrom1"] = _pandas.Categorical(df["chrom1"])
         df["chrom2"] = _pandas.Categorical(df["chrom2"])
@@ -3961,8 +4056,8 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     else:
         # Normalize chromosome names
         df["chrom"] = _normalize_chroms(df["chrom"].astype(str).tolist())
-        # Sort by chrom
-        df = df.sort_values(["chrom"]).reset_index(drop=True)
+        # Sort by chrom, as R does (by chrom id)
+        df = _sort_by_chrom(df, ["chrom"])
         # Convert chrom to categorical (R factor style)
         df["chrom"] = _pandas.Categorical(df["chrom"])
         # Ensure start/end are float (R numeric)
@@ -4015,13 +4110,13 @@ def _replace_intervals_set(intervals: pd.DataFrame, intervals_set: str) -> None:
     from . import _shared
     assert _shared._GROOT is not None
 
-    dest = Path(_shared._GROOT) / "tracks" / f"{intervals_set.replace('.', '/')}.interv"
+    dest = Path(_shared._names_dir()) / f"{intervals_set.replace('.', '/')}.interv"
 
     # An underscore suffix (not a dotted one) keeps the temporary set a sibling
     # *file* of dest rather than a new dotted namespace, so the rename below
     # stays inside one directory - and therefore one filesystem.
     tmp_name = f"{intervals_set}_pmtmp{os.getpid()}_{os.urandom(4).hex()}"
-    tmp_path = Path(_shared._GROOT) / "tracks" / f"{tmp_name.replace('.', '/')}.interv"
+    tmp_path = Path(_shared._names_dir()) / f"{tmp_name.replace('.', '/')}.interv"
 
     # Raises before anything is destroyed if the frame is not saveable.
     gintervals_save(intervals, tmp_name)
@@ -4426,6 +4521,7 @@ def gintervals_convert_to_indexed(
     if not isinstance(set_name, str) or not set_name:
         raise ValueError("set_name must be a non-empty string")
     _checkroot()
+    _refuse_dataset_order("Interval set", set_name, gintervals_dataset(set_name))
 
     interv_path = _intervset_path(set_name)
     if not interv_path.exists():
@@ -4437,6 +4533,7 @@ def gintervals_convert_to_indexed(
     dat_path = interv_path / "intervals.dat"
     if idx_path.exists() and not force:
         return
+    _refuse_subdir_order(set_name, interv_path)
 
     dat_tmp = interv_path / "intervals.dat.tmp"
     idx_tmp = interv_path / "intervals.idx.tmp"
@@ -4444,20 +4541,29 @@ def gintervals_convert_to_indexed(
     chroms = gintervals_all()["chrom"].tolist()
     chrom_map = _chrom_id_map()
 
+    # The chromosome files, listed once (GenomeTrack::ChromFiles, as R converts): by the
+    # canonical name or an alias, those next to an existing index included. A file not
+    # named by a chromosome stops the conversion, and so does one that cannot be read.
+    files = _pymisha.pm_chrom_files(str(interv_path), False, True)
+    if files["unnamed"]:
+        raise ValueError(
+            f"Intervals set {set_name}: file {files['unnamed'][0]} is not named by a chromosome"
+        )
+    used = {c: interv_path / f for c, f, u in zip(files["chrom"], files["file"], files["used"], strict=True) if u}
+    # removed with remove_old, also those that the packed ones hid
+    files_to_remove = [interv_path / f for f in files["file"]]
+
     entries = []
     crc = _crc64_init()
     current_offset = 0
-    files_to_remove = []
 
-    with open(dat_tmp, "wb") as dat_fh, open(idx_tmp, "wb") as idx_fh:
+    with _removed_on_error(dat_tmp, idx_tmp), open(dat_tmp, "wb") as dat_fh, open(idx_tmp, "wb") as idx_fh:
         _write_index_header_1d(idx_fh, len(chroms), 0)
         for chrom in chroms:
-            chrom_file = _resolve_chrom_file(interv_path, chrom)
+            chrom_file = used.get(chrom)
             length = 0
-            if chrom_file and chrom_file.exists():
+            if chrom_file is not None:
                 length = _copy_file_contents(chrom_file, dat_fh)
-                if length > 0:
-                    files_to_remove.append(chrom_file)
             chrom_id = chrom_map[chrom]
             entry = (chrom_id, current_offset, length)
             entries.append(entry)
@@ -4536,6 +4642,7 @@ def gintervals_2d_convert_to_indexed(
     if not isinstance(set_name, str) or not set_name:
         raise ValueError("set_name must be a non-empty string")
     _checkroot()
+    _refuse_dataset_order("Interval set", set_name, gintervals_dataset(set_name))
 
     interv_path = _intervset_path(set_name)
     if not interv_path.exists():
@@ -4547,39 +4654,37 @@ def gintervals_2d_convert_to_indexed(
     dat_path = interv_path / "intervals2d.dat"
     if idx_path.exists() and not force:
         return
+    _refuse_subdir_order(set_name, interv_path)
 
     dat_tmp = interv_path / "intervals2d.dat.tmp"
     idx_tmp = interv_path / "intervals2d.idx.tmp"
 
     chrom_map = _chrom_id_map()
 
-    pair_files = []
-    for entry in interv_path.iterdir():
-        if entry.name in {"intervals.idx", "intervals.dat", "intervals2d.idx", "intervals2d.dat", ".meta"}:
-            continue
-        if entry.is_dir():
-            continue
-        if "-" not in entry.name:
-            continue
-        chrom1_name, chrom2_name = entry.name.split("-", 1)
-        chrom1_id = _chrom_id_lookup(chrom_map, chrom1_name)
-        chrom2_id = _chrom_id_lookup(chrom_map, chrom2_name)
-        if chrom1_id is None or chrom2_id is None:
-            continue
-        pair_files.append((chrom1_id, chrom2_id, entry))
-
-    pair_files.sort(key=lambda x: (x[0], x[1]))
+    # The per-pair files, listed once (GenomeTrack::ChromFiles, as R converts): by the
+    # canonical names or aliases, those next to an existing index included, sorted by
+    # chrom ids. A file not named by a chromosome pair stops the conversion, and so does
+    # one that cannot be read.
+    files = _pymisha.pm_chrom_files(str(interv_path), True, True)
+    if files["unnamed"]:
+        raise ValueError(
+            f"Intervals set {set_name}: file {files['unnamed'][0]} is not named by a chromosome pair"
+        )
+    pair_files = sorted(
+        (chrom_map[c1], chrom_map[c2], interv_path / f)
+        for c1, c2, f, u in zip(files["chrom1"], files["chrom2"], files["file"], files["used"], strict=True)
+        if u
+    )
+    # removed with remove_old, also those that the packed ones hid
+    files_to_remove = [interv_path / f for f in files["file"]]
 
     crc = _crc64_init()
     current_offset = 0
-    files_to_remove = []
 
-    with open(dat_tmp, "wb") as dat_fh, open(idx_tmp, "wb") as idx_fh:
+    with _removed_on_error(dat_tmp, idx_tmp), open(dat_tmp, "wb") as dat_fh, open(idx_tmp, "wb") as idx_fh:
         _write_index_header_2d(idx_fh, len(pair_files), 0)
         for chrom1_id, chrom2_id, path in pair_files:
             length = _copy_file_contents(path, dat_fh)
-            if length > 0:
-                files_to_remove.append(path)
             idx_fh.write(struct.pack("<IIQQI", chrom1_id, chrom2_id, current_offset, length, 0))
             crc = _crc64_incremental(crc, struct.pack("<I", chrom1_id))
             crc = _crc64_incremental(crc, struct.pack("<I", chrom2_id))
@@ -4857,7 +4962,7 @@ def _resolve_2d_scope(intervals: pd.DataFrame | str | None) -> pd.DataFrame:
     from .tracks import gtrack_exists, gtrack_info
 
     if intervals is None:
-        return gintervals_2d_all(mode="full")
+        return _gintervals_2d_all("full")
 
     if isinstance(intervals, str):
         if gtrack_exists(intervals):
@@ -4866,7 +4971,7 @@ def _resolve_2d_scope(intervals: pd.DataFrame | str | None) -> pd.DataFrame:
                     f"Track '{intervals}' is not 2D; a cartesian-grid iterator "
                     "requires a 2D scope"
                 )
-            res = gextract(intervals, gintervals_2d_all(mode="full"))
+            res = gextract(intervals, _gintervals_2d_all("full"))
             if res is None or len(res) == 0:
                 return _pandas.DataFrame(
                     columns=["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
@@ -5256,7 +5361,7 @@ def giterator_intervals(
                     # all chrom pairs (full mode), so a bare 2D-track iterator
                     # visits every rectangle of the track - not just the
                     # intra-chromosomal (diagonal) ones.
-                    intervals = gintervals_2d_all(mode="full")
+                    intervals = _gintervals_2d_all("full")
                 elif isinstance(intervals, str):
                     # The scope may be an interval-set name *or* a 2D track name
                     # (its rectangles); _maybe_load_intervals_set handles both,
@@ -5314,18 +5419,19 @@ def giterator_intervals(
     # 2D intervals DataFrame as iterator: the iteration cells are the clipped
     # intersections of the iterator rects with the 2D scope (R's
     # TrackExpressionIntervals2DIterator builds a quadtree over the scope and
-    # walks the iterator rects).  Coordinates only - no track values.
+    # walks the iterator rects), in R's order, each with the 1-based row of its
+    # scope interval as intervalID.  Coordinates only - no track values.
     if (
         isinstance(itr, _pandas.DataFrame)
         and _is_2d_intervals_df(itr)
         and isinstance(intervals, _pandas.DataFrame)
         and _is_2d_intervals_df(intervals)
     ):
-        units = _intersect_2d_rects(itr, intervals)
-        if len(units) == 0:
+        from .extract import _gextract_2d_units, _validate_band
+
+        units = _gextract_2d_units(intervals, itr, _validate_band(band))
+        if units is None or len(units) == 0:
             return None
-        units = _sort_2d_intervals(units).reset_index(drop=True)
-        units["intervalID"] = _numpy.arange(len(units), dtype=int)
         if intervals_set_out is not None:
             gintervals_save(units, intervals_set_out)
             return None
@@ -6215,9 +6321,9 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
     from . import _shared
     assert _shared._GROOT is not None
 
-    groot = _shared._GROOT
+    # under the working directory (gdir_cd), as R misha does
     path_part = intervals_set.replace(".", "/")
-    interv_path = Path(groot) / "tracks" / f"{path_part}.interv"
+    interv_path = Path(_shared._names_dir()) / f"{path_part}.interv"
 
     if not interv_path.exists():
         if force:

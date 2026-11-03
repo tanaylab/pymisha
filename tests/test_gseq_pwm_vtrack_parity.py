@@ -27,10 +27,14 @@ import pymisha as pm
 _TOL = 1e-5
 
 # How to force each of gseq_pwm's three implementations. The dispatch is in
-# gseq_pwm(): naming neutral_chars leaves the C++ path, and a region of
-# interest additionally leaves the vectorized one.
+# gseq_pwm(): only neutral_chars_policy = "log_quarter" reaches the C++ path
+# (it charges log(1/4) for an N, which is that policy; the sequences here have
+# no N, so the policies cannot differ), naming neutral_chars leaves it, and a
+# region of interest additionally leaves the vectorized one. The "cpp" entry
+# used to be {}, which ran the vectorized path: _path_spy below now checks
+# that each entry runs the implementation it is named after.
 _PATHS = {
-    "cpp": {},
+    "cpp": {"neutral_chars_policy": "log_quarter"},
     "vectorized": {"neutral_chars": ["N", "n", "*"]},
     "python": {"neutral_chars": ["N", "n", "*"], "start_pos": 1},
 }
@@ -46,6 +50,27 @@ def _clean_vtracks():
     _remove_all_vtracks()
     yield
     _remove_all_vtracks()
+
+
+@pytest.fixture(autouse=True)
+def _path_spy(request, monkeypatch):
+    """In a test parametrized by `path`, fail unless gseq_pwm ran that
+    implementation and no other."""
+    path = getattr(request.node, "callspec", None) and request.node.callspec.params.get("path")
+    if path is None:
+        yield
+        return
+    import pymisha.sequence as seqmod
+    from pymisha._shared import _pymisha
+
+    ran: set[str] = set()
+    for name, mod, fn in (("cpp", _pymisha, "pm_pwm_score_strings"),
+                          ("vectorized", seqmod, "_pwm_score_batch_vectorized"),
+                          ("python", seqmod, "_pwm_score_sequence")):
+        orig = getattr(mod, fn)
+        monkeypatch.setattr(mod, fn, lambda *a, _o=orig, _n=name, **k: ran.add(_n) or _o(*a, **k))
+    yield
+    assert ran == {path}, f"the {path!r} entry ran {sorted(ran)}"
 
 
 def _parity_pssm():
@@ -303,3 +328,42 @@ def test_a_palindromic_window_is_one_hit_scored_on_both_strands(path):
                        **_PATHS[path])[0] == pytest.approx(0.0)
     assert pm.gseq_pwm("AT", pssm, mode="count", score_thresh=0, bidirect=False,
                        strand=1, prior=0, **_PATHS[path])[0] == 1
+
+
+@pytest.mark.parametrize("route", list(_PATHS))
+@pytest.mark.parametrize("mode", ["lse", "max"])
+def test_log_quarter_charges_an_n_log_quarter_on_both_strands(route, mode, monkeypatch):
+    # R's gseq.pwm charges a neutral base log(1/4) on either strand under
+    # neutral_chars_policy = "log_quarter". The C++ scorer does not (its lse
+    # charges the reverse strand the column mean, its max both strands), so a
+    # sequence holding an N must not reach it, whichever arguments ask for it.
+    from pymisha._shared import _pymisha
+
+    pssm = _parity_pssm()
+    w = pssm.shape[0]
+    seq = _seqs(_parity_intervals())[3]
+    seq = seq[:30] + "N" + seq[31:90] + "NN" + seq[92:]
+
+    logp = np.log(pssm + 0.01) - np.log((pssm + 0.01).sum(axis=1, keepdims=True))
+    code = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+    def win_score(win, rev):
+        t = 0.0
+        for j in range(w):
+            b = win[j]
+            row = w - 1 - j if rev else j
+            t += np.log(0.25) if b == "N" else logp[row, 3 - code[b] if rev else code[b]]
+        return t
+
+    union = [np.logaddexp(win_score(seq[i:i + w], False), win_score(seq[i:i + w], True))
+             for i in range(len(seq) - w + 1)]
+    want = np.logaddexp.reduce(union) if mode == "lse" else max(union)
+
+    calls = []
+    orig = _pymisha.pm_pwm_score_strings
+    monkeypatch.setattr(_pymisha, "pm_pwm_score_strings",
+                        lambda *a, **k: calls.append(1) or orig(*a, **k))
+    kw = dict(_PATHS[route], neutral_chars_policy="log_quarter")
+    got = pm.gseq_pwm([seq], pssm, mode=mode, bidirect=True, prior=0.01, **kw)[0]
+    assert not calls, "a sequence with an N reached the C++ path"
+    assert got == pytest.approx(want, rel=1e-12)

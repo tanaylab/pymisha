@@ -59,8 +59,8 @@ class TestTransContactMirroring:
                 fn for fn in os.listdir(tdir) if not fn.startswith(".")
             )
             # Both 1-2 and 2-1 files must exist
-            assert "1-2" in files, f"Expected 1-2 in {files}"
-            assert "2-1" in files, f"Expected 2-1 in {files}"
+            assert "chr1-chr2" in files, f"Expected chr1-chr2 in {files}"
+            assert "chr2-chr1" in files, f"Expected chr2-chr1 in {files}"
         finally:
             self._cleanup()
 
@@ -167,7 +167,7 @@ class TestTransContactMirroring:
             # Only 1-1 file should exist (no mirroring for cis -- cis mirroring
             # is handled at the contact level, not at the file level)
             chrom_pair_files = [fn for fn in files if "-" in fn]
-            assert chrom_pair_files == ["1-1"], \
+            assert chrom_pair_files == ["chr1-chr1"], \
                 f"Expected only 1-1 for cis contacts, got {chrom_pair_files}"
 
             # Querying should still work
@@ -197,12 +197,12 @@ class TestTransContactMirroring:
             files = sorted(
                 fn for fn in os.listdir(tdir) if not fn.startswith(".")
             )
-            # Expect: 1-1 (cis), 1-2 + 2-1 (trans), 2-X + X-2 (trans)
-            assert "1-1" in files
-            assert "1-2" in files
-            assert "2-1" in files
-            assert "2-X" in files
-            assert "X-2" in files
+            # Expect: chr1-chr1 (cis), chr1-chr2 + chr2-chr1 (trans), chr2-chrX + chrX-chr2 (trans)
+            assert "chr1-chr1" in files
+            assert "chr1-chr2" in files
+            assert "chr2-chr1" in files
+            assert "chr2-chrX" in files
+            assert "chrX-chr2" in files
         finally:
             self._cleanup()
 
@@ -222,8 +222,8 @@ class TestTransContactMirroring:
             files = sorted(
                 fn for fn in os.listdir(tdir) if not fn.startswith(".")
             )
-            assert "1-2" in files, f"Expected 1-2 in {files}"
-            assert "2-1" in files, f"Expected 2-1 in {files}"
+            assert "chr1-chr2" in files, f"Expected chr1-chr2 in {files}"
+            assert "chr2-chr1" in files, f"Expected chr2-chr1 in {files}"
 
             # Both queries should return results
             ivs_12 = pd.DataFrame({

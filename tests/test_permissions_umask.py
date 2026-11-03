@@ -26,6 +26,7 @@ EXPECTED = {
     "seq": 0o770,
     "chrom_sizes.txt": 0o660,
     "namespace_dir": 0o770,
+    "gdir_create_dir": 0o770,
     "track_dir": 0o770,
     "nested_track_dir": 0o770,
     "attributes": 0o660,
@@ -52,6 +53,7 @@ _SCRIPT = textwrap.dedent(
     pm.gtrack_create_dirs("ns.sub.t")
     pm.gtrack_create_dense("ns.sub.t", "test", iv, [2.0], binsize=100)
     pm.gintervals_save(iv, "myiv")
+    pm.gdir_create("sub")
 
     paths = {
         "groot": root,
@@ -59,6 +61,7 @@ _SCRIPT = textwrap.dedent(
         "seq": root + "/seq",
         "chrom_sizes.txt": root + "/chrom_sizes.txt",
         "namespace_dir": root + "/tracks/ns",
+        "gdir_create_dir": root + "/tracks/sub",
         "track_dir": root + "/tracks/t1.track",
         "nested_track_dir": root + "/tracks/ns/sub/t.track",
         "attributes": root + "/tracks/t1.track/.attributes",

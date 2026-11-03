@@ -50,7 +50,7 @@ class TestHappyPath:
 
     def test_chain1_block1_values(self):
         out = _call(CHAIN_FILE)
-        assert out["chrom"][0] == "1"
+        assert out["chrom"][0] == "chr1"
         assert out["start"][0] == 12000
         assert out["end"][0] == 12500
         assert out["strand"][0] == 0
@@ -63,7 +63,7 @@ class TestHappyPath:
 
     def test_chain2_block_values(self):
         out = _call(CHAIN_FILE)
-        chrx_rows = np.where(out["chrom"] == "X")[0]
+        chrx_rows = np.where(out["chrom"] == "chrX")[0]
         assert len(chrx_rows) == 1
         i = chrx_rows[0]
         assert out["start"][i] == 5000
@@ -102,7 +102,7 @@ class TestEdgeCases:
         out = _call(path)
         assert out is not None
         assert len(out["chrom"]) == 1
-        assert out["chrom"][0] == "1"
+        assert out["chrom"][0] == "chr1"
         assert out["start"][0] == 0
         assert out["end"][0] == 100
 
@@ -130,7 +130,7 @@ class TestEdgeCases:
         out = _call(path)
         assert out is not None
         assert len(out["chrom"]) == 1
-        assert out["chrom"][0] == "1"
+        assert out["chrom"][0] == "chr1"
         assert out["chain_id"][0] == 2
 
     def test_unknown_target_only_returns_none(self, tmp_path):

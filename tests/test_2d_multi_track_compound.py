@@ -269,8 +269,8 @@ class TestCompoundVtrackExprIntervalsScanner:
         compound = pm.gextract(["v_a + v_b"], intervals=scope)
 
         monkeypatch.setenv("PYMISHA_USE_SCANNER_FOR_INTERVALS", "0")
-        a = pm.gextract(["v_a"], intervals=scope)
-        b = pm.gextract(["v_b"], intervals=scope)
+        a = pm.gextract(["v_a"], intervals=scope, iterator=scope)
+        b = pm.gextract(["v_b"], intervals=scope, iterator=scope)
         np.testing.assert_allclose(
             compound["v_a + v_b"].to_numpy(),
             a["v_a"].to_numpy() + b["v_b"].to_numpy(),

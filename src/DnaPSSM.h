@@ -107,13 +107,15 @@ public:
 
 class DnaPSSM  {
 
-protected:
-
-	vector<DnaProbVec> m_chars;
+public:
 
 	// "no spatial cap". Anything at or above a target's length scans all of
 	// it; INT_MAX says so without pretending to be a real distance.
 	static const int NO_RANGE_CAP = 2147483647;
+
+protected:
+
+	vector<DnaProbVec> m_chars;
 
 	int m_min_range;
 	int m_max_range;

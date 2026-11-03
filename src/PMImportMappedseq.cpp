@@ -1,12 +1,12 @@
 /*
  * PMImportMappedseq.cpp
  *
- * Port of R misha GenomeTrackImportMappedseq.cpp.
- * Task 3: per-byte FSM SAM/tab parser + gzip auto-detect.
- * Track writers come in Tasks 4-5.
+ * Port of R misha GenomeTrackImportMappedseq.cpp (gtrackimport_mappedseq):
+ * per-byte FSM SAM/tab parser, SAM flag / MAPQ filters, paired-end fragments,
+ * plain / gzip / BAM (samtools) / named-pipe input.
  *
- * R parity: exact chrom-name match (no normalization), tab-only split.
- * pymisha extension: gzip auto-detect via zlib (0x1f 0x8b magic bytes).
+ * pymisha additions: "-" and "fd:N" read from a file descriptor, and an indexed
+ * database is written through IndexedTrackWriter.
  */
 
 #include <algorithm>
@@ -43,10 +43,14 @@ using namespace std;
 
 namespace {
 
-enum { SEQ_COL, CHROM_COL, COORD_COL, STRAND_COL, NUM_COLS };
+// The first NUM_USER_COLS columns are the ones cols_order positions; the rest are read only from SAM
+// (MAPQ, CIGAR, PNEXT, TLEN) or from fragment files (END). A column with order 0 is not read.
+enum { SEQ_COL, CHROM_COL, COORD_COL, STRAND_COL, NUM_USER_COLS, MAPQ_COL = NUM_USER_COLS, CIGAR_COL, PNEXT_COL, TLEN_COL, END_COL, NUM_COLS };
 static const char *COL_NAMES[NUM_COLS] = {
-    "sequence", "chromosome", "coordinate", "strand"
+    "sequence", "chromosome", "coordinate", "strand", "mapq", "cigar", "pnext", "tlen", "end"
 };
+// SAM flags: unmapped (0x4), secondary (0x100), QC fail (0x200) and supplementary (0x800) records are never imported
+static const uint64_t SAM_SKIP_FLAGS = 0x4 | 0x100 | 0x200 | 0x800;
 
 static bool file_exists_pm(const string &path) {
     struct stat st; return stat(path.c_str(), &st) == 0;
@@ -87,6 +91,8 @@ public:
 
 class GzipSource : public ByteSource {
     gzFile gz_;
+    std::string head_; // bytes read ahead by peek(), served before the rest of the stream
+    size_t head_pos_ = 0;
 public:
     explicit GzipSource(const std::string &path) : gz_(nullptr) {
         gz_ = gzopen(path.c_str(), "rb");
@@ -94,7 +100,14 @@ public:
             verror("Failed to open gzipped %s: %s", path.c_str(), strerror(errno));
     }
     ~GzipSource() override { if (gz_) gzclose(gz_); }
-    int getc() override { return gzgetc(gz_); }
+    int getc() override { return head_pos_ < head_.size() ? (unsigned char)head_[head_pos_++] : gzgetc(gz_); }
+    // The first n (decompressed) bytes, without consuming them; works on a pipe.
+    const std::string &peek(size_t n) {
+        int c;
+        while (head_.size() < n && (c = gzgetc(gz_)) != EOF)
+            head_.push_back((char)c);
+        return head_;
+    }
     bool error() const override {
         if (!gz_) return true;
         int err = 0;
@@ -181,6 +194,16 @@ static size_t read_magic_bytes(const std::string &path, unsigned char *buf, size
     return n;
 }
 
+// True if the decompressed stream starts with the BAM magic "BAM\1".
+static bool has_bam_payload(const std::string &path) {
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) return false;
+    char magic[4];
+    int n = gzread(gz, magic, 4);
+    gzclose(gz);
+    return n == 4 && !memcmp(magic, "BAM\1", 4);
+}
+
 static std::unique_ptr<ByteSource> open_source(const std::string &path) {
     // stdin shorthand
     if (path == "-")
@@ -193,20 +216,58 @@ static std::unique_ptr<ByteSource> open_source(const std::string &path) {
             verror("Invalid fd path: %s (expected fd:N for non-negative integer N)", path.c_str());
         return std::unique_ptr<ByteSource>(new FdSource((int)fd));
     }
-    // Regular path: peek magic bytes. BAM is bgzip = gzip with FLG=0x04
-    // (FEXTRA - block-size subfield); plain gzip has FLG=0x00 or 0x08, so
-    // byte 3 distinguishes BAM. Pipe BAM through samtools view; gzip and
-    // plain stay as before.
+    // A FIFO or other non-regular file cannot be sniffed: reading its first bytes consumes them and closes
+    // the only reader. zlib reads plain or gzipped text from it as a stream.
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0 && !S_ISREG(st.st_mode)) {
+        auto src = std::unique_ptr<GzipSource>(new GzipSource(path));
+        if (src->peek(4) == std::string("BAM\1", 4))
+            verror("%s is a pipe carrying BAM, which misha reads only from a regular file. "
+                   "Send SAM through the pipe instead (samtools view -h).", path.c_str());
+        return src;
+    }
+
+    // Regular path: peek magic bytes. bgzip uses gzip magic with FLG.FEXTRA (0x04) and method 0x08; that
+    // distinguishes BAM/bgzip from plain gzip (which has FLG 0x00 or 0x08). A bgzipped text file (e.g. a
+    // 10x fragments.tsv.gz) is read with zlib.
     unsigned char magic[4] = {0, 0, 0, 0};
     size_t n = read_magic_bytes(path, magic, 4);
     if (n == 4 && magic[0] == 0x1f && magic[1] == 0x8b &&
-                  magic[2] == 0x08 && magic[3] == 0x04) {
+                  magic[2] == 0x08 && magic[3] == 0x04 && has_bam_payload(path)) {
         const std::string cmd = "samtools view " + shellquote_single(path);
         return std::unique_ptr<ByteSource>(new PipeSource(cmd));
     }
     if (n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b)
         return std::unique_ptr<ByteSource>(new GzipSource(path));
     return std::unique_ptr<ByteSource>(new PlainSource(path));
+}
+
+// Reference length of a CIGAR (M, D, N, = and X operations); -1 for "*", a malformed CIGAR or an absurd length.
+static int64_t cigar_ref_span(const std::string &cigar) {
+    const int64_t MAX_LEN = (int64_t)1 << 40; // keeps len and span far from overflow
+    int64_t span = 0, len = 0;
+    bool has_len = false;
+    for (char ch : cigar) {
+        if (ch >= '0' && ch <= '9') {
+            len = len * 10 + (ch - '0');
+            if (len >= MAX_LEN)
+                return -1;
+            has_len = true;
+            continue;
+        }
+        if (!has_len)
+            return -1;
+        if (ch == 'M' || ch == 'D' || ch == 'N' || ch == '=' || ch == 'X') {
+            span += len;
+            if (span >= MAX_LEN)
+                return -1;
+        }
+        else if (ch != 'I' && ch != 'S' && ch != 'H' && ch != 'P')
+            return -1;
+        len = 0;
+        has_len = false;
+    }
+    return has_len ? -1 : span;
 }
 
 }  // namespace
@@ -223,34 +284,62 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         long binsize = -1;
         PyObject *py_cols_order = nullptr;
         int remove_dups_int = 0;
+        int paired_int = 0;
+        long min_mapq = 0;
+        long long max_fraglen = 2000;
+        int one_based_int = 0;
 
-        if (!PyArg_ParseTuple(args, "ssllOp",
+        if (!PyArg_ParseTuple(args, "ssllOp|plLp",
                               &track_dir_cstr, &file_path_cstr,
                               &pileup, &binsize,
-                              &py_cols_order, &remove_dups_int))
+                              &py_cols_order, &remove_dups_int,
+                              &paired_int, &min_mapq, &max_fraglen, &one_based_int))
             verror("Invalid arguments to pm_import_mappedseq");
 
         const string track_dir(track_dir_cstr);
         const string file_path(file_path_cstr);
+        const bool remove_dups = (remove_dups_int != 0);
+        const bool paired = (paired_int != 0);
 
-        // cols_order: None -> SAM defaults; else 4-int sequence (1-based).
-        int cols_order[NUM_COLS];
+        // cols_order: None -> SAM; else 4-int sequence (1-based).
+        int cols_order[NUM_COLS] = { 0 };
         const bool is_sam_format = (py_cols_order == Py_None);
+        // paired on a non-SAM file: tab-delimited fragments, 0-based half-open chrom/start/end in columns 1-3
+        // (BED, 10x fragments.tsv.gz). Fragment files are taken as already deduplicated.
+        const bool is_frag_format = paired && !is_sam_format;
+        // SAM POS is 1-based by the spec; a tab-delimited coordinate is 1-based only when one_based is set
+        const bool one_based = is_sam_format || one_based_int;
+        // Tab-delimited files without one_based keep the historical placement: the coordinate is taken as is,
+        // and a reverse read is recorded one base past its 5' end (its end-exclusive coordinate).
+        const bool legacy = !is_sam_format && !is_frag_format && !one_based;
+        const int64_t rev_end_off = legacy ? 0 : 1; // recorded reverse-read coordinate + rev_end_off = end-exclusive coordinate
+
+        if (is_frag_format && one_based_int)
+            verror("one_based is not used for fragment files: their coordinates are 0-based, half-open");
+
         if (is_sam_format) {
             cols_order[SEQ_COL]    = 10;
             cols_order[CHROM_COL]  = 3;
             cols_order[COORD_COL]  = 4;
             cols_order[STRAND_COL] = 2;
+            cols_order[MAPQ_COL]   = 5;
+            cols_order[CIGAR_COL]  = 6;
+            cols_order[PNEXT_COL]  = 8;
+            cols_order[TLEN_COL]   = 9;
+        } else if (is_frag_format) {
+            cols_order[CHROM_COL] = 1;
+            cols_order[COORD_COL] = 2;
+            cols_order[END_COL]   = 3;
         } else {
             PyObject *seq = PySequence_Fast(py_cols_order,
                 "cols_order must be a sequence of 4 ints or None");
             if (!seq)
                 verror("cols_order must be a sequence of 4 ints or None");
-            if (PySequence_Fast_GET_SIZE(seq) != NUM_COLS) {
+            if (PySequence_Fast_GET_SIZE(seq) != NUM_USER_COLS) {
                 Py_DECREF(seq);
-                verror("cols_order must have %d entries", NUM_COLS);
+                verror("cols_order must have %d entries", NUM_USER_COLS);
             }
-            for (int i = 0; i < NUM_COLS; ++i) {
+            for (int i = 0; i < NUM_USER_COLS; ++i) {
                 PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
                 long v = PyLong_AsLong(item);
                 if (PyErr_Occurred()) {
@@ -260,19 +349,38 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
                 cols_order[i] = (int)v;
             }
             Py_DECREF(seq);
+            for (int i = 0; i < NUM_USER_COLS; ++i) {
+                if (cols_order[i] <= 0)
+                    verror("Invalid cols_order: %s index is %d (must be >= 1)",
+                           COL_NAMES[i], cols_order[i]);
+            }
         }
 
         if (pileup < 0)
             verror("pileup cannot be negative");
-        if (pileup == 0 && binsize >= 0)
-            verror("For pileup=0 (sparse), binsize must be -1");
-        if (pileup > 0 && binsize <= 0)
-            verror("For pileup>0 (dense), binsize must be > 0");
+        if (min_mapq < 0)
+            verror("min_mapq cannot be negative");
+        if (min_mapq > 0 && !is_sam_format)
+            verror("min_mapq requires SAM or BAM input (a SAM file needs cols_order=None)");
+        if (paired) {
+            if (pileup)
+                verror("pileup is not used with paired=True: each fragment covers its own span. Set pileup to 0.");
+            if (binsize <= 0)
+                verror("For paired=True (dense), binsize must be > 0");
+            if (max_fraglen <= 0)
+                verror("max_fraglen must be positive");
+        } else {
+            if (pileup == 0 && binsize >= 0)
+                verror("For pileup=0 (sparse), binsize must be -1");
+            if (pileup > 0 && binsize <= 0)
+                verror("For pileup>0 (dense), binsize must be > 0");
+        }
 
+        int num_used_cols = 0;
         for (int i = 0; i < NUM_COLS; ++i) {
-            if (cols_order[i] <= 0)
-                verror("Invalid cols_order: %s index is %d (must be >= 1)",
-                       COL_NAMES[i], cols_order[i]);
+            if (!cols_order[i])
+                continue;
+            ++num_used_cols;
             for (int j = i + 1; j < NUM_COLS; ++j) {
                 if (cols_order[i] == cols_order[j])
                     verror("Invalid cols_order: %s and %s share index %d",
@@ -291,7 +399,7 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         const auto &chromkey = g_pmdb->chromkey();
         const uint32_t num_chroms = (uint32_t)chromkey.get_num_chroms();
 
-        // Build chrom name -> index map (R lines 96-104).
+        // Chrom name -> index map; exact names, as R matches them
         std::unordered_map<std::string, int> str2chrom;
         str2chrom.reserve(num_chroms);
         std::vector<int64_t> chrom_ends(num_chroms);
@@ -303,19 +411,22 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         // Per-chrom counters and coordinate storage.
         // coords[0..num_chroms) = plus strand, coords[num_chroms..2*num_chroms) = minus strand.
         std::vector<uint64_t> num_mapped(num_chroms, 0);
-        std::vector<uint64_t> num_dups(num_chroms, 0);  // populated by writer tasks (4-5)
+        std::vector<uint64_t> num_dups(num_chroms, 0);
         std::vector<std::vector<int64_t>> coords(2 * num_chroms);
+        std::vector<std::vector<std::pair<int64_t, int64_t>>> frags(paired ? num_chroms : 0);
+        // lines starting with this char are headers / comments
+        const int comment_char = is_sam_format ? '@' : is_frag_format ? '#' : 0;
 
         auto src = open_source(file_path);
         int64_t total_unmapped = 0;
+        int64_t total_filtered = 0;
 
-        // FSM state (mirrors R lines 119-225).
+        // FSM state (mirrors R's gtrackimport_mappedseq).
         int col = 1;
         int active_col_idx = -1;
         int pos = 0;
-        std::string col_buf[NUM_COLS];
+        std::string str[NUM_COLS];
 
-        // Prime active_col_idx for col=1.
         for (int i = 0; i < NUM_COLS; ++i) {
             if (cols_order[i] == 1) { active_col_idx = i; break; }
         }
@@ -323,8 +434,12 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         while (true) {
             int c = src->getc();
 
-            // SAM '@' header skip - only at start of line, only in SAM mode.
-            if (!pos && is_sam_format && c == '@') {
+            // CRLF line endings: drop the CR
+            if (c == '\r')
+                continue;
+
+            // skip SAM headers (@) and fragment file comments (#)
+            if (!pos && comment_char && c == comment_char) {
                 while (true) {
                     c = src->getc();
                     if (c == '\n' || c == EOF) break;
@@ -336,53 +451,139 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
 
             if (c == '\n' || c == EOF || c == '\t') {
                 if (c == '\n' || c == EOF) {
-                    int num_nonempty = 0;
+                    int num_nonempty_strs = 0;
                     bool mapped = false;
+                    bool filtered = false; // a valid record left out by a filter (flags, MAPQ, fragment length)
+                    bool second_mate = false; // a paired SAM import counts each pair once, by its first mate
+
                     pos = 0;
                     for (int i = 0; i < NUM_COLS; ++i)
-                        if (!col_buf[i].empty()) ++num_nonempty;
+                        if (!str[i].empty()) ++num_nonempty_strs;
 
-                    // R's one-shot block (mirrors `while (num_nonempty_strs == NUM_COLS) {...break;}`).
-                    if (num_nonempty == NUM_COLS) {
-                        auto it = str2chrom.find(col_buf[CHROM_COL]);
-                        if (it != str2chrom.end()) {
-                            int chrom_idx = it->second;
-                            char *endptr = nullptr;
-                            int64_t coord = strtoll(col_buf[COORD_COL].c_str(), &endptr, 10);
-                            if (*endptr == '\0' && coord >= 0 && coord < chrom_ends[chrom_idx]) {
-                                std::string strand;
-                                bool strand_ok = true;
-                                if (is_sam_format) {
-                                    char *fendp = nullptr;
-                                    uint64_t flag = (uint64_t)strtoll(col_buf[STRAND_COL].c_str(), &fendp, 0);
-                                    if (*fendp != '\0') strand_ok = false;
-                                    else strand = (flag & 0x10) ? "-" : "+";
-                                } else {
-                                    strand = col_buf[STRAND_COL];
-                                }
-                                if (strand_ok) {
-                                    if (strand == "+" || strand == "F") {
-                                        coords[chrom_idx].push_back(coord);
-                                        ++num_mapped[chrom_idx];
-                                        mapped = true;
-                                    } else if (strand == "-" || strand == "R") {
-                                        coords[num_chroms + chrom_idx].push_back(
-                                            coord + (int64_t)col_buf[SEQ_COL].size());
-                                        ++num_mapped[chrom_idx];
-                                        mapped = true;
-                                    }
-                                }
+                    // one pass, left early with break
+                    while (num_nonempty_strs == num_used_cols) {
+                        char *endptr;
+                        uint64_t flag = 0;
+                        int64_t span = -1; // reference span of a SAM read, from its CIGAR
+
+                        if (is_sam_format) {
+                            flag = strtoull(str[STRAND_COL].c_str(), &endptr, 0);
+                            if (*endptr)
+                                break;
+                            if (paired && (flag & 0x1) && (flag & 0x80)) {
+                                second_mate = true;
+                                break;
                             }
                         }
+
+                        auto istr2chrom = str2chrom.find(str[CHROM_COL]);
+                        if (istr2chrom == str2chrom.end())
+                            break;
+                        int chrom_idx = istr2chrom->second;
+                        int64_t chrom_end = chrom_ends[chrom_idx];
+
+                        int64_t coord = strtoll(str[COORD_COL].c_str(), &endptr, 10);
+                        if (*endptr || coord < (one_based ? 1 : 0)) // SAM POS 0 means no position
+                            break;
+                        if (one_based)
+                            --coord; // 0-based leftmost base
+                        if (coord >= chrom_end)
+                            break;
+
+                        if (is_frag_format) {
+                            int64_t end = strtoll(str[END_COL].c_str(), &endptr, 10);
+                            if (*endptr || end <= coord)
+                                break;
+                            if (end - coord > max_fraglen) {
+                                filtered = true;
+                                break;
+                            }
+                            frags[chrom_idx].emplace_back(coord, std::min(end, chrom_end));
+                            mapped = true;
+                            ++num_mapped[chrom_idx];
+                            break;
+                        }
+
+                        if (is_sam_format) {
+                            if (flag & 0x4)
+                                break;
+
+                            if (flag & SAM_SKIP_FLAGS) {
+                                filtered = true;
+                                break;
+                            }
+
+                            if (min_mapq) {
+                                long mapq = strtol(str[MAPQ_COL].c_str(), &endptr, 10);
+                                if (*endptr)
+                                    break;
+                                if (mapq < min_mapq) {
+                                    filtered = true;
+                                    break;
+                                }
+                            }
+
+                            // htslib (and so a BAM import) takes a mapped record without a CIGAR ('*') as unmapped;
+                            // a malformed CIGAR, or one with no aligned reference base, is unusable too
+                            if ((span = cigar_ref_span(str[CIGAR_COL])) <= 0)
+                                break;
+
+                            if (paired) {
+                                // One fragment per proper pair, taken from the first mate (as MACS3 BAMPE does):
+                                // [min(POS, PNEXT), + |TLEN|) in 1-based POS terms. Unpaired reads are filtered.
+                                if ((flag & 0x3) != 0x3 || (flag & 0x8)) {
+                                    filtered = true;
+                                    break;
+                                }
+                                int64_t pnext = strtoll(str[PNEXT_COL].c_str(), &endptr, 10);
+                                if (*endptr)
+                                    break;
+                                int64_t tlen = strtoll(str[TLEN_COL].c_str(), &endptr, 10);
+                                if (*endptr)
+                                    break;
+                                tlen = llabs(tlen);
+                                int64_t start = std::min(coord, pnext - 1);
+                                if (!tlen || tlen > max_fraglen || start < 0) {
+                                    filtered = true;
+                                    break;
+                                }
+                                frags[chrom_idx].emplace_back(start, std::min(start + tlen, chrom_end));
+                                mapped = true;
+                                ++num_mapped[chrom_idx];
+                                break;
+                            }
+
+                            str[STRAND_COL] = flag & 0x10 ? "-" : "+";
+                        }
+
+                        if (str[STRAND_COL] == "+" || str[STRAND_COL] == "F")
+                            coords[chrom_idx].push_back(coord);
+                        else if (str[STRAND_COL] == "-" || str[STRAND_COL] == "R") {
+                            // the 5' end of a reverse read is its rightmost aligned base (one past it in legacy mode)
+                            if (span <= 0) // a tab-delimited file: no CIGAR
+                                span = str[SEQ_COL].size();
+                            // the recorded point must lie on the chromosome; a legacy dense track clips the read instead
+                            int64_t room = chrom_end - coord;
+                            if (legacy ? !pileup && span >= room : span > room)
+                                break;
+                            coords[num_chroms + chrom_idx].push_back(coord + span - rev_end_off);
+                        } else
+                            break;
+
+                        mapped = true;
+                        ++num_mapped[chrom_idx];
+                        break;
                     }
 
-                    if (!mapped && num_nonempty > 0)
+                    if (filtered)
+                        ++total_filtered;
+                    else if (!mapped && !second_mate && num_nonempty_strs)
                         ++total_unmapped;
 
                     if (c == EOF) break;
 
-                    if (num_nonempty > 0) {
-                        for (int i = 0; i < NUM_COLS; ++i) col_buf[i].clear();
+                    if (num_nonempty_strs > 0) {
+                        for (int i = 0; i < NUM_COLS; ++i) str[i].clear();
                     }
                     col = 1;
                 } else {
@@ -394,7 +595,7 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
                     if (cols_order[i] == col) { active_col_idx = i; break; }
                 }
             } else if (active_col_idx >= 0) {
-                col_buf[active_col_idx].push_back((char)c);
+                str[active_col_idx].push_back((char)c);
             }
         }
 
@@ -422,22 +623,23 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
             }
         }
 
-        // Write track files (Tasks 4-5).
+        // Write track files: dense with pileup or paired, sparse otherwise
         ensure_track_dir_pm(track_dir);
+        const bool dense = pileup > 0 || paired;
 
         const bool indexed_db = db_is_indexed_pm();
         std::unique_ptr<IndexedTrackWriter> indexed_writer;
         if (indexed_db) {
-            MishaTrackType type = (pileup > 0) ? MishaTrackType::DENSE : MishaTrackType::SPARSE;
+            MishaTrackType type = dense ? MishaTrackType::DENSE : MishaTrackType::SPARSE;
             indexed_writer.reset(new IndexedTrackWriter(track_dir, type, num_chroms));
         }
 
-        if (pileup > 0) {
+        if (dense) {
             const uint32_t bs_u32 = (uint32_t)binsize;
-            const bool remove_dups = (remove_dups_int != 0);
+            const double binsize_d = (double)binsize;  // R computes the bins in double
             for (uint32_t chrom = 0; chrom < num_chroms; ++chrom) {
                 int64_t chrom_end = chrom_ends[chrom];
-                int64_t nbins = (int64_t)std::ceil((double)chrom_end / (double)binsize);
+                int64_t nbins = (int64_t)std::ceil((double)chrom_end / binsize_d);
                 if (nbins < 0) nbins = 0;
 
                 GenomeTrackFixedBin gtrack;
@@ -451,34 +653,50 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
 
                 std::vector<float> trackvals((size_t)nbins, 0.0f);
 
+                // adds the fraction of each bin covered by [from_coord, to_coord); float += double, as in R
+                auto add_coverage = [&](int64_t from_coord, int64_t to_coord) {
+                    // a reverse read longer than pileup can end past the chromosome: nothing left to add
+                    if (from_coord >= to_coord)
+                        return;
+                    int64_t from_bin = (int64_t)(from_coord / binsize_d);
+                    int64_t to_bin = (int64_t)std::ceil(to_coord / binsize_d) - 1;
+
+                    // the last, partial bin of a chromosome is also divided by binsize, as in R
+                    if (from_bin >= to_bin)
+                        trackvals[from_bin] += (to_coord - from_coord) / binsize_d;
+                    else {
+                        trackvals[from_bin] += from_bin + 1 - from_coord / binsize_d;
+                        trackvals[to_bin] += to_coord / binsize_d - to_bin;
+                        for (int64_t bin = from_bin + 1; bin < to_bin; ++bin)
+                            trackvals[bin]++;
+                    }
+                };
+
+                if (paired) {
+                    std::vector<std::pair<int64_t, int64_t>> &cur_frags = frags[chrom];
+                    std::sort(cur_frags.begin(), cur_frags.end());
+
+                    for (size_t k = 0; k < cur_frags.size(); ++k) {
+                        if (remove_dups && !is_frag_format && k > 0 && cur_frags[k] == cur_frags[k - 1]) {
+                            ++num_dups[chrom];
+                            continue;
+                        }
+                        add_coverage(cur_frags[k].first, cur_frags[k].second);
+                    }
+                    std::vector<std::pair<int64_t, int64_t>>().swap(cur_frags);
+                }
+
                 for (int strand = 0; strand < 2; ++strand) {
                     std::vector<int64_t> &cur = coords[strand * num_chroms + chrom];
                     std::sort(cur.begin(), cur.end());
 
                     for (size_t k = 0; k < cur.size(); ++k) {
-                        int64_t coord = cur[k];
-                        if (remove_dups && k > 0 && coord == cur[k - 1]) {
+                        if (remove_dups && k > 0 && cur[k] == cur[k - 1]) {
                             ++num_dups[chrom];
                             continue;
                         }
-                        int64_t from_coord = std::max<int64_t>(
-                            strand ? coord - (int64_t)pileup : coord, (int64_t)0);
-                        int64_t to_coord = std::min<int64_t>(
-                            strand ? coord : coord + (int64_t)pileup, chrom_end);
-                        int64_t from_bin = (int64_t)(from_coord / binsize);
-                        int64_t to_bin = (int64_t)std::ceil((double)to_coord / (double)binsize) - 1;
-
-                        if (from_bin >= to_bin) {
-                            trackvals[from_bin] +=
-                                (float)((double)(to_coord - from_coord) / (double)binsize);
-                        } else {
-                            trackvals[from_bin] +=
-                                (float)((double)(from_bin + 1) - (double)from_coord / (double)binsize);
-                            trackvals[to_bin]   +=
-                                (float)((double)to_coord / (double)binsize - (double)to_bin);
-                            for (int64_t b = from_bin + 1; b < to_bin; ++b)
-                                trackvals[b] += 1.0f;
-                        }
+                        int64_t end_coord = strand ? cur[k] + rev_end_off : cur[k] + pileup;
+                        add_coverage(std::max(end_coord - (int64_t)pileup, (int64_t)0), std::min(end_coord, chrom_end));
                     }
                 }
 
@@ -492,8 +710,7 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
                 }
             }
             if (indexed_db) indexed_writer->finish();
-        } else {  // pileup == 0  ->  sparse
-            const bool remove_dups = (remove_dups_int != 0);
+        } else {  // sparse
             const int32_t sparse_sig = GenomeTrack::FORMAT_SIGNATURES[GenomeTrack::SPARSE];
 
             for (uint32_t chrom = 0; chrom < num_chroms; ++chrom) {
@@ -578,11 +795,13 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
             PyDict_SetItemString(d, key, f);
             Py_DECREF(f);
         };
+        // tot_mapped includes the duplicates
         set_float(total, "total",
-                  (double)(tot_mapped + (uint64_t)total_unmapped + tot_dups));
+                  (double)(tot_mapped + (uint64_t)total_unmapped + (uint64_t)total_filtered));
         set_float(total, "total.mapped",   (double)tot_mapped);
         set_float(total, "total.unmapped", (double)total_unmapped);
         set_float(total, "total.dups",     (double)tot_dups);
+        set_float(total, "total.filtered", (double)total_filtered);
 
         PyObject *chroms_l = PyList_New(num_chroms);
         PyObject *mapped_l = PyList_New(num_chroms);

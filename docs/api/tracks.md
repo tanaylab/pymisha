@@ -57,6 +57,11 @@ Functions for creating, importing, modifying, and managing genomic tracks, inclu
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gtrack_import_parquet
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gtrack_rm
     options:
       show_root_heading: true

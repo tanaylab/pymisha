@@ -25,8 +25,8 @@ def test_giterator_cartesian_grid_uses_second_intervals_and_expansion():
     grid = pm.giterator_cartesian_grid(intervs1, [-10, 10], intervs2, [-20, 0, 20])
 
     assert len(grid) == 2
-    assert (grid["chrom1"] == "1").all()
-    assert (grid["chrom2"] == "2").all()
+    assert (grid["chrom1"] == "chr1").all()
+    assert (grid["chrom2"] == "chr2").all()
 
 
 def test_giterator_cartesian_grid_band_idx_filters_pairs():

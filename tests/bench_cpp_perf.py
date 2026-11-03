@@ -134,9 +134,6 @@ def run_benchmarks():
     # 13. gtrack_liftover: end-to-end C++ orchestrator vs pure-Python on 1M-bin + 10k-chain.
     results.append(bench_gtrack_liftover())
 
-    # 14. gtrack_import_mappedseq: C++ vs Python fallback on a 100k-read synthetic SAM.
-    results.append(bench_import_mappedseq())
-
     results.append(bench_sliding_reducer())
 
     return results
@@ -146,7 +143,7 @@ def bench_liftover_aggregate():
     """Compare pure-Python vs C++ _aggregate_overlapping on ~100k overlapping
     intervals across ~22 chroms. Returns a single-summary dict with both
     timings and the speedup."""
-    from pymisha.liftover import _aggregate_overlapping, _AGG_FUNCS
+    from pymisha.liftover import _aggregate_overlapping
 
     rng = np.random.default_rng(60427)
     n = 100_000
@@ -156,23 +153,22 @@ def bench_liftover_aggregate():
     lengths = rng.integers(50, 500, size=n).astype(np.int64)
     ends = starts + lengths
     values = rng.normal(size=n)
-    df = pd.DataFrame({"chrom": chroms, "start": starts, "end": ends, "value": values})
-
-    mean_fn = _AGG_FUNCS["mean"]
+    df = pd.DataFrame({"chrom": chroms, "start": starts, "end": ends, "value": values,
+                       "key": np.arange(n, dtype=np.int64)})
 
     # Warm both paths once.
-    _aggregate_overlapping(df, mean_fn, na_rm=True)
-    _aggregate_overlapping(df, mean_fn, na_rm=True, agg_name="mean")
+    _aggregate_overlapping(df, agg_name="mean", _force_pure_python=True)
+    _aggregate_overlapping(df, agg_name="mean")
 
     gc.collect()
     t0 = time.perf_counter()
-    _aggregate_overlapping(df, mean_fn, na_rm=True)
+    _aggregate_overlapping(df, agg_name="mean", _force_pure_python=True)
     t1 = time.perf_counter()
     python_seconds = t1 - t0
 
     gc.collect()
     t0 = time.perf_counter()
-    _aggregate_overlapping(df, mean_fn, na_rm=True, agg_name="mean")
+    _aggregate_overlapping(df, agg_name="mean")
     t1 = time.perf_counter()
     cpp_seconds = t1 - t0
 
@@ -538,111 +534,6 @@ def bench_gtrack_liftover(n_bins: int = 1_000_000, n_chain: int = 10_000) -> dic
         "cpp_seconds": round(t_cpp, 6),
         "speedup": round(speedup, 3),
         "median_s": round(t_cpp, 6),
-        "std_s": 0.0,
-    }
-
-
-def bench_import_mappedseq(n_reads: int = 100_000) -> dict:
-    """Benchmark pm_import_mappedseq vs the pure-Python fallback on a
-    synthetic n_reads-line SAM.
-
-    Uses the small test DB (chrom '1', 500k bp); reads are uniformly
-    distributed within the chrom. Mix of + and - strand. Some duplicates
-    expected on a 100k-read uniform sample over 500k positions.
-    """
-    import shutil
-    import tempfile
-
-    rng = np.random.default_rng(60427)
-
-    test_db = "tests/testdb/trackdb/test"
-    if not os.path.isdir(test_db):
-        return {"label": "import_mappedseq_100k", "skip": True,
-                "median_s": 0.0, "std_s": 0.0}
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_root = os.path.join(tmpdir, "trackdb", "test")
-        shutil.copytree(test_db, db_root)
-
-        # Synthetic SAM: header + n_reads alignment lines.
-        sam_path = os.path.join(tmpdir, "reads.sam")
-        chrom = "1"
-        chrom_size = 500_000
-        seq_len = 50
-        coords = rng.integers(0, chrom_size - seq_len, size=n_reads)
-        flags = rng.choice([0, 16], size=n_reads)  # 0 = +, 16 = -
-        seq = "A" * seq_len
-        with open(sam_path, "w") as fh:
-            fh.write("@HD\tVN:1.6\n")
-            fh.write(f"@SQ\tSN:{chrom}\tLN:{chrom_size}\n")
-            for i in range(n_reads):
-                fh.write(
-                    f"r{i}\t{flags[i]}\t{chrom}\t{coords[i]}\t30\t"
-                    f"{seq_len}M\t*\t0\t0\t{seq}\t*\n"
-                )
-
-        pm.gdb_init(db_root)
-
-        # Time C++ path.
-        gc.collect()
-        t0 = time.perf_counter()
-        pm.gtrack_import_mappedseq(
-            "bench_cpp_dense", "bench", sam_path,
-            pileup=50, binsize=100,
-            cols_order=None, remove_dups=True,
-        )
-        t_cpp_dense = time.perf_counter() - t0
-
-        # Time Python fallback.
-        os.environ["PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ"] = "1"
-        try:
-            gc.collect()
-            t0 = time.perf_counter()
-            pm.gtrack_import_mappedseq(
-                "bench_py_dense", "bench", sam_path,
-                pileup=50, binsize=100,
-                cols_order=None, remove_dups=True,
-            )
-            t_py_dense = time.perf_counter() - t0
-        finally:
-            os.environ.pop("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", None)
-
-        # Time C++ sparse.
-        gc.collect()
-        t0 = time.perf_counter()
-        pm.gtrack_import_mappedseq(
-            "bench_cpp_sparse", "bench", sam_path,
-            pileup=0, binsize=-1,
-            cols_order=None, remove_dups=True,
-        )
-        t_cpp_sparse = time.perf_counter() - t0
-
-        os.environ["PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ"] = "1"
-        try:
-            gc.collect()
-            t0 = time.perf_counter()
-            pm.gtrack_import_mappedseq(
-                "bench_py_sparse", "bench", sam_path,
-                pileup=0, binsize=-1,
-                cols_order=None, remove_dups=True,
-            )
-            t_py_sparse = time.perf_counter() - t0
-        finally:
-            os.environ.pop("PYMISHA_FORCE_PY_IMPORT_MAPPEDSEQ", None)
-
-    speedup_dense = t_py_dense / t_cpp_dense if t_cpp_dense > 0 else float("inf")
-    speedup_sparse = t_py_sparse / t_cpp_sparse if t_cpp_sparse > 0 else float("inf")
-    return {
-        "label": f"import_mappedseq_{n_reads // 1000}k",
-        "name": f"gtrack_import_mappedseq ({n_reads} SAM reads)",
-        "n_reads": n_reads,
-        "py_dense_seconds": round(t_py_dense, 6),
-        "cpp_dense_seconds": round(t_cpp_dense, 6),
-        "dense_speedup": round(speedup_dense, 3),
-        "py_sparse_seconds": round(t_py_sparse, 6),
-        "cpp_sparse_seconds": round(t_cpp_sparse, 6),
-        "sparse_speedup": round(speedup_sparse, 3),
-        "median_s": round(t_cpp_dense, 6),
         "std_s": 0.0,
     }
 

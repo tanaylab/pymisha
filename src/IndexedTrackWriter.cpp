@@ -8,6 +8,19 @@
 #include "GenomeTrack.h"
 #include "TGLException.h"
 
+int close_written(FILE *fp)
+{
+    int err = 0;
+    if (fflush(fp))
+        err = errno;
+    else if (ferror(fp))
+        err = EIO;
+    fsync(fileno(fp));
+    if (fclose(fp) && !err)
+        err = errno;
+    return err;
+}
+
 IndexedTrackWriter::IndexedTrackWriter(const std::string &track_dir,
                                        MishaTrackType type,
                                        std::uint32_t nchroms)
@@ -175,12 +188,15 @@ void IndexedTrackWriter::finish()
     if (fwrite(&checksum, sizeof(checksum), 1, idx_fp) != 1)
         TGLError<GenomeTrack>("Failed to write checksum to %s", idx_tmp.c_str());
 
-    fflush(dat_fp);
-    fflush(idx_fp);
-    fsync(fileno(dat_fp));
-    fsync(fileno(idx_fp));
-    fclose(dat_fp); dat_fp = nullptr;
-    fclose(idx_fp); idx_fp = nullptr;
+    // Checked, or a short file is renamed into place as a complete track (misha's
+    // GenomeTrackIndexedWriter checks both). On failure the destructor removes the temporary files.
+    int dat_err = close_written(dat_fp);
+    dat_fp = nullptr;
+    int idx_err = close_written(idx_fp);
+    idx_fp = nullptr;
+    if (dat_err || idx_err)
+        TGLError<GenomeTrack>("Failed to write %s: %s", (dat_err ? dat_path : idx_path).c_str(),
+                              strerror(dat_err ? dat_err : idx_err));
 
     if (rename(dat_tmp.c_str(), dat_path.c_str()) != 0)
         TGLError<GenomeTrack>("Failed to rename %s -> %s: %s",

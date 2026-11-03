@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 #include <deque>
+#include <limits>
 #include "GenomeSeqScorer.h"
 #include "DnaPSSM.h"
 #include "utils/RunningLogSumExp.h"
@@ -46,12 +47,31 @@ public:
     // Invalidate sliding window cache
     void invalidate_cache();
 
+    // Best per-anchor score seen by the LAST score_interval() call in
+    // MAX_LIKELIHOOD_POS mode, or -inf when that call found no scorable
+    // anchor (and so returned NaN). A position on its own cannot be compared
+    // between two intervals, so an aggregation over a gvtrack_filter's parts
+    // needs the score to decide which part's position to report - the same
+    // role PottsScorer::get_last_max_score() plays for its family. Only
+    // MAX_LIKELIHOOD_POS maintains it; every other mode returns its score
+    // directly. pm_vtrack_compute() returns it under the spec key
+    // "last_max_score", for vtracks.py's filter aggregation.
+    double get_last_max_score() const { return m_last_max_score; }
+
+protected:
+    int64_t pattern_length() const override { return (int64_t)m_pssm.size(); }
+
 private:
     // Sliding window cache for contiguous intervals
     struct SlideCache {
         int chromid = -1;
         char strand_mode = 0;     // 1=plus, -1=minus, 0=both
         bool valid = false;
+        // Geometry is recorded even when the aggregators are not built, so the
+        // NEXT call can measure a stride and decide to build them. Without the
+        // split, declining once left the cache invalid, the following call saw
+        // stride == 0 again, and an overlapping-window scan never bootstrapped.
+        bool populated = false;
         int64_t last_interval_start = -1;
         int64_t last_interval_end = -1;
         size_t last_i_min = 0;
@@ -109,15 +129,18 @@ private:
     };
 
     // Sliding window methods
+    // The largest window the sliding cache will materialise, in anchors, when
+    // a scan has no stride yet to show the window will be reused. Seeding
+    // costs ~21 bytes per anchor; that was bounded only because the scan
+    // itself stopped after a million anchors. Past this size no
+    // whole-chromosome or tiling iterator can start its next interval inside
+    // the window, so the answer is computed without it. The scan still covers
+    // every anchor.
+    static const size_t MAX_CACHED_WINDOW_ANCHORS = 1000000;
+
     double score_with_sliding_window(const std::string& target, const GInterval& original_interval,
                                      const GInterval& expanded_interval,
                                      size_t i_min, size_t i_max, size_t motif_len);
-    // The largest window the sliding cache will materialise, in anchors.
-    // Seeding costs ~21 bytes per anchor; that was bounded only because the
-    // scan itself stopped after a million anchors. Past this size no iterator
-    // that also fits in memory can start its next interval inside the window.
-    static const size_t MAX_CACHED_WINDOW_ANCHORS = 1000000;
-
     double reduce_window(const std::string& target, const GInterval& expanded_interval,
                          size_t i_min, size_t i_max, size_t motif_len);
     double seed_sliding_window(const std::string& target, const GInterval& original_interval,
@@ -192,6 +215,9 @@ private:
     DnaPSSM m_pssm;
     ScoringMode m_mode;
     float m_score_thresh = 0.0f;
+
+    // See get_last_max_score(). Reset at the top of every score_interval().
+    double m_last_max_score = -std::numeric_limits<double>::infinity();
 
     // Spatial weighting
     bool m_use_spat = false;

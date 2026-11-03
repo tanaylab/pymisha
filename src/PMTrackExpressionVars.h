@@ -150,6 +150,14 @@ public:
     // Pad tail slots with NaN to prevent stale data in partial batches
     void pad_tail_with_nan(unsigned start_idx, unsigned end_idx);
 
+    // Apply `sub` to every sequence vtrack's reads until the next call
+    // (gextract_variants). A default SeqSubstitution means none.
+    void set_substitution(const SeqSubstitution &sub);
+
+    // Per sequence vtrack, (lo, hi) such that a bin [s, e) reads [s + lo, e + hi):
+    // its iterator shifts plus the scorer's read_extension(). Used by gextract_variants.
+    std::vector<std::pair<int64_t, int64_t>> seq_read_offsets() const;
+
 private:
     std::vector<TrackVar> m_track_vars;
     std::vector<VTrackVar> m_vtrack_vars;
@@ -161,6 +169,7 @@ private:
     GenomeTrack::Type m_common_track_type{GenomeTrack::NUM_TYPES};
     bool m_common_track_type_valid{false};
     bool m_mixed_track_types{false};  // dense + sparse mixed in one expression
+    SeqSubstitution m_substitution;
 
     // Convert track name to valid Python variable name
     void name2var(const std::string &name, std::string &var_name) const;

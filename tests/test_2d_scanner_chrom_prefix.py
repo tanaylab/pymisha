@@ -93,8 +93,8 @@ class TestScannerNormalizesChromPrefix:
         assert float(r["vt"].iloc[0]) == pytest.approx(1.0)
         # The returned chrom matches the DB's storage convention, not the input
         # prefix (callers can re-prefix downstream if needed).
-        assert str(r["chrom1"].iloc[0]) == "1"
-        assert str(r["chrom2"].iloc[0]) == "1"
+        assert str(r["chrom1"].iloc[0]) == "chr1"
+        assert str(r["chrom2"].iloc[0]) == "chr1"
 
     def test_chr_prefixed_input_no_band(self, simple_2d_rects):
         """Same as above without a band -- pins the normalization in isolation

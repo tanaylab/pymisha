@@ -153,9 +153,9 @@ def gdist(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import gintervals_2d_all
+        from .intervals import _gintervals_2d_all
         _str_exprs = [a for a in args if isinstance(a, str)]
-        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(_str_exprs) else gintervals_all()
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(_str_exprs, iterator) else gintervals_all()
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gdist")
@@ -221,6 +221,7 @@ def gdist(
             intervals,
             include_lowest,
             band,
+            iterator=iterator if _is_2d_intervals(intervals) else None,
             progress=progress,
             progress_desc=progress_desc,
         )
@@ -278,6 +279,7 @@ def _gdist_band_path(
     include_lowest: bool,
     band: tuple[int, int] | None,
     *,
+    iterator: Iterator | str = None,
     progress: Any = None,
     progress_desc: str | None = None,
 ) -> np.ndarray:
@@ -285,7 +287,8 @@ def _gdist_band_path(
     counts = _numpy.zeros(n_bins, dtype=_numpy.int64)
 
     for i, expr in enumerate(exprs):
-        result = gextract(expr, intervals, band=band, progress=progress, progress_desc=progress_desc)
+        result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress,
+                          progress_desc=progress_desc)
         if result is None or len(result) == 0:
             continue
 
@@ -1012,8 +1015,8 @@ def gsummary(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import gintervals_2d_all
-        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1139,8 +1142,8 @@ def gquantiles(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import gintervals_2d_all
-        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1593,8 +1596,8 @@ def gpartition(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import gintervals_2d_all
-        intervals = gintervals_2d_all(mode="full") if _expr_is_2d(expr) else gintervals_all()
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -1622,7 +1625,8 @@ def gpartition(
 
 
 def gsample(
-    expr: str, n: int, intervals: pd.DataFrame | str | None = None, iterator: Iterator | str = None
+    expr: str, n: int, intervals: pd.DataFrame | str | None = None, iterator: Iterator | str = None,
+    band: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """
     Sample values from a track expression using reservoir sampling.
@@ -1639,15 +1643,20 @@ def gsample(
     n : int
         Number of samples to draw.
     intervals : DataFrame, optional
-        Genomic scope.  If ``None``, uses ``gintervals_all()``.
+        Genomic scope.  If ``None``, the whole genome: every chromosome pair
+        when the iterator is 2D (a 2D track in *expr*, or a 2D iterator), as in
+        R, ``gintervals_all()`` otherwise.
     iterator : int or str, optional
         Iterator policy for binning the intervals.
+    band : tuple of (int, int), optional
+        Diagonal band ``(d1, d2)`` for a 2D scope, as in :func:`gextract`.
 
     Returns
     -------
     numpy.ndarray
         1-D array of sampled values (float64).  Length may be less than *n*
-        if fewer non-NaN data points exist.
+        if fewer non-NaN data points exist. Over a 2D scope the values are
+        those :func:`gextract` gives, sampled with numpy's random generator.
 
     Raises
     ------
@@ -1673,9 +1682,24 @@ def gsample(
     _checkroot()
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
+
+    if _is_2d_intervals(intervals):
+        if int(n) < 1:
+            raise ValueError("n must be at least 1")
+        from .extract import gextract
+        res = gextract(expr, intervals, iterator=iterator, band=band, colnames=["_v"])
+        vals = _numpy.array([], dtype=_numpy.float64) if res is None else res["_v"].to_numpy(dtype=_numpy.float64)
+        vals = vals[~_numpy.isnan(vals)]
+        if len(vals) > int(n):
+            vals = _numpy.random.default_rng().choice(vals, size=int(n), replace=False)
+        return vals
+    if band is not None:
+        raise ValueError("band parameter is only supported with 2D intervals")
 
     result = _pymisha.pm_sample(
         expr,
@@ -1695,6 +1719,7 @@ def gcor(
     *exprs: str,
     intervals: pd.DataFrame | str | None = None,
     iterator: Iterator | str = None,
+    band: tuple[int, int] | None = None,
     method: str = "pearson",
     details: bool = False,
     names: list[str] | None = None,
@@ -1712,9 +1737,13 @@ def gcor(
         An even number of track expressions.  Each consecutive pair (expr1,
         expr2) defines one correlation to compute.
     intervals : DataFrame, optional
-        Genomic scope.  If ``None``, uses ``gintervals_all()``.
+        Genomic scope.  If ``None``, the whole genome: every chromosome pair
+        when the iterator is 2D (a 2D track in the expressions, or a 2D
+        iterator), as in R, ``gintervals_all()`` otherwise.
     iterator : int or str, optional
         Iterator policy.
+    band : tuple of (int, int), optional
+        Diagonal band ``(d1, d2)`` for a 2D scope, as in :func:`gextract`.
     method : {"pearson", "spearman", "spearman.exact"}, default "pearson"
         Correlation method. ``"pearson"`` computes Pearson correlation in a
         streaming pass. ``"spearman"`` computes an approximate, memory-bounded
@@ -1783,17 +1812,24 @@ def gcor(
         raise ValueError("method must be one of: 'pearson', 'spearman', 'spearman.exact'")
 
     if intervals is None:
-        intervals = gintervals_all()
+        from .expr import _expr_is_2d
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr_list, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    result = _pymisha.pm_cor(
-        expr_list,
-        _df2pymisha(intervals),
-        iterator,
-        method,
-        CONFIG,
-    )
+    if _is_2d_intervals(intervals):
+        result = _gcor_2d(expr_list, intervals, iterator, band, method)
+    else:
+        if band is not None:
+            raise ValueError("band parameter is only supported with 2D intervals")
+        result = _pymisha.pm_cor(
+            expr_list,
+            _df2pymisha(intervals),
+            iterator,
+            method,
+            CONFIG,
+        )
 
     if result is None:
         return None
@@ -1831,6 +1867,81 @@ def gcor(
         return _pandas.DataFrame(rows, index=names)
 
     return _numpy.array([d["cor"] for d in result])
+
+
+def _gcor_2d(
+    expr_list: list[str],
+    intervals: pd.DataFrame,
+    iterator: Any,
+    band: tuple[int, int] | None,
+    method: str,
+) -> list[dict[str, float]] | None:
+    """gcor over a 2D scope, as R's gtrackcor computes it over its 2D iterator.
+
+    Every pair reads the cells :func:`gextract` gives for all the expressions;
+    a cell counts in ``n``, and in the statistics when both values are not NaN.
+    Pearson as R's CorSummary; Spearman as R's exact one, the average rank of
+    ties, for both "spearman" and "spearman.exact" (R samples the values for
+    "spearman" when there are more than it holds, and then estimates ranks).
+    """
+    from .extract import gextract
+
+    cols = [f"_e{i}" for i in range(len(expr_list))]
+    res = gextract(expr_list, intervals, iterator=iterator, band=band, colnames=cols)
+    if res is None:
+        return None
+
+    def _ranks(v: np.ndarray) -> np.ndarray:
+        order = _numpy.argsort(v, kind="stable")
+        sv = v[order]
+        ranks = _numpy.empty(len(v), dtype=_numpy.float64)
+        i = 0
+        while i < len(v):
+            j = i
+            while j < len(v) and sv[j] == sv[i]:
+                j += 1
+            ranks[order[i:j]] = (i + 1 + j) / 2.0
+            i = j
+        return ranks
+
+    def _var(sx: float, sx2: float, n: float) -> float:
+        var = (sx2 - sx * sx / n) / (n - 1)
+        return 0.0 if -1e-12 < var < 0 else var
+
+    out: list[dict[str, float]] = []
+    for i in range(0, len(cols), 2):
+        x = res[cols[i]].to_numpy(dtype=_numpy.float64)
+        y = res[cols[i + 1]].to_numpy(dtype=_numpy.float64)
+        ok = ~_numpy.isnan(x) & ~_numpy.isnan(y)
+        x, y = x[ok], y[ok]
+        nb, nn = float(len(res)), float(len(x))
+        d: dict[str, float] = {"n": nb, "n.na": nb - nn}
+        if method != "pearson":
+            d["cor"] = _numpy.nan
+            if nn >= 2:
+                rx, ry = _ranks(x), _ranks(y)
+                vx = _var(rx.sum(), (rx * rx).sum(), nn)
+                vy = _var(ry.sum(), (ry * ry).sum(), nn)
+                if vx > 0 and vy > 0:
+                    cov = ((rx * ry).sum() - rx.sum() * ry.sum() / nn) / (nn - 1)
+                    d["cor"] = cov / (_numpy.sqrt(vx) * _numpy.sqrt(vy))
+            out.append(d)
+            continue
+        d.update({"mean1": _numpy.nan, "mean2": _numpy.nan, "sd1": _numpy.nan, "sd2": _numpy.nan,
+                  "cov": _numpy.nan, "cor": _numpy.nan})
+        if nn > 0:
+            sx, sy = x.sum(), y.sum()
+            d["mean1"], d["mean2"] = sx / nn, sy / nn
+            if nn >= 2:
+                v1, v2 = _var(sx, (x * x).sum(), nn), _var(sy, (y * y).sum(), nn)
+                sd1 = _numpy.sqrt(v1) if v1 >= 0 else _numpy.nan
+                sd2 = _numpy.sqrt(v2) if v2 >= 0 else _numpy.nan
+                cov = ((x * y).sum() - sx * sy / nn) / (nn - 1)
+                d["sd1"], d["sd2"], d["cov"] = sd1, sd2, cov
+                if sd1 > 0 and sd2 > 0:
+                    d["cor"] = cov / (sd1 * sd2)
+        out.append(d)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1953,7 +2064,10 @@ def gbins_summary(
         expr = bin_exprs[0]
 
     if intervals is None:
-        intervals = gintervals_all()
+        # R's .misha$ALLGENOME: the 2D genome when the iterator is 2D
+        from .expr import _expr_is_2d
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -2133,7 +2247,10 @@ def gbins_quantiles(
         raise ValueError("percentiles must be within [0, 1]")
 
     if intervals is None:
-        intervals = gintervals_all()
+        # R's .misha$ALLGENOME: the 2D genome when the iterator is 2D
+        from .expr import _expr_is_2d
+        from .intervals import _gintervals_2d_all
+        intervals = _gintervals_2d_all("full") if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 

@@ -227,6 +227,7 @@ double PWMScorer::score_string(const char* seq, int seq_len)
 void PWMScorer::invalidate_cache()
 {
     m_slide.valid = false;
+    m_slide.populated = false;
     m_slide.stride = 0;
     m_spat_slide.valid = false;
 }
@@ -294,10 +295,12 @@ double PWMScorer::count_motif_hits_no_spatial(const std::string& target, size_t 
     const bool scan_rev  = scan_both || (m_strand == -1);
 
     int count = 0;
-    size_t max_pos = target.length() - motif_length;
+    // Only anchors inside the spat_min/spat_max window
+    const size_t lo = std::max(0, m_pssm.get_min_range());
+    const size_t max_pos = m_pssm.max_offset(target.length());
 
     // Per-position union (LSE) across permitted strands
-    for (size_t i = 0; i <= max_pos; ++i) {
+    for (size_t i = lo; i <= max_pos; ++i) {
         float comb = -std::numeric_limits<float>::infinity();
         bool have = false;
         if (scan_fwd) {
@@ -327,11 +330,14 @@ double PWMScorer::count_motif_hits_with_spatial(const std::string& target, size_
     const bool scan_rev  = scan_both || (m_strand == -1);
 
     int count = 0;
-    size_t max_pos = target.length() - motif_length;
+    // Only anchors inside the spat_min/spat_max window
+    const size_t lo = std::max(0, m_pssm.get_min_range());
+    const size_t max_pos = m_pssm.max_offset(target.length());
 
-    // Per-position union (LSE) across permitted strands, with spatial offset
-    for (size_t i = 0; i <= max_pos; ++i) {
-        float spat_log = get_spatial_log_factor(i);
+    // Per-position union (LSE) across permitted strands, with spatial offset.
+    // Bins count from the window start, as in the other spatial paths.
+    for (size_t i = lo; i <= max_pos; ++i) {
+        float spat_log = get_spatial_log_factor(i - lo);
         float comb = -std::numeric_limits<float>::infinity();
         bool have = false;
         if (scan_fwd) {
@@ -400,6 +406,12 @@ double PWMScorer::get_max_likelihood_pos_with_spatial(const std::string& target,
         }
     }
 
+    m_last_max_score = best_val;
+    if (!std::isfinite(best_val)) {
+        // No anchor was scorable: NaN, as in score_without_spatial(). best_index
+        // is still 0 here and would report a made-up position.
+        return std::numeric_limits<double>::quiet_NaN();
+    }
     return compute_position_result(best_index, target.length(), motif_length, best_dir);
 }
 
@@ -427,6 +439,7 @@ double PWMScorer::score_without_spatial(const std::string& target, int64_t motif
     }
     
     // MAX_LIKELIHOOD_POS
+    m_last_max_score = best_logp;
     if (!std::isfinite(best_logp)) {
         // No anchor was scorable, so there is no position to name. NaN is what
         // the rest of the family answers here; best_pos is target.begin() in
@@ -592,6 +605,8 @@ double PWMScorer::try_slide_window(const std::string& target,
         int64_t best_genomic_pos = m_slide.rmax.argmax_genomic_position();
         int best_dir = m_slide.rmax.argmax_direction();
 
+        m_last_max_score = m_slide.rmax.value();
+
         // Convert genomic position to index in target string
         size_t pos_in_target = anchor_target_index(expanded_interval, best_genomic_pos, motif_len, strand_mode);
 
@@ -715,7 +730,11 @@ double PWMScorer::reduce_window(const std::string& target,
             sum += std::exp(double(v) - M);
         }
         if (m_mode == MAX_LIKELIHOOD) return best;
-        return std::isfinite(M) ? M + std::log(sum)
+        // (float), because the populating path returns RunningLogSumExp's
+        // value through the same cast. Without it `pwm` became path-dependent
+        // by ~2e-07 - under an ulp, but the answer should not depend on which
+        // path ran.
+        return std::isfinite(M) ? (float)(M + std::log(sum))
                                 : -std::numeric_limits<double>::infinity();
     }
 
@@ -728,9 +747,19 @@ double PWMScorer::reduce_window(const std::string& target,
             int dir = 1;
             const float v = pos_value_with_dir(m_pssm, target, i, strand_mode,
                                                get_spatial_log_factor(i - i_min), dir);
-            // `>` keeps the FIRST of equal values, which is what the deque does.
-            if (!any || v > best) { best = v; best_dir = dir; best_i = i; any = true; }
+            // On a tie this keeps the FIRST anchor in ASCENDING TARGET INDEX.
+            // RunningMaxDeque, seeded in ascending GENOMIC order, keeps the
+            // first in that order - the same anchor on the plus strand and the
+            // opposite one on the minus, where the target is reverse
+            // complemented. Unreachable today (score_interval() never sends
+            // MAX_LIKELIHOOD_POS down the non-spatial slide), so the
+            // minus-strand case is matched explicitly rather than left to
+            // differ if the routing ever changes.
+            const bool takes = !any || v > best ||
+                               (v == best && m_strand == -1);
+            if (takes) { best = v; best_dir = dir; best_i = i; any = true; }
         }
+        m_last_max_score = best;
         if (!std::isfinite(best))
             return std::numeric_limits<double>::quiet_NaN();
         return compute_position_result(best_i, target.length(), motif_len, best_dir);
@@ -768,10 +797,20 @@ double PWMScorer::seed_sliding_window(const std::string& target,
 
     if (!populate) {
         // The same scan, reduced into scalars instead of into three vectors and
-        // two aggregators. Nothing here is kept, so the cache is left invalid
-        // and the next interval re-seeds; that costs a re-scan only where a
-        // slide was never possible anyway.
-        invalidate_cache();
+        // two aggregators. The GEOMETRY is still recorded - only the
+        // aggregators are skipped - so the next call can measure a stride
+        // against it and populate if a slide turns out to be possible.
+        m_slide.valid = true;
+        m_slide.populated = false;
+        m_slide.chromid = original_interval.chromid;
+        m_slide.strand_mode = strand_mode;
+        m_slide.last_interval_start = original_interval.start;
+        m_slide.last_interval_end = original_interval.end;
+        m_slide.last_i_min = i_min;
+        m_slide.last_i_max = i_max;
+        m_slide.window_size = i_max - i_min + 1;
+        m_slide.pos0 = 0;
+        m_slide.stride = 0;
         return reduce_window(target, expanded_interval, i_min, i_max, motif_len);
     }
 
@@ -824,6 +863,7 @@ double PWMScorer::seed_sliding_window(const std::string& target,
     m_slide.window_size = W;
     m_slide.pos0 = 0;
     m_slide.stride = 0;
+    m_slide.populated = true;
 
     // RunningMaxDeque must be seeded in ascending genomic order, which on the
     // minus strand is descending target index (the target is reverse-
@@ -857,6 +897,8 @@ double PWMScorer::seed_sliding_window(const std::string& target,
         // MAX_LIKELIHOOD_POS: Get genomic position directly from deque
         int64_t best_genomic_pos = m_slide.rmax.argmax_genomic_position();
         int best_dir = m_slide.rmax.argmax_direction();
+
+        m_last_max_score = m_slide.rmax.value();
 
         // Convert genomic position to index in target string
         size_t pos_in_target = anchor_target_index(expanded_interval, best_genomic_pos, motif_len, strand_mode);
@@ -923,7 +965,7 @@ double PWMScorer::score_with_sliding_window(const std::string& target,
                      (m_slide.stride == 0 || stride == m_slide.stride);
 
     bool can_slide =
-        m_slide.valid &&
+        m_slide.valid && m_slide.populated &&
         m_slide.chromid == original_interval.chromid &&
         m_slide.strand_mode == strand_mode &&
         stride_ok &&
@@ -939,19 +981,35 @@ double PWMScorer::score_with_sliding_window(const std::string& target,
         // If sliding failed, fall through to re-seeding
     }
 
-    // Seed or re-seed the window
-    // Populate the aggregators only where a later slide could reuse an anchor,
-    // and only where keeping the window is affordable. See
-    // MAX_CACHED_WINDOW_ANCHORS; PottsScorer makes the same decision.
+    // Seed or re-seed the window.
+    //
+    // Populate the aggregators only where a later slide could reuse an anchor.
+    // With a known stride, `stride < window` says the next interval starts
+    // inside this window, so it is kept whatever its size: refusing there
+    // costs a full re-scan per interval, and 1.1 Mb windows stepping 1 kb ran
+    // 12.8x slower for the sake of 5-37 MB. A stride at or beyond the window
+    // shares nothing with its predecessor.
+    //
+    // stride == 0 is the first call of a scan, with no history to predict
+    // from, so the size bound decides: a window past MAX_CACHED_WINDOW_ANCHORS
+    // (a whole-chromosome iterator, say) is answered without the cache.
+    // Declining still records the geometry (see SlideCache::populated), so the
+    // next call measures a real stride and can populate if a slide turns out
+    // to be possible. PottsScorer::score_with_sliding_window() makes the same
+    // decision.
     const size_t window = i_max - i_min + 1;
-    const bool populate = (stride == 0 || stride < window) &&
-                          window <= MAX_CACHED_WINDOW_ANCHORS;
+    const bool populate = (stride == 0) ? (window <= MAX_CACHED_WINDOW_ANCHORS)
+                                        : (stride < window);
     return seed_sliding_window(target, original_interval, expanded_interval, i_min, i_max, motif_len, populate);
 }
 
 double PWMScorer::score_interval(const GInterval& interval, const GenomeChromKey& chromkey)
 {
     // Calculate expanded interval to include full motif coverage
+    // Every early return below leaves this at -inf, which is what
+    // get_last_max_score() promises for a call that found no scorable anchor.
+    m_last_max_score = -std::numeric_limits<double>::infinity();
+
     int64_t motif_length = m_pssm.size();
     GInterval expanded_interval = calculate_expanded_interval(interval, chromkey, motif_length);
     expanded_interval.strand = m_strand;
@@ -1008,9 +1066,15 @@ double PWMScorer::score_interval(const GInterval& interval, const GenomeChromKey
                 }
             }
 
-            // Ensure valid range
+            // No anchor inside both the iterator and the spat_min/spat_max
+            // window (spat_min past a short bin's end): NaN, as for any
+            // interval with no anchor. This used to reset i_min to 0 and scan
+            // anchors outside the window. The caches are dropped, so the next
+            // interval reseeds rather than slides from a window it did not see.
             if (i_min > i_max) {
-                i_min = 0;
+                m_slide.valid = false;
+                m_spat_slide.valid = false;
+                return std::numeric_limits<float>::quiet_NaN();
             }
 
             // Try spatial sliding window optimization
@@ -1570,6 +1634,10 @@ double PWMScorer::spat_answer_MAXPOS(const std::string& target,
     }
     if (best_idx < 0) return std::numeric_limits<float>::quiet_NaN();
 
+    // Publish the part's max score for the filter aggregation to compare parts
+    // by (see get_last_max_score()). Read-only side channel: no spatial cache
+    // state, control flow or answer depends on it.
+    m_last_max_score = best_val;
     // Convert ring index to relative j, then to absolute target index
     const size_t j = j_from_ring_idx((size_t)best_idx);
     const size_t target_idx = i_min + j;

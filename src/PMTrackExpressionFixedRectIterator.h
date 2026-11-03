@@ -38,12 +38,14 @@ public:
     virtual const GInterval2D &last_interval() const override { return m_last; }
 
     virtual uint64_t idx() const override { return m_emitted; }
-    virtual uint64_t original_interval_idx() const override { return m_scope_idx + 1; }
+    // 1-based index, into the scope as given, of the scope rect of the current cell.
+    virtual uint64_t original_interval_idx() const override { return m_scope_orig[m_scope_idx] + 1; }
 
 private:
     int64_t                  m_width;
     int64_t                  m_height;
-    std::vector<GInterval2D> m_scope;
+    std::vector<GInterval2D> m_scope;          // sorted by chromosome pair, as R walks it
+    std::vector<size_t>      m_scope_orig;     // index of each m_scope interval in the scope as given
     quadtree::DiagonalBand   m_band;   // active when m_use_band is true
     bool                     m_use_band;
 

@@ -9,6 +9,10 @@ import pymisha as pm
 from pymisha import _shared
 from pymisha._quadtree import write_2d_track_file
 
+# --doctest-modules imports every module under tests/; a fixture generator such as
+# fixtures/parquet/make_fixtures.py (R's, kept verbatim) rewrites the fixtures when imported.
+collect_ignore_glob = ["fixtures/*"]
+
 
 def pytest_collection_modifyitems(config, items):
     """Auto-skip benchmark tests unless explicitly selected with ``-m benchmark``."""

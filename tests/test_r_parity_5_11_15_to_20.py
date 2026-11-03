@@ -63,6 +63,57 @@ class TestVtrackParamValidation:
         r = pm.gextract("v", intervals=pm.gintervals("1", 200, 240), iterator=40)
         assert np.isfinite(r["v"].iloc[0])
 
+    def test_every_handlers_documented_keys_still_work(self):
+        # R test-vtrack-params-validation.R, "every handler's currently-
+        # documented keys still work after validation": each call is silent.
+        pssm = _pssm()
+        calls = [
+            ("v_pwm", None, "pwm", {
+                "pssm": pssm, "bidirect": False, "prior": 0.01, "extend": True, "strand": 1,
+                "spat_factor": [1, 1], "spat_bin": 40, "spat_min": 1, "spat_max": 100}),
+            ("v_pwm_count", None, "pwm.count", {"pssm": pssm, "score.thresh": -5}),
+            ("v_kmer", None, "kmer.count", {"kmer": "AT", "extend": True, "strand": 1}),
+            ("v_kmer2", None, "kmer.frac", {"params": {"kmer": "AC", "strand": 0}}),
+            ("v_edist", None, "pwm.edit_distance", {
+                "pssm": pssm, "score.thresh": -5, "max_edits": 2, "max_indels": 1,
+                "score.min": -10, "score.max": 0, "direction": "above"}),
+            ("v_nmut", None, "pwm.n_mutations", {
+                "pssm": pssm, "score.thresh": -5, "score.min": -10, "score.max": 0,
+                "direction": "below"}),
+            ("v_lse", None, "pwm.edit_distance.lse", {
+                "pssm": pssm, "score.thresh": -5, "max_edits": 2, "score.min": -10,
+                "score.max": 0}),
+            ("v_near", pm.gintervals("1", 100, 110), "neighbor.count", {"params": 10}),
+        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for name, src, func, kw in calls:
+                pm.gvtrack_create(name, src, func, **kw)
+        assert set(pm.gvtrack_ls()) >= {c[0] for c in calls}
+
+    def test_mixing_params_and_keyword_arguments_errors(self):
+        # R test-vtrack-params-validation.R, "mixing 'params' and named '...'
+        # arguments in one call errors".
+        pssm = _pssm()
+        with pytest.raises(ValueError, match="bidirect"):
+            pm.gvtrack_create("v_mixed", None, "pwm", params={"pssm": pssm}, bidirect=False)
+        with pytest.raises(ValueError, match="params"):
+            pm.gvtrack_create("v_mixed", None, "pwm", params={"pssm": pssm}, bidirect=False)
+        assert "v_mixed" not in pm.gvtrack_ls()
+
+        # Same hole in the kmer handler (params wins over dots there too).
+        with pytest.raises(ValueError, match="strand"):
+            pm.gvtrack_create("v_mixed2", None, "kmer.count", params={"kmer": "AC"}, strand=1)
+
+        # Either style alone still works, and they still agree with each other.
+        scope = pm.gintervals("chr1", 0, 300)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            pm.gvtrack_create("v_p", None, "pwm", params={"pssm": pssm, "bidirect": False})
+            pm.gvtrack_create("v_d", None, "pwm", pssm=pssm, bidirect=False)
+        res = pm.gextract(["v_p", "v_d"], scope, iterator=100)
+        np.testing.assert_array_equal(res["v_p"], res["v_d"])
+
     def test_dotted_r_spelling_is_accepted(self):
         # score.thresh, R's spelling, must not read as an unknown parameter.
         pm.gvtrack_create("v", None, "pwm.count", pssm=_pssm(), prior=0,

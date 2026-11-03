@@ -108,11 +108,12 @@ def test_cpp_parser_variablestep_default_span(tmp_path: Path) -> None:
     np.testing.assert_array_equal(out["end"], [5, 10])
 
 
-def test_cpp_parser_empty_file_raises(tmp_path: Path) -> None:
+def test_cpp_parser_empty_file_gives_no_records(tmp_path: Path) -> None:
+    # gtrack_import makes an empty track of it, as misha does
     p = tmp_path / "empty.wig"
     p.write_text("# only comments\n")
-    with pytest.raises(Exception, match="no intervals|empty|no data"):
-        _read_via_cpp(str(p))
+    out = _read_via_cpp(str(p))
+    assert all(len(out[c]) == 0 for c in ("chrom", "start", "end", "value", "step"))
 
 
 def test_cpp_parser_malformed_fixedstep_raises(tmp_path: Path) -> None:
@@ -126,10 +127,7 @@ def test_cpp_parser_malformed_fixedstep_raises(tmp_path: Path) -> None:
 
 
 def test_cpp_parser_gzipped_rejected(tmp_path: Path) -> None:
-    """Gzipped paths are handled by the Python wrapper, not C++ directly.
-
-    The C++ parser is plain-text only; the Python wrapper falls back when
-    the path looks gzipped.
+    """The C++ parser is plain-text only; gtrack_import unzips a gzipped file first.
     """
     wig = tmp_path / "x.wig.gz"
     with gzip.open(str(wig), "wt") as fh:

@@ -136,6 +136,58 @@ def test_pwm_max_pos_aggregates_across_a_filters_parts_by_score_not_index(spatia
     )
 
 
+@pytest.mark.parametrize("strand", ["bidirect", "minus"])
+def test_spatial_pwm_max_pos_ranks_the_parts_by_the_score_its_position_won_with(strand):
+    # R ranks the parts by PWMScorer::get_last_max_score(): the best per-anchor
+    # score INCLUDING its spatial weight, bins counted from the part's start on
+    # either strand of a bidirect scan. pymisha used to rebuild that from two
+    # single-strand pwm.max scans, and the reverse one read the reverse
+    # complement, whose bins count from the 3' end - so with weights that are
+    # not symmetric over a part it named a part R does not.
+    pssm = _filter_agg_pssm()
+    w = pssm.shape[0]
+    spat, sbin = [0.5, 1.0, 2.0, 1.0, 0.5], 100
+    params = {"pssm": pssm, "prior": 0.01, "extend": False,
+              "spat_factor": spat, "spat_bin": sbin}
+    params.update({"bidirect": True} if strand == "bidirect" else {"bidirect": False, "strand": -1})
+    logp = np.log(pssm + 0.01) - np.log((pssm + 0.01).sum(axis=1, keepdims=True))
+    code = {"A": 0, "C": 1, "G": 2, "T": 3}
+    lspat = np.log(np.asarray(spat, dtype=np.float32))
+
+    def part_best(start, end):
+        """The best anchor score with its spatial weight, as the scorer ranks."""
+        seq = pm.gseq_extract(pm.gintervals("1", start, end))[0].upper()
+        if strand == "minus":   # scanned on the reverse complement
+            seq = seq[::-1].translate(str.maketrans("ACGT", "TGCA"))
+        best = -np.inf
+        for i in range(len(seq) - w + 1):
+            win = [code[b] for b in seq[i:i + w]]
+            sw = lspat[min(i // sbin, len(spat) - 1)]
+            rc = sum(logp[w - 1 - j, 3 - win[j]] for j in range(w))
+            fwd = sum(logp[j, win[j]] for j in range(w))
+            best = max(best, (max(fwd, rc) if strand == "bidirect" else fwd) + sw)
+        return best
+
+    starts = np.arange(10000, 40000, 1000)
+    pm.gvtrack_create("t_pos", None, "pwm.max.pos", **params)
+    pm.gvtrack_filter("t_pos", filter=pm.gintervals(["1"] * len(starts), starts + 200, starts + 250))
+    pm.gvtrack_create("p_pos", None, "pwm.max.pos", **params)
+    ivs = pm.gintervals(["1"] * len(starts), starts, starts + 500)
+    got = pm.gextract("t_pos", ivs, iterator=ivs).sort_values("start")["t_pos"].to_numpy()
+
+    checked = 0
+    for s, g in zip(starts, got, strict=True):
+        parts = [(int(s), int(s) + 200), (int(s) + 250, int(s) + 500)]
+        best = [part_best(*p) for p in parts]
+        if abs(best[0] - best[1]) < 1e-4:
+            continue   # a near tie is decided by float rounding, not the rule
+        a, b = parts[int(np.argmax(best))]
+        pos = _one("p_pos", pm.gintervals("1", a, b))
+        assert g == np.sign(pos) * (abs(pos) + (a - s)), int(s)
+        checked += 1
+    assert checked > 20
+
+
 def test_a_single_unmasked_pwm_part_is_scored_like_the_unfiltered_survivor():
     # A mask flush with one edge of the iterator interval leaves exactly one
     # unmasked part rather than two. pwm, pwm.max and pwm.count don't care: a

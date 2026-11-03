@@ -228,3 +228,52 @@ def test_strategy_auto_with_many_exprs_routes_through_track_parallel(monkeypatch
     assert len(calls) == 1, (
         "_parallel_extract_tracks should run for auto + many exprs; got 0 calls"
     )
+
+
+def test_file_and_intervals_set_out_are_written_under_strategy_tracks(tmp_path, monkeypatch):
+    """R misha 5.14.0 fixed gextract(file=) and intervals.set.out being ignored under
+    gmultitasking.strategy = "tracks". pymisha writes both after the extraction, whichever
+    path computed it (file= output is never computed by the track-parallel path)."""
+    from pymisha import extract as _extract_mod
+
+    calls = []
+    orig = _extract_mod._parallel_extract_tracks
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(_extract_mod, "_parallel_extract_tracks", spy)
+
+    intervals = _make_intervals()
+    exprs = _many_exprs(10)
+    config = pm.CONFIG
+    saved = config.copy()
+    set_name = "test_strategy_tracks_set_out"
+    try:
+        config.update({"multitasking": False})
+        ref = pm.gextract(exprs, intervals, iterator=100)
+        config.update({
+            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
+            "min_processes": 3, "max_processes": 3,
+            "multitasking_strategy": "tracks",
+        })
+
+        tsv = tmp_path / "x.tsv"
+        assert pm.gextract(exprs, intervals, iterator=100, file=str(tsv)) is None
+        got = pd.read_csv(tsv, sep="\t")
+        assert len(got) == len(ref)
+        pdt.assert_series_equal(got[exprs[0]], ref[exprs[0]], check_names=False, rtol=1e-6)
+
+        parquet = tmp_path / "x.parquet"
+        assert pm.gextract(exprs, intervals, iterator=100, file=str(parquet)) is None
+        assert parquet.read_bytes()[:4] == b"PAR1"
+
+        assert pm.gextract(exprs, intervals, iterator=100, intervals_set_out=set_name) is None
+        assert pm.gintervals_exists(set_name)
+        assert len(pm.gintervals_load(set_name)) == len(ref)
+        assert calls == [1], "the intervals_set_out extraction did not take the track-parallel path"
+    finally:
+        _restore(config, saved)
+        if pm.gintervals_exists(set_name):
+            pm.gintervals_rm(set_name, force=True)

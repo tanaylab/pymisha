@@ -379,10 +379,10 @@ class TestDimOutputStructure:
 
         assert result is not None
         row = result.iloc[0]
-        assert str(row["chrom1"]) == "1"
+        assert str(row["chrom1"]) == "chr1"
         assert int(row["start1"]) == 50000
         assert int(row["end1"]) == 60000
-        assert str(row["chrom2"]) == "2"
+        assert str(row["chrom2"]) == "chr2"
         assert int(row["start2"]) == 10000
         assert int(row["end2"]) == 20000
 

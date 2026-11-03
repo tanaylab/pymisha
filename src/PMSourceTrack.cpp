@@ -11,6 +11,8 @@
 
 #include "pymisha.h"
 #include "PMSourceTrack.h"
+#include "PMDb.h"
+#include "GenomeTrack.h"
 #include "CRC64.h"
 
 #include <algorithm>
@@ -21,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -111,77 +114,70 @@ uint64_t compute_idx_checksum(const std::vector<TrackIdxEntry> &entries)
     return crc64.finalize_incremental(crc);
 }
 
-// Walk up from src_track_dir until a path component named "tracks" is found;
-// return its parent as db_root. Returns false if not found.
+}  // namespace
+
+// The database that holds the track directory src_track_dir: the parent of the nearest
+// enclosing directory named "tracks" that has a chrom_sizes.txt next to it. Found from the
+// resolved path, so a relative or symlinked src_track_dir works. Returns false if no
+// database holds the track.
 bool source_db_root_from_track_dir(const std::string &src_track_dir, std::string &db_root_out)
 {
-    std::string p = src_track_dir;
-    while (p.size() > 1 && p.back() == '/') p.pop_back();
-    while (true) {
-        size_t slash = p.find_last_of('/');
+    char *resolved = realpath(src_track_dir.c_str(), nullptr);
+    if (!resolved) return false;
+    std::string dir(resolved);
+    free(resolved);
+    while (dir.size() > 1) {
+        size_t slash = dir.find_last_of('/');
         if (slash == std::string::npos) return false;
-        std::string parent = p.substr(0, slash);
-        std::string base = p.substr(slash + 1);
-        if (base == "tracks") {
-            db_root_out = parent;
-            return true;
+        std::string parent = slash ? dir.substr(0, slash) : "/";
+        size_t pslash = parent.find_last_of('/');
+        if (pslash != std::string::npos && parent.compare(pslash + 1, std::string::npos, "tracks") == 0) {
+            std::string groot = pslash ? parent.substr(0, pslash) : "/";
+            struct stat st;
+            if (stat((groot + "/chrom_sizes.txt").c_str(), &st) == 0) {
+                db_root_out = groot;
+                return true;
+            }
         }
-        p = parent;
-        if (p.empty()) return false;
+        dir = parent;
     }
+    return false;
 }
 
-// Load chrom_id -> chrom_name list from <db_root>/chrom_sizes.txt.
-// Names are indexed by line order (0-based). Throws std::invalid_argument on
-// failure (missing file, malformed line).
+// The chromosome names of the database at db_root by chrom id, as PMDb gives them when it
+// opens the database (gdb_chrom_order). Throws std::invalid_argument on failure (missing
+// file, malformed line).
 void load_source_chrom_names(const std::string &db_root, std::vector<std::string> &names_out)
 {
     std::string path = db_root + "/chrom_sizes.txt";
-    FILE *fp = fopen(path.c_str(), "r");
-    if (!fp) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
         char buf[1024];
         snprintf(buf, sizeof(buf),
             "Cannot resolve chromosome IDs for indexed source track: missing %s",
             path.c_str());
         throw std::invalid_argument(buf);
     }
-    char *line = nullptr;
-    size_t cap = 0;
-    ssize_t nread = 0;
-    while ((nread = getline(&line, &cap, fp)) != -1) {
-        // Strip trailing whitespace including newlines.
-        while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r' ||
-                              line[nread - 1] == ' '  || line[nread - 1] == '\t')) {
-            line[--nread] = '\0';
-        }
-        if (nread == 0) continue;
-        // Skip leading whitespace.
-        char *p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (!*p) continue;
-        // Find end of first token (chrom name).
-        char *q = p;
-        while (*q && *q != ' ' && *q != '\t') ++q;
-        bool has_size = (*q != '\0');
-        *q = '\0';
-        if (!has_size) {
-            std::string msg;
-            char buf[1024];
-            snprintf(buf, sizeof(buf), "Invalid line in %s: %s", path.c_str(), p);
-            free(line);
-            fclose(fp);
-            throw std::invalid_argument(buf);
-        }
-        names_out.emplace_back(p);
+    try {
+        std::vector<std::string> file_names;
+        std::vector<uint64_t> file_sizes;
+        read_chrom_sizes(db_root, file_names, file_sizes);
+        GdbChromOrder order = gdb_chrom_order(db_root, file_names);
+        names_out.clear();
+        for (size_t idx : order.id_order)
+            names_out.push_back(order.names[idx]);
+    } catch (TGLException &e) {
+        throw std::invalid_argument(e.msg());
     }
-    if (line) free(line);
-    fclose(fp);
 }
+
+namespace {
 
 // ---- End indexed format helpers ----
 
 // Decode a dense payload: int32 bin_size + float32 array.
-// Append valid (non-NaN, non-Inf) bins to the output vectors. chrom_name is
+// Append every bin to the output vectors, an infinite value as NaN (as R's
+// GenomeTrackFixedBin reads it). chrom_name is
 // the per-chrom file name (per-chrom case) or chrom_sizes.txt name (indexed).
 // out_bin_size is set to the bin size extracted from the payload header.
 void decode_dense_payload(
@@ -221,7 +217,7 @@ void decode_dense_payload(
     const float *floats = reinterpret_cast<const float *>(payload.data() + 4);
     for (size_t i = 0; i < n_bins; ++i) {
         float v = floats[i];
-        if (std::isnan(v) || std::isinf(v)) continue;
+        if (std::isinf(v)) v = std::numeric_limits<float>::quiet_NaN();
         chroms_out.push_back(chrom_name);
         int64_t start = (int64_t)i * (int64_t)bin_size;
         starts_out.push_back(start);
@@ -331,7 +327,7 @@ void decode_sparse_payload(
             memcpy(&s, body + i * SIZE_64,      sizeof(int64_t));
             memcpy(&e, body + i * SIZE_64 + 8,  sizeof(int64_t));
             memcpy(&v, body + i * SIZE_64 + 16, sizeof(float));
-            if (std::isnan(v) || std::isinf(v)) continue;
+            if (std::isinf(v)) v = std::numeric_limits<float>::quiet_NaN();  // as R's GenomeTrackSparse
             chroms_out.push_back(chrom_name);
             starts_out.push_back(s);
             ends_out.push_back(e);
@@ -344,7 +340,7 @@ void decode_sparse_payload(
             memcpy(&s, body + i * SIZE_32,     sizeof(int32_t));
             memcpy(&e, body + i * SIZE_32 + 4, sizeof(int32_t));
             memcpy(&v, body + i * SIZE_32 + 8, sizeof(float));
-            if (std::isnan(v) || std::isinf(v)) continue;
+            if (std::isinf(v)) v = std::numeric_limits<float>::quiet_NaN();  // as R's GenomeTrackSparse
             chroms_out.push_back(chrom_name);
             starts_out.push_back(s);
             ends_out.push_back(e);
@@ -357,6 +353,17 @@ void decode_sparse_payload(
 
 // ---- Public C++ helper (declared in PMSourceTrack.h) ----
 
+void chain_src_chromkey(const std::vector<std::string> &src_names, GenomeChromKey &key)
+{
+    key = GenomeChromKey();
+    for (const std::string &name : src_names)
+        key.add_chrom(name, std::numeric_limits<int64_t>::max());
+    for (size_t i = 0; i < src_names.size(); ++i) {
+        const std::string &name = src_names[i];
+        key.add_chrom_alias(name.compare(0, 3, "chr") ? "chr" + name : name.substr(3), (int)i);
+    }
+}
+
 void read_source_track_1d_cpp(
     const std::string &src_track_dir,
     std::string &out_type,
@@ -364,7 +371,9 @@ void read_source_track_1d_cpp(
     std::vector<std::string> &out_chrom,
     std::vector<std::int64_t> &out_start,
     std::vector<std::int64_t> &out_end,
-    std::vector<double> &out_value)
+    std::vector<double> &out_value,
+    const GenomeChromKey *src_chromkey,
+    const std::vector<std::string> *db_chroms)
 {
     std::vector<std::string> entries;
     if (!list_dir_sorted(src_track_dir, entries)) {
@@ -488,12 +497,16 @@ void read_source_track_1d_cpp(
         if (!source_db_root_from_track_dir(src_track_dir, db_root)) {
             char buf[1024];
             snprintf(buf, sizeof(buf),
-                "Indexed source track path must be located under a database tracks directory "
-                "(got: %s)", src_track_dir.c_str());
+                "Indexed source track %s is not in a database (a directory with chrom_sizes.txt "
+                "whose \"tracks\" directory contains the track); an indexed track is read by the "
+                "chromosome ids of its database", src_track_dir.c_str());
             throw std::invalid_argument(buf);
         }
         std::vector<std::string> chrom_names;
-        load_source_chrom_names(db_root, chrom_names);  // throws on error
+        if (db_chroms)
+            chrom_names = *db_chroms;
+        else
+            load_source_chrom_names(db_root, chrom_names);  // throws on error
 
         if (track_type_raw == TRACK_TYPE_DENSE_RAW) track_type = "dense";
         else                                          track_type = "sparse";
@@ -563,7 +576,25 @@ void read_source_track_1d_cpp(
 
         prev_bin_size = indexed_bin_size;
     } else {
-        for (const auto &fname : per_chrom_files) {
+        // the files of the chain's chromosomes, as every reader finds them, named by the
+        // chain's names; two files of a chromosome are an error here
+        std::vector<std::pair<std::string, std::string>> chrom_files;  // (chrom, file)
+        if (src_chromkey) {
+            const GenomeTrack::ChromFiles files(*src_chromkey, src_track_dir);
+            for (int chromid : files.chromids())
+                chrom_files.emplace_back(src_chromkey->id2chrom(chromid), files.filename(chromid));
+            // read in file name order, as every file is read without the key
+            std::sort(chrom_files.begin(), chrom_files.end(),
+                      [](const std::pair<std::string, std::string> &a, const std::pair<std::string, std::string> &b) {
+                          return a.second < b.second;
+                      });
+        } else {
+            for (const auto &fname : per_chrom_files)
+                chrom_files.emplace_back(fname, fname);
+        }
+        for (const auto &chrom_file : chrom_files) {
+            const std::string &fname = chrom_file.second;
+            const std::string &chrom = chrom_file.first;
             std::string fpath = src_track_dir + "/" + fname;
             struct stat ist;
             if (stat(fpath.c_str(), &ist) != 0 || !S_ISREG(ist.st_mode)) continue;
@@ -588,7 +619,7 @@ void read_source_track_1d_cpp(
                     throw std::invalid_argument(buf);
                 }
                 int32_t this_bin_size = 0;
-                decode_dense_payload(fname, payload, out_chrom, out_start, out_end, out_value,
+                decode_dense_payload(chrom, payload, out_chrom, out_start, out_end, out_value,
                                      "per-chrom source track", this_bin_size);
                 // R-parity: all dense per-chrom files must have the same bin_size.
                 if (this_bin_size > 0) {
@@ -610,7 +641,7 @@ void read_source_track_1d_cpp(
                         "Mixed dense/sparse source files in %s", src_track_dir.c_str());
                     throw std::invalid_argument(buf);
                 }
-                decode_sparse_payload(fname, payload, out_chrom, out_start, out_end, out_value,
+                decode_sparse_payload(chrom, payload, out_chrom, out_start, out_end, out_value,
                                       "per-chrom source track");
             }
             // Other signatures: silently skip (matches Python which only handles
@@ -631,7 +662,8 @@ void read_source_track_1d_cpp(
  * Returns: 2-tuple (track_type, df_dict).
  *   track_type : "dense" | "sparse".
  *   df_dict    : numpy-array dict with keys "chrom" (NPY_OBJECT[str]),
- *                "start"/"end" (NPY_INT64), "value" (NPY_FLOAT64). All arrays
+ *                "start"/"end" (NPY_INT64), "value" (NPY_FLOAT64; NaN
+ *                values included, an infinite one read as NaN). All arrays
  *                have the same length N. N==0 is valid (empty track).
  *
  * Raises:

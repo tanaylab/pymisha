@@ -6,6 +6,7 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -226,7 +227,7 @@ class TestGtrackLiftover:
             pm.gdb_init(str(TEST_DB))
 
     def test_liftover_nan_values_skipped(self, tmp_path):
-        """NaN values in source track are omitted from lifted track."""
+        """An infinite source value is read as NaN, as R reads it, and lifts to a NaN bin."""
         root = _copy_db(tmp_path)
         try:
             pm.gdb_init(str(root))
@@ -250,11 +251,8 @@ class TestGtrackLiftover:
 
             intervs = pm.gintervals("chr1", 1000, 1300)
             out = pm.gextract("lifted_nan", intervs)
-            # Should have values at positions for bins 1 and 3 (1.0 and 3.0)
-            # Bin 2 had inf -> NaN, should be absent in sparse output
-            vals = sorted(out["lifted_nan"].dropna().tolist())
-            assert 1.0 in vals
-            assert 3.0 in vals
+            # bins 1 and 3 keep 1.0 and 3.0; bin 2 had inf, read as NaN
+            np.testing.assert_array_equal(out["lifted_nan"].to_numpy(), [1.0, np.nan, 3.0])
         finally:
             pm.gdb_init(str(TEST_DB))
 
@@ -1310,3 +1308,71 @@ class TestGtrackLiftoverSparseOverlapMerge:
                     assert out.iloc[i]["end"] <= out.iloc[i + 1]["start"]
         finally:
             pm.gdb_init(str(TEST_DB))
+
+
+class TestGtrackLiftoverRefusesClusterPolicies:
+    """gtrack_liftover refuses the best_cluster_* target-overlap policies, as R's
+    gtrack.liftover does (R misha 5.12.1, R/track-liftover.R), whether they are
+    given with a chain file, carried by a pre-loaded chain, or given with a chain
+    that carries none. gintervals_liftover takes them."""
+
+    POLICIES = ["best_source_cluster", "best_cluster_union", "best_cluster_sum", "best_cluster_max"]
+
+    @staticmethod
+    def _r_message(policy):
+        # R's text, verbatim
+        return (f"tgt_overlap_policy = '{policy}' is only supported by gintervals.liftover(), "
+                "not gtrack.liftover(). Use 'auto', 'agg', 'keep', or 'discard'.")
+
+    @pytest.fixture()
+    def setup(self, tmp_path):
+        root = _copy_db(tmp_path)
+        pm.gdb_init(str(root))
+        _create_sparse_track_dir(tmp_path / "sp.track", {"srcA": [(100, 200, 5.0)]})
+        _create_dense_track_dir(tmp_path / "dn.track", 100, {"srcA": np.array([1.0, 2.0], dtype=np.float32)})
+        chain = _write_chain(tmp_path, [
+            ({"score": 1000, "src_chrom": "srcA", "src_size": 10000,
+              "src_strand": "+", "src_start": 0, "src_end": 1000,
+              "tgt_chrom": "chr1", "tgt_size": 500000,
+              "tgt_strand": "+", "tgt_start": 2000, "tgt_end": 3000,
+              "chain_id": 1},
+             [(1000,)]),
+        ])
+        pm.gdb_init(str(root))
+        src_2d = root / "tracks" / "pts2d.track"
+        pm.gtrack_2d_create("pts2d", "x", pm.gintervals_2d("1", 10, 20, "1", 30, 40), [1.0])
+        yield tmp_path, chain, src_2d
+        pm.gdb_init(str(TEST_DB))
+
+    @pytest.mark.parametrize("policy", POLICIES)
+    @pytest.mark.parametrize("src", ["sp", "dn", "2d"])
+    @pytest.mark.parametrize("force_python", [False, True])
+    def test_chain_file(self, setup, policy, src, force_python):
+        tmp_path, chain, src_2d = setup
+        src_dir = src_2d if src == "2d" else tmp_path / f"{src}.track"
+        with pytest.raises(ValueError) as exc:
+            pm.gtrack_liftover("lifted", "x", str(src_dir), chain, src_overlap_policy="keep",
+                               tgt_overlap_policy=policy, _force_pure_python=force_python)
+        assert str(exc.value) == self._r_message(policy)
+        assert not pm.gtrack_exists("lifted")
+
+    @pytest.mark.parametrize("policy", POLICIES)
+    def test_preloaded_chain(self, setup, policy):
+        tmp_path, chain, _ = setup
+        loaded = pm.gintervals_load_chain(chain, tgt_overlap_policy=policy)
+        with pytest.raises(ValueError) as exc:
+            pm.gtrack_liftover("lifted", "x", str(tmp_path / "sp.track"), loaded)
+        assert str(exc.value) == self._r_message(policy)
+        # a chain that carries no policy takes the one given
+        loaded.attrs.clear()
+        with pytest.raises(ValueError) as exc:
+            pm.gtrack_liftover("lifted", "x", str(tmp_path / "sp.track"), loaded, tgt_overlap_policy=policy)
+        assert str(exc.value) == self._r_message(policy)
+        assert not pm.gtrack_exists("lifted")
+
+    @pytest.mark.parametrize("policy", POLICIES)
+    def test_gintervals_liftover_takes_them(self, setup, policy):
+        _, chain, _ = setup
+        src = pd.DataFrame({"chrom": ["srcA"], "start": [100], "end": [200]})
+        out = pm.gintervals_liftover(src, chain, tgt_overlap_policy=policy)
+        assert out[["chrom", "start", "end"]].values.tolist() == [["chr1", 2100, 2200]]

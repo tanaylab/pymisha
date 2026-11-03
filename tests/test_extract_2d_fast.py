@@ -260,26 +260,31 @@ def test_indexed_format_parity(indexed_rects_track):
     _parity(indexed_rects_track, intervals)
 
 
-def test_gextract_top_level_uses_fast_path(rects_track):
-    """End-to-end: pm.gextract on a bare 2D track + 2D intervals must
-    produce the same DataFrame as before (via the slow oracle)."""
+def test_gextract_top_level_clips_objects_to_scope(rects_track):
+    """End-to-end: pm.gextract on a bare 2D track + 2D intervals iterates the
+    track's objects, each cut by the scope intervals it meets, as R does; the
+    objects come from the slow oracle, and intervalID is the scope row + 1.
+    (The fixture's rects overlap, so a cut rect's value - the avg over it - can
+    mix two objects; only the coordinates are compared.)"""
     intervals = pd.DataFrame({
         "chrom1": ["1", "1"],
-        "start1": [50, 100],
-        "end1":   [350, 200],
+        "start1": [50, 300],
+        "end1":   [250, 400],
         "chrom2": ["1", "1"],
-        "start2": [150, 250],
-        "end2":   [450, 350],
+        "start2": [150, 150],
+        "end2":   [450, 450],
     })
     fast = pm.gextract(rects_track, intervals)
     slow = _gextract_2d_single_python(rects_track, rects_track, intervals, None)
-    if fast is None or slow is None:
-        assert fast is None and slow is None
-        return
-    pd.testing.assert_frame_equal(
-        fast.reset_index(drop=True),
-        slow.reset_index(drop=True),
-    )
+    expected = set()
+    for r in slow.itertuples(index=False):
+        q = intervals.iloc[int(r.intervalID)]
+        s1, e1 = max(r.start1, q.start1), min(r.end1, q.end1)
+        s2, e2 = max(r.start2, q.start2), min(r.end2, q.end2)
+        expected.add((int(s1), int(e1), int(s2), int(e2), int(r.intervalID) + 1))
+    got = {(int(r.start1), int(r.end1), int(r.start2), int(r.end2), int(r.intervalID))
+           for r in fast.itertuples(index=False)}
+    assert got == expected
 
 
 def test_one_d_track_raises_or_falls_back():

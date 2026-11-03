@@ -16,9 +16,9 @@ PMTrackExpressionTrackRectsIterator::PMTrackExpressionTrackRectsIterator(
     : m_chromkey(chromkey),
       m_band(band ? *band : quadtree::DiagonalBand{}),
       m_use_band(band != nullptr && band->active),
-      m_obj_idx(0),
-      m_scope_in_pair_idx(0),
-      m_scope_global_idx(0),
+      m_pair_first(0),
+      m_pair_last(0),
+      m_emit_idx(0),
       m_emitted(0),
       m_isend(false)
 {
@@ -26,18 +26,11 @@ PMTrackExpressionTrackRectsIterator::PMTrackExpressionTrackRectsIterator(
     // We let TGLException propagate; the binding converts it to RuntimeError.
     m_track.init(track_name);
 
-    // Group scope rects by (chromid1, chromid2).
-    // When band is active, inter-chrom pairs are skipped entirely (R semantics).
-    for (size_t i = 0; i < scope.size(); ++i) {
-        const GInterval2D &r = scope[i];
-        // Skip zero-area rects.
-        if (r.end1 <= r.start1 || r.end2 <= r.start2)
-            continue;
-        // Under active band, skip inter-chrom scope rects.
-        if (m_use_band && r.chromid1 != r.chromid2)
-            continue;
-        PairKey key{r.chromid1, r.chromid2};
-        m_pair_groups[key].emplace_back(i, r);
+    // R walks the scope sorted by chromosome pair (r_2d_sort_order)
+    std::vector<size_t> order = r_2d_sort_order(scope);
+    for (size_t i : order) {
+        m_scope.push_back(scope[i]);
+        m_scope_orig.push_back(i);
     }
 
     // ctor does NOT prime; caller calls begin().
@@ -51,33 +44,12 @@ void PMTrackExpressionTrackRectsIterator::begin()
 {
     m_last      = GInterval2D{};
     m_emitted   = 0;
-    m_obj_idx   = 0;
-    m_scope_in_pair_idx = 0;
-    m_scope_global_idx  = 0;
-    m_obj_x1.clear();
-    m_obj_y1.clear();
-    m_obj_x2.clear();
-    m_obj_y2.clear();
-
-    m_pair_it = m_pair_groups.begin();
-
-    if (m_pair_groups.empty()) {
-        m_isend = true;
-        return;
-    }
-
-    m_isend = false;
-    // Advance to the first pair that has track data.
-    if (!advance_to_next_pair()) {
-        m_isend = true;
-        return;
-    }
-    // Find the first valid emission.
-    if (!find_next_in_pair()) {
-        // First pair has objects but none intersect the scope rects (or
-        // advance_to_next_pair already walked past it); next() will continue.
-        next();
-    }
+    m_pair_first = m_pair_last = 0;
+    m_emits.clear();
+    m_emit_scope.clear();
+    m_emit_idx  = 0;
+    m_isend     = false;
+    next_pair_emissions();
 }
 
 // ---------------------------------------------------------------------------
@@ -87,48 +59,45 @@ void PMTrackExpressionTrackRectsIterator::begin()
 void PMTrackExpressionTrackRectsIterator::next()
 {
     if (m_isend) return;
-
-    // Try to advance within the current pair.
-    // find_next_in_pair() starts from the current (m_obj_idx, m_scope_in_pair_idx)
-    // but we need to move past the current emission first.
-    // After an emission: increment m_scope_in_pair_idx, then search forward.
-    ++m_scope_in_pair_idx;
-    if (find_next_in_pair())
+    ++m_emit_idx;
+    if (m_emit_idx < m_emits.size()) {
+        m_last = m_emits[m_emit_idx];
+        ++m_emitted;
         return;
-
-    // Current pair exhausted.  advance_to_next_pair() walks m_pair_it forward
-    // past absent pairs itself, so we must NOT double-increment here.
-    // Pattern: pre-increment once, then let advance_to_next_pair do the rest.
-    ++m_pair_it;
-    while (m_pair_it != m_pair_groups.end()) {
-        if (advance_to_next_pair()) {
-            // advance_to_next_pair left m_pair_it at a pair with data.
-            if (find_next_in_pair())
-                return;
-            // Has objects but none intersect the scope rects for this pair.
-            // Advance past this pair and keep looking.
-            ++m_pair_it;
-        }
-        // advance_to_next_pair returned false -> it walked m_pair_it to end();
-        // the while guard will exit on the next iteration check.
     }
-
-    m_isend = true;
+    next_pair_emissions();
 }
 
 // ---------------------------------------------------------------------------
-// advance_to_next_pair()
+// next_pair_emissions()
 //
-// Opens m_track for the pair at m_pair_it, materialises all objects.
-// Resets m_obj_idx = 0, m_scope_in_pair_idx = 0.
-// Returns true if the pair has at least one object.
+// TrackExpressionTrackRectsIterator::next() for the next chromosome pair of the
+// scope that gives anything: the track's objects in the order R's quad-tree
+// iterator returns them, each cut by the scope intervals of the pair as R's
+// scope quad tree returns them (intersect_scope_qtree). Under a band an
+// inter-chromosomal pair is skipped. Sets m_isend when no pair is left.
 // ---------------------------------------------------------------------------
 
-bool PMTrackExpressionTrackRectsIterator::advance_to_next_pair()
+void PMTrackExpressionTrackRectsIterator::next_pair_emissions()
 {
-    while (m_pair_it != m_pair_groups.end()) {
-        int c1 = m_pair_it->first.first;
-        int c2 = m_pair_it->first.second;
+    m_emits.clear();
+    m_emit_scope.clear();
+    m_emit_idx = 0;
+
+    RectsQuadTree qtree;
+    Rectangles intersection;
+    std::vector<uint64_t> indices;
+
+    while (m_pair_last < m_scope.size()) {
+        m_pair_first = m_pair_last;
+        while (m_pair_last < m_scope.size() && m_scope[m_pair_last].is_same_chrom_pair(m_scope[m_pair_first]))
+            ++m_pair_last;
+
+        int c1 = m_scope[m_pair_first].chromid1;
+        int c2 = m_scope[m_pair_first].chromid2;
+
+        if (m_use_band && c1 != c2)
+            continue;
 
         bool has_data = m_track.set_chrom_pair(c1, c2);
 
@@ -139,105 +108,36 @@ bool PMTrackExpressionTrackRectsIterator::advance_to_next_pair()
                 + std::to_string(c1) + ", " + std::to_string(c2) + ")");
         }
 
-        if (!has_data || ls == PMGenomeTrack2D::LOOKUP_ABSENT) {
-            // Pair genuinely absent — skip.
-            ++m_pair_it;
+        if (!has_data || ls == PMGenomeTrack2D::LOOKUP_ABSENT)
             continue;
-        }
 
-        // Enumerate all objects on this pair by querying with the full chrom extent.
-        // Memory note: the result is materialised in a vector. For very large Hi-C
-        // tracks this could be gigabytes — streaming enumeration is a deferred
-        // optimisation (TODO).
+        // A query over the whole pair returns the objects in the order of R's
+        // StatQuadTreeCached::Iterator: depth first, quads in order, each object once.
+        // Memory note: the objects of a pair are materialised in a vector.
         int64_t cs1 = static_cast<int64_t>(m_chromkey.get_chrom_size(c1));
         int64_t cs2 = static_cast<int64_t>(m_chromkey.get_chrom_size(c2));
         quadtree::QueryObjects objs = m_track.query_objects(0, 0, cs1, cs2, nullptr);
-
-        size_t n = objs.x1s.size();
-        m_obj_x1.assign(objs.x1s.begin(), objs.x1s.end());
-        m_obj_y1.assign(objs.y1s.begin(), objs.y1s.end());
-        m_obj_x2.assign(objs.x2s.begin(), objs.x2s.end());
-        m_obj_y2.assign(objs.y2s.begin(), objs.y2s.end());
-
-        m_obj_idx = 0;
-        m_scope_in_pair_idx = 0;
-
-        if (n == 0) {
-            ++m_pair_it;
+        if (objs.x1s.empty())
             continue;
-        }
 
-        return true;
-    }
-    return false;
-}
+        build_scope_qtree(qtree, m_scope, m_pair_first, m_pair_last, m_chromkey);
 
-// ---------------------------------------------------------------------------
-// find_next_in_pair()
-//
-// Searches from the current (m_obj_idx, m_scope_in_pair_idx) for the next
-// non-empty intersection.  Updates m_last and m_scope_global_idx.
-// Returns true on success, false when all objects x scope-rects are exhausted.
-// ---------------------------------------------------------------------------
-
-bool PMTrackExpressionTrackRectsIterator::find_next_in_pair()
-{
-    int c1 = m_pair_it->first.first;
-    int c2 = m_pair_it->first.second;
-    const auto &pair_scope = m_pair_it->second;  // vector<pair<size_t, GInterval2D>>
-    size_t n_objs  = m_obj_x1.size();
-    size_t n_scope = pair_scope.size();
-
-    while (m_obj_idx < n_objs) {
-        int64_t ox1 = m_obj_x1[m_obj_idx];
-        int64_t oy1 = m_obj_y1[m_obj_idx];
-        int64_t ox2 = m_obj_x2[m_obj_idx];
-        int64_t oy2 = m_obj_y2[m_obj_idx];
-
-        while (m_scope_in_pair_idx < n_scope) {
-            const GInterval2D &sr = pair_scope[m_scope_in_pair_idx].second;
-
-            // Compute intersection.
-            int64_t ix1 = std::max(ox1, sr.start1);
-            int64_t ix2 = std::min(ox2, sr.end1);
-            int64_t iy1 = std::max(oy1, sr.start2);
-            int64_t iy2 = std::min(oy2, sr.end2);
-
-            if (ix1 < ix2 && iy1 < iy2) {
-                // Non-empty intersection found; apply band if active.
-                if (m_use_band && c1 == c2) {
-                    quadtree::Rectangle rc{ix1, iy1, ix2, iy2};
-                    if (!m_band.do_intersect(rc)) {
-                        ++m_scope_in_pair_idx;
-                        continue;
-                    }
-                    m_band.shrink2intersected(rc);
-                    ix1 = rc.x1; iy1 = rc.y1;
-                    ix2 = rc.x2; iy2 = rc.y2;
-                    if (ix1 >= ix2 || iy1 >= iy2) {
-                        ++m_scope_in_pair_idx;
-                        continue;
-                    }
-                }
-
-                m_last.chromid1 = c1;
-                m_last.chromid2 = c2;
-                m_last.start1   = ix1;
-                m_last.end1     = ix2;
-                m_last.start2   = iy1;
-                m_last.end2     = iy2;
-                m_scope_global_idx = pair_scope[m_scope_in_pair_idx].first;
-                ++m_emitted;
-                return true;
+        for (size_t k = 0; k < objs.x1s.size(); ++k) {
+            intersect_scope_qtree(qtree, Rectangle(objs.x1s[k], objs.y1s[k], objs.x2s[k], objs.y2s[k]),
+                                  m_use_band ? &m_band : nullptr, intersection, indices);
+            for (size_t j = 0; j < intersection.size(); ++j) {
+                const Rectangle &r = intersection[j];
+                m_emits.emplace_back(c1, r.x1, r.x2, c2, r.y1, r.y2);
+                m_emit_scope.push_back(m_scope_orig[m_pair_first + indices[j]]);
             }
-
-            ++m_scope_in_pair_idx;
         }
 
-        // Move to the next object; reset scope-rect pointer.
-        ++m_obj_idx;
-        m_scope_in_pair_idx = 0;
+        if (!m_emits.empty()) {
+            m_last = m_emits[0];
+            ++m_emitted;
+            return;
+        }
     }
 
-    return false;
+    m_isend = true;
 }

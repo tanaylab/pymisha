@@ -34,6 +34,15 @@ except ImportError as e:
         f"Original error: {e}"
     ) from e
 
+def _default_max_mem_usage_kb() -> int:
+    """R misha's gmax.mem.usage default: 80% of the system RAM in KB, at least 10 GB."""
+    try:
+        sys_mem = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        sys_mem = 0
+    return max(10_000_000, int(sys_mem * 0.8 / 1024))
+
+
 # Configuration dictionary (following pynaryn pattern)
 CONFIG = {
     'multitasking': True,           # Allow parallel processing
@@ -52,6 +61,14 @@ CONFIG = {
     # CONFIG['max_processes'] by hand still overrides it.
     'max_processes': max(4, min(32, int((_os.cpu_count() or 1) * 0.7))),
     'max_data_size': 10000000,      # Max rows in memory
+    # Memory budget in KB, R misha's gmax.mem.usage: 80% of the RAM, at least
+    # 10 GB. The parallel 2D imports start a chromosome pair only when its
+    # estimated memory fits into it with the pairs being written.
+    'max_mem_usage': _default_max_mem_usage_kb(),
+    # gintervals_2d_all() returns every chromosome pair on a genome with up to
+    # this many chromosomes and only the intra-chromosomal pairs above it, as
+    # R misha's gmulticontig.2d.threshold does.
+    'multicontig_2d_threshold': 100,
     # Umask held around every write to the database. "0007" gives 660 files and
     # 770 directories - group rwx, no world access - which is what pymisha's own
     # C++ layer already sets (PyMisha's constructor) and what the shared lab
@@ -84,7 +101,13 @@ _GROOT: str | None = None    # Global database root
 _UROOT: str | None = None    # User database root
 _GWD: str | None = None      # Global working directory (tracks root or subdir)
 _GDATASETS: list[str] = []  # Loaded dataset roots (in load order)
-_VTRACKS: dict[str, dict[str, Any]] = {}    # Virtual tracks
+# The chromosome names by chrom id of each loaded dataset that numbers them differently
+# from the working database (R's GDATASET_CHROMS), by its root; see gdataset_load.
+_GDATASET_CHROMS: dict[str, list[str]] = {}
+_VTRACKS: dict[str, dict[str, Any]] = {}    # Virtual tracks of the working directory
+# The virtual tracks of the other working directories they were created in, by directory
+# (R's GVTRACKS keeps them by GWD): gdir_cd puts them back on return
+_GVTRACKS: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def gmax_processes(n=None):
@@ -305,6 +328,42 @@ def _with_umask():
         _os.umask(old)
 
 
+@_contextlib.contextmanager
+def _with_cpp_umask():
+    """Hold the umask 007 that every C++ call runs under (PyMisha, as R misha's
+    RdbInitializer), for a file R misha writes from C++ and pymisha from Python: a new file
+    is 0660 whatever the caller's umask, and one written in place keeps its permission bits.
+    """
+    old = _os.umask(0o007)
+    try:
+        yield
+    finally:
+        _os.umask(old)
+
+
+@_contextlib.contextmanager
+def _write_file(path):
+    """``open(path, "wb")`` for a file the database keeps.
+
+    A write that fails midway, fails when ``close()`` writes the last buffer
+    (a full disk, a quota, an NFS error reported at close) or is interrupted
+    removes the file and re-raises, naming it, instead of leaving a truncated
+    file behind for the next scan to find. Mirrors R misha's
+    ``.gserialize_file``.
+    """
+    # Opened outside the try: a file that could not even be opened was not truncated, so it stays.
+    fh = open(path, "wb")  # noqa: SIM115
+    try:
+        with fh:
+            yield fh
+    except BaseException as exc:
+        with _contextlib.suppress(OSError):
+            _os.unlink(path)
+        if isinstance(exc, OSError) and exc.filename is None:
+            exc.filename = _os.fspath(path)
+        raise
+
+
 def _invalidate_dir_cache(*paths: object) -> None:
     """Drop the C++ memoised track index for one or more track directories.
 
@@ -431,6 +490,150 @@ def _itr2pymisha(itr):
     return [itr[0], _df2pymisha(itr[1])] if isinstance(itr, list) and len(itr) == 2 else _df2pymisha(itr)
 
 
+_CHROM_COLS = ("chrom", "chrom1", "chrom2")
+
+
+def _with_canonical_chroms(df: _pandas.DataFrame) -> _pandas.DataFrame:
+    """df with its chromosome columns holding the database's names for the
+    chromosomes (an alias, such as "1" for chr1, replaced). A name the database
+    does not know is kept, and all of them with no database."""
+    out = df
+    if _GROOT is None:
+        return out
+    for col in _CHROM_COLS:
+        if col not in df.columns:
+            continue
+        values = df[col].astype(str)
+        uniq = values.unique().tolist()
+        try:
+            canonical = dict(zip(uniq, _pymisha.pm_normalize_chroms(uniq), strict=True))
+        except _pymisha.error:
+            canonical = {}
+            for name in uniq:
+                try:
+                    canonical[name] = _pymisha.pm_normalize_chroms([name])[0]
+                except _pymisha.error:
+                    canonical[name] = name
+        if all(k == v for k, v in canonical.items()):
+            continue
+        if out is df:
+            out = df.copy()
+        out[col] = values.map(canonical)
+    return out
+
+
+def _chrom_sort_keys(chroms: Any) -> tuple[_numpy.ndarray, _numpy.ndarray]:
+    """The keys that order chromosome names as misha orders them, for ``numpy.lexsort``
+    (the primary key last): the chrom id, and the name for names the database does not
+    know, which come after all its chromosomes. An alias (such as "1" for chr1) has its
+    chromosome's id. In a per-chromosome database the ids follow R's collation of the
+    names, not the order of the strings (chr1_KI270706v1_random sorts before chr10)."""
+    codes, uniques = _pandas.factorize(_numpy.asarray(chroms, dtype=object).astype(str))
+    uniques = _numpy.asarray(uniques, dtype=str)
+    ids = _numpy.full(len(uniques), -1, dtype=_numpy.intp)
+    if _GROOT is not None and len(uniques):
+        ids = _numpy.asarray(_pymisha.pm_chrom_ids(uniques.tolist()), dtype=_numpy.intp)
+    unknown = ids < 0
+    name_rank = _numpy.zeros(len(uniques), dtype=_numpy.intp)
+    order = _numpy.argsort(uniques[unknown], kind="stable")
+    name_rank[_numpy.flatnonzero(unknown)[order]] = _numpy.arange(1, len(order) + 1)
+    rank = _numpy.where(unknown, _numpy.iinfo(_numpy.intp).max, ids)
+    return name_rank[codes], rank[codes]
+
+
+def _chrom_sizes_names_at(root: Any) -> list[str]:
+    """The chromosome names of chrom_sizes.txt in the database at root, as written."""
+    with open(_os.path.join(str(root), "chrom_sizes.txt"), encoding="utf-8") as fh:
+        return [line.split()[0] for line in fh if line.strip()]
+
+
+def _gdb_check_genome_idx(groot: str, names: list[str] | None = None,
+                          sizes: list[int] | None = None) -> None:
+    """R misha's ``.gdb.check_genome_idx``: raises where gsetroot stops for the
+    database's seq/genome.idx, and warns as it warns (``pm_gdb_check_genome_idx``)."""
+    warning = _pymisha.pm_gdb_check_genome_idx(str(groot), names, sizes)
+    if warning:
+        _warnings.warn(warning, stacklevel=user_stacklevel())
+
+
+def _has_own_sequence(groot: str, first_chrom: str) -> bool:
+    """Whether the seq/ of the database at groot holds sequence: genome.idx and
+    genome.seq, or the first chromosome's .seq file, with or without "chr"."""
+    seq_dir = _os.path.join(groot, "seq")
+    if all(_os.path.exists(_os.path.join(seq_dir, f)) for f in ("genome.idx", "genome.seq")):
+        return True
+    stripped = first_chrom[3:] if first_chrom.startswith("chr") else first_chrom
+    return any(_os.path.exists(_os.path.join(seq_dir, f"{name}.seq"))
+               for name in (first_chrom, f"chr{first_chrom}", stripped))
+
+
+def _gdb_chrom_names_at(groot: str, from_disk: bool = False) -> list[str]:
+    """R misha's ``.gdb.chrom_names_at``: the chromosome names of the database at
+    groot by chrom id, as gdb_init gives them. An indexed track of the database is
+    keyed by these ids. The loaded database and its loaded datasets take the session's
+    order (a dataset loaded with an order of its own keeps it, ``_GDATASET_CHROMS``),
+    unless ``from_disk``; any other database is read from disk without loading it, and
+    one whose seq/ holds no sequence, so that its order cannot be told, is an error."""
+    real = _os.path.realpath(str(groot))
+    if not from_disk and _GROOT is not None:
+        loaded = [_GROOT] + list(_GDATASETS)
+        if real in {_os.path.realpath(p) for p in loaded}:
+            own = _GDATASET_CHROMS.get(real)
+            if own is not None:
+                return list(own)
+            return [str(c) for c in _pymisha.pm_intervals_all()[1]]
+    cs = _os.path.join(str(groot), "chrom_sizes.txt")
+    if not _os.path.exists(cs):
+        raise ValueError(f"chrom_sizes.txt missing in {groot}")
+    names, sizes, file_names, per_chromosome = _pymisha.pm_gdb_chrom_order(str(groot))
+    # Names mostly without the "chr" prefix are sorted in a per-chromosome database and
+    # kept in chrom_sizes.txt order in an indexed one; a seq/ with no sequence cannot tell
+    # which. (file_names is by chrom id; chrom_sizes.txt's first name is the one probed.)
+    with open(cs, encoding="utf-8") as fh:
+        first = next((line.split()[0] for line in fh if line.strip()), None)
+    if (not per_chromosome and file_names and first is not None
+            and not _has_own_sequence(str(groot), first)
+            and sum(not n.startswith("chr") for n in file_names) >= 0.8 * len(file_names)):
+        raise ValueError(
+            f"The chromosome order of {groot} cannot be told: its chrom_sizes.txt names lack "
+            "the \"chr\" prefix, so its indexed tracks are keyed by the sorted names if it is a "
+            "per-chromosome database and by the chrom_sizes.txt order if it is indexed, and its "
+            "seq/ has no sequence to show which (as in a copy of a database's tracks without its "
+            "seq/). Put back its seq/ (a link to the original database's seq/ will do), or load "
+            "it with gdataset_load() as a dataset of its database."
+        )
+    # as gdb_init checks it: an indexed seq/ linked to a database converted since gives the
+    # order of chrom_sizes.txt, not of the index its tracks would be read with
+    _gdb_check_genome_idx(str(groot), list(names), list(sizes))
+    return list(names)
+
+
+def _refuse_dataset_order(what: str, name: str, db_root: str | None) -> None:
+    """Stops writing a track or interval set of a dataset loaded with an order of its own
+    (``_GDATASET_CHROMS``) in the indexed format, keyed by the session's chrom ids, as R's
+    gtrack.convert_to_indexed and gintervals.convert_to_indexed do."""
+    if db_root and _os.path.realpath(db_root) in _GDATASET_CHROMS:
+        raise ValueError(
+            f"{what} {name} is in a dataset that numbers the chromosomes differently from the "
+            "working database, so it cannot be written in the indexed format in this session; "
+            "load that database with gsetroot() to do it there."
+        )
+
+
+def _sort_by_chrom(df: _pandas.DataFrame, by: list[str]) -> _pandas.DataFrame:
+    """df sorted (stably) by the columns ``by``, a chromosome column as misha orders
+    chromosomes (``_chrom_sort_keys``)."""
+    if len(df) < 2:
+        return df.reset_index(drop=True)
+    keys: list[Any] = []
+    for col in reversed(by):
+        if col in _CHROM_COLS:
+            keys += list(_chrom_sort_keys(df[col]))
+        else:
+            keys.append(df[col].to_numpy())
+    return df.iloc[_numpy.lexsort(keys)].reset_index(drop=True)
+
+
 def _intersect_scope_with_iterator(scope, iterator_intervals):
     """Intersect scope intervals with iterator intervals.
 
@@ -456,7 +659,8 @@ def _intersect_scope_with_iterator(scope, iterator_intervals):
     itr_chroms = iterator_intervals["chrom"].to_numpy()
     itr_starts = iterator_intervals["start"].to_numpy(dtype=_numpy.int64, copy=False)
     itr_ends = iterator_intervals["end"].to_numpy(dtype=_numpy.int64, copy=False)
-    itr_order = _numpy.lexsort((itr_starts, itr_chroms))
+    # misha's order: by chrom id, not by the name (see _chrom_sort_keys)
+    itr_order = _numpy.lexsort((itr_starts, *_chrom_sort_keys(itr_chroms)))
     itr_chroms = itr_chroms[itr_order]
     itr_starts = itr_starts[itr_order]
     itr_ends = itr_ends[itr_order]
@@ -491,7 +695,7 @@ def _intersect_scope_with_iterator(scope, iterator_intervals):
     sc_chroms = scope["chrom"].to_numpy()
     sc_starts = scope["start"].to_numpy(dtype=_numpy.int64, copy=False)
     sc_ends = scope["end"].to_numpy(dtype=_numpy.int64, copy=False)
-    sc_order = _numpy.lexsort((sc_starts, sc_chroms))
+    sc_order = _numpy.lexsort((sc_starts, *_chrom_sort_keys(sc_chroms)))
     sc_chroms_sorted = sc_chroms[sc_order]
     sc_starts_sorted = sc_starts[sc_order]
     sc_ends_sorted = sc_ends[sc_order]
@@ -596,9 +800,7 @@ def _canonic_scope(intervals):
     scope is a coordinate mask, and any extra column would be ambiguous once two
     rows become one.
     """
-    df = intervals[["chrom", "start", "end"]].sort_values(
-        ["chrom", "start", "end"], kind="mergesort"
-    )
+    df = _sort_by_chrom(intervals[["chrom", "start", "end"]], ["chrom", "start", "end"])
     out = []
     for chrom, grp in df.groupby("chrom", sort=False):
         cur_start, cur_end = None, None
@@ -762,6 +964,12 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
             "DataFrame iterator must have 'chrom', 'start', 'end' columns"
         )
 
+    # The intersection matches the chromosomes by name: name both by the
+    # database's names, as misha does (an alias such as "1" for chr1 is accepted).
+    iterator = _with_canonical_chroms(iterator)
+    if isinstance(intervals, _pandas.DataFrame) and "chrom" in intervals.columns:
+        intervals = _with_canonical_chroms(intervals)
+
     # Canonicalise the SCOPE before intersecting, never the iterator. The C++
     # entry points skip their own unify when they receive the intersection
     # (iterator_policy == -1), because by then these are bins, not a scope -
@@ -769,10 +977,8 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     # R parity: an overlapping or duplicated scope with a two-bin touching
     # iterator gives 2 in misha, exactly as a canonical scope does.
     #
-    # Deliberately not gintervals_canonic(): it round-trips through the C++
-    # chromkey and hands back misha's internal chromosome names, so a caller's
-    # "chr1" comes back as "1" and the intersection below then matches nothing.
-    # Merging here in pandas keeps the caller's own labels.
+    # Merged here in pandas rather than by gintervals_canonic(), which round-trips
+    # through the C++ chromkey.
     # Opt-in, because it is only correct for the aggregating callers. misha
     # canonicalises the scope in gsummary/gquantiles/gcor/gscreen/gsample/
     # gsegment/gwilcox/gpartition/gdist/giterator.intervals and NOT in gextract,
@@ -879,32 +1085,115 @@ def _chunk_slices(n, chunk_size):
     return [(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
 
 
-def _gwd_prefix():
-    """Return the dotted prefix for the current working directory.
+def _gwd_is_subdir() -> bool:
+    """Whether the working directory (gdir_cd) is a subdirectory: not the tracks/ of the
+    working database, the user root or a loaded dataset. Names are then relative to it, and
+    only those under it are listed (R misha's ``!is.null(.gdb.gwd_db())``)."""
+    return bool(_pymisha.pm_gwd_is_subdir())
 
-    If GWD is ``{GROOT}/tracks/subdir``, returns ``"subdir."``.
-    If GWD is the tracks root, returns ``""``.
+
+def _path_db(path: Any) -> str | None:
+    """R misha's ``.gdb.path_db``: the loaded database a path is in, the one whose tracks/
+    holds it, the most specific one when several do (comparing the directories with links
+    resolved), or None when none does or when a database root (a directory with
+    chrom_sizes.txt and tracks/, loaded or not) lies between the path and that tracks/."""
+    groots = [g for g in [_GROOT, *_GDATASETS] if g]
+    tracks_dirs = [_os.path.realpath(_os.path.join(g, "tracks")) for g in groots]
+    # links are followed in the part of the path that exists (a new track's directory does not yet)
+    path = _os.path.abspath(str(path))
+    rest: list[str] = []
+    while not _os.path.exists(path) and _os.path.dirname(path) != path:
+        rest.insert(0, _os.path.basename(path))
+        path = _os.path.dirname(path)
+    path = _os.path.join(_os.path.realpath(path), *rest)
+    within = [i for i, t in enumerate(tracks_dirs) if path == t or path.startswith(t + "/")]
+    if not within:
+        return None
+    best = max(within, key=lambda i: len(tracks_dirs[i]))
+    while len(path) > len(tracks_dirs[best]):
+        if _os.path.exists(_os.path.join(path, "chrom_sizes.txt")) and _os.path.isdir(_os.path.join(path, "tracks")):
+            return None
+        path = _os.path.dirname(path)
+    return groots[best]
+
+
+def _gwd_db() -> str | None:
+    """R misha's ``.gdb.gwd_db``, for a working directory that is a subdirectory
+    (``_gwd_is_subdir``): the loaded database it is in (``_path_db``), None if none."""
+    return _path_db(_GWD)
+
+
+def _same_order(db: str | None) -> bool:
+    """R misha's ``.gdb.same_order``: whether the session's chrom ids are those of loaded
+    database db. The working database's are, and a dataset's only when its order can be
+    read now and is the same (as gdataset_load compares them); None or an unreadable order
+    is not."""
+    if db is None:
+        return False
+    if db == _GROOT:
+        return True
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            chroms = _gdb_chrom_names_at(db, from_disk=True)
+    except Exception:
+        return False
+
+    def strip(names: list[str]) -> list[str]:
+        return [n[3:] if n.startswith("chr") else n for n in names]
+
+    assert _GROOT is not None
+    return strip(chroms) == strip(_gdb_chrom_names_at(_GROOT))
+
+
+def _names_dir(db: str | None = None) -> str:
+    """R misha's ``.gdb.names_dir``: the directory the names of database db are relative
+    to: the working directory for None, and for the database it is in when it is a
+    subdirectory (gdir_cd); db's tracks/ otherwise."""
+    assert _GWD is not None
+    if db is None or (_gwd_is_subdir() and _same_path(db, _gwd_db())):
+        return _GWD
+    return _os.path.join(db, "tracks")
+
+
+def _same_path(a: Any, b: Any) -> bool:
+    """Whether two paths are the same directory, links resolved (None is no path)."""
+    return a is not None and b is not None and _os.path.realpath(str(a)) == _os.path.realpath(str(b))
+
+
+def _check_spat_bounds(
+    spat_min: Any, spat_max: Any, motif_len: int
+) -> tuple[float | None, float | None]:
+    """R misha's checks on spat_min/spat_max, for the pwm virtual tracks and gseq_pwm.
+
+    Each is a single 1-based position >= 1. A window spat_min..spat_max shorter
+    than the motif can never hold it, so it is an error too, with spat_min taken
+    as 1 when only spat_max is given. Returns the two as floats (None if not
+    given); the caller converts them as R does.
     """
-    if _GROOT is None or _GWD is None:
-        return ""
-    import os
-    tracks_root = os.path.join(_GROOT, "tracks")
-    if tracks_root == _GWD:
-        return ""
-    relpath = os.path.relpath(_GWD, tracks_root)
-    return relpath.replace(os.sep, ".") + "."
-
-
-def _apply_gwd_to_names(names):
-    """Filter and rebase names by current working directory prefix.
-
-    Given a list of dotted names (tracks or intervals), keeps only those
-    under the current GWD prefix and strips that prefix.
-    """
-    prefix = _gwd_prefix()
-    if not prefix:
-        return names
-    return [n[len(prefix):] for n in names if n.startswith(prefix)]
+    out: list[float | None] = []
+    for key, v in (("spat_min", spat_min), ("spat_max", spat_max)):
+        if v is None:
+            out.append(None)
+            continue
+        if (
+            isinstance(v, bool)
+            or not isinstance(v, (int, float, _numpy.number))
+            or _numpy.isnan(v)
+            or v < 1
+        ):
+            raise ValueError(f"{key} must be a single 1-based position (>= 1)")
+        # R's as.integer() turns these into NA with a warning
+        if v > 2**31 - 1:
+            raise ValueError(f"{key} is outside the 32-bit integer range")
+        out.append(float(v))
+    smin, smax = out
+    if smax is not None and smax - (1 if smin is None else smin) + 1 < motif_len:
+        raise ValueError(
+            f"the spat_min..spat_max window is shorter than the motif ({motif_len} bp), "
+            "so no position can be scored"
+        )
+    return smin, smax
 
 
 def _coerce_score_thresh(value: Any) -> float:
@@ -1050,6 +1339,13 @@ def _coerce_potts_model(model: Any, what: str) -> dict[str, Any]:
             raise ValueError(f"{what}: 'width' says {width} but 'e' has {w} rows")
 
     pairs_in = model.get("pairs")
+    # Declared unparameterised on purpose. The two branches below produce
+    # different shape types - zeros((0, 2)) is ndarray[tuple[int, int], ...]
+    # while ascontiguousarray() is ndarray[tuple[int, ...], ...] - and how
+    # precisely numpy's stubs express that varies by numpy version, so the
+    # 3.10 CI leg rejected the assignment while 3.11 and 3.12 accepted it.
+    # Binding the name once, to any ndarray, is stub-agnostic.
+    pairs: _numpy.ndarray
     if pairs_in is None:
         pairs = _numpy.zeros((0, 2), dtype=_numpy.int64)
     else:

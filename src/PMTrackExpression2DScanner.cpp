@@ -90,6 +90,7 @@ void PMTrackExpr2DScanner::run(
     // Reset all state from any prior run.
     m_vars.clear();
     m_emitted_intervals.clear();
+    m_emitted_scope_idx.clear();
     m_emitted = 0;
     m_num_intervals = 0;
 
@@ -116,6 +117,7 @@ void PMTrackExpr2DScanner::run(
         // A streaming variant will be needed in a later release; for release-1
         // workloads (test DB) this is acceptable.
         m_emitted_intervals.push_back(itr->last_interval());
+        m_emitted_scope_idx.push_back(static_cast<int64_t>(itr->original_interval_idx()) - 1);
         itr->next();
     }
 

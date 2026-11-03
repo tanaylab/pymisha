@@ -18,14 +18,11 @@ import pymisha as pm
 def make_intervals(data):
     """Create intervals DataFrame from list of (chrom, start, end) tuples.
 
-    Note: Chromosome names are normalized to match the test database format.
-    The test database uses '1', '2', 'X' (without 'chr' prefix).
+    The test database names its chromosomes chr1, chr2 and chrX.
     """
     if not data:
         return pd.DataFrame({'chrom': pd.Categorical([]), 'start': [], 'end': []})
     chroms, starts, ends = zip(*data, strict=False)
-    # Normalize chromosome names to database format (remove 'chr' prefix)
-    chroms = [c.replace('chr', '') if isinstance(c, str) else c for c in chroms]
     return pd.DataFrame({
         'chrom': pd.Categorical(chroms),
         'start': list(starts),
@@ -502,7 +499,7 @@ class TestGintervalsCanonic:
 class TestGintervals:
     """Tests for gintervals constructor function.
 
-    Note: Test database has chromosomes "1", "2", "X" (without chr prefix).
+    Note: Test database has chromosomes chr1, chr2, chrX (chrom_sizes.txt holds 1, 2, X).
     """
 
     def test_gintervals_single_chrom(self):
@@ -510,7 +507,7 @@ class TestGintervals:
         result = pm.gintervals("1", 100, 200)
 
         assert len(result) == 1
-        assert result.iloc[0]['chrom'] == '1'
+        assert result.iloc[0]['chrom'] == 'chr1'
         assert result.iloc[0]['start'] == 100
         assert result.iloc[0]['end'] == 200
 
@@ -529,8 +526,8 @@ class TestGintervals:
 
         assert len(result) == 2
         chroms = list(result['chrom'])
-        assert '1' in chroms
-        assert '2' in chroms
+        assert 'chr1' in chroms
+        assert 'chr2' in chroms
 
     def test_gintervals_with_strand(self):
         """Create intervals with strand information."""
@@ -559,12 +556,11 @@ class TestGintervals:
 
     def test_gintervals_integer_chrom(self):
         """Accept integer chromosome names (converted to chr1, chr2, etc)."""
-        # Note: This converts 1 to "chr1", but test db uses "1"
-        # So we test the conversion happens, but it may not match the db
+        # "1" names chr1 (an alias of the database's name)
         result = pm.gintervals("1", 100, 200)
 
         assert len(result) == 1
-        assert result.iloc[0]['chrom'] == '1'
+        assert result.iloc[0]['chrom'] == 'chr1'
 
     def test_gintervals_raises_on_invalid_coords(self):
         """Raise error for invalid coordinates."""
@@ -591,7 +587,7 @@ class TestGintervals:
         )
 
         # Should be sorted: 1:100, 1:300, 2:100
-        assert list(result['chrom']) == ['1', '1', '2']
+        assert list(result['chrom']) == ['chr1', 'chr1', 'chr2']
         assert list(result['start']) == [100, 300, 100]
 
 
@@ -602,13 +598,13 @@ class TestGintervals:
 class TestGintervalsForceRange:
     """Tests for gintervals_force_range function.
 
-    Note: Test database has chromosomes "1", "2", "X" (without chr prefix).
+    Note: Test database has chromosomes chr1, chr2, chrX (chrom_sizes.txt holds 1, 2, X).
     Sizes: 1=500000, 2=300000, X=200000
     """
 
     def test_force_range_already_valid(self):
         """Intervals already within range are unchanged."""
-        intervs = make_intervals([('1', 100, 200)])
+        intervs = make_intervals([('chr1', 100, 200)])
 
         result = pm.gintervals_force_range(intervs)
 
@@ -1085,13 +1081,13 @@ class TestGintervalsUpdate:
 
             # Verify update
             loaded = pm.gintervals_load(tmp_name)
-            chrom2_rows = loaded[loaded["chrom"].astype(str) == "2"]
+            chrom2_rows = loaded[loaded["chrom"].astype(str) == "chr2"]
             assert len(chrom2_rows) == 1
             assert int(chrom2_rows.iloc[0]["start"]) == 500
             assert int(chrom2_rows.iloc[0]["end"]) == 1500
 
             # Chrom 1 should be unchanged
-            chrom1_rows = loaded[loaded["chrom"].astype(str) == "1"]
+            chrom1_rows = loaded[loaded["chrom"].astype(str) == "chr1"]
             assert len(chrom1_rows) == 1
             assert int(chrom1_rows.iloc[0]["start"]) == 100
             assert int(chrom1_rows.iloc[0]["end"]) == 1000
@@ -1114,8 +1110,8 @@ class TestGintervalsUpdate:
             loaded = pm.gintervals_load(tmp_name)
             assert loaded is not None
             chroms = [str(c) for c in loaded["chrom"]]
-            assert "2" not in chroms
-            assert "1" in chroms
+            assert "chr2" not in chroms
+            assert "chr1" in chroms
         finally:
             pm.gintervals_rm(tmp_name, force=True)
 
@@ -1135,16 +1131,16 @@ class TestGintervalsUpdate:
 
             loaded_before = pm.gintervals_load(tmp_name)
             chroms_before = {str(c) for c in loaded_before["chrom"]}
-            assert "1" in chroms_before
-            assert "2" in chroms_before
+            assert "chr1" in chroms_before
+            assert "chr2" in chroms_before
 
             # Remove chrom 2
             pm.gintervals_update(tmp_name, None, chrom="2")
 
             loaded_after = pm.gintervals_load(tmp_name)
             chroms_after = {str(c) for c in loaded_after["chrom"]}
-            assert "1" in chroms_after
-            assert "2" not in chroms_after
+            assert "chr1" in chroms_after
+            assert "chr2" not in chroms_after
             assert len(loaded_after) < len(loaded_before)
         finally:
             pm.gintervals_rm(tmp_name, force=True)

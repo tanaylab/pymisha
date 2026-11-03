@@ -3,8 +3,7 @@
 Each ``expect_regression(<expr>, "<id>")`` is run on R's own test DB and compared
 to R's frozen ``.rds`` baseline via :func:`assert_matches_baseline`.
 
-Feature gaps in pymisha (array-track extract, COMPUTED 2D Hi-C tracks, 2D
-gscreen on rects) are marked ``xfail(strict=True)`` so they flip to failures -
+Feature gaps in pymisha (array-track extract, 2D gscreen on rects) are marked ``xfail(strict=True)`` so they flip to failures -
 and alert us to re-port - the moment the feature lands.
 """
 
@@ -51,7 +50,6 @@ def test_gextract_computed2d_1():
     )
 
 
-@pytest.mark.xfail(reason="COMPUTED Hi-C tracks not supported", strict=True)
 def test_gextract_computed2d_2():
     intervs = pm.gscreen("test.computed2d > 9000000")
     assert_matches_baseline(
@@ -89,7 +87,6 @@ def test_gextract_allgenome_rects():
     )
 
 
-@pytest.mark.xfail(reason="COMPUTED Hi-C tracks not supported", strict=True)
 def test_gextract_allgenome_computed2d():
     assert_matches_baseline(
         pm.gextract("test.computed2d", pm.gintervals_2d_all(mode="full")),

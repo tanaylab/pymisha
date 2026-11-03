@@ -82,7 +82,7 @@ class TestSplitIndexedKernel:
 
         _pymisha.pm_track_split_indexed_to_per_chrom(
             str(track_dir),
-            pm.tracks._db_chrom_names_at(root),
+            pm._shared._gdb_chrom_names_at(str(root)),
             True,
         )
         assert not (track_dir / "track.idx").exists()
@@ -107,7 +107,7 @@ class TestSplitIndexedKernel:
         pm.gtrack_convert_to_indexed("tm")
         _pymisha.pm_track_split_indexed_to_per_chrom(
             str(track_dir),
-            pm.tracks._db_chrom_names_at(root),
+            pm._shared._gdb_chrom_names_at(str(root)),
             True,
         )
 
@@ -136,7 +136,7 @@ class TestSplitIndexedKernel:
         pm.gtrack_convert_to_indexed("tk")
         _pymisha.pm_track_split_indexed_to_per_chrom(
             str(track_dir),
-            pm.tracks._db_chrom_names_at(root),
+            pm._shared._gdb_chrom_names_at(str(root)),
             False,
         )
         assert (track_dir / "track.idx").exists()

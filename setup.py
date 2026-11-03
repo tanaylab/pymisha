@@ -47,7 +47,7 @@ setup(
     ext_modules=[
         Extension('_pymisha',
             sources=src_files,
-            include_dirs=[numpy.get_include(), 'src'],
+            include_dirs=[numpy.get_include(), 'src', 'src/shims'],
             libraries=['z'],
             extra_compile_args=compile_args,
             extra_link_args=link_args,

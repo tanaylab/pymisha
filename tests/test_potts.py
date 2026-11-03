@@ -3,18 +3,20 @@
 The reference throughout is the pure-Python oracle in tests/_potts_oracle.py,
 which shares no logic with src/PottsModel.h.
 
-One test differs from R's by design. R covers PottsModel's two kernels through
-C_potts_score_codes_cmp, a test-only .Call that scores an integer code matrix
-with score_codes_naive() and score_codes_blocked() side by side. pymisha has no
-such entry point; the sweep at the bottom of this file drives both kernels
-through the public gseq_potts() instead, relying on PottsModel's own dispatch
-gate to pick each one - see the comment there for which case selects which.
+The kernel tests reach PottsModel's two kernels through
+_pymisha.pm_potts_score_codes_cmp, a test-only entry point (misha's is
+C_potts_score_codes_cmp) that scores an integer code matrix with
+score_codes_naive() and score_codes_blocked() side by side and reports which
+one the gate in build_blocked_tables() picks (use_blocked), for the model and
+for its reverse complement.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 
+import _pymisha
 import numpy as np
 import pytest
 from _potts_oracle import (
@@ -262,18 +264,48 @@ def test_mode_pos_works_on_the_reverse_strand_alone():
     )
 
 
-# PottsModel.h builds both kernels whenever W allows and picks between them per
-# model, on lookup count: blocked costs ceil(W/2) + C(ceil(W/2), 2) lookups
-# whatever the pairing, naive costs 1 + W + npair. So at W = 20 that is 55
-# against 21 + npair, and at W = 21 it is 66 against 22 + npair - the dense and
-# sparse models below select BLOCKED, the order-1 ones select NAIVE, and W = 21
-# additionally exercises the trailing size-1 block an odd width leaves.
-#
-# R covers this through C_potts_score_codes_cmp, which calls the two kernels
-# directly. pymisha exports no such entry point, so the sweep goes through
-# gseq_potts() and compares against the oracle instead - which tests the
-# production dispatch as well as the kernel it lands on, at the cost of not
-# being able to reach the kernel the gate did not pick.
+def _kernel_params(m, what="kernel equivalence test"):
+    return _potts_params(m, bidirect=True, extend=False, strand=1, score_thresh=0.0, what=what)
+
+
+def _random_codes(n, w, seed):
+    """n random windows of w base codes, one window per row."""
+    return np.random.default_rng(seed).integers(0, 4, size=(n, w), dtype=np.int32)
+
+
+def _score_codes_cmp(params, codes):
+    return _pymisha.pm_potts_score_codes_cmp(params, codes)
+
+
+def test_the_blocked_kernel_agrees_with_the_naive_one_on_1e6_random_windows_at_w20_full_pairwise():
+    # PottsModel.h's score_codes() runs whichever kernel build_blocked_tables()'s
+    # gate picks for the model - the blocked one for a dense model like this
+    # one. This is the equivalence check that choice rests on, kept as a
+    # permanent regression test.
+    m = potts_ref_model(20, npair_mode="full", seed=1)
+    res = _score_codes_cmp(_kernel_params(m), _random_codes(1_000_000, 20, seed=2))
+    max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+    assert max_diff < 1e-9, f"max |naive - blocked| = {max_diff:.3e} over 1e6 windows"
+
+
+# The trailing size-1 block build_blocked_tables() uses for an odd W has no
+# coverage in the tests above - every W above (4, 6, 8, 20) is even. Sweep
+# W = 20/21 (even/odd) x every pairing density: score_codes_blocked() must
+# agree with score_codes_naive() at EVERY density.
+@pytest.mark.parametrize("w", [20, 21])
+@pytest.mark.parametrize("npair_mode", ["full", "sparse", "none"])
+def test_blocked_kernel_agrees_with_naive(w, npair_mode):
+    m = potts_ref_model(w, npair_mode=npair_mode, seed=3)
+    res = _score_codes_cmp(_kernel_params(m), _random_codes(50_000, w, seed=4))
+    max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+    assert max_diff < 1e-9, f"W={w} {npair_mode}: max |naive - blocked| = {max_diff:.3e}"
+    # The gate puts every one of these on the blocked kernel, both strands: an
+    # order-1 model, and models whose couplings are dense or local.
+    assert res["use_blocked"] == (True, True)
+
+
+# Not in R's suite: the same models through gseq_potts(), against the oracle,
+# so the production dispatch is checked as well as the two kernels.
 @pytest.mark.parametrize("w", [20, 21])
 @pytest.mark.parametrize("npair_mode", ["full", "sparse", "none"])
 def test_kernel_agrees_with_the_oracle_over_random_windows(w, npair_mode):
@@ -287,6 +319,155 @@ def test_kernel_agrees_with_the_oracle_over_random_windows(w, npair_mode):
         f"W={w} {npair_mode}: max |kernel - oracle| = {max_diff:.3e} over "
         f"{len(seqs)} windows"
     )
+
+
+def _model_with_pairs(pairs, w, seed):
+    """A random model over the given 1-based ``pairs``."""
+    rng = np.random.default_rng(seed)
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    return {
+        "e": np.round(rng.normal(size=(w, 4)), 4),
+        "J": [np.round(rng.normal(size=(4, 4)), 4) for _ in range(len(pairs))],
+        "pairs": pairs,
+        "intercept": float(np.round(rng.normal(), 4)),
+    }
+
+
+def _scattered_model(seed):
+    """Five diagonals of couplings at odd spacings (11, 31, 51, 71 and 91
+    apart) at W = 128, which put each of the 385 couplings in a block pair of
+    its own."""
+    w = 128
+    pairs = np.concatenate([
+        np.column_stack([np.arange(1, w - d + 1), np.arange(1, w - d + 1) + d])
+        for d in range(11, 92, 20)
+    ])
+    pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+    return _model_with_pairs(pairs, w, seed)
+
+
+def _band(lo, hi):
+    """Every pair of positions in [lo, hi] at most 8 apart, 1-based."""
+    return [(i, j) for i, j in itertools.combinations(range(lo, hi + 1), 2) if j - i <= 8]
+
+
+def test_a_model_whose_couplings_link_only_some_block_pairs_scores_like_the_oracle():
+    # build_blocked_tables() gives a table only to a block pair that some
+    # coupling links. Two bands of local couplings (positions 1-14 and 21-41,
+    # at most 8 apart), a pair inside block 7 (positions 15-16) and a pair from
+    # position 1 to the trailing size-1 block (41) link some of the 210 block
+    # pairs and leave blocks 6-9 linked to no later block. The gate picks the
+    # blocked kernel for both strands. The reverse strand is scored by the
+    # model's reverse complement, which (odd W shifts the blocks) links a
+    # different set of block pairs.
+    w = 41
+    pairs = np.array(sorted(_band(1, 14) + [(15, 16)] + _band(21, 41) + [(1, 41)]),
+                     dtype=np.int64)
+    m = _model_with_pairs(pairs, w, seed=51)
+
+    # The fixture covers what the comment says it does.
+    nb = (w + 1) // 2
+    blocks = (pairs - 1) // 2
+    linked = np.unique(blocks[blocks[:, 0] != blocks[:, 1]], axis=0)
+    assert len(linked) < math.comb(nb, 2)
+    assert not np.isin(np.arange(6, 10), linked[:, 0]).any()
+    assert (linked[:, 1] == nb - 1).any()
+
+    # Both kernels on the model and on its reverse complement.
+    codes = _random_codes(20_000, w, seed=52)
+    for model in (m, potts_ref_rc(m)):
+        res = _score_codes_cmp(_kernel_params(model, "linked block pairs test"), codes)
+        max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+        assert max_diff < 1e-9, f"max |naive - blocked| = {max_diff:.3e}"
+        assert res["use_blocked"] == (True, True)
+
+    rng = np.random.default_rng(53)
+    seqs = random_seqs(30, w, rng)
+    np.testing.assert_allclose(
+        pm.gseq_potts(seqs, m, mode="max", bidirect=False, strand=1),
+        [potts_ref_window(s, m) for s in seqs], rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        pm.gseq_potts(seqs, m, mode="max", bidirect=False, strand=-1),
+        [potts_ref_window(s, potts_ref_rc(m)) for s in seqs], rtol=1e-6,
+    )
+
+
+def test_the_blocked_kernel_agrees_with_naive_on_both_sides_of_80pct_linked_block_pairs():
+    # build_blocked_tables() gives every block pair a table, and the kernel
+    # loops over all of them, once at least 80% of block pairs are linked;
+    # below that it loops over the linked ones only. At W = 20, full pairwise
+    # minus the couplings of block pair (0, 9) links 44 of the 45 block pairs;
+    # minus every block pair 6 or more apart, 35 of them.
+    w = 20
+    full = np.array(list(itertools.combinations(range(1, w + 1), 2)), dtype=np.int64)
+    bu = (full[:, 0] - 1) // 2
+    bv = (full[:, 1] - 1) // 2
+    for keep, nlinked in ((~((bu == 0) & (bv == 9)), 44), (bv - bu < 6, 35)):
+        both = np.column_stack([bu, bv])[keep & (bu != bv)]
+        assert len(np.unique(both, axis=0)) == nlinked
+        m = _model_with_pairs(full[keep], w, seed=61)
+        res = _score_codes_cmp(_kernel_params(m, "80% linked test"), _random_codes(20_000, w, seed=62))
+        max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+        assert max_diff < 1e-9, f"{nlinked} linked: max |naive - blocked| = {max_diff:.3e}"
+
+
+def test_an_odd_w_window_followed_by_an_n_or_by_nothing_scores_like_the_oracle():
+    # potts_block_codes() packs each block code once per window. The trailing
+    # size-1 block of an odd W reads the base after the window, or 0 past the
+    # end of the sequence or before an N, and its tables ignore that base.
+    w = 21
+    m = potts_ref_model(w, npair_mode="full", seed=7)
+    rng = np.random.default_rng(71)
+    wins = random_seqs(20, w, rng)
+    for tail in ("", "N", "ACGTN"):
+        s = [x + tail for x in wins]
+        for strand in (1, -1):
+            got = pm.gseq_potts(s, m, mode="max", bidirect=False, strand=strand)
+            want = [np.nanmax(potts_ref_anchors(x, m, bidirect=False, strand=strand)) for x in s]
+            np.testing.assert_allclose(got, want, rtol=0, atol=1e-9, err_msg=f"{tail!r} {strand}")
+
+
+def test_a_model_wider_than_256_runs_the_naive_kernel_and_scores_like_the_oracle():
+    # build_blocked_tables() builds no blocked tables past W = 256, so
+    # score_codes() falls back to the naive kernel whatever the gate would
+    # say.
+    w = 257
+    pairs = [(i, j) for i, j in itertools.combinations(range(1, w + 1), 2) if j - i <= 2]
+    m = _model_with_pairs(pairs, w, seed=91)
+    rng = np.random.default_rng(92)
+    s = random_seqs(5, w + 3, rng)
+    for strand in (1, -1):
+        got = pm.gseq_potts(s, m, mode="max", bidirect=False, strand=strand)
+        want = [potts_ref_anchors(x, m, bidirect=False, strand=strand).max() for x in s]
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-9, err_msg=f"strand {strand}")
+
+
+def test_couplings_scattered_one_per_block_pair_run_the_naive_kernel():
+    # Each of the scattered model's 385 couplings sits in a block pair of its
+    # own. A linked block pair's table is 2 KB where the naive kernel reads
+    # 128 bytes per coupling, so the gate picks the naive kernel for both
+    # strands. The two kernels must still agree.
+    m = _scattered_model(seed=81)
+    assert len(np.unique((m["pairs"] - 1) // 2, axis=0)) == len(m["pairs"])
+    res = _score_codes_cmp(_kernel_params(m, "scattered couplings test"), _random_codes(5000, 128, seed=82))
+    assert res["use_blocked"] == (False, False)
+    max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+    assert max_diff < 1e-9, f"W = 128: max |naive - blocked| = {max_diff:.3e}"
+
+    # The same holds where every block pair gets a table (80% or more
+    # linked): one coupling in each of the block pairs (u, v) with u + v not
+    # a multiple of 6 links 83% of them at W = 64.
+    w = 64
+    nb = w // 2
+    bp = np.array(list(itertools.combinations(range(nb), 2)), dtype=np.int64)
+    bp = bp[bp.sum(axis=1) % 6 != 0]
+    assert len(bp) >= 0.8 * math.comb(nb, 2)
+    m = _model_with_pairs(2 * bp + 1, w, seed=83)
+    res = _score_codes_cmp(_kernel_params(m, "scattered couplings test"), _random_codes(5000, w, seed=84))
+    assert res["use_blocked"] == (False, False)
+    max_diff = float(np.abs(res["naive"] - res["blocked"]).max())
+    assert max_diff < 1e-9, f"W = 64: max |naive - blocked| = {max_diff:.3e}"
 
 
 def test_rejects_a_model_whose_window_score_cannot_fit_a_float():
@@ -374,12 +555,16 @@ def test_a_repeated_pair_contributes_both_couplings():
     #
     # R reaches both kernels through a test-only entry point that calls each
     # directly. pymisha goes through gseq_potts, so the kernel is whichever
-    # PottsModel's gate picks: at W = 6 sparse that is naive, at W = 20 full it
-    # is blocked (see the sweep above for the arithmetic).
+    # PottsModel's gate picks: the blocked one for W = 6 sparse and W = 20
+    # full, the naive one for couplings scattered one per block pair at
+    # W = 128 (see test_couplings_scattered_one_per_block_pair_run_the_naive_kernel).
     import _pymisha
 
-    for w, npair_mode in ((6, "sparse"), (20, "full")):
-        m = potts_ref_model(w, npair_mode=npair_mode, seed=11)
+    models = [potts_ref_model(w, npair_mode=npair_mode, seed=11)
+              for w, npair_mode in ((6, "sparse"), (20, "full"))]
+    models.append(_scattered_model(seed=11))
+    for m in models:
+        w = len(m["e"])
         single = _potts_params(m, bidirect=False, extend=False, strand=1,
                                score_thresh=0.0, what="duplicate pair test")
         dup = dict(single)
@@ -402,6 +587,34 @@ def test_a_repeated_pair_contributes_both_couplings():
         ])
         np.testing.assert_allclose(r2 - r1, extra, atol=1e-9)
         assert not np.allclose(r2, r1)
+
+
+def test_a_repeated_pair_contributes_both_couplings_in_both_kernels():
+    # _coerce_potts_model() rejects a duplicate (p1, p2), so this cannot be
+    # reached through gseq_potts() or a vtrack. PMPottsParams::parse() reads a
+    # caller-supplied dict all the same, and build_blocked_tables() SUMS a
+    # repeat rather than letting the last one win - which is what
+    # score_codes_naive()'s loop over k does naturally.
+    w = 6
+    m = potts_ref_model(w, npair_mode="sparse", seed=11)
+    single = _kernel_params(m, "duplicate pair test")
+    dup = dict(single)
+    dup["pairs"] = np.vstack([single["pairs"], single["pairs"][:1]])
+    dup["J"] = np.vstack([single["J"], single["J"][:1]])
+
+    codes = _random_codes(2000, w, seed=12)
+    r1 = _score_codes_cmp(single, codes)
+    r2 = _score_codes_cmp(dup, codes)
+
+    # The duplicated block is counted twice, so the difference is exactly that
+    # coupling's own contribution to each window - not zero, and not double the
+    # whole score.
+    j1 = single["J"][0].reshape(4, 4, order="F")
+    p1, p2 = int(single["pairs"][0][0]), int(single["pairs"][0][1])
+    extra = j1[codes[:, p1 - 1], codes[:, p2 - 1]]
+    np.testing.assert_allclose(r2["naive"] - r1["naive"], extra, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(r2["blocked"], r2["naive"], rtol=0, atol=1e-9)
+    assert not np.allclose(r2["naive"], r1["naive"])
 
 
 def test_a_labelled_j_block_is_reordered_by_name_like_es_columns():

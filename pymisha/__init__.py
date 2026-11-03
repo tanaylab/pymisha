@@ -200,6 +200,7 @@ from .tracks import (
     gtrack_exists,
     gtrack_import,
     gtrack_import_mappedseq,
+    gtrack_import_parquet,
     gtrack_import_set,
     gtrack_info,
     gtrack_ls,
@@ -213,6 +214,7 @@ from .tracks import (
     gtrack_var_rm,
     gtrack_var_set,
 )
+from .variants import gextract_variants
 from .vtracks import (
     gvtrack_array_slice,
     gvtrack_clear,
@@ -303,6 +305,7 @@ __all__ = [
 
     # Track functions
     'gextract',
+    'gextract_variants',
     'gscreen',
     'gsummary',
     'gquantiles',
@@ -328,6 +331,7 @@ __all__ = [
     'gtrack_create_sparse',
     'gtrack_import',
     'gtrack_import_mappedseq',
+    'gtrack_import_parquet',
     'gtrack_import_set',
     'gtrack_rm',
     'gtrack_mv',

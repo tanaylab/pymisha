@@ -120,11 +120,11 @@ class TestAggregateHelperRoundtrip:
             "value": np.array([1.0, 3.0], dtype=np.float64),
         }
         result = _pymisha.pm_liftover_aggregate(df, "mean", True, -1, 0)
-        # Sweep: [100,150) -> 1, [150,200) -> 2 (mean(1,3)), [200,250) -> 3
-        assert list(result["chrom"]) == ["chr1", "chr1", "chr1"]
-        assert list(result["start"]) == [100, 150, 200]
-        assert list(result["end"])   == [150, 200, 250]
-        assert list(result["value"]) == [1.0, 2.0, 3.0]
+        # R merges the overlapping run into one interval: [100,250) -> mean(1,3)
+        assert list(result["chrom"]) == ["chr1"]
+        assert list(result["start"]) == [100]
+        assert list(result["end"])   == [250]
+        assert list(result["value"]) == [2.0]
 
 
 class TestPmLiftoverTrackEndToEnd:
@@ -164,7 +164,7 @@ class TestPmLiftoverTrackEndToEnd:
             pm.gdb_init(str(root))
             chain_df = pm.gintervals_load_chain(chain_path, tgt_overlap_policy="keep")
             chain_dict = self._build_chain_dict(chain_df)
-            tgt_chrom_sizes = {"1": 500000, "2": 300000, "X": 200000}
+            tgt_chrom_sizes = {"chr1": 500000, "chr2": 300000, "chrX": 200000}
             result = _pymisha.pm_liftover_track(
                 str(src_dir), chain_dict, tgt_chrom_sizes,
                 "", "mean", True, -1, 0,
@@ -177,7 +177,7 @@ class TestPmLiftoverTrackEndToEnd:
         chrom_arr = np.asarray(result["chrom"], dtype=object)
         start_arr = np.asarray(result["start"], dtype=np.int64)
         value_arr = np.asarray(result["value"], dtype=np.float64)
-        mask = (chrom_arr == "1") & np.isin(start_arr, [1000, 1100, 1200])
+        mask = (chrom_arr == "chr1") & np.isin(start_arr, [1000, 1100, 1200])
         ordered = np.argsort(start_arr[mask])
         non_nan = value_arr[mask][ordered]
         assert list(non_nan) == [10.0, 20.0, 30.0]

@@ -4,18 +4,15 @@ Runs against the hg19 snapshot DB (``hg19_overlay`` fixture), which carries the
 real ``hic.K562.*`` tracks plus the synthetic ``hic.test_*`` / ``domains.test`` /
 ``insulation.test`` fixtures the R file's ``setup_hic_test_data`` persisted.
 
-13 cases match R: 1D insulation extract / screen, 2D ``gextract`` with a band,
+14 cases match R: 1D insulation extract / screen, 2D ``gextract`` with a band,
 ``gintervals.2d`` construction (bins / all / domains), ``gintervals.2d.band_intersect``
-(incl. positive/negative bands), and ``weighted.sum`` marginals (single and
-multi-track, explicit 2D iterator).
+(incl. positive/negative bands), ``weighted.sum`` marginals (single and
+multi-track, explicit 2D iterator), and a ``weighted.sum`` vtrack with no iterator.
 
 The remaining cases ``xfail(strict)`` / ``skip`` on distinct gaps:
 
 * ``GAP_2D_BAND`` -- a 2D ``band`` query near the diagonal returns a different
   contact set / coordinates than R (negative/near-diagonal bands).
-* ``GAP_2D_ITER`` -- 2D iterator semantics differ: a value vtrack with no explicit
-  iterator over a 2D scope, ``gvtrack.iterator.2d`` shifts, and a 1D-style 2D
-  iterator span.
 * ``GAP_BAND_GITER`` -- ``giterator_intervals`` has no ``band=`` argument (also
   blocks the 2D ``gintervals.neighbors`` case that builds its set that way).
 * ``GAP_R_POSTPROC`` -- the baseline is pure R post-processing
@@ -35,7 +32,6 @@ import pymisha as pm
 from .baseline import assert_matches_baseline, assert_matches_list_baseline
 
 GAP_2D_BAND = "2D band query near the diagonal returns a different contact set/coords than R"
-GAP_2D_ITER = "2D iterator semantics differ (default 2D iterator / gvtrack.iterator.2d shifts / 2D span)"
 GAP_BAND_GITER = "giterator_intervals has no band= argument"
 GAP_NN_TIE = "equidistant 2D neighbors tie-break differs from R (priority_queue pop order not portable)"
 GAP_R_POSTPROC = "baseline is pure R post-processing (cut/table or rpois seed) not reproducible cross-impl"
@@ -178,14 +174,8 @@ def test_band_intersect_pos_neg(hg19_overlay):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.xfail(reason=GAP_2D_ITER, strict=True)
 def test_real_k562_vtrack_weighted_sum(hg19_overlay):
-    # Re-deferred in v0.8.6: the v0.8.3 default-iterator-from-2D-source
-    # inference flipped this case but broke a large surface of local
-    # aggregation-vtrack tests that expected one-row-per-scope output.
-    # Routing the iterator inference per-func needs more R-parity tests to
-    # anchor the right shape; until then, this single flip is rolled back
-    # to keep the broader API stable.
+    # With no iterator a 2D vtrack iterates its source's objects, as in R.
     _clear()
     pm.gvtrack_create("v_k562_score", "hic.K562.ela_k562_score", func="weighted.sum")
     sc = pm.gintervals_2d("chr1", 0, 1e6, "chr1", 0, 1e6)

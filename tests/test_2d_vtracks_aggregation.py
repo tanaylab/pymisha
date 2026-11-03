@@ -252,7 +252,7 @@ class TestAreaBasic:
         pm.gvtrack_create("vt_area", rects_agg_track, func="area")
         # Query fully contains Rect A (100,200,300,400) and partially overlaps Rect B
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_area", intervals)
+        result = pm.gextract("vt_area", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1, "Aggregation should return one row per query interval"
@@ -269,7 +269,7 @@ class TestAreaBasic:
         # Query overlaps Rect A in [150,300) x [250,400) = 150*150 = 22500
         # Query also overlaps Rect B in [200,300) x [300,400) = 100*100 = 10000
         intervals = pm.gintervals_2d("1", 150, 300, "1", 250, 400)
-        result = pm.gextract("vt_area_p", intervals)
+        result = pm.gextract("vt_area_p", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -289,7 +289,7 @@ class TestAreaBasic:
             starts2=[0, 900],
             ends2=[700, 2100],
         )
-        result = pm.gextract("vt_area_m", intervals)
+        result = pm.gextract("vt_area_m", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 2
@@ -311,7 +311,7 @@ class TestWeightedSumBasic:
         pm.gvtrack_create("vt_ws", rects_agg_track, func="weighted.sum")
         # Query hits only Rect C: (1000,1000,2000,2000) val=3.0
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_ws", intervals)
+        result = pm.gextract("vt_ws", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -324,7 +324,7 @@ class TestWeightedSumBasic:
         pm.gvtrack_create("vt_ws2", rects_agg_track, func="weighted.sum")
         # Query hits Rect A and Rect B
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_ws2", intervals)
+        result = pm.gextract("vt_ws2", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -341,7 +341,7 @@ class TestMinBasic:
         pm.gvtrack_create("vt_min", rects_agg_track, func="min")
         # Query hits only Rect C: val=3.0
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_min", intervals)
+        result = pm.gextract("vt_min", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -352,7 +352,7 @@ class TestMinBasic:
         pm.gvtrack_create("vt_min2", rects_agg_track, func="min")
         # Query hits Rect A (val=5) and Rect B (val=10)
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_min2", intervals)
+        result = pm.gextract("vt_min2", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -363,7 +363,7 @@ class TestMinBasic:
         pm.gvtrack_create("vt_min3", rects_agg_track, func="min")
         # Query hits all three rects
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_min3", intervals)
+        result = pm.gextract("vt_min3", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -379,7 +379,7 @@ class TestMaxBasic:
         pm.gvtrack_create("vt_max", rects_agg_track, func="max")
         # Query hits only Rect C: val=3.0
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_max", intervals)
+        result = pm.gextract("vt_max", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -390,7 +390,7 @@ class TestMaxBasic:
         pm.gvtrack_create("vt_max2", rects_agg_track, func="max")
         # Query hits Rect A (val=5) and Rect B (val=10)
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_max2", intervals)
+        result = pm.gextract("vt_max2", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -400,7 +400,7 @@ class TestMaxBasic:
         """Max over all three objects returns the global maximum."""
         pm.gvtrack_create("vt_max3", rects_agg_track, func="max")
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_max3", intervals)
+        result = pm.gextract("vt_max3", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -417,7 +417,7 @@ class TestAvgBasic:
         # Query fully contains Rect C: val=3.0, area=1000000
         # avg = 3.0 * 1000000 / 1000000 = 3.0
         intervals = pm.gintervals_2d("1", 900, 2100, "1", 900, 2100)
-        result = pm.gextract("vt_avg", intervals)
+        result = pm.gextract("vt_avg", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -428,7 +428,7 @@ class TestAvgBasic:
         pm.gvtrack_create("vt_avg2", rects_agg_track, func="avg")
         # Query: (0, 0, 600, 700) hits Rect A and Rect B
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_avg2", intervals)
+        result = pm.gextract("vt_avg2", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -447,7 +447,7 @@ class TestAvgBasic:
             starts2=[0, 900],
             ends2=[700, 2100],
         )
-        result = pm.gextract("vt_avg_shape", intervals)
+        result = pm.gextract("vt_avg_shape", intervals, iterator=intervals)
 
         assert result is not None
         # Must be exactly 2 rows, one per query interval
@@ -455,25 +455,24 @@ class TestAvgBasic:
 
 
 class TestNoIntersectionReturnsNaN:
-    """Test that query intervals with no matching objects return NaN."""
+    """Test that query intervals with no matching objects return NaN (area: 0, as in R)."""
 
     def test_area_no_intersection(self, rects_agg_track):
-        """Area returns NaN when no objects intersect the query."""
+        """Area is 0 when no objects intersect the query, as R gives it."""
         pm.gvtrack_create("vt_area_nan", rects_agg_track, func="area")
         # Query far from any objects
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_area_nan", intervals)
+        result = pm.gextract("vt_area_nan", intervals, iterator=intervals)
 
-        # Result should either be None (no data) or have NaN
-        if result is not None:
-            assert len(result) == 1
-            assert np.isnan(result["vt_area_nan"].iloc[0])
+        assert result is not None
+        assert len(result) == 1
+        assert result["vt_area_nan"].iloc[0] == 0
 
     def test_weighted_sum_no_intersection(self, rects_agg_track):
         """Weighted sum returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_ws_nan", rects_agg_track, func="weighted.sum")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_ws_nan", intervals)
+        result = pm.gextract("vt_ws_nan", intervals, iterator=intervals)
 
         if result is not None:
             assert len(result) == 1
@@ -483,7 +482,7 @@ class TestNoIntersectionReturnsNaN:
         """Min returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_min_nan", rects_agg_track, func="min")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_min_nan", intervals)
+        result = pm.gextract("vt_min_nan", intervals, iterator=intervals)
 
         if result is not None:
             assert len(result) == 1
@@ -493,7 +492,7 @@ class TestNoIntersectionReturnsNaN:
         """Max returns NaN when no objects intersect."""
         pm.gvtrack_create("vt_max_nan", rects_agg_track, func="max")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_max_nan", intervals)
+        result = pm.gextract("vt_max_nan", intervals, iterator=intervals)
 
         if result is not None:
             assert len(result) == 1
@@ -503,14 +502,14 @@ class TestNoIntersectionReturnsNaN:
         """Avg returns NaN when no objects intersect (0/0 case)."""
         pm.gvtrack_create("vt_avg_nan", rects_agg_track, func="avg")
         intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_avg_nan", intervals)
+        result = pm.gextract("vt_avg_nan", intervals, iterator=intervals)
 
         if result is not None:
             assert len(result) == 1
             assert np.isnan(result["vt_avg_nan"].iloc[0])
 
     def test_mixed_hit_and_miss(self, rects_agg_track):
-        """Some intervals hit objects, others do not: hits get values, misses get NaN."""
+        """Some intervals hit objects, others do not: hits get their area, misses 0 (R parity)."""
         pm.gvtrack_create("vt_mixed", rects_agg_track, func="area")
         intervals = pm.gintervals_2d(
             chroms1=["1", "1"],
@@ -520,16 +519,16 @@ class TestNoIntersectionReturnsNaN:
             starts2=[0, 400000],
             ends2=[700, 500000],
         )
-        result = pm.gextract("vt_mixed", intervals)
+        result = pm.gextract("vt_mixed", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 2
 
         result = result.sort_values("start1").reset_index(drop=True)
-        # First interval should have a non-NaN area value
-        assert not np.isnan(result["vt_mixed"].iloc[0])
-        # Second interval has no intersecting objects -> NaN
-        assert np.isnan(result["vt_mixed"].iloc[1])
+        # First interval should have a positive area value
+        assert result["vt_mixed"].iloc[0] > 0
+        # Second interval has no intersecting objects -> 0, as in R
+        assert result["vt_mixed"].iloc[1] == 0
 
 
 class TestAreaWithBand:
@@ -569,7 +568,7 @@ class TestAreaWithBand:
 
         # Instead, just verify that area works with band at all, and the output
         # has the aggregated (one-row-per-interval) shape.
-        result = pm.gextract("vt_area_band", query, band=(-500, 500))
+        result = pm.gextract("vt_area_band", query, band=(-500, 500), iterator=query)
         assert result is not None
         assert len(result) == 1  # One row for the single query interval
 
@@ -577,17 +576,16 @@ class TestAreaWithBand:
         assert result["vt_area_band"].iloc[0] > 0
 
     def test_area_band_excludes_all(self, rects_agg_track):
-        """Band that excludes all objects should yield NaN."""
+        """Band that excludes all objects gives area 0, as in R."""
         pm.gvtrack_create("vt_area_band2", rects_agg_track, func="area")
         query = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
 
-        # Very far band that no object can reach
-        result = pm.gextract("vt_area_band2", query, band=(999000, 1000000))
+        # A band that meets the query only in its corner, far from every object
+        result = pm.gextract("vt_area_band2", query, iterator=query, band=(499000, 1000000))
 
-        # Either None or one row with NaN
-        if result is not None:
-            assert len(result) == 1
-            assert np.isnan(result["vt_area_band2"].iloc[0])
+        assert result is not None
+        assert len(result) == 1
+        assert result["vt_area_band2"].iloc[0] == 0
 
 
 class TestWeightedSumWith2dShifts:
@@ -602,7 +600,7 @@ class TestWeightedSumWith2dShifts:
         # Query: (0, 0, 600, 700) -> with shift becomes (1000, 1000, 1600, 1700)
         # Shifted query should hit Rect C (1000,1000,2000,2000)
         intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_ws_shift", intervals)
+        result = pm.gextract("vt_ws_shift", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -624,8 +622,8 @@ class TestWeightedSumWith2dShifts:
         query = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
         shifted_query = pm.gintervals_2d("1", 500, 1100, "1", 500, 1200)
 
-        auto_result = pm.gextract("vt_ws_auto", query)
-        manual_result = pm.gextract("vt_ws_manual", shifted_query)
+        auto_result = pm.gextract("vt_ws_auto", query, iterator=query)
+        manual_result = pm.gextract("vt_ws_manual", shifted_query, iterator=shifted_query)
 
         if auto_result is not None and manual_result is not None:
             np.testing.assert_allclose(
@@ -646,7 +644,7 @@ class TestMultipleObjectsPerInterval:
         for func_name in ["area", "weighted.sum", "min", "max", "avg"]:
             vt_name = f"vt_multi_{func_name.replace('.', '_')}"
             pm.gvtrack_create(vt_name, rects_agg_track, func=func_name)
-            result = pm.gextract(vt_name, intervals)
+            result = pm.gextract(vt_name, intervals, iterator=intervals)
 
             assert result is not None, f"func={func_name}: result should not be None"
             assert len(result) == 1, f"func={func_name}: should be one row per interval"
@@ -665,7 +663,7 @@ class TestMultipleObjectsPerInterval:
         # Intersection with A: (150,250,250,350) -> 100*100 = 10000
         # Intersection with B: (200,300,250,350) -> 50*50 = 2500
         intervals = pm.gintervals_2d("1", 150, 250, "1", 250, 350)
-        result = pm.gextract("vt_partial", intervals)
+        result = pm.gextract("vt_partial", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -679,20 +677,20 @@ class TestAggregationVtrackReturnsOneRowPerInterval:
 
     def test_output_shape_matches_input_intervals(self, rects_agg_track):
         """Number of output rows equals number of input query intervals."""
-        # 5 query intervals: some hit objects, some do not
+        # 5 disjoint query intervals: some hit objects, some do not
         intervals = pm.gintervals_2d(
             chroms1=["1", "1", "1", "1", "1"],
             starts1=[0, 900, 3000, 100, 400000],
             ends1=[600, 2100, 4000, 200, 500000],
             chroms2=["1", "1", "1", "1", "1"],
-            starts2=[0, 900, 3000, 200, 400000],
-            ends2=[700, 2100, 4000, 300, 500000],
+            starts2=[0, 900, 3000, 800, 400000],
+            ends2=[700, 2100, 4000, 900, 500000],
         )
 
         for func_name in ["area", "weighted.sum", "min", "max", "avg"]:
             vt_name = f"vt_shape_{func_name.replace('.', '_')}"
             pm.gvtrack_create(vt_name, rects_agg_track, func=func_name)
-            result = pm.gextract(vt_name, intervals)
+            result = pm.gextract(vt_name, intervals, iterator=intervals)
 
             assert result is not None, f"func={func_name}: should not be None"
             assert len(result) == 5, (
@@ -711,11 +709,11 @@ class TestAggregationVtrackReturnsOneRowPerInterval:
             ends2=[700, 2100],
         )
         pm.gvtrack_create("vt_iid", rects_agg_track, func="area")
-        result = pm.gextract("vt_iid", intervals)
+        result = pm.gextract("vt_iid", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 2
-        assert set(result["intervalID"].unique()) == {0, 1}
+        assert set(result["intervalID"].unique()) == {1, 2}
 
 
 class TestAreaPointsTrack:
@@ -726,7 +724,7 @@ class TestAreaPointsTrack:
         pm.gvtrack_create("vt_pt_area", points_agg_track, func="area")
         # Query covers P1 (100,200) and P2 (150,250) but not P3 (5000,5000)
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_pt_area", intervals)
+        result = pm.gextract("vt_pt_area", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -739,7 +737,7 @@ class TestAreaPointsTrack:
         """Weighted sum for points: sum of values (each area=1)."""
         pm.gvtrack_create("vt_pt_ws", points_agg_track, func="weighted.sum")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_pt_ws", intervals)
+        result = pm.gextract("vt_pt_ws", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -752,7 +750,7 @@ class TestAreaPointsTrack:
         """Min for points: minimum value among matching points."""
         pm.gvtrack_create("vt_pt_min", points_agg_track, func="min")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_pt_min", intervals)
+        result = pm.gextract("vt_pt_min", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -762,7 +760,7 @@ class TestAreaPointsTrack:
         """Max for points: maximum value among matching points."""
         pm.gvtrack_create("vt_pt_max", points_agg_track, func="max")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_pt_max", intervals)
+        result = pm.gextract("vt_pt_max", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -772,7 +770,7 @@ class TestAreaPointsTrack:
         """Avg for points: simple average (all areas=1)."""
         pm.gvtrack_create("vt_pt_avg", points_agg_track, func="avg")
         intervals = pm.gintervals_2d("1", 0, 300, "1", 0, 300)
-        result = pm.gextract("vt_pt_avg", intervals)
+        result = pm.gextract("vt_pt_avg", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -781,14 +779,13 @@ class TestAreaPointsTrack:
         assert result["vt_pt_avg"].iloc[0] == pytest.approx(expected, rel=1e-5)
 
     def test_points_no_match(self, points_agg_track):
-        """Points query with no match returns NaN."""
+        """Points query with no match has area 0, as in R."""
         pm.gvtrack_create("vt_pt_empty", points_agg_track, func="area")
         intervals = pm.gintervals_2d("1", 300000, 400000, "1", 300000, 400000)
-        result = pm.gextract("vt_pt_empty", intervals)
+        result = pm.gextract("vt_pt_empty", intervals, iterator=intervals)
 
-        if result is not None:
-            assert len(result) == 1
-            assert np.isnan(result["vt_pt_empty"].iloc[0])
+        assert len(result) == 1
+        assert result["vt_pt_empty"].iloc[0] == 0
 
 
 class TestAggregationConsistency:
@@ -809,9 +806,9 @@ class TestAggregationConsistency:
             ends2=[700, 2100],
         )
 
-        res_area = pm.gextract("vt_area_c", intervals)
-        res_ws = pm.gextract("vt_ws_c", intervals)
-        res_avg = pm.gextract("vt_avg_c", intervals)
+        res_area = pm.gextract("vt_area_c", intervals, iterator=intervals)
+        res_ws = pm.gextract("vt_ws_c", intervals, iterator=intervals)
+        res_avg = pm.gextract("vt_avg_c", intervals, iterator=intervals)
 
         assert res_area is not None
         assert res_ws is not None
@@ -836,9 +833,9 @@ class TestAggregationConsistency:
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
 
-        res_min = pm.gextract("vt_min_r", intervals)
-        res_avg = pm.gextract("vt_avg_r", intervals)
-        res_max = pm.gextract("vt_max_r", intervals)
+        res_min = pm.gextract("vt_min_r", intervals, iterator=intervals)
+        res_avg = pm.gextract("vt_avg_r", intervals, iterator=intervals)
+        res_max = pm.gextract("vt_max_r", intervals, iterator=intervals)
 
         assert res_min is not None
         assert res_avg is not None
@@ -860,7 +857,7 @@ class TestEdgeCases:
         pm.gvtrack_create("vt_edge", rects_agg_track, func="area")
         # Rect A ends at x2=300. Query starts at x1=300 -> no overlap (half-open).
         intervals = pm.gintervals_2d("1", 300, 400, "1", 200, 400)
-        result = pm.gextract("vt_edge", intervals)
+        result = pm.gextract("vt_edge", intervals, iterator=intervals)
 
         if result is not None and len(result) == 1:
             # The query [300,400) x [200,400) should overlap Rect B (200,300,500,600)
@@ -874,7 +871,7 @@ class TestEdgeCases:
         pm.gvtrack_create("vt_1bp", rects_agg_track, func="area")
         # Point (150, 250) is inside Rect A [100,300) x [200,400)
         intervals = pm.gintervals_2d("1", 150, 151, "1", 250, 251)
-        result = pm.gextract("vt_1bp", intervals)
+        result = pm.gextract("vt_1bp", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -885,12 +882,11 @@ class TestEdgeCases:
         """Query on chr1-chr2 where the agg track only has chr1-chr1 data."""
         pm.gvtrack_create("vt_trans", rects_agg_track, func="area")
         intervals = pm.gintervals_2d("1", 0, 500000, "2", 0, 300000)
-        result = pm.gextract("vt_trans", intervals)
+        result = pm.gextract("vt_trans", intervals, iterator=intervals)
 
-        # No chr1-chr2 file exists -> should be None or NaN
-        if result is not None:
-            assert len(result) == 1
-            assert np.isnan(result["vt_trans"].iloc[0])
+        # No chr1-chr2 file exists -> area 0, as R gives for a pair with no file
+        assert len(result) == 1
+        assert result["vt_trans"].iloc[0] == 0
 
 
 class TestVtrackCreationValidation:
@@ -916,7 +912,7 @@ class TestExpressionMixing:
         pm.gvtrack_create("vt_max_e", rects_agg_track, func="max")
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        result = pm.gextract("vt_min_e + vt_max_e", intervals)
+        result = pm.gextract("vt_min_e + vt_max_e", intervals, iterator=intervals)
 
         assert result is not None
         assert len(result) == 1
@@ -941,7 +937,7 @@ class TestExpressionMixing:
 
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
         try:
-            result = pm.gextract(f"vt_agg_mix + {rects_agg_track}", intervals)
+            result = pm.gextract(f"vt_agg_mix + {rects_agg_track}", intervals, iterator=intervals)
             # If it succeeds, the shape should be consistent
             assert result is not None
         except (ValueError, RuntimeError):

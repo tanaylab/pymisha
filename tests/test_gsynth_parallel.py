@@ -134,8 +134,8 @@ class TestChunkIntervals:
             [1000, 500],
         )
         chunks = _chunk_intervals(iv, 2)
-        assert str(chunks[0].iloc[0]["chrom"]) == "1"
-        assert str(chunks[1].iloc[0]["chrom"]) == "2"
+        assert str(chunks[0].iloc[0]["chrom"]) == "chr1"
+        assert str(chunks[1].iloc[0]["chrom"]) == "chr2"
 
 
 class TestGenerateChunkSeeds:

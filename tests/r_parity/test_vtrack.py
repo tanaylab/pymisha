@@ -18,7 +18,6 @@ this port:
 Open gaps marked ``xfail(strict=True)``:
 
 * ``GAP_ARRAY`` -- array-track extraction / ``gvtrack.array.slice`` extraction.
-* ``GAP_COMPUTED`` -- COMPUTED 2D Hi-C tracks (``test.computed2d``).
 * ``GAP_VTRACK_ITER`` -- default iterator not inferred from a value-based
   vtrack's source track (+ ``gvtrack.iterator`` shifts).
 * ``GAP_2D_ITER`` -- a 1D vtrack ``dim``-projected over a 2D iterator.
@@ -38,7 +37,6 @@ import pymisha as pm
 from .baseline import assert_matches_baseline, load_baseline
 
 GAP_ARRAY = "array-track gextract / gvtrack.array.slice extraction not supported"
-GAP_COMPUTED = "COMPUTED 2D Hi-C tracks (test.computed2d) not supported"
 # global.percentile.min/.max read R's frozen vars/pv.percentiles binned table
 # (exact native per-bin values -> exact bin). The AVG variant now matches R as
 # well: the sliding-window reducer accumulates the windowed mean in double
@@ -169,17 +167,17 @@ _CASES: dict[str, tuple] = {
     "vtrack.sparse.avg.high": (_value("test.sparse", "avg", 10000), None),
     "vtrack.array.avg.high": (_value("test.array", "avg", 10000), None),
     "vtrack.rects.avg.2d": (_value_2d("test.rects", "avg"), None),
-    "vtrack.computed2d.avg.2d": (_value_2d("test.computed2d", "avg"), GAP_COMPUTED),
+    "vtrack.computed2d.avg.2d": (_value_2d("test.computed2d", "avg"), None),
     "vtrack.sparse.max": (_value("test.fixedbin", "max", 233), None),
     "vtrack.sparse.max.high": (_value("test.sparse", "max", 10000), None),
     "vtrack.array.max.high": (_value("test.array", "max", 10000), None),
     "vtrack.rects.max.2d": (_value_2d("test.rects", "max"), None),
-    "vtrack.computed2d.max.2d": (_value_2d("test.computed2d", "max"), GAP_COMPUTED),
+    "vtrack.computed2d.max.2d": (_value_2d("test.computed2d", "max"), None),
     "vtrack.fixedbin_min": (_value("test.fixedbin", "min", 233), None),
     "vtrack.sparse_min": (_value("test.sparse", "min", 10000), None),
     "vtrack.array_min": (_value("test.array", "min", 10000), None),
     "vtrack.rects_min": (_value_2d("test.rects", "min"), None),
-    "vtrack.computed2d_min": (_value_2d("test.computed2d", "min"), GAP_COMPUTED),
+    "vtrack.computed2d_min": (_value_2d("test.computed2d", "min"), None),
     "vtrack.fixedbin_nearest": (_value("test.fixedbin", "nearest", 233), None),
     "vtrack.sparse_nearest": (_value("test.sparse", "nearest", 10000), None),
     "vtrack.array_nearest": (_value("test.array", "nearest", 10000), None),
@@ -219,11 +217,11 @@ _CASES: dict[str, tuple] = {
     "vtrack.tracktype_test.fixedbin_iterator_dim1_gintervals2d_testrects_regression": (_iter_dim(dim=1, scope=_iv2d_rects, it="test.rects"), None),
     "vtrack.fixedbin_dim2_gintervals2d_testrects_regression": (_iter_dim(dim=2, scope=_iv2d_rects, it="test.rects"), None),
     "vtrack.fixedbin_dim1_shifts_gintervals2d_testrects_regression": (_iter_dim(dim=1, sshift=-130, eshift=224, scope=_iv2d_rects, it="test.rects"), None),
-    "vtrack.fixedbin_dim1_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=1, scope=_iv2d_b, it="test.computed2d"), GAP_COMPUTED),
-    "vtrack.fixedbin_dim2_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=2, scope=_iv2d_b, it="test.computed2d"), GAP_COMPUTED),
-    "vtrack.fixedbin_dim1_shifts_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=1, sshift=-130, eshift=224, scope=_iv2d_b, it="test.computed2d"), GAP_COMPUTED),
+    "vtrack.fixedbin_dim1_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=1, scope=_iv2d_b, it="test.computed2d"), None),
+    "vtrack.fixedbin_dim2_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=2, scope=_iv2d_b, it="test.computed2d"), None),
+    "vtrack.fixedbin_dim1_shifts_gintervals2d_testcomputed2d_v1_regression": (_iter_dim(dim=1, sshift=-130, eshift=224, scope=_iv2d_b, it="test.computed2d"), None),
     "vtrack.rects_iterator2d_customShifts_gintervals2d_testrects_regression": (_iter2d_custom("test.rects", _iv2d_rects), None),
-    "vtrack.computed2d_iterator2d_customShifts_gintervals2d_testcomputed2d_regression": (_iter2d_custom("test.computed2d", _iv2d_b), GAP_COMPUTED),
+    "vtrack.computed2d_iterator2d_customShifts_gintervals2d_testcomputed2d_regression": (_iter2d_custom("test.computed2d", _iv2d_b), None),
     "vtrack.multipleCreation_gvtrackls_regression": (_ls(("v1", "test.rects"), ("v2", "test.sparse"), ("v3", "test.computed2d")), None),
     "vtrack.sparseCreation_v1Removal_gvtrackls_regression": (_ls(("v2", "test.sparse")), None),
 }

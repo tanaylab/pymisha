@@ -8,7 +8,7 @@ def test_gintervals_from_tuples_supports_tuple_and_strand_override():
     rows = [("chr1", 10, 20), ("1", 30, 40)]
     result = pm.gintervals_from_tuples(rows, strand=[1, -1])
 
-    assert list(result["chrom"]) == ["1", "1"]
+    assert list(result["chrom"]) == ["chr1", "chr1"]
     assert list(result["start"]) == [10, 30]
     assert list(result["end"]) == [20, 40]
     assert list(result["strand"]) == [1, -1]
@@ -21,7 +21,7 @@ def test_gintervals_from_tuples_supports_dict_rows():
     ]
     result = pm.gintervals_from_tuples(rows)
 
-    assert list(result["chrom"]) == ["2", "2"]
+    assert list(result["chrom"]) == ["chr2", "chr2"]
     assert list(result["start"]) == [5, 20]
     assert list(result["end"]) == [15, 30]
     assert list(result["strand"]) == [-1, 1]
@@ -36,7 +36,7 @@ def test_gintervals_from_tuples_empty_returns_empty_dataframe():
 
 def test_gintervals_from_strings_parses_basic_and_strand_forms():
     result = pm.gintervals_from_strings(["chr1:10-20", "1:30-40:-"])
-    assert list(result["chrom"]) == ["1", "1"]
+    assert list(result["chrom"]) == ["chr1", "chr1"]
     assert list(result["start"]) == [10, 30]
     assert list(result["end"]) == [20, 40]
     assert list(result["strand"]) == [0, -1]
@@ -44,11 +44,11 @@ def test_gintervals_from_strings_parses_basic_and_strand_forms():
 
 def test_gintervals_from_strings_chrom_only_uses_full_chrom_extent():
     all_intervals = pm.gintervals_all()
-    chr1_end = int(all_intervals.loc[all_intervals["chrom"] == "1", "end"].iloc[0])
+    chr1_end = int(all_intervals.loc[all_intervals["chrom"] == "chr1", "end"].iloc[0])
 
     result = pm.gintervals_from_strings("chr1")
     assert len(result) == 1
-    assert result.iloc[0]["chrom"] == "1"
+    assert result.iloc[0]["chrom"] == "chr1"
     assert int(result.iloc[0]["start"]) == 0
     assert int(result.iloc[0]["end"]) == chr1_end
 
@@ -69,7 +69,7 @@ def test_gintervals_from_bed_with_and_without_strand(tmp_path):
     )
 
     with_strand = pm.gintervals_from_bed(bed_path, has_strand=True)
-    assert list(with_strand["chrom"]) == ["1", "1", "1"]
+    assert list(with_strand["chrom"]) == ["chr1", "chr1", "chr1"]
     assert list(with_strand["start"]) == [10, 30, 50]
     assert list(with_strand["end"]) == [20, 40, 60]
     assert list(with_strand["strand"]) == [1, -1, 0]
@@ -127,7 +127,7 @@ def test_gintervals_import_bed_with_metadata(tmp_path):
     )
 
     df = pm.gintervals_import_bed(bed)
-    assert list(df["chrom"]) == ["1", "1", "2"]
+    assert list(df["chrom"]) == ["chr1", "chr1", "chr2"]
     assert list(df["start"]) == [100, 300, 100]
     assert list(df["end"]) == [200, 400, 150]
     assert list(df["strand"]) == [1, -1, 0]
@@ -176,7 +176,7 @@ def test_gintervals_import_gff_offsets_start(tmp_path):
     )
 
     df = pm.gintervals_import_gff(gff)
-    assert list(df["chrom"]) == ["1", "1", "2"]
+    assert list(df["chrom"]) == ["chr1", "chr1", "chr2"]
     assert list(df["start"]) == [100, 300, 10]
     assert list(df["end"]) == [200, 400, 20]
     assert list(df["strand"]) == [1, -1, 0]
@@ -218,7 +218,7 @@ def test_gintervals_import_vcf_uses_ref_length(tmp_path):
     )
 
     df = pm.gintervals_import_vcf(vcf)
-    assert list(df["chrom"]) == ["1", "1"]
+    assert list(df["chrom"]) == ["chr1", "chr1"]
     assert list(df["start"]) == [99, 199]
     assert list(df["end"]) == [100, 203]
     assert list(df["id"]) == ["v1", "v2"]
@@ -242,11 +242,11 @@ def test_gintervals_import_vcf_drops_info(tmp_path):
 
 def test_gintervals_window_broadcasts_scalars():
     result = pm.gintervals_window("chr1", [100, 200], half_width=25)
-    assert list(result["chrom"]) == ["1", "1"]
+    assert list(result["chrom"]) == ["chr1", "chr1"]
     assert list(result["start"]) == [75, 175]
     assert list(result["end"]) == [125, 225]
 
     result2 = pm.gintervals_window(["1", "2"], 100, half_width=10)
-    assert list(result2["chrom"]) == ["1", "2"]
+    assert list(result2["chrom"]) == ["chr1", "chr2"]
     assert list(result2["start"]) == [90, 90]
     assert list(result2["end"]) == [110, 110]

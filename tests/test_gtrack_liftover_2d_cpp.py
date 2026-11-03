@@ -1,11 +1,10 @@
-"""Cross-validation tests for pm_liftover_track_2d (G1.P3.D)."""
+"""Tests of gtrack_liftover of a 2D source track (pm_liftover_track_2d)."""
 from __future__ import annotations
 
 import shutil
 from pathlib import Path
 
 import _pymisha
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -14,279 +13,6 @@ from pymisha._quadtree import read_2d_track_objects, write_2d_track_file
 
 from _dbpath import TESTDB_ROOT
 TEST_DB = TESTDB_ROOT
-
-
-EMPTY_CHAIN = {
-    "chrom":     np.array([], dtype=object),
-    "start":     np.array([], dtype=np.int64),
-    "end":       np.array([], dtype=np.int64),
-    "strand":    np.array([], dtype=np.int64),
-    "chromsrc":  np.array([], dtype=object),
-    "startsrc":  np.array([], dtype=np.int64),
-    "endsrc":    np.array([], dtype=np.int64),
-    "strandsrc": np.array([], dtype=np.int64),
-    "chain_id":  np.array([], dtype=np.int64),
-    "score":     np.array([], dtype=np.float64),
-}
-
-
-def _chain(rows):
-    """Build a chain dict from a list of dict rows."""
-    cols = ("chrom", "start", "end", "strand", "chromsrc", "startsrc", "endsrc",
-            "strandsrc", "chain_id", "score")
-    if not rows:
-        return EMPTY_CHAIN
-    return {
-        "chrom":     np.array([r["chrom"]     for r in rows], dtype=object),
-        "start":     np.array([r["start"]     for r in rows], dtype=np.int64),
-        "end":       np.array([r["end"]       for r in rows], dtype=np.int64),
-        "strand":    np.array([r["strand"]    for r in rows], dtype=np.int64),
-        "chromsrc":  np.array([r["chromsrc"]  for r in rows], dtype=object),
-        "startsrc":  np.array([r["startsrc"]  for r in rows], dtype=np.int64),
-        "endsrc":    np.array([r["endsrc"]    for r in rows], dtype=np.int64),
-        "strandsrc": np.array([r["strandsrc"] for r in rows], dtype=np.int64),
-        "chain_id":  np.array([r["chain_id"]  for r in rows], dtype=np.int64),
-        "score":     np.array([r["score"]     for r in rows], dtype=np.float64),
-    }
-
-
-def _identity_chain(src_chrom="chr1", tgt_chrom="1", length=1000, chain_id=1):
-    """Identity chain: src [0, length) maps to tgt [0, length) on + strand."""
-    return _chain([{
-        "chrom": tgt_chrom, "start": 0, "end": length, "strand": 0,
-        "chromsrc": src_chrom, "startsrc": 0, "endsrc": length, "strandsrc": 0,
-        "chain_id": chain_id, "score": 1000.0,
-    }])
-
-
-def _result_to_sorted_rows(r):
-    return sorted(zip(
-        r["chrom1"], r["chrom2"],
-        r["x1"], r["y1"], r["x2"], r["y2"],
-        r["value"],
-    ))
-
-
-class TestAggregate2DRects:
-    """_aggregate_2d_rects turns possibly-overlapping mapped rects into disjoint
-    cells before insertion into the quadtree (R 5.11.8)."""
-
-    def _agg(self, x1, y1, x2, y2, v, agg="mean", na_rm=True, min_n=None, nth=0):
-        from pymisha.liftover import _aggregate_2d_rects
-        return sorted(_aggregate_2d_rects(
-            np.array(x1), np.array(y1), np.array(x2), np.array(y2),
-            np.array(v, dtype=float), agg, na_rm, min_n, nth))
-
-    def test_disjoint_rects_pass_through(self):
-        cells = self._agg([0, 20], [0, 20], [10, 30], [10, 30], [1.0, 2.0])
-        assert cells == [(0, 0, 10, 10, 1.0), (20, 20, 30, 30, 2.0)]
-
-    def test_fully_overlapping_rects_aggregated(self):
-        # Two identical rects -> one cell holding the aggregate (mean).
-        cells = self._agg([0, 0], [0, 0], [10, 10], [10, 10], [4.0, 8.0])
-        assert cells == [(0, 0, 10, 10, 6.0)]
-
-    def test_fully_overlapping_rects_max(self):
-        cells = self._agg([0, 0], [0, 0], [10, 10], [10, 10], [4.0, 8.0], agg="max")
-        assert cells == [(0, 0, 10, 10, 8.0)]
-
-    def test_partial_overlap_splits_into_disjoint_cells(self):
-        # A: x[0,10] y[0,30]=2 ; B: x[0,10] y[10,20]=6 (overlap in y[10,20]).
-        cells = self._agg([0, 0], [0, 10], [10, 10], [30, 20], [2.0, 6.0])
-        assert cells == [
-            (0, 0, 10, 10, 2.0),    # A only
-            (0, 10, 10, 20, 4.0),   # mean(A, B)
-            (0, 20, 10, 30, 2.0),   # A only
-        ]
-
-    def test_output_rects_are_disjoint(self):
-        # A random-ish overlap must never yield two cells sharing interior area.
-        cells = self._agg([0, 5], [0, 5], [10, 15], [10, 15], [1.0, 3.0])
-        for i in range(len(cells)):
-            for j in range(i + 1, len(cells)):
-                ax1, ay1, ax2, ay2, _ = cells[i]
-                bx1, by1, bx2, by2, _ = cells[j]
-                overlap_x = min(ax2, bx2) - max(ax1, bx1)
-                overlap_y = min(ay2, by2) - max(ay1, by1)
-                assert overlap_x <= 0 or overlap_y <= 0
-
-
-class TestPmLiftoverTrack2dSkeleton:
-    def test_returns_empty_on_empty_source(self, tmp_path):
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), EMPTY_CHAIN)
-        assert len(r["chrom1"]) == 0
-        assert r["is_points"] is False
-
-    def test_rejects_non_dict_chain(self, tmp_path):
-        with pytest.raises(TypeError):
-            _pymisha.pm_liftover_track_2d(str(tmp_path), "not a dict")
-
-    def test_missing_src_dir_raises(self, tmp_path):
-        with pytest.raises(RuntimeError):
-            _pymisha.pm_liftover_track_2d(str(tmp_path / "nope"), EMPTY_CHAIN)
-
-
-class TestPmLiftoverTrack2dRectsIdentity:
-    def test_single_rect_identity_chain(self, tmp_path):
-        # Source has one rect on (chr1, chr1).
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [(10, 20, 30, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        chain = _identity_chain("chr1", "1", 1000)
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        assert _result_to_sorted_rows(r) == [("1", "1", 10, 20, 30, 40, 1.5)]
-        assert r["is_points"] is False
-
-    def test_multi_rect_identity_chain(self, tmp_path):
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [
-                (10, 20, 30, 40, 1.5),
-                (100, 200, 150, 250, 2.5),
-            ],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        chain = _identity_chain("chr1", "1", 1000)
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        assert _result_to_sorted_rows(r) == sorted([
-            ("1", "1", 10, 20, 30, 40, 1.5),
-            ("1", "1", 100, 200, 150, 250, 2.5),
-        ])
-
-    def test_cross_chrom_pair(self, tmp_path):
-        # Source rect on (chr1, chr2).
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr2"),
-            [(10, 20, 30, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        chain = _chain([
-            {"chrom": "1", "start": 0, "end": 1000, "strand": 0,
-             "chromsrc": "chr1", "startsrc": 0, "endsrc": 1000, "strandsrc": 0,
-             "chain_id": 1, "score": 1000.0},
-            {"chrom": "2", "start": 0, "end": 1000, "strand": 0,
-             "chromsrc": "chr2", "startsrc": 0, "endsrc": 1000, "strandsrc": 0,
-             "chain_id": 2, "score": 1000.0},
-        ])
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        assert _result_to_sorted_rows(r) == [("1", "2", 10, 20, 30, 40, 1.5)]
-
-
-class TestPmLiftoverTrack2dDropsRectsThatDontMatchChain:
-    def test_no_chain_for_chrom1_drops(self, tmp_path):
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [(10, 20, 30, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        # Chain has entries only on chr99 - matches nothing.
-        chain = _identity_chain("chr99", "99", 1000)
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        assert len(r["chrom1"]) == 0
-
-    def test_no_chain_for_chrom2_drops(self, tmp_path):
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr2"),
-            [(10, 20, 30, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        # Chain matches chr1 (x-dim) but not chr2 (y-dim).
-        chain = _identity_chain("chr1", "1", 1000)
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        assert len(r["chrom1"]) == 0
-
-
-class TestPmLiftoverTrack2dMultiBlockSplit:
-    def test_x_dim_chain_splits_rect_into_two(self, tmp_path):
-        # X-dim chain has TWO blocks with a gap between target intervals:
-        #   src [0, 50) -> tgt [0, 50)
-        #   src [50, 100) -> tgt [100, 150)  (gap at tgt [50, 100))
-        # Y-dim has one identity block on (chr1, 1).
-        # Source rect (10, 20, 80, 40, 1.5) spans both x-blocks.
-        # Expected: x-dim mapping yields two intervals -> two target rects.
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [(10, 20, 80, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        chain = _chain([
-            {"chrom": "1", "start": 0,   "end": 50,  "strand": 0,
-             "chromsrc": "chr1", "startsrc": 0,  "endsrc": 50,  "strandsrc": 0,
-             "chain_id": 1, "score": 1000.0},
-            {"chrom": "1", "start": 100, "end": 150, "strand": 0,
-             "chromsrc": "chr1", "startsrc": 50, "endsrc": 100, "strandsrc": 0,
-             "chain_id": 2, "score": 1000.0},
-        ])
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        rows = _result_to_sorted_rows(r)
-        # Source x-interval [10, 80) intersects chain block 1 -> [10, 50)
-        # (target [10, 50)), and chain block 2 -> [50, 80) (target [100, 130)).
-        # Y-dim [20, 40) maps identity -> [20, 40).
-        # Cross-product = 2 target rects.
-        assert rows == sorted([
-            ("1", "1", 10, 20, 50, 40, 1.5),
-            ("1", "1", 100, 20, 130, 40, 1.5),
-        ])
-
-
-class TestPmLiftoverTrack2dPoints:
-    def test_single_point_identity(self, tmp_path):
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [(10, 20, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=True,
-        )
-        chain = _identity_chain("chr1", "1", 1000)
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        # Points are emitted as (x, x+1, y, y+1, v).
-        assert _result_to_sorted_rows(r) == [("1", "1", 10, 20, 11, 21, 1.5)]
-        assert r["is_points"] is True
-
-
-class TestPmLiftoverTrack2dNegStrand:
-    def test_neg_strand_on_x_dim_reflects_coords(self, tmp_path):
-        # Source rect (10, 20, 30, 40, 1.5) on chr1-chr1.
-        # X-dim chain block is negative strand: src [0, 100) on chr1 maps
-        # to tgt [0, 100) on '1' but with reflection.
-        # For src [10, 30) on neg-strand: target = (chain_end_tgt - (src_pos - chain_start_src))
-        # which is mirror-image around the chain block.
-        # Specifically, R's map_interval on a neg-strand chain block with
-        # src [10, 30) within [0, 100) on neg-strand maps tgt to
-        # [100 - 30, 100 - 10) = [70, 90).
-        # Y-dim is identity.
-        write_2d_track_file(
-            str(tmp_path / "chr1-chr1"),
-            [(10, 20, 30, 40, 1.5)],
-            (0, 0, 1000, 1000),
-            is_points=False,
-        )
-        chain = _chain([
-            # X-dim: chr1 src -> '1' tgt, src strand=0, tgt strand=1 (neg).
-            {"chrom": "1", "start": 0, "end": 100, "strand": 1,
-             "chromsrc": "chr1", "startsrc": 0, "endsrc": 100, "strandsrc": 0,
-             "chain_id": 1, "score": 1000.0},
-        ])
-        r = _pymisha.pm_liftover_track_2d(str(tmp_path), chain)
-        rows = _result_to_sorted_rows(r)
-        # Both x-dim and y-dim use the same chain (same name 'chr1').
-        # Y-interval [20, 40) on chr1 with neg-strand chain -> [60, 80).
-        # X-interval [10, 30) -> [70, 90).
-        # So output: (1, 1, 70, 60, 90, 80, 1.5).
-        assert rows == [("1", "1", 70, 60, 90, 80, 1.5)]
-
-
-# ---------------------------------------------------------------------------
-# End-to-end dispatcher tests via gtrack_liftover (Python public API)
-# ---------------------------------------------------------------------------
 
 
 def _track_dir(name: str) -> Path:
@@ -307,6 +33,145 @@ def _make_chain_df(rows):
     df.attrs["src_overlap_policy"] = "keep"
     df.attrs["tgt_overlap_policy"] = "keep"
     return df
+
+
+def _identity_chain(src_chrom="chr1", tgt_chrom="1", length=1000, chain_id=1):
+    """Identity chain: src [0, length) maps to tgt [0, length) on + strand."""
+    return _make_chain_df([[tgt_chrom, 0, length, 0, src_chrom, 0, length, 0, chain_id, 1000.0]])
+
+
+def _lift(tmp_path, pairs, chain, is_points=False):
+    """Lift a source of the given {pair file: objects} with chain into the test DB;
+    the lifted objects as sorted (chrom1, chrom2, x1, y1, x2, y2, v) rows."""
+    src_dir = tmp_path / "src.track"
+    src_dir.mkdir()
+    for name, objs in pairs.items():
+        write_2d_track_file(str(src_dir / name), objs, (0, 0, 1000, 1000), is_points=is_points)
+    out_name = "test.lifted_2d"
+    _cleanup_track(out_name)
+    try:
+        pm.gtrack_liftover(out_name, "x", str(src_dir), chain)
+        rows = []
+        for pair_file in sorted(_track_dir(out_name).iterdir()):
+            if pair_file.name.startswith("."):
+                continue
+            c1, c2 = pair_file.name.split("-")
+            file_is_points, objs = read_2d_track_objects(str(pair_file))
+            assert file_is_points is is_points
+            for o in objs:
+                rows.append((c1, c2, o[0], o[1], o[0] + 1, o[1] + 1, o[2]) if is_points else (c1, c2, *o))
+        return sorted(rows)
+    finally:
+        _cleanup_track(out_name)
+
+
+@pytest.fixture(autouse=True)
+def _reinit_db():
+    # Re-init in case a previous test (e.g. test_path_functions.py via
+    # gdb_init_examples) left the global GROOT pointing elsewhere.
+    pm.gdb_init(str(TEST_DB))
+    yield
+
+
+class TestLiftover2DRectsIdentity:
+    def test_single_rect_identity_chain(self, tmp_path):
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 30, 40, 1.5)]}, _identity_chain("chr1", "1", 1000))
+        assert rows == [("chr1", "chr1", 10, 20, 30, 40, 1.5)]
+
+    def test_multi_rect_identity_chain(self, tmp_path):
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 30, 40, 1.5), (100, 200, 150, 250, 2.5)]},
+                     _identity_chain("chr1", "1", 1000))
+        assert rows == sorted([
+            ("chr1", "chr1", 10, 20, 30, 40, 1.5),
+            ("chr1", "chr1", 100, 200, 150, 250, 2.5),
+        ])
+
+    def test_cross_chrom_pair(self, tmp_path):
+        chain = _make_chain_df([
+            ["1", 0, 1000, 0, "chr1", 0, 1000, 0, 1, 1000.0],
+            ["2", 0, 1000, 0, "chr2", 0, 1000, 0, 2, 1000.0],
+        ])
+        rows = _lift(tmp_path, {"chr1-chr2": [(10, 20, 30, 40, 1.5)]}, chain)
+        assert rows == [("chr1", "chr2", 10, 20, 30, 40, 1.5)]
+
+
+class TestLiftover2DDropsRectsThatDontMatchChain:
+    def test_no_chain_for_chrom1_drops(self, tmp_path):
+        # Chain has entries only for source chr99 - matches nothing.
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 30, 40, 1.5)]}, _identity_chain("chr99", "1", 1000))
+        assert rows == []
+
+    def test_no_chain_for_chrom2_drops(self, tmp_path):
+        # Chain matches chr1 (x-dim) but not chr2 (y-dim).
+        rows = _lift(tmp_path, {"chr1-chr2": [(10, 20, 30, 40, 1.5)]}, _identity_chain("chr1", "1", 1000))
+        assert rows == []
+
+
+class TestLiftover2DMultiBlockSplit:
+    def test_x_dim_chain_splits_rect_into_two(self, tmp_path):
+        # X-dim chain has TWO blocks with a gap between target intervals:
+        #   src [0, 50) -> tgt [0, 50)
+        #   src [50, 100) -> tgt [100, 150)  (gap at tgt [50, 100))
+        # The y-dim [20, 40) maps by the first block as is.
+        # Source rect (10, 20, 80, 40, 1.5) spans both x-blocks: two target rects.
+        chain = _make_chain_df([
+            ["1", 0, 50, 0, "chr1", 0, 50, 0, 1, 1000.0],
+            ["1", 100, 150, 0, "chr1", 50, 100, 0, 2, 1000.0],
+        ])
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 80, 40, 1.5)]}, chain)
+        assert rows == sorted([
+            ("chr1", "chr1", 10, 20, 50, 40, 1.5),
+            ("chr1", "chr1", 100, 20, 130, 40, 1.5),
+        ])
+
+
+class TestLiftover2DPoints:
+    def test_single_point_identity(self, tmp_path):
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 1.5)]}, _identity_chain("chr1", "1", 1000), is_points=True)
+        assert rows == [("chr1", "chr1", 10, 20, 11, 21, 1.5)]
+
+
+class TestLiftover2DNegStrand:
+    def test_neg_strand_on_x_dim_reflects_coords(self, tmp_path):
+        # A negative-strand block src [0, 100) -> tgt [0, 100) reflects an interval:
+        # src [10, 30) -> tgt [100 - 30, 100 - 10) = [70, 90), and the y-dim
+        # src [20, 40) -> [60, 80).
+        chain = _make_chain_df([["1", 0, 100, 1, "chr1", 0, 100, 0, 1, 1000.0]])
+        rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 30, 40, 1.5)]}, chain)
+        assert rows == [("chr1", "chr1", 70, 60, 90, 80, 1.5)]
+
+
+class TestLiftover2DAggregatesOverlaps:
+    """Overlapping mapped rects are cut into disjoint cells, each holding the aggregate of
+    the rects covering it (R 5.11.8)."""
+
+    @staticmethod
+    def _two_blocks_onto_one():
+        # src [0, 100) and [500, 600) both land on tgt [0, 100)
+        return _make_chain_df([
+            ["1", 0, 100, 0, "chr1", 0, 100, 0, 1, 1000.0],
+            ["1", 0, 100, 0, "chr1", 500, 600, 0, 2, 1000.0],
+        ])
+
+    def test_fully_overlapping_rects_aggregated(self, tmp_path):
+        rows = _lift(tmp_path, {"chr1-chr1": [(0, 0, 10, 10, 4.0), (500, 500, 510, 510, 8.0)]},
+                     self._two_blocks_onto_one())
+        assert rows == [("chr1", "chr1", 0, 0, 10, 10, 6.0)]
+
+    def test_partial_overlap_splits_into_disjoint_cells(self, tmp_path):
+        # A: x[0,10] y[0,30]=2 ; B: x[0,10] y[10,20]=6 (overlap in y[10,20]).
+        rows = _lift(tmp_path, {"chr1-chr1": [(0, 0, 10, 30, 2.0), (500, 510, 510, 520, 6.0)]},
+                     self._two_blocks_onto_one())
+        assert rows == [
+            ("chr1", "chr1", 0, 0, 10, 10, 2.0),    # A only
+            ("chr1", "chr1", 0, 10, 10, 20, 4.0),   # mean(A, B)
+            ("chr1", "chr1", 0, 20, 10, 30, 2.0),   # A only
+        ]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end dispatcher tests via gtrack_liftover (Python public API)
+# ---------------------------------------------------------------------------
 
 
 class TestGtrackLiftoverDispatcher2D:
@@ -344,7 +209,7 @@ class TestGtrackLiftoverDispatcher2D:
             pm.gtrack_liftover(out_name, "lifted 2d rects", str(src_dir), chain)
             # Verify the output via direct quadtree read.
             out_dir = _track_dir(out_name)
-            pair_file = out_dir / "1-1"
+            pair_file = out_dir / "chr1-chr1"
             assert pair_file.exists(), f"expected 2D pair file at {pair_file}, found: {list(out_dir.iterdir())}"
             is_points, objs = read_2d_track_objects(str(pair_file))
             assert is_points is False
@@ -373,7 +238,7 @@ class TestGtrackLiftoverDispatcher2D:
         try:
             pm.gtrack_liftover(out_name, "lifted 2d points", str(src_dir), chain)
             out_dir = _track_dir(out_name)
-            pair_file = out_dir / "1-1"
+            pair_file = out_dir / "chr1-chr1"
             assert pair_file.exists()
             is_points, objs = read_2d_track_objects(str(pair_file))
             assert is_points is True
@@ -438,6 +303,7 @@ class TestDetectSourceTrack2d:
 
     def test_returns_false_for_1d_dense(self, tmp_path):
         import struct as _s
+
         from pymisha.liftover import _detect_source_track_2d
         with open(tmp_path / "src1", "wb") as f:
             f.write(_s.pack("<i", 100))  # dense 1D signature (bin_size > 0)
@@ -446,6 +312,7 @@ class TestDetectSourceTrack2d:
 
     def test_returns_false_for_1d_sparse(self, tmp_path):
         import struct as _s
+
         from pymisha.liftover import _detect_source_track_2d
         with open(tmp_path / "src1", "wb") as f:
             f.write(_s.pack("<i", -1))  # sparse 1D signature

@@ -32,10 +32,44 @@ def pm_dbinit(
     uroot: str = ...,
     config: dict[str, Any] | None = ...,
     /,
-) -> None:
-    """Initialize database connection.
+) -> str | None:
+    """Initialize database connection. Returns the warning gsetroot gives for the
+    database's seq/genome.idx (``pm_gdb_check_genome_idx``), None if none.
 
     C++ signature: ``PyArg_ParseTuple(args, "s|sO", &groot, &uroot, &py_config)``
+    """
+
+def pm_gdb_chrom_order(groot: str, /) -> tuple[list[str], list[int], list[str], bool]:
+    """The chromosomes of the database at ``groot`` by chrom id, as ``pm_dbinit``
+    gives them: canonical names, sizes, the names in chrom_sizes.txt, and whether
+    it is a per-chromosome database whose names get the "chr" prefix.
+
+    C++ signature: ``PyArg_ParseTuple(args, "s", &groot)``
+    """
+
+def pm_gdb_check_genome_idx(
+    groot: str, names: list[str] | None = ..., sizes: list[int] | None = ..., /
+) -> str | None:
+    """R misha's ``.gdb.check_genome_idx``: raises where gsetroot stops for the
+    database's seq/genome.idx (sizes or order other than its chromosomes', a
+    chromosome listed twice), and returns gsetroot's warning when only names
+    differ, None otherwise. The chromosomes are those ``pm_gdb_chrom_order``
+    gives, or ``names`` and ``sizes`` by chrom id.
+
+    C++ signature: ``PyArg_ParseTuple(args, "s|OO", &groot, &names, &sizes)``
+    """
+
+def pm_chrom_files(dir: str, is_2d: bool, converting: bool = ..., /) -> dict[str, list[Any]]:
+    """The per-chromosome files of a track or intervals set directory, as every
+    reader finds them (R's ``gchrom_files``): one entry per file named by a
+    chromosome (by a pair if ``is_2d``), by its canonical name or an alias.
+    Keys ``chrom`` (or ``chrom1`` and ``chrom2``: canonical names), ``file`` and
+    ``used`` (whether it is the file the readers open), and ``unnamed``: the
+    other files of the directory, not named by a chromosome (pair), symlinks
+    aside. ``converting``: the files next to an intervals set's index count, as
+    a conversion packs them.
+
+    C++ signature: ``PyArg_ParseTuple(args, "sp|p", &dir, &is_2d, &converting)``
     """
 
 def pm_dbreload() -> None:
@@ -52,6 +86,15 @@ def pm_dbsetdatasets(datasets: list[str], /) -> None:
 
 def pm_dbgetdatasets() -> list[str]:
     """Get loaded dataset roots."""
+
+def pm_dbsetgwd(gwd: str, /) -> None:
+    """Set the working directory (gdir_cd); the track list follows at the next pm_dbreload."""
+
+def pm_gwd_is_subdir() -> bool:
+    """Whether the working directory is a subdirectory, where names are relative to it."""
+
+def pm_new_track_path(track: str, /) -> str:
+    """The directory a new track of this name is created in."""
 
 # -- Track Data Extraction & Analysis -----------------------------------------
 
@@ -168,6 +211,12 @@ def pm_track_dataset(track: str, /) -> str | None:
     C++ signature: ``PyArg_ParseTuple(args, "O", &py_track)``
     """
 
+def pm_chrom_ids(chroms: Sequence[str], /) -> list[int]:
+    """The chrom id of each chromosome name (any of its names), -1 for an unknown name.
+
+    C++ signature: ``PyArg_ParseTuple(args, "O", &py_chroms)``
+    """
+
 def pm_normalize_chroms(chroms: Sequence[str | int], /) -> list[str]:
     """Normalize chromosome names to canonical DB names.
 
@@ -221,11 +270,14 @@ def pm_track_create_sparse(track: str, data: Any, /) -> None:
     """
 
 def pm_track_create_dense(
-    track: str, data: Any, binsize: int, defval: float, func: str, /
+    track: str, data: Any, binsize: int, defval: float, func: str, float_products: bool = False, /
 ) -> None:
     """Create dense track from intervals+values.
 
-    C++ signature: ``PyArg_ParseTuple(args, "sOIds", &track, &py_data, &binsize, &defval, &func)``
+    ``float_products``: gtrack.import's weighted mean, which multiplies each
+    float value by its overlap in float (gtrack.create_dense uses double).
+
+    C++ signature: ``PyArg_ParseTuple(args, "sOIds|p", &track, &py_data, &binsize, &defval, &func, &float_products)``
     """
 
 def pm_track_create_expr(
