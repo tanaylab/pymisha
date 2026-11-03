@@ -9,6 +9,7 @@ precision.
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,12 @@ import pymisha as pm
 FIXTURE = Path(__file__).parent / "test_data" / "2d_r_parity"
 BASELINE = json.loads((FIXTURE / "baseline.json").read_text())
 COORDS = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+
+# R's walk order and track bytes are those of R built on libstdc++: GIntervals2D::sort (and
+# r_2d_sort_order, its port) uses std::sort, which is not stable, and libc++ (macOS) orders
+# intervals with equal keys differently, in R too. There the same rows, and tracks of the
+# same sizes and contents, are checked instead.
+LIBSTDCXX = sys.platform != "darwin"
 
 
 def _frame(d):
@@ -169,6 +176,10 @@ def _assert_rows(got, exp, value_cols=()):
     assert got is not None, "pymisha gives no rows"
     got = got.reset_index(drop=True)
     assert len(got) == len(exp)
+    if not LIBSTDCXX:
+        keys = [c for c in (*COORDS, "intervalID") if c in exp]
+        got = got.astype({"chrom1": str, "chrom2": str}).sort_values(keys, kind="stable").reset_index(drop=True)
+        exp = exp.astype({"chrom1": str, "chrom2": str}).sort_values(keys, kind="stable").reset_index(drop=True)
     for c in COORDS:
         if c in ("chrom1", "chrom2"):
             assert got[c].astype(str).tolist() == exp[c].tolist(), c
@@ -265,6 +276,25 @@ def _read_input(name):
     return pd.read_csv(FIXTURE / name, sep="\t", float_precision="round_trip").astype({"chrom1": str, "chrom2": str})
 
 
+def _objects(df, value_col):
+    """The objects of a 2D frame, sorted, their values as the track stores them (float)."""
+    vals = df[value_col].to_numpy(dtype=np.float32)
+    return sorted(zip(df["chrom1"].astype(str), df["start1"].astype(int), df["end1"].astype(int),
+                      df["chrom2"].astype(str), df["start2"].astype(int), df["end2"].astype(int),
+                      ["nan" if math.isnan(v) else float(v) for v in vals], strict=True))
+
+
+def _assert_r_track(track, expected_files, inputs):
+    """The track is the files R writes; on a C++ library other than libstdc++ (LIBSTDCXX),
+    files of the same sizes holding the input's objects."""
+    files = _track_files(track)
+    if LIBSTDCXX:
+        assert files == expected_files
+        return
+    assert {f: v["size"] for f, v in files.items()} == {f: v["size"] for f, v in expected_files.items()}
+    assert _objects(pm.gextract(track, pm.gintervals_2d_all()), track) == _objects(inputs, "value")
+
+
 @pytest.mark.parametrize("case,inp", [("create", "create_rects.tsv"), ("create_points", "create_points.tsv")])
 def test_gtrack_2d_create_writes_r_bytes(case, inp, _writer_track):
     """gtrack_2d_create writes the files R writes: R's insertion order, R's chunks, and
@@ -273,7 +303,7 @@ def test_gtrack_2d_create_writes_r_bytes(case, inp, _writer_track):
     _writer_track("test.w2d")
     pm.gtrack_2d_create("test.w2d", "x", df.drop(columns="value"), df["value"].to_numpy())
     assert pm.gtrack_info("test.w2d")["type"] == WRITERS["types"][case]
-    assert _track_files("test.w2d") == WRITERS[case]
+    _assert_r_track("test.w2d", WRITERS[case], df)
 
 
 @pytest.mark.parametrize("case,inputs,max_data_size", [
@@ -290,7 +320,7 @@ def test_gtrack_2d_import_writes_r_bytes(case, inputs, max_data_size, _writer_tr
     pm.gtrack_2d_import("test.w2d", "x", [str(FIXTURE / f) for f in inputs])
     if case == "import_points":
         assert pm.gtrack_info("test.w2d")["type"] == WRITERS["types"]["import_points"]
-    assert _track_files("test.w2d") == WRITERS[case]
+    _assert_r_track("test.w2d", WRITERS[case], pd.concat([_read_input(f) for f in inputs]))
 
 
 def _expected_contacts(files):

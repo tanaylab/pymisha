@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.15.3 (2026-11-03)
+
+### Bug fixes
+
+* 2D track files written by pymisha built with clang (as on macOS) no longer carry stray bytes in the padding of their quad-tree nodes, so the same input gives byte-identical files (serial and parallel imports included), as in R misha 5.14.4.
+
 ## v0.15.2 (2026-11-03)
 
 Brings pymisha to R misha 5.14.2.
