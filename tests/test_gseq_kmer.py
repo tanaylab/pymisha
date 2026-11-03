@@ -503,14 +503,14 @@ class TestGseqKmerRParity:
         assert got[0] == res["count_ta"].iloc[0]
 
     def test_matches_gextract_kmer_frac_vtrack(self):
-        seq, res = self._seq_and_vtracks({"frac_ta": {"func": "kmer.frac", "kmer": "TA", "strand": 1}})
+        seq, res = self._seq_and_vtracks({"frac_ta": {"func": "kmer.frac", "kmer": "TA", "strand": 1, "extend": False}})
         got = pm.gseq_kmer(seq, "TA", mode="frac", strand=1, start_pos=1, end_pos=len(seq), extend=False)
         assert got[0] == pytest.approx(res["frac_ta"].iloc[0], rel=1e-6)
 
     def test_matches_gextract_kmer_vtrack_with_longer_kmer(self):
         seq, res = self._seq_and_vtracks({
-            "count_ccc": {"func": "kmer.count", "kmer": "CCC", "strand": 1},
-            "frac_ccc": {"func": "kmer.frac", "kmer": "CCC", "strand": 1},
+            "count_ccc": {"func": "kmer.count", "kmer": "CCC", "strand": 1, "extend": False},
+            "frac_ccc": {"func": "kmer.frac", "kmer": "CCC", "strand": 1, "extend": False},
         })
         kw = {"strand": 1, "start_pos": 1, "end_pos": len(seq), "extend": False}
         assert pm.gseq_kmer(seq, "CCC", mode="count", **kw)[0] == res["count_ccc"].iloc[0]

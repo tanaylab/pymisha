@@ -1,8 +1,4 @@
-#ifndef _POSIX_C_SOURCE
-    #define _POSIX_C_SOURCE 199309
-    #include <time.h>
-    #undef _POSIX_C_SOURCE
-#endif
+#include <time.h>
 
 #include <ctype.h>
 #include <errno.h>

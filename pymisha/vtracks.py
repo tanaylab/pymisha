@@ -173,6 +173,22 @@ def _kmer_params(func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, An
     return kp
 
 
+def _kmer_possible_positions(seg_df: _pandas.DataFrame, payload: dict) -> _numpy.ndarray:
+    """R misha's ``KmerCounter::possible_positions`` for each part: the anchors in it whose
+    k-mer fits in the sequence read for it (read k-1 bases past its end with extend, up to
+    the chromosome end), on each strand scored."""
+    from .intervals import gintervals_all
+
+    k = len(payload["kmer"])
+    all_df = gintervals_all()
+    sizes = seg_df["chrom"].astype(str).map(dict(zip(all_df["chrom"].astype(str), all_df["end"], strict=True)))
+    starts = seg_df["start"].to_numpy(dtype=_numpy.int64)
+    ends = seg_df["end"].to_numpy(dtype=_numpy.int64)
+    read_end = _numpy.minimum(ends + (k - 1 if payload.get("extend", True) else 0), sizes.to_numpy(dtype=_numpy.int64))
+    per_strand: _numpy.ndarray = _numpy.maximum(_numpy.minimum(ends, read_end - k + 1) - starts, 0)
+    return per_strand * 2 if int(payload.get("strand", 0)) == 0 else per_strand
+
+
 def _check_vtrack_params(func: str | None, kwargs: dict) -> None:
     """Reject kwargs that ``func`` does not accept (R misha 5.11.15)."""
     keys = {k for k in kwargs if k != "filter"}
@@ -1581,13 +1597,17 @@ def _compute_vtrack_values(
         dtype=float,
     )
 
+    # kmer.frac pools the parts by their possible positions, not their lengths (R misha 5.14.2)
+    seg_weights = (_kmer_possible_positions(seg_df, payload_eval) if func == "kmer.frac"
+                   else seg_df["seg_len"].to_numpy())
+
     per_vals: list[list[float]] = [[] for _ in range(len(intervals))]
     per_lens: list[list[int]] = [[] for _ in range(len(intervals))]
     per_starts: list[list[int]] = [[] for _ in range(len(intervals))]
     per_base_starts: list[int | None] = [None for _ in range(len(intervals))]
     for orig_idx, seg_len, seg_start, base_start, seg_val in zip(
         seg_df["orig_idx"],
-        seg_df["seg_len"],
+        seg_weights,
         seg_df["start"],
         seg_df["base_start"],
         seg_vals, strict=False,
@@ -1605,7 +1625,18 @@ def _compute_vtrack_values(
             continue
         arr = _numpy.asarray(vals, dtype=float)
         valid = ~_numpy.isnan(arr)
-        if func in _FILTER_WEIGHTED_FUNCS:
+        if func == "kmer.frac":
+            # R's SequenceVarProcessor: one part is scored alone; several pool their counts
+            # (fraction times possible positions) over their possible positions, 0 if none
+            if len(vals) == 1:
+                out[i] = vals[0]
+            else:
+                total_positions = sum(per_lens[i])
+                total_count = 0.0
+                for v, n in zip(vals, per_lens[i], strict=True):
+                    total_count += v * n
+                out[i] = total_count / total_positions if total_positions > 0 else 0.0
+        elif func in _FILTER_WEIGHTED_FUNCS:
             if not valid.any():
                 continue
             lens = _numpy.asarray(per_lens[i], dtype=float)[valid]
@@ -1808,7 +1839,13 @@ def gvtrack_create(
           edit distance functions. Windows above this are skipped.
         - ``strand`` (int) -- Strand selection: 1 (forward), -1 (reverse),
           0 (both). Used by kmer and single-strand PWM modes.
-        - ``kmer`` (str) -- DNA k-mer sequence for kmer functions.
+        - ``kmer`` (str) -- DNA k-mer sequence for kmer functions. The
+          ``'kmer.frac'`` denominator is the number of possible anchor
+          positions in the interval: every anchor with ``extend=True``
+          (minus the last k-1 at a chromosome end), the first L-k+1 of an
+          interval of length L with ``extend=False``; with ``strand=0``
+          positions on both strands are counted, so the fraction stays in
+          [0, 1].
         - ``spat_factor`` (list of float) -- Spatial weighting factors
           for PWM functions.
         - ``spat_bin`` (int) -- Bin width for spatial weighting.

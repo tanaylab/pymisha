@@ -1,13 +1,13 @@
 """kmer.count / kmer.frac virtual tracks, ported from R misha's
-tests/testthat/test-kmer.R (all 39 test_that blocks, in R's order).
+tests/testthat/test-kmer.R (all 41 test_that blocks, in R's order).
 
 R's ``gvtrack.create(name, NULL, func, list(kmer = ..., strand = ...))`` passes
 the parameters as ``params``; those tests pass a dict as ``params`` here.
 
-misha scores 4 or more sequence vtracks of one expression in batches, and its
-batched kmer counts were wrong near bin edges until 5.14.1 (#200). pymisha has
-no batched path, so it always counted what misha now counts; the last tests
-keep it that way.
+misha scores kmer vtracks in batches (since 5.14.2, 32 or more of them on bins of
+100 bp or more), and its batched kmer counts were wrong near bin edges until
+5.14.1 (#200). pymisha has no batched path, so it always counted what misha now
+counts; the last tests keep it that way.
 """
 
 from __future__ import annotations
@@ -29,17 +29,16 @@ def _clean_vtracks():
 
 def count_kmers_manually(sequence, kmer, original, extended=None):
     """Occurrences of kmer whose start falls in original, in sequence fetched
-    over extended (R's helper of the same name)."""
+    over extended (R's helper of the same name); the possible positions are the
+    anchors whose kmer fits in the sequence (R misha 5.14.2)."""
     kmer = kmer.upper()
     sequence = sequence.upper()
     o_start, o_end = original
     offset = o_start - extended[0] if extended is not None and extended[0] < o_start else 0
     k = len(kmer)
-    count = sum(
-        1 for i in range(offset, offset + o_end - o_start)
-        if i + k <= len(sequence) and sequence[i:i + k] == kmer
-    )
-    possible = max(0, o_end - o_start - k + 1)
+    anchors = [i for i in range(offset, offset + o_end - o_start) if i + k <= len(sequence)]
+    count = sum(1 for i in anchors if sequence[i:i + k] == kmer)
+    possible = len(anchors)
     return count, possible, (count / possible if possible > 0 else 0.0)
 
 
@@ -69,7 +68,7 @@ def test_kmer_count_and_kmer_frac_vtracks_work_with_basic_inputs():
     _vt("frac_ccc", "kmer.frac", kmer="CCC", strand=1)
     scores = _one(["count_ta", "frac_ta", "count_ccc", "frac_ccc"], iv)
 
-    ext = (199, 241)
+    ext = (199, 242)  # extend=True reads k - 1 past the end; CCC needs 2
     ext_seq = _seq(*ext)
     ta = count_kmers_manually(ext_seq, "TA", (200, 240), ext)
     ccc = count_kmers_manually(ext_seq, "CCC", (200, 240), ext)
@@ -168,7 +167,8 @@ def test_kmer_count_and_kmer_frac_handle_edge_cases_correctly():
     scores = _one(["count_full", "frac_full", "count_a", "frac_a"], iv)
     c, _, f = count_kmers_manually(_seq(200, 240), "A", (200, 240), (200, 240))
     assert scores["count_full"].iloc[0] == 1
-    assert scores["frac_full"].iloc[0] == 1
+    # with extend=True all 40 anchors can hold the 40-mer, so its fraction is 1/40
+    assert scores["frac_full"].iloc[0] == pytest.approx(1 / 40, rel=1e-6)
     assert scores["count_a"].iloc[0] == c
     assert scores["frac_a"].iloc[0] == pytest.approx(f, rel=1e-5)
 
@@ -200,9 +200,10 @@ def test_kmer_count_and_kmer_frac_work_with_overlapping_kmers():
     scores = _one(["count_taa", "frac_taa"], iv)
     ext_seq = _seq(198, 222)
     seq = _seq(200, 220)
-    # R's loop, 1-based i from 2 to 2 + nchar(seq) - 3, over substr(ext_seq, i, i + 2)
-    taa = sum(1 for i in range(2, 2 + len(seq) - 3 + 1) if ext_seq[i - 1:i + 2] == "TAA")
-    possible = len(seq) - 3 + 1
+    # R's loop, 1-based i from 3 to 2 + nchar(seq), over substr(ext_seq, i, i + 2): the anchors
+    # are the interval's own bases, and extend=True lets each of them hold the k-mer
+    taa = sum(1 for i in range(3, 2 + len(seq) + 1) if ext_seq[i - 1:i + 2] == "TAA")
+    possible = len(seq)
     assert scores["count_taa"].iloc[0] == taa
     assert scores["frac_taa"].iloc[0] == pytest.approx(taa / possible, rel=1e-5)
 
@@ -628,17 +629,16 @@ def test_kmer_honors_iterator_shifts_for_both_strands_extend_true():
     scores = _shift_scores(names, 0, k, shifts)
     for name, s in zip(names, shifts, strict=True):
         orig, fetch, seq = _window(s, k)
-        fwd, _, _ = count_kmers_manually(seq, k, orig, fetch)
+        fwd, possible, _ = count_kmers_manually(seq, k, orig, fetch)
         rev, _, _ = count_kmers_manually(seq, rc_k, orig, fetch)
-        possible = max(0, (orig[1] - orig[0]) - len(k) + 1)
         expected_frac = (fwd + rev) / (2 * possible) if possible > 0 else 0.0
         assert scores[f"count_{name}"].iloc[0] == fwd + rev, s
         assert scores[f"frac_{name}"].iloc[0] == pytest.approx(expected_frac, rel=1e-5), s
 
 
-# With 4 or more sequence vtracks (and none filtered) misha scores kmer vtracks
-# in batches. A batched kmer vtrack must count exactly the k-mers it counts when
-# scored on its own: those whose 0-based genomic start lies in its (shifted)
+# With 32 or more kmer vtracks (none filtered), misha scores bins of 100 bp or
+# more in batches. A batched kmer vtrack must count exactly the k-mers it counts
+# when scored on its own: those whose 0-based genomic start lies in its (shifted)
 # iterator interval, on either strand.
 @pytest.fixture
 def kmer_seq_db(tmp_path):
@@ -671,24 +671,30 @@ def test_batched_kmer_vtracks_count_the_same_kmers_as_a_kmer_vtrack_scored_alone
     soft = np.where((np.arange(613) // 25) % 2 == 1, np.char.lower(soft), soft)
     kmer_seq_db({"chr1": "".join(rand_seq(601)), "chr2": "".join(soft)})
 
-    # Whole chromosomes in 1 bp and 7 bp bins: every bin touching a chromosome
-    # end is scored, including a short last bin.
-    intervals = pm.gintervals_all()
-    others = ("o1", "o2", "o3")
+    # 600 bp ending at each chromosome end, cut into 100 and 150 bp bins from
+    # its start, so the last bin ends at the chromosome end and is batched too.
+    intervals = pm.gintervals(["chr1", "chr2"], [1, 13], [601, 613])
+    dimers = [a + b for b in "ACGT" for a in "ACGT"]
+    other_kmers = ["C", "GG", "GATTACA", *dimers, "ACG", "TTAC", "GTAAC", "CCGGAT", "T", "TATA",
+                   "GCGCG", "ACGTACGT", "CAT", "AAAAA", "TGCA", "GGG"]
+    others = [f"o{i + 1}" for i in range(len(other_kmers))]
     for func in ("kmer.count", "kmer.frac"):
         for strand in (1, 0, -1):
             for extend in (True, False):
                 # The other k-mers are longer than most tested ones, so under
                 # extend=False a short k-mer shares its batch with a longer one.
-                for o, kmer in zip(others, ("C", "GG", "GATTACA"), strict=True):
+                for o, kmer in zip(others, other_kmers, strict=True):
                     pm.gvtrack_create(o, None, "kmer.count", kmer=kmer, extend=extend, strand=strand)
                 for kmer in ("A", "CA", "ACG", "TTAC"):
                     for shift in (None, (-3, 2), (4, 4)):
                         pm.gvtrack_create("k1", None, func, kmer=kmer, extend=extend, strand=strand)
                         if shift is not None:
                             pm.gvtrack_iterator("k1", sshift=shift[0], eshift=shift[1])
-                        for iterator in (1, 7):
-                            alone, batched = _alone_and_batched("k1", others, intervals, iterator)
+                        for iterator in (100, 150):
+                            starts = [*range(1, 601, iterator), *range(13, 613, iterator)]
+                            bins = pm.gintervals(["chr1"] * (600 // iterator) + ["chr2"] * (600 // iterator),
+                                                 starts, [st + iterator for st in starts])
+                            alone, batched = _alone_and_batched("k1", others, intervals, bins)
                             np.testing.assert_allclose(
                                 batched, alone, rtol=1.5e-8,
                                 err_msg=f"{func} kmer={kmer} strand={strand} extend={extend} "
@@ -704,17 +710,83 @@ def test_batched_kmer_count_does_not_count_a_reverse_strand_kmer_anchored_left_o
     chr2 = list(chr1)
     chr2[99] = "G"
     kmer_seq_db({"chr1": "".join(chr1), "chr2": "".join(chr2)})
-    for v in ("k1", "k2", "k3", "k4"):
+    vts = [f"k{i}" for i in range(1, 33)]
+    for v in vts:
         pm.gvtrack_create(v, None, "kmer.count", kmer="ACG", extend=True, strand=0)
-    bins = pm.gintervals(["chr1", "chr2"], [100, 100], [110, 110])
-    alone = pm.gextract("k1", bins, iterator=10, colnames=["v"])["v"].tolist()
-    batched = pm.gextract("k1 + 0 * k2 + 0 * k3 + 0 * k4", bins, iterator=10, colnames=["v"])["v"].tolist()
+    bins = pm.gintervals(["chr1", "chr2"], [100, 100], [200, 200])
+    alone = pm.gextract("k1", bins, iterator=100, colnames=["v"])["v"].tolist()
+    batched_expr = " + ".join(["k1", *(f"0 * {v}" for v in vts[1:])])
+    batched = pm.gextract(batched_expr, bins, iterator=100, colnames=["v"])["v"].tolist()
     assert alone == [0, 0]
     assert batched == [0, 0]
     # Not in R's test: chr2's bin before counts that k-mer, plus ACG on the
     # forward strand at 97.
     before = pm.gintervals(["chr1", "chr2"], [90, 90], [100, 100])
     assert pm.gextract("k1", before, iterator=10, colnames=["v"])["v"].tolist() == [0, 2]
+
+
+def test_kmer_frac_divides_by_the_anchors_whose_kmer_fits_so_it_stays_in_0_1():
+    all_iv = pm.gintervals_all()
+    chr1_end = int(all_iv.loc[all_iv["chrom"] == "chr1", "end"].iloc[0])
+    bins = [(200, 240),  # CCCTAACCC... telomere repeat
+            (10000, 10500),
+            (chr1_end - 300, chr1_end)]  # no room past the chromosome end
+    # R's expand.grid: the k-mer varies fastest, then the strand
+    cases = [(kmer, strand, extend) for extend in (True, False) for strand in (1, -1, 0)
+             for kmer in ("CC", "CCCTAA", "A")]
+
+    def possible(iv, k, extend, strand):
+        end = iv["end"].to_numpy()
+        read_end = np.minimum(end + k - 1, chr1_end) if extend else end
+        return np.maximum(0, np.minimum(end, read_end - k + 1) - iv["start"].to_numpy()) * (2 if strand == 0 else 1)
+
+    for i, (kmer, strand, extend) in enumerate(cases, start=1):
+        _vt(f"count_{i}", "kmer.count", kmer=kmer, strand=strand, extend=extend)
+        _vt(f"frac_{i}", "kmer.frac", kmer=kmer, strand=strand, extend=extend)
+    vt = [f"count_{i}" for i in range(1, len(cases) + 1)] + [f"frac_{i}" for i in range(1, len(cases) + 1)]
+    scope = pm.gintervals("chr1", [b[0] for b in bins], [b[1] for b in bins])
+
+    for it in (1, 7, 25, 100):
+        # bins of `it` bp cut from each interval's start
+        starts = [st for b in bins for st in range(b[0], b[1], it)]
+        ends = [min(st + it, b[1]) for b in bins for st in range(b[0], b[1], it)]
+        tiles = pm.gintervals("chr1", starts, ends)
+        fracs, expected = [], []
+        for i, (kmer, strand, extend) in enumerate(cases, start=1):
+            r = pm.gextract([f"count_{i}", f"frac_{i}"], scope, iterator=tiles, colnames=["count", "frac"])
+            n = possible(r, len(kmer), extend, strand)
+            fracs.append(r["frac"].to_numpy())
+            expected.append(np.where(n > 0, r["count"].to_numpy() / np.maximum(n, 1), 0))
+        alone = np.concatenate(fracs)
+        assert ((alone >= 0) & (alone <= 1)).all(), it
+        np.testing.assert_allclose(alone, np.concatenate(expected), rtol=1e-6, err_msg=str(it))
+
+        # all 36 in one call (misha's batched path with 100 bp bins)
+        batched = pm.gextract(vt, scope, iterator=tiles)
+        np.testing.assert_allclose(
+            np.concatenate([batched[f"frac_{i}"].to_numpy() for i in range(1, len(cases) + 1)]),
+            alone, rtol=1e-6, err_msg=str(it))
+
+    # 1 bp bins with extend=True: a matching anchor is the whole bin
+    one = pm.gextract(["count_1", "frac_1"], _iv(200, 210), iterator=1)
+    assert one["frac_1"].tolist() == one["count_1"].tolist()
+
+
+def test_kmer_frac_over_a_filtered_bin_pools_the_unmasked_parts_counts_and_possible_positions():
+    bin_iv = _iv(1000, 1100)
+    mask = pm.gintervals("chr1", [1040, 1070], [1042, 1071])
+    parts = pm.gintervals("chr1", [1000, 1042, 1071], [1040, 1070, 1100])
+    for extend in (True, False):
+        for strand in (1, 0):
+            _vt("f", "kmer.frac", kmer="CCT", extend=extend, strand=strand)
+            _vt("c", "kmer.count", kmer="CCT", extend=extend, strand=strand)
+            pm.gvtrack_filter("f", mask)
+            got = _one("f", bin_iv)["f"].iloc[0]
+
+            per_part = pm.gextract("c", parts, iterator=parts)["c"].to_numpy()
+            read_end = parts["end"].to_numpy() + (2 if extend else 0)
+            n = (np.minimum(parts["end"].to_numpy(), read_end - 2) - parts["start"].to_numpy()) * (2 if strand == 0 else 1)
+            assert got == pytest.approx(per_part.sum() / n.sum(), rel=1e-6), (extend, strand)
 
 
 # ---------------------------------------------------------------------------

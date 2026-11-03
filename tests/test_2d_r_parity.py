@@ -293,6 +293,32 @@ def test_gtrack_2d_import_writes_r_bytes(case, inputs, max_data_size, _writer_tr
     assert _track_files("test.w2d") == WRITERS[case]
 
 
+def _expected_contacts(files):
+    """The contacts an import of these contacts files holds, by (chrom1, chrom2, x, y): each
+    at its intervals' midpoints, ordered by chromosome (and in a cis pair x <= y), duplicates
+    summed, a cis contact mirrored around the diagonal and a trans one in both files."""
+    chrom_id = {c: i for i, c in enumerate(pm.gintervals_all()["chrom"])}
+    sums: dict = {}
+    for f in files:
+        df = pd.read_csv(f, sep="\t", dtype={"chrom1": str, "chrom2": str})
+        cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "value"]
+        for c1, s1, e1, c2, s2, e2, v in df[cols].itertuples(index=False):
+            x, y = (s1 + e1) // 2, (s2 + e2) // 2
+            if (chrom_id[c1], x) > (chrom_id[c2], y):
+                c1, c2, x, y = c2, c1, y, x
+            sums[(c1, c2, x, y)] = sums.get((c1, c2, x, y), 0.0) + float(np.float32(v))
+    out = {}
+    for (c1, c2, x, y), v in sums.items():
+        out[(c1, c2, x, y)] = out[(c2, c1, y, x)] = float(np.float32(v))
+    return out
+
+
+def _track_contacts(track):
+    r = pm.gextract(track, pm.gintervals_2d_all())
+    return {(c1, c2, int(x), int(y)): float(v)
+            for c1, x, c2, y, v in r[["chrom1", "start1", "chrom2", "start2", track]].itertuples(index=False)}
+
+
 @pytest.mark.parametrize("case,max_data_size", [("contacts", None), ("contacts_split", 16)])
 def test_gtrack_2d_import_contacts_writes_r_bytes(case, max_data_size, _writer_track, monkeypatch):
     """gtrack_2d_import_contacts writes the files R writes: duplicates summed in R's
@@ -300,8 +326,18 @@ def test_gtrack_2d_import_contacts_writes_r_bytes(case, max_data_size, _writer_t
     if max_data_size is not None:
         monkeypatch.setitem(pm.CONFIG, "max_data_size", max_data_size)
     _writer_track("test.w2d")
-    pm.gtrack_2d_import_contacts("test.w2d", "x", [str(FIXTURE / "contacts_a.tsv"), str(FIXTURE / "contacts_b.tsv")])
-    assert _track_files("test.w2d") == WRITERS[case]
+    inputs = [str(FIXTURE / "contacts_a.tsv"), str(FIXTURE / "contacts_b.tsv")]
+    pm.gtrack_2d_import_contacts("test.w2d", "x", inputs)
+    got, want = _track_contacts("test.w2d"), _expected_contacts(inputs)
+    assert got.keys() == want.keys()
+    np.testing.assert_allclose([got[k] for k in want], list(want.values()), rtol=1e-6)
+
+    files = _track_files("test.w2d")
+    if files != WRITERS[case]:
+        # R, like pymisha, fills the quad trees in the iteration order of an unordered_map,
+        # which depends on the C++ library's hash-table sizes (gcc 8's libstdc++, which the
+        # baseline was made with, and gcc 15's differ): the same contacts, laid out differently
+        assert {f: v["size"] for f, v in files.items()} == {f: v["size"] for f, v in WRITERS[case].items()}
 
 
 # --- functions whose default scope is the 2D genome for a 2D expression -----------------------

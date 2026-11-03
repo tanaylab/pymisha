@@ -30,9 +30,10 @@ def shift_pssm():
     })
 
 
-def shifted_values(sshift, eshift, scope):
+def shifted_values(sshift, eshift, scope, batched=False):
     """Every vtrack flavor that has its own out-of-range path, extracted with
-    the given shift."""
+    the given shift. With batched=True, 31 more k-mer vtracks make 32, so misha
+    takes its batched k-mer path on the 1 kb bins (pymisha has none)."""
     pm.gvtrack_clear()
     src = pm.gintervals(["chr1", "chr1"], [100100, 100500], [100200, 100600])
     pm.gvtrack_create("s_pwm", None, func="pwm", pssm=shift_pssm(), prior=0.01)
@@ -45,25 +46,30 @@ def shifted_values(sshift, eshift, scope):
     pm.gvtrack_create("s_track", "dense_track", "avg")
     vtracks = ["s_pwm", "s_pwm_max", "s_kmer", "s_masked",
                "s_coverage", "s_neighbor", "s_distance", "s_track"]
+    if batched:
+        pads = [f"s_kmer_{i}" for i in range(1, 32)]
+        for p in pads:
+            pm.gvtrack_create(p, None, func="kmer.count", kmer="ACGT", strand=1)
+        vtracks += pads
     for v in vtracks:
         pm.gvtrack_iterator(v, sshift=sshift, eshift=eshift)
-    # 4+ sequence vtracks in one call also exercises misha's batched sequence path
     r = pm.gextract(vtracks, scope, iterator=scope)
     return r.iloc[0][vtracks].to_numpy(dtype=float)
 
 
 def test_a_shift_that_leaves_the_chromosome_yields_nan_for_every_vtrack_function():
     scope = pm.gintervals("chr1", 100000, 101000)
-    assert not np.isnan(shifted_values(0, 0, scope)).any()
-    # window pushed 5 Mb to the left of the chromosome start
-    assert np.isnan(shifted_values(-5_000_000, -5_000_000, scope)).all()
-    # window pushed past the chromosome end
     all_iv = pm.gintervals_all()
     chr1_end = int(all_iv.loc[all_iv["chrom"] == "chr1", "end"].iloc[0])
     tail_scope = pm.gintervals("chr1", chr1_end - 1000, chr1_end)
-    assert np.isnan(shifted_values(10000, 10000, tail_scope)).all()
-    # sshift/eshift that collapse the window to nothing
-    assert np.isnan(shifted_values(500, -500, scope)).all()
+    for batched in (False, True):
+        assert not np.isnan(shifted_values(0, 0, scope, batched)).any()
+        # window pushed 5 Mb to the left of the chromosome start
+        assert np.isnan(shifted_values(-5_000_000, -5_000_000, scope, batched)).all()
+        # window pushed past the chromosome end
+        assert np.isnan(shifted_values(10000, 10000, tail_scope, batched)).all()
+        # sshift/eshift that collapse the window to nothing
+        assert np.isnan(shifted_values(500, -500, scope, batched)).all()
 
 
 def test_a_shift_that_only_partly_leaves_the_chromosome_clamps_the_window():

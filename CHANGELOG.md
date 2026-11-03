@@ -1,10 +1,23 @@
 # Changelog
 
+## v0.15.2 (2026-11-03)
+
+Brings pymisha to R misha 5.14.2.
+
+### Breaking
+
+* `kmer.frac` with `extend=True` (the default) could exceed 1. It now divides by every start position in the interval, so values for k > 1 drop by a factor of (L - k + 1) / L for an interval of length L, as in R misha 5.14.2.
+
+### Bug fixes
+
+* pymisha builds on macOS again; 0.15.0 and 0.15.1 have no macOS wheels and do not build there from source.
+* `kmer.frac` with `gvtrack_filter()` pools the unmasked parts (total count over total positions) instead of averaging their fractions by length, as in R misha 5.14.2.
+
 ## v0.15.1 (2026-11-03)
 
 ### Bug fixes
 
-* pymisha builds on macOS again; 0.15.0 has no macOS wheels and does not build there from source.
+* One of 0.15.0's two macOS build errors is fixed; 0.15.1 still does not build on macOS (fixed in 0.15.2).
 * 2D track files are the bytes R misha writes also when pymisha is compiled for a CPU with fused multiply-add.
 
 ## v0.15.0 (2026-11-03)

@@ -247,7 +247,7 @@ pm.gextract("g_frac + c_frac", intervals=peaks, iterator=peaks, colnames=["gc_w"
 pm.gvtrack_create("cg_frac", None, "kmer.frac", kmer="CG", strand=1)
 ```
 
-`src=None` selects the genome sequence as the source. Optional kwargs: `strand` (0 = both, default; 1 / -1 = stranded), `extend` (True by default, scan past iterator bin edges so a k-mer straddling the boundary still gets counted).
+`src=None` selects the genome sequence as the source. Optional kwargs: `strand` (0 = both, default; 1 / -1 = stranded), `extend` (True by default, scan past iterator bin edges so a k-mer straddling the boundary still gets counted). `kmer.frac` divides by the anchors whose k-mer fits: all L of an interval of length L with `extend=True`, L-k+1 with `extend=False` (twice that with `strand=0`).
 
 For ephemeral analyses, the two-vtrack-plus-expression form above is fine; for tracks you'll reuse, materialize via `gtrack_create` over a kmer vtrack.
 

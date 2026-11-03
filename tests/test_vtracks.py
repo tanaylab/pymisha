@@ -99,7 +99,8 @@ def test_kmer_and_masked_vtracks():
     for start, end in zip(intervals["start"], intervals["end"], strict=False):
         count = _count_kmer(seq, kmer, start, end)
         expected_counts.append(count)
-        denom = max(0, (end - start) - (len(kmer) - 1))
+        # extend=True: every anchor whose k-mer fits before the chromosome end (R misha 5.14.2)
+        denom = sum(1 for pos in range(start, end) if pos + len(kmer) <= len(seq))
         expected_frac.append(count / denom if denom else 0.0)
         masked = sum(1 for c in seq[start:end] if c.islower())
         expected_masked.append(masked)

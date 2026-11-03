@@ -871,8 +871,8 @@ class TestPwmCountVtrack:
         )
         assert out["count_prior0"].iloc[0] >= out["count_prior01"].iloc[0]
 
-    def test_count_batch_path_consistent(self):
-        """5 identical pwm.count vtracks return consistent values."""
+    def test_count_with_many_vtracks_in_one_call_consistent(self):
+        """5 identical pwm.count vtracks scored in one call return consistent values."""
         pssm = _create_test_pssm()
         test_interval = pm.gintervals(["1"], [200], [300])
 

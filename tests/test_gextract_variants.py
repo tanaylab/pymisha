@@ -218,20 +218,29 @@ def test_reach_is_complete_changing_every_base_outside_it_leaves_the_value_uncha
         edb = edit_outside(res)
         np.testing.assert_allclose(values_on_db(edb, vt, [b]), values_on_db(db, vt, [b]), err_msg=vt)
 
-    # Single-vtrack expressions never take misha's batched sequence path (it
-    # runs for >= 4 kmer/pwm/potts/masked vtracks), so R checks one such
-    # expression too. pymisha has no batched path; checked all the same.
-    expr = "v_kmer + 0 * v_pwm + 0 * v_potts + 0 * v_masked"
+    # misha takes its batched k-mer path only with 32+ k-mer vtracks on bins of
+    # 100 bp or more, so R checks one such expression too. pymisha has no
+    # batched path; checked all the same.
+    pads = [f"v_pad{i}" for i in range(1, 32)]
+
+    def define_vtracks():
+        define_variant_vtracks()
+        for p in pads:
+            pm.gvtrack_create(p, None, "kmer.count", kmer="CGT", extend=True, strand=0)
+
+    expr = " + ".join(["v_kmer", "0 * v_pwm", "0 * v_potts", "0 * v_masked", *(f"0 * {p}" for p in pads)])
+    bin_iv = pm.gintervals("chr1", b, b + 100)
 
     def value_on(root):
         pm.gdb_init(root)
-        define_variant_vtracks()
-        return pm.gextract(expr, pm.gintervals("chr1", b, b + 1), iterator=1, colnames=["x"])["x"].to_numpy()
+        define_vtracks()
+        return pm.gextract(expr, bin_iv, iterator=100, colnames=["x"])["x"].to_numpy()
 
     pm.gdb_init(db)
-    define_variant_vtracks()
-    res = pm.gextract_variants(expr, pm.gintervals("chr1", b, b + 1), iterator=1)
-    edb = edit_outside(res)
+    define_vtracks()
+    res = pm.gextract_variants(expr, bin_iv, iterator=100)
+    outside = sorted(set(range(150, 351)) - set(res["pos"]))
+    edb = make_seq_db(substitute_bases(seq, outside, [shift[seq[p].upper()] for p in outside]))
     np.testing.assert_allclose(value_on(edb), value_on(db), err_msg="batched expression")
 
 
