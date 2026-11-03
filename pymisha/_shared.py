@@ -530,7 +530,7 @@ def _chrom_sort_keys(chroms: Any) -> tuple[_numpy.ndarray, _numpy.ndarray]:
     names, not the order of the strings (chr1_KI270706v1_random sorts before chr10)."""
     codes, uniques = _pandas.factorize(_numpy.asarray(chroms, dtype=object).astype(str))
     uniques = _numpy.asarray(uniques, dtype=str)
-    ids = _numpy.full(len(uniques), -1, dtype=_numpy.intp)
+    ids: _numpy.ndarray = _numpy.full(len(uniques), -1, dtype=_numpy.intp)
     if _GROOT is not None and len(uniques):
         ids = _numpy.asarray(_pymisha.pm_chrom_ids(uniques.tolist()), dtype=_numpy.intp)
     unknown = ids < 0

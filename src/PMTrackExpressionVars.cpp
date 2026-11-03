@@ -98,7 +98,12 @@ std::pair<int64_t, int64_t> track_dir_mtimes(const std::string &track_dir)
         struct stat st;
         if (stat(path.c_str(), &st) != 0)
             return 0;
-        return (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+#ifdef __APPLE__
+        const struct timespec &t = st.st_mtimespec;
+#else
+        const struct timespec &t = st.st_mtim;
+#endif
+        return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
     };
     return {mtime(track_dir), mtime(track_dir + "/track.idx")};
 }

@@ -2288,10 +2288,11 @@ def _parse_sparse_payload(
             )
 
     # every interval, an infinite value as NaN, as R's GenomeTrackSparse reads it
-    vals = recs["value"].astype(np.float64)
+    # typed as arrays: numpy 2.2's stubs (the last for Python 3.10) type tolist() of a field as a scalar
+    vals: np.ndarray = recs["value"].astype(np.float64)
     vals[np.isinf(vals)] = np.nan
-    starts = recs["start"].astype(np.int64, copy=False)
-    ends = recs["end"].astype(np.int64, copy=False)
+    starts: np.ndarray = recs["start"].astype(np.int64, copy=False)
+    ends: np.ndarray = recs["end"].astype(np.int64, copy=False)
     chroms = np.full(starts.size, chrom_name, dtype=object)
     return list(zip(chroms.tolist(), starts.tolist(), ends.tolist(), vals.tolist(), strict=False))
 

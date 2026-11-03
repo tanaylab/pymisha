@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.15.1 (2026-11-03)
+
+### Bug fixes
+
+* pymisha builds on macOS again; 0.15.0 has no macOS wheels and does not build there from source.
+* 2D track files are the bytes R misha writes also when pymisha is compiled for a CPU with fused multiply-add.
+
 ## v0.15.0 (2026-11-03)
 
 Brings pymisha to R misha 5.14.1: 2D tracks and `gtrack_liftover`, chromosome naming and alias-named files, the bigWig, Parquet, mappedseq and 2D imports, `gextract_variants`, Potts, pwm and kmer scoring, names under `gdir_cd`, and failed writes.

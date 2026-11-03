@@ -11,6 +11,10 @@ compile_args = [
     '-Wno-unused-function',
     '-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION',
     '-DPYTHON',
+    # No fused multiply-add: a build for a CPU that has it (as on the Ubuntu 26.04 CI
+    # runners) rounds the 2D tracks' statistics differently, and the files then differ
+    # from the bytes R misha writes
+    '-ffp-contract=off',
 ]
 link_args = []
 
