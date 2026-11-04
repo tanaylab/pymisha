@@ -399,8 +399,10 @@ def _gdist_vtrack_streaming(
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+        from .extract import _default_vtrack_iterator
 
-        iter_df = _iterated_intervals(intervals, iterator)
+        intervals, iterator = _default_vtrack_iterator(intervals, iterator, exprs, used_vtracks)
+        iter_df = _iterated_intervals(intervals, iterator, unlimited=True)
         track_arrays = {}
 
     if iter_df is None or len(iter_df) == 0:
@@ -564,8 +566,10 @@ def _gsummary_vtrack_streaming(
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+        from .extract import _default_vtrack_iterator
 
-        iter_df = _iterated_intervals(intervals, iterator)
+        intervals, iterator = _default_vtrack_iterator(intervals, iterator, [expr], expr_vtracks)
+        iter_df = _iterated_intervals(intervals, iterator, unlimited=True)
         track_arrays = {}
 
     if iter_df is None or len(iter_df) == 0:
@@ -766,8 +770,10 @@ def _gquantiles_vtrack_streaming(
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
         from ._shared import _iterated_intervals
+        from .extract import _default_vtrack_iterator
 
-        iter_df = _iterated_intervals(intervals, iterator)
+        intervals, iterator = _default_vtrack_iterator(intervals, iterator, [expr], expr_vtracks)
+        iter_df = _iterated_intervals(intervals, iterator, unlimited=True)
         track_arrays = {}
 
     if iter_df is None or len(iter_df) == 0:
@@ -1553,15 +1559,17 @@ def gpartition(
         If True, the lowest value of the range is included in the first bin.
     iterator : int or str, optional
         Track expression iterator. If None, determined implicitly.
-    band : optional
-        Track expression band (not yet supported).
+    band : tuple of (int, int), optional
+        Diagonal band ``(d1, d2)`` for a 2D scope, as in :func:`gextract`.
 
     Returns
     -------
     DataFrame or None
         DataFrame with columns 'chrom', 'start', 'end', 'bin' where 'bin' is
         the 1-based bin index. Returns None if no values fall within the breaks.
-        Adjacent intervals with the same bin are merged.
+        Adjacent intervals with the same bin are merged. Over a 2D scope, as in
+        R, the columns are 'chrom1' ... 'end2' and 'bin', one row per iterator
+        rectangle, not merged.
 
     Examples
     --------
@@ -1589,8 +1597,9 @@ def gpartition(
     if breaks is None:
         raise ValueError("gpartition requires breaks argument")
 
-    # Convert breaks to list if needed
-    breaks_list = list(breaks)
+    # tolist() gives Python numbers; list() of an int array gives np.int64,
+    # which the C++ side rejects.
+    breaks_list = breaks.tolist() if isinstance(breaks, np.ndarray) else list(breaks)
     if len(breaks_list) < 2:
         raise ValueError("gpartition requires at least 2 break values (for 1 bin)")
 
@@ -1600,17 +1609,27 @@ def gpartition(
         intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
+    band = kwargs.get("band")
+    intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
 
-    # Handle DataFrame-as-iterator
-    intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
-
-    with _config_no_mt(_itr_id_map) as _cfg:
-        result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator, include_lowest, _cfg)
-
-    if result is None:
-        return None
-
-    out = _pandas.DataFrame(result)
+    if band is not None or _is_2d_intervals(intervals):
+        out = _gpartition_2d(expr, breaks_list, intervals, iterator, include_lowest, band)
+        if out is None:
+            return None
+    else:
+        # Handle DataFrame-as-iterator
+        intervals, iterator, _itr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
+        if _find_vtracks_in_expr(expr):
+            out = _gpartition_vtrack(expr, breaks_list, intervals, iterator, include_lowest)
+            if out is None:
+                return None
+        else:
+            with _config_no_mt(_itr_id_map) as _cfg:
+                result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator,
+                                               include_lowest, _cfg)
+            if result is None:
+                return None
+            out = _pandas.DataFrame(result)
 
     intervals_set_out = kwargs.get("intervals_set_out")
     if intervals_set_out is not None:
@@ -1622,6 +1641,46 @@ def gpartition(
         return None
 
     return out
+
+
+def _gpartition_2d(expr, breaks, intervals, iterator, include_lowest, band):
+    """R's 2D gpartition: each iterator rectangle whose value falls in a bin, in the
+    scanner's order, with its 1-based bin; rectangles are not merged."""
+    df = gextract(expr, intervals, iterator=iterator, band=band, progress=False)
+    if df is None or len(df) == 0:
+        return None
+    bins = _bin_values(df.iloc[:, 6].to_numpy(dtype=float), _numpy.asarray(breaks, dtype=float), include_lowest)
+    keep = bins >= 0
+    if not keep.any():
+        return None
+    out = df.iloc[:, :6][keep].reset_index(drop=True)
+    out["bin"] = bins[keep] + 1
+    return out
+
+
+def _gpartition_vtrack(expr, breaks, intervals, iterator, include_lowest):
+    """gpartition of an expression with virtual tracks: the values from gextract,
+    binned and merged as pm_partition's compute_partition does (a run of touching
+    iterator intervals in one bin becomes one interval; bins are 1-based)."""
+    from .extract import gextract
+
+    df = gextract(expr, intervals, iterator=iterator, progress=False)
+    if df is None or len(df) == 0:
+        return None
+    vals = df.iloc[:, 3].to_numpy(dtype=float)
+    bins = _bin_values(vals, _numpy.asarray(breaks, dtype=float), include_lowest)
+    rows: list[list] = []
+    for chrom, start, end, b in zip(df["chrom"].astype(str), df["start"].to_numpy(),
+                                    df["end"].to_numpy(), bins, strict=True):
+        if b < 0:
+            continue
+        if rows and rows[-1][3] == b + 1 and rows[-1][0] == chrom and rows[-1][2] == start:
+            rows[-1][2] = int(end)
+        else:
+            rows.append([chrom, int(start), int(end), int(b) + 1])
+    if not rows:
+        return None
+    return _pandas.DataFrame(rows, columns=["chrom", "start", "end", "bin"])
 
 
 def gsample(
@@ -1688,7 +1747,8 @@ def gsample(
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    if _is_2d_intervals(intervals):
+    # pm_sample has no virtual tracks; sample gextract's values instead
+    if _is_2d_intervals(intervals) or (band is None and _find_vtracks_in_expr(expr)):
         if int(n) < 1:
             raise ValueError("n must be at least 1")
         from .extract import gextract
@@ -1820,9 +1880,12 @@ def gcor(
 
     if _is_2d_intervals(intervals):
         result = _gcor_2d(expr_list, intervals, iterator, band, method)
+    elif band is not None:
+        raise ValueError("band parameter is only supported with 2D intervals")
+    elif any(_find_vtracks_in_expr(e) for e in expr_list):
+        # pm_cor has no virtual tracks; the gextract-based computation does
+        result = _gcor_2d(expr_list, intervals, iterator, None, method)
     else:
-        if band is not None:
-            raise ValueError("band parameter is only supported with 2D intervals")
         result = _pymisha.pm_cor(
             expr_list,
             _df2pymisha(intervals),

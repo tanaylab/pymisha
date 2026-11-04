@@ -214,6 +214,12 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
             return std::make_unique<PMFixedBinIterator>(intervals, bin_size);
         }
 
+        if (m_expr_vars.has_sequence_vtracks())
+            TGLError("Cannot implicitly determine iterator policy:\n"
+                     "track expression \"%s\" contains a sequence-based virtual track "
+                     "(pwm, potts, kmer or masked) or tracks in different formats.",
+                     m_track_exprs.empty() ? "" : m_track_exprs[0].c_str());
+
         return std::make_unique<PMIntervalsIterator>(intervals);
     } else {
         // -1 or less = intervals iterator
@@ -542,6 +548,12 @@ bool PMTrackExprScanner::eval_next()
                     if (PyErr_Occurred()) {
                         PyObject *py_type, *py_value, *py_traceback;
                         PyErr_Fetch(&py_type, &py_value, &py_traceback);
+                        if (py_type && PyErr_GivenExceptionMatches(py_type, PyExc_KeyboardInterrupt)) {
+                            // Ctrl-C inside the expression: leave it pending, as
+                            // check_interrupt() does, so no caller retries the scan.
+                            PyErr_Restore(py_type, py_value, py_traceback);
+                            TGLError("Command interrupted!");
+                        }
                         std::string err_msg = "Error while evaluating expression '";
                         err_msg += m_track_exprs[iexpr];
                         err_msg += "'";
@@ -556,6 +568,32 @@ bool PMTrackExprScanner::eval_next()
                         Py_XDECREF(py_value);
                         Py_XDECREF(py_traceback);
                         TGLError("%s", err_msg.c_str());
+                    }
+
+                    // A constant expression ("1", "2.5", "1 > 0") gives a scalar;
+                    // R returns it for every position, so broadcast it.
+                    PyObject *res = *m_py_eval_bufs[iexpr];
+                    if (res && !PMIS1D(m_py_eval_bufs[iexpr]) &&
+                        (PyArray_IsAnyScalar(res) ||
+                         (PyArray_Check(res) && PyArray_NDIM((PyArrayObject *)res) == 0))) {
+                        const bool is_bool = PyBool_Check(res) || PyArray_IsScalar(res, Bool) ||
+                            (PyArray_Check(res) && PyArray_TYPE((PyArrayObject *)res) == NPY_BOOL);
+                        double v = PyFloat_AsDouble(res);
+                        if (PyErr_Occurred()) {
+                            PyErr_Clear();
+                            TGLError("Evaluation of expression '%s' does not produce a numpy array",
+                                     m_track_exprs[iexpr].c_str());
+                        }
+                        npy_intp n = m_eval_buf_limit;
+                        PyObject *arr = PyArray_SimpleNew(1, &n, is_bool ? NPY_BOOL : NPY_DOUBLE);
+                        if (!arr)
+                            TGLError("Failed to allocate the result of expression '%s'", m_track_exprs[iexpr].c_str());
+                        if (is_bool)
+                            memset(PyArray_DATA((PyArrayObject *)arr), v != 0, n);
+                        else
+                            std::fill((double *)PyArray_DATA((PyArrayObject *)arr),
+                                      (double *)PyArray_DATA((PyArrayObject *)arr) + n, v);
+                        m_py_eval_bufs[iexpr].assign(arr, true);
                     }
 
                     if (!PMIS1D(m_py_eval_bufs[iexpr])) {

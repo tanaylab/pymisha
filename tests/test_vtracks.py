@@ -1604,11 +1604,9 @@ class TestCoreVtracks:
         pm.gvtrack_clear()
 
     def test_create_with_invalid_func_raises_error(self):
-        """Creating vtrack with invalid function raises error at extraction time (R line 26-36)."""
-        # In pymisha, invalid func may not raise at creation time, but will at extraction
-        pm.gvtrack_create("v_bad", "dense_track", func="blabla")
-        with pytest.raises(Exception):
-            pm.gextract("v_bad", pm.gintervals(["1"]), iterator=100)
+        """An invalid function is an error at gvtrack_create, as in R (R line 26-36)."""
+        with pytest.raises(ValueError, match="invalid function blabla used for a virtual track"):
+            pm.gvtrack_create("v_bad", "dense_track", func="blabla")
 
     def test_vtrack_avg_with_numeric_iterator(self):
         """avg function with numeric iterator (R line 44-50)."""
@@ -1642,17 +1640,9 @@ class TestCoreVtracks:
         assert len(res) > 0
 
     def test_vtrack_quantile_requires_params(self):
-        """quantile without params raises error at extraction time (R line 302-306)."""
-        # In pymisha, quantile without params may not raise at creation,
-        # but may use a default or raise at extraction
-        pm.gvtrack_create("v_q_no", "dense_track", func="quantile")
-        # It might default to 0.5 or raise - either behavior is acceptable
-        try:
-            res = pm.gextract("v_q_no", pm.gintervals(["1"]), iterator=100)
-            # If it doesn't raise, it used a default
-            assert len(res) > 0
-        except Exception:
-            pass  # R raises, pymisha may too
+        """quantile without params is an error at gvtrack_create, as in R (R line 302-306)."""
+        with pytest.raises(ValueError, match="requires an additional parameter"):
+            pm.gvtrack_create("v_q_no", "dense_track", func="quantile")
 
     def test_vtrack_quantile_with_params(self):
         """quantile with params 0.5 and 0.9 (R line 308-315)."""
@@ -1774,12 +1764,10 @@ class TestValueBasedVtracksPartialGaps:
     def teardown_method(self):
         pm.gvtrack_clear()
 
-    def test_value_based_filter_avg_uses_weighted_segments(self):
-        """Filter avg for value-based vtrack weights by unmasked segment length (R line 98-123).
-
-        When a filter masks out part of the iterator interval, avg is computed
-        as a weighted average over the unmasked segments, weighted by their
-        lengths.  pymisha uses length-weighted averaging under filter.
+    def test_value_based_filter_avg_is_unweighted(self):
+        """Filtered avg of a value-based vtrack is the plain mean of the source
+        intervals left after masking, as without a filter. R misha 5.14.2 gives 5
+        for this case (with and without the mask), not a length-weighted 6.8.
         """
         src = pd.DataFrame({
             "chrom": ["chr1", "chr1"],
@@ -1795,10 +1783,7 @@ class TestValueBasedVtracksPartialGaps:
 
         q = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [400]})
         avg_res = pm.gextract("vb_favg", q, iterator=-1)
-
-        # Weighted average: (2*50 + 8*200) / (50+200) = 1700/250 = 6.8
-        expected_avg = (2.0 * 50 + 8.0 * 200) / (50 + 200)
-        np.testing.assert_allclose(avg_res["vb_favg"].values, [expected_avg], rtol=1e-6)
+        np.testing.assert_allclose(avg_res["vb_favg"].values, [5.0], rtol=1e-6)
 
     def test_value_based_filter_preserves_count_based_stddev(self):
         """Filter preserves count-based stddev for value-based vtrack (R line 98-123).

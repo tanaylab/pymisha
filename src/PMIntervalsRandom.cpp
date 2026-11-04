@@ -101,10 +101,21 @@ static void parse_intervals_df(PyObject *py_df,
         if (PyList_Check(chrom_col) && PyList_Size(chrom_col) == 2) {
             PyObject *cats = PyList_GetItem(chrom_col, 0);
             PyObject *codes = PyList_GetItem(chrom_col, 1);
-            long code = *(long *)PyArray_GETPTR1((PyArrayObject *)codes, i);
+            // pandas picks the smallest signed int dtype for the codes (int8 for
+            // few categories), so read by item size, not as long.
+            const void *cp = PyArray_GETPTR1((PyArrayObject *)codes, i);
+            int64_t code;
+            switch (PyArray_ITEMSIZE((PyArrayObject *)codes)) {
+            case 1: code = *(const int8_t *)cp; break;
+            case 2: code = *(const int16_t *)cp; break;
+            case 4: code = *(const int32_t *)cp; break;
+            default: code = *(const int64_t *)cp; break;
+            }
             if (code < 0) {
                 return false;  // NA chrom -> skip
             }
+            if (code >= (int64_t)PyArray_SIZE((PyArrayObject *)cats))
+                TGLError("%s: invalid chrom category at row %lld", what, (long long)i);
             PyObject *name = *(PyObject **)PyArray_GETPTR1((PyArrayObject *)cats, code);
             if (!name || !PyUnicode_Check(name)) {
                 TGLError("%s: invalid chrom category at row %lld", what, (long long)i);

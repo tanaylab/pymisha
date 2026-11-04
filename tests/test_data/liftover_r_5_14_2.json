@@ -1,0 +1,980 @@
+{
+ "nonconsecutive": {
+  "name": "nonconsecutive",
+  "chain": "chain 1000 source1 100 + 10 30 chr1 500000 + 0 20 1\n20\n\nchain 1000 source1 100 + 10 30 chr2 300000 + 0 20 2\n20\n\nchain 1000 source1 100 + 30 32 chrX 200000 + 0 2 3\n2\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    20
+   ],
+   "end": [
+    21
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr2"
+   ],
+   "start": [
+    10,
+    10
+   ],
+   "end": [
+    11,
+    11
+   ],
+   "intervalID": [
+    1,
+    1
+   ],
+   "chain_id": [
+    1,
+    2
+   ]
+  }
+ },
+ "hint_right": {
+  "name": "hint_right",
+  "chain": "chain 1000 source1 200 + 0 100 chr1 500000 + 0 100 1\n100\n\nchain 1000 source1 200 + 15 16 chr2 300000 + 0 1 2\n1\n\nchain 1000 source1 200 + 80 110 chrX 200000 + 0 30 3\n30\n\n",
+  "q": {
+   "chrom": [
+    "source1",
+    "source1"
+   ],
+   "start": [
+    70,
+    90
+   ],
+   "end": [
+    71,
+    91
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr1",
+    "chrX"
+   ],
+   "start": [
+    70,
+    90,
+    10
+   ],
+   "end": [
+    71,
+    91,
+    11
+   ],
+   "intervalID": [
+    1,
+    2,
+    2
+   ],
+   "chain_id": [
+    1,
+    1,
+    3
+   ]
+  }
+ },
+ "identical_start_src": {
+  "name": "identical_start_src",
+  "chain": "chain 1000 source1 500 + 100 120 chr1 500000 + 0 20 1\n20\n\nchain 1000 source1 500 + 100 110 chr2 300000 + 0 10 2\n10\n\nchain 1000 source1 500 + 100 130 chrX 200000 + 0 30 3\n30\n\nchain 1000 source1 500 + 100 115 chr1 500000 + 20 35 4\n15\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    105
+   ],
+   "end": [
+    106
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr2",
+    "chr1",
+    "chr1",
+    "chrX"
+   ],
+   "start": [
+    5,
+    25,
+    5,
+    5
+   ],
+   "end": [
+    6,
+    26,
+    6,
+    6
+   ],
+   "intervalID": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "chain_id": [
+    2,
+    4,
+    1,
+    3
+   ]
+  }
+ },
+ "minus_edges": {
+  "name": "minus_edges",
+  "chain": "chain 1000 source1 100 + 0 30 chr1 500000 - 20 50 1\n30\n\n",
+  "q": {
+   "chrom": [
+    "source1",
+    "source1",
+    "source1"
+   ],
+   "start": [
+    0,
+    15,
+    29
+   ],
+   "end": [
+    1,
+    16,
+    30
+   ]
+  },
+  "load": {},
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr1",
+    "chr1"
+   ],
+   "start": [
+    499979,
+    499964,
+    499950
+   ],
+   "end": [
+    499980,
+    499965,
+    499951
+   ],
+   "intervalID": [
+    1,
+    2,
+    3
+   ],
+   "chain_id": [
+    1,
+    1,
+    1
+   ]
+  }
+ },
+ "dense_cluster": {
+  "name": "dense_cluster",
+  "chain": "chain 1000 source1 10000 + 50 51 chr2 300000 + 10 11 1\n1\n\nchain 1000 source1 10000 + 50 52 chr1 500000 + 20 22 2\n2\n\nchain 1000 source1 10000 + 50 53 chr2 300000 + 30 33 3\n3\n\nchain 1000 source1 10000 + 50 54 chr1 500000 + 40 44 4\n4\n\nchain 1000 source1 10000 + 50 55 chr2 300000 + 50 55 5\n5\n\nchain 1000 source1 10000 + 50 56 chr1 500000 + 60 66 6\n6\n\nchain 1000 source1 10000 + 50 57 chr2 300000 + 70 77 7\n7\n\nchain 1000 source1 10000 + 50 58 chr1 500000 + 80 88 8\n8\n\nchain 1000 source1 10000 + 50 59 chr2 300000 + 90 99 9\n9\n\nchain 1000 source1 10000 + 50 60 chr1 500000 + 100 110 10\n10\n\nchain 1000 source1 10000 + 50 61 chr2 300000 + 110 121 11\n11\n\nchain 1000 source1 10000 + 50 62 chr1 500000 + 120 132 12\n12\n\nchain 1000 source1 10000 + 50 63 chr2 300000 + 130 143 13\n13\n\nchain 1000 source1 10000 + 50 64 chr1 500000 + 140 154 14\n14\n\nchain 1000 source1 10000 + 50 65 chr2 300000 + 150 165 15\n15\n\nchain 1000 source1 10000 + 50 66 chr1 500000 + 160 176 16\n16\n\nchain 1000 source1 10000 + 50 67 chr2 300000 + 170 187 17\n17\n\nchain 1000 source1 10000 + 50 68 chr1 500000 + 180 198 18\n18\n\nchain 1000 source1 10000 + 50 69 chr2 300000 + 190 209 19\n19\n\nchain 1000 source1 10000 + 50 70 chr1 500000 + 200 220 20\n20\n\nchain 1000 source1 10000 + 50 71 chr2 300000 + 210 231 21\n21\n\nchain 1000 source1 10000 + 50 72 chr1 500000 + 220 242 22\n22\n\nchain 1000 source1 10000 + 50 73 chr2 300000 + 230 253 23\n23\n\nchain 1000 source1 10000 + 50 74 chr1 500000 + 240 264 24\n24\n\nchain 1000 source1 10000 + 50 75 chr2 300000 + 250 275 25\n25\n\nchain 1000 source1 10000 + 50 76 chr1 500000 + 260 286 26\n26\n\nchain 1000 source1 10000 + 50 77 chr2 300000 + 270 297 27\n27\n\nchain 1000 source1 10000 + 50 78 chr1 500000 + 280 308 28\n28\n\nchain 1000 source1 10000 + 50 79 chr2 300000 + 290 319 29\n29\n\nchain 1000 source1 10000 + 50 80 chr1 500000 + 300 330 30\n30\n\nchain 1000 source1 10000 + 50 81 chr2 300000 + 310 341 31\n31\n\nchain 1000 source1 10000 + 50 82 chr1 500000 + 320 352 32\n32\n\nchain 1000 source1 10000 + 50 83 chr2 300000 + 330 363 33\n33\n\nchain 1000 source1 10000 + 50 84 chr1 500000 + 340 374 34\n34\n\nchain 1000 source1 10000 + 50 85 chr2 300000 + 350 385 35\n35\n\nchain 1000 source1 10000 + 50 86 chr1 500000 + 360 396 36\n36\n\nchain 1000 source1 10000 + 50 87 chr2 300000 + 370 407 37\n37\n\nchain 1000 source1 10000 + 50 88 chr1 500000 + 380 418 38\n38\n\nchain 1000 source1 10000 + 50 89 chr2 300000 + 390 429 39\n39\n\nchain 1000 source1 10000 + 50 90 chr1 500000 + 400 440 40\n40\n\nchain 1000 source1 10000 + 50 91 chr2 300000 + 410 451 41\n41\n\nchain 1000 source1 10000 + 50 92 chr1 500000 + 420 462 42\n42\n\nchain 1000 source1 10000 + 50 93 chr2 300000 + 430 473 43\n43\n\nchain 1000 source1 10000 + 50 94 chr1 500000 + 440 484 44\n44\n\nchain 1000 source1 10000 + 50 95 chr2 300000 + 450 495 45\n45\n\nchain 1000 source1 10000 + 50 96 chr1 500000 + 460 506 46\n46\n\nchain 1000 source1 10000 + 50 97 chr2 300000 + 470 517 47\n47\n\nchain 1000 source1 10000 + 50 98 chr1 500000 + 480 528 48\n48\n\nchain 1000 source1 10000 + 50 99 chr2 300000 + 490 539 49\n49\n\nchain 1000 source1 10000 + 50 100 chr1 500000 + 500 550 50\n50\n\nchain 1000 source1 10000 + 50 101 chr2 300000 + 510 561 51\n51\n\nchain 1000 source1 10000 + 50 102 chr1 500000 + 520 572 52\n52\n\nchain 1000 source1 10000 + 50 103 chr2 300000 + 530 583 53\n53\n\nchain 1000 source1 10000 + 50 104 chr1 500000 + 540 594 54\n54\n\nchain 1000 source1 10000 + 50 105 chr2 300000 + 550 605 55\n55\n\nchain 1000 source1 10000 + 50 106 chr1 500000 + 560 616 56\n56\n\nchain 1000 source1 10000 + 50 107 chr2 300000 + 570 627 57\n57\n\nchain 1000 source1 10000 + 50 108 chr1 500000 + 580 638 58\n58\n\nchain 1000 source1 10000 + 50 109 chr2 300000 + 590 649 59\n59\n\nchain 1000 source1 10000 + 50 110 chr1 500000 + 600 660 60\n60\n\nchain 1000 source1 10000 + 50 111 chr2 300000 + 610 671 61\n61\n\nchain 1000 source1 10000 + 50 112 chr1 500000 + 620 682 62\n62\n\nchain 1000 source1 10000 + 50 113 chr2 300000 + 630 693 63\n63\n\nchain 1000 source1 10000 + 50 114 chr1 500000 + 640 704 64\n64\n\nchain 1000 source1 10000 + 50 115 chr2 300000 + 650 715 65\n65\n\nchain 1000 source1 10000 + 50 116 chr1 500000 + 660 726 66\n66\n\nchain 1000 source1 10000 + 50 117 chr2 300000 + 670 737 67\n67\n\nchain 1000 source1 10000 + 50 118 chr1 500000 + 680 748 68\n68\n\nchain 1000 source1 10000 + 50 119 chr2 300000 + 690 759 69\n69\n\nchain 1000 source1 10000 + 50 120 chr1 500000 + 700 770 70\n70\n\nchain 1000 source1 10000 + 50 121 chr2 300000 + 710 781 71\n71\n\nchain 1000 source1 10000 + 50 122 chr1 500000 + 720 792 72\n72\n\nchain 1000 source1 10000 + 50 123 chr2 300000 + 730 803 73\n73\n\nchain 1000 source1 10000 + 50 124 chr1 500000 + 740 814 74\n74\n\nchain 1000 source1 10000 + 50 125 chr2 300000 + 750 825 75\n75\n\nchain 1000 source1 10000 + 50 126 chr1 500000 + 760 836 76\n76\n\nchain 1000 source1 10000 + 50 127 chr2 300000 + 770 847 77\n77\n\nchain 1000 source1 10000 + 50 128 chr1 500000 + 780 858 78\n78\n\nchain 1000 source1 10000 + 50 129 chr2 300000 + 790 869 79\n79\n\nchain 1000 source1 10000 + 50 130 chr1 500000 + 800 880 80\n80\n\nchain 1000 source1 10000 + 50 131 chr2 300000 + 810 891 81\n81\n\nchain 1000 source1 10000 + 50 132 chr1 500000 + 820 902 82\n82\n\nchain 1000 source1 10000 + 50 133 chr2 300000 + 830 913 83\n83\n\nchain 1000 source1 10000 + 50 134 chr1 500000 + 840 924 84\n84\n\nchain 1000 source1 10000 + 50 135 chr2 300000 + 850 935 85\n85\n\nchain 1000 source1 10000 + 50 136 chr1 500000 + 860 946 86\n86\n\nchain 1000 source1 10000 + 50 137 chr2 300000 + 870 957 87\n87\n\nchain 1000 source1 10000 + 50 138 chr1 500000 + 880 968 88\n88\n\nchain 1000 source1 10000 + 50 139 chr2 300000 + 890 979 89\n89\n\nchain 1000 source1 10000 + 50 140 chr1 500000 + 900 990 90\n90\n\nchain 1000 source1 10000 + 50 141 chr2 300000 + 910 1001 91\n91\n\nchain 1000 source1 10000 + 50 142 chr1 500000 + 920 1012 92\n92\n\nchain 1000 source1 10000 + 50 143 chr2 300000 + 930 1023 93\n93\n\nchain 1000 source1 10000 + 50 144 chr1 500000 + 940 1034 94\n94\n\nchain 1000 source1 10000 + 50 145 chr2 300000 + 950 1045 95\n95\n\nchain 1000 source1 10000 + 50 146 chr1 500000 + 960 1056 96\n96\n\nchain 1000 source1 10000 + 50 147 chr2 300000 + 970 1067 97\n97\n\nchain 1000 source1 10000 + 50 148 chr1 500000 + 980 1078 98\n98\n\nchain 1000 source1 10000 + 50 149 chr2 300000 + 990 1089 99\n99\n\nchain 1000 source1 10000 + 50 150 chr1 500000 + 1000 1100 100\n100\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    60
+   ],
+   "end": [
+    61
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1",
+    "chr2",
+    "chr1"
+   ],
+   "start": [
+    120,
+    130,
+    140,
+    150,
+    160,
+    170,
+    180,
+    190,
+    200,
+    210,
+    220,
+    230,
+    240,
+    250,
+    260,
+    270,
+    280,
+    290,
+    300,
+    310,
+    320,
+    330,
+    340,
+    350,
+    360,
+    370,
+    380,
+    390,
+    400,
+    410,
+    420,
+    430,
+    440,
+    450,
+    460,
+    470,
+    480,
+    490,
+    500,
+    510,
+    520,
+    530,
+    540,
+    550,
+    560,
+    570,
+    580,
+    590,
+    600,
+    610,
+    620,
+    630,
+    640,
+    650,
+    660,
+    670,
+    680,
+    690,
+    700,
+    710,
+    720,
+    730,
+    740,
+    750,
+    760,
+    770,
+    780,
+    790,
+    800,
+    810,
+    820,
+    830,
+    840,
+    850,
+    860,
+    870,
+    880,
+    890,
+    900,
+    910,
+    920,
+    930,
+    940,
+    950,
+    960,
+    970,
+    980,
+    990,
+    1000,
+    1010
+   ],
+   "end": [
+    121,
+    131,
+    141,
+    151,
+    161,
+    171,
+    181,
+    191,
+    201,
+    211,
+    221,
+    231,
+    241,
+    251,
+    261,
+    271,
+    281,
+    291,
+    301,
+    311,
+    321,
+    331,
+    341,
+    351,
+    361,
+    371,
+    381,
+    391,
+    401,
+    411,
+    421,
+    431,
+    441,
+    451,
+    461,
+    471,
+    481,
+    491,
+    501,
+    511,
+    521,
+    531,
+    541,
+    551,
+    561,
+    571,
+    581,
+    591,
+    601,
+    611,
+    621,
+    631,
+    641,
+    651,
+    661,
+    671,
+    681,
+    691,
+    701,
+    711,
+    721,
+    731,
+    741,
+    751,
+    761,
+    771,
+    781,
+    791,
+    801,
+    811,
+    821,
+    831,
+    841,
+    851,
+    861,
+    871,
+    881,
+    891,
+    901,
+    911,
+    921,
+    931,
+    941,
+    951,
+    961,
+    971,
+    981,
+    991,
+    1001,
+    1011
+   ],
+   "intervalID": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "chain_id": [
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100
+   ]
+  }
+ },
+ "contained_auto_first": {
+  "name": "contained_auto_first",
+  "chain": "chain 1000 sourceA 500 + 0 200 chr1 500000 + 0 200 1\n200\n\nchain 1000 sourceB 500 + 0 120 chr1 500000 + 50 170 2\n120\n\n",
+  "q": {
+   "chrom": [
+    "sourceA"
+   ],
+   "start": [
+    60
+   ],
+   "end": [
+    80
+   ]
+  },
+  "load": {
+   "tgt_overlap_policy": "auto_first"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1"
+   ],
+   "start": [
+    60
+   ],
+   "end": [
+    80
+   ],
+   "intervalID": [
+    1
+   ],
+   "chain_id": [
+    1
+   ]
+  }
+ },
+ "contained_auto_first_B": {
+  "name": "contained_auto_first_B",
+  "chain": "chain 1000 sourceA 500 + 0 200 chr1 500000 + 0 200 1\n200\n\nchain 1000 sourceB 500 + 0 120 chr1 500000 + 50 170 2\n120\n\n",
+  "q": {
+   "chrom": [
+    "sourceB"
+   ],
+   "start": [
+    60
+   ],
+   "end": [
+    80
+   ]
+  },
+  "load": {
+   "tgt_overlap_policy": "auto_first"
+  },
+  "lift": {},
+  "r": {
+   "error": [
+    "Source chromosome does not exist in the chain source genome"
+   ]
+  }
+ },
+ "contained_keep_B": {
+  "name": "contained_keep_B",
+  "chain": "chain 1000 sourceA 500 + 0 200 chr1 500000 + 0 200 1\n200\n\nchain 1000 sourceB 500 + 0 120 chr1 500000 + 50 170 2\n120\n\n",
+  "q": {
+   "chrom": [
+    "sourceB"
+   ],
+   "start": [
+    60
+   ],
+   "end": [
+    80
+   ]
+  },
+  "load": {
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1"
+   ],
+   "start": [
+    110
+   ],
+   "end": [
+    130
+   ],
+   "intervalID": [
+    1
+   ],
+   "chain_id": [
+    2
+   ]
+  }
+ },
+ "ucsc_single_hit": {
+  "name": "ucsc_single_hit",
+  "chain": "chain 1000 chrS 5000000 + 4550000 4551000 chr1 500000 + 15000 16000 1\n1000\n\nchain 1000 chrS 5000000 + 4560010 4560015 chr1 500000 + 14790 14795 101\n5\n\nchain 1000 chrS 5000000 + 4560020 4560025 chr1 500000 + 15190 15195 102\n5\n\nchain 1000 chrS 5000000 + 4560030 4560035 chr1 500000 + 15590 15595 103\n5\n\nchain 1000 chrS 5000000 + 4560040 4560045 chr1 500000 + 15990 15995 104\n5\n\nchain 1000 chrS 5000000 + 4560050 4560055 chr1 500000 + 16390 16395 105\n5\n\nchain 1000 chrS 5000000 + 4560060 4560065 chr1 500000 + 16790 16795 106\n5\n\nchain 1000 chrS 5000000 + 4560070 4560075 chr1 500000 + 17190 17195 107\n5\n\nchain 1000 chrS 5000000 + 4560080 4560085 chr1 500000 + 17590 17595 108\n5\n\nchain 1000 chrS 5000000 + 4560090 4560095 chr1 500000 + 17990 17995 109\n5\n\nchain 1000 chrS 5000000 + 4560100 4560105 chr1 500000 + 18390 18395 110\n5\n\nchain 1000 chrS 5000000 + 4560110 4560115 chr1 500000 + 18790 18795 111\n5\n\n",
+  "q": {
+   "chrom": [
+    "chrS"
+   ],
+   "start": [
+    4550156
+   ],
+   "end": [
+    4550157
+   ]
+  },
+  "load": {},
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1"
+   ],
+   "start": [
+    15156
+   ],
+   "end": [
+    15157
+   ],
+   "intervalID": [
+    1
+   ],
+   "chain_id": [
+    1
+   ]
+  }
+ },
+ "large_coords": {
+  "name": "large_coords",
+  "chain": "chain 1000 source1 1125899906843624 + 1125899906842624 1125899906842724 chr1 500000 + 0 100 1\n100\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    1125899906842634
+   ],
+   "end": [
+    1125899906842644
+   ]
+  },
+  "load": {},
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1"
+   ],
+   "start": [
+    10
+   ],
+   "end": [
+    20
+   ],
+   "intervalID": [
+    1
+   ],
+   "chain_id": [
+    1
+   ]
+  }
+ },
+ "dup_chain_id": {
+  "name": "dup_chain_id",
+  "chain": "chain 1000 source1 200 + 0 100 chr1 500000 + 0 100 101\n100\n\nchain 1000 source1 200 + 0 100 chr1 500000 + 500 600 205\n100\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    0
+   ],
+   "end": [
+    100
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr1"
+   ],
+   "start": [
+    0,
+    500
+   ],
+   "end": [
+    100,
+    600
+   ],
+   "intervalID": [
+    1,
+    1
+   ],
+   "chain_id": [
+    101,
+    205
+   ]
+  }
+ },
+ "dup_blocks": {
+  "name": "dup_blocks",
+  "chain": "chain 1000 source1 300 + 0 200 chr1 500000 + 0 200 101\n50\t50\t50\n100\n\nchain 1000 source1 300 + 0 200 chr1 500000 + 500 700 205\n50\t50\t50\n100\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    0
+   ],
+   "end": [
+    200
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {},
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr1",
+    "chr1",
+    "chr1"
+   ],
+   "start": [
+    0,
+    500,
+    100,
+    600
+   ],
+   "end": [
+    50,
+    550,
+    200,
+    700
+   ],
+   "intervalID": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "chain_id": [
+    101,
+    205,
+    101,
+    205
+   ]
+  }
+ },
+ "canonic_chain_ids": {
+  "name": "canonic_chain_ids",
+  "chain": "chain 1000 source1 200 + 0 50 chr1 500000 + 0 50 101\n50\n\nchain 1000 source1 200 + 0 50 chr1 500000 + 50 100 205\n50\n\n",
+  "q": {
+   "chrom": [
+    "source1"
+   ],
+   "start": [
+    0
+   ],
+   "end": [
+    50
+   ]
+  },
+  "load": {
+   "src_overlap_policy": "keep",
+   "tgt_overlap_policy": "keep"
+  },
+  "lift": {
+   "canonic": true
+  },
+  "r": {
+   "chrom": [
+    "chr1",
+    "chr1"
+   ],
+   "start": [
+    0,
+    50
+   ],
+   "end": [
+    50,
+    100
+   ],
+   "intervalID": [
+    1,
+    1
+   ],
+   "chain_id": [
+    101,
+    205
+   ]
+  }
+ }
+}

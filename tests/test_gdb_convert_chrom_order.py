@@ -556,7 +556,7 @@ def test_conversion_of_a_loaded_dataset_keeps_the_rest_of_the_session(tmp_path, 
                 convert()
     unloaded = how != "failed in the genome step"
     assert x == pm._shared._GROOT
-    assert pm.gdataset_ls() == ([str(z.resolve())] if unloaded else [y, str(z.resolve())])
+    assert pm.gdataset_ls()[1:] == ([str(z.resolve())] if unloaded else [y, str(z.resolve())])
     assert pm.gvtrack_ls() == ["v"]
     assert pm.gextract("v", pm.gintervals("chr1", 0, 10))["v"].tolist() == [7]
     if unloaded:
@@ -577,10 +577,10 @@ def test_unloads_a_loaded_dataset_only_when_it_changed_it(tmp_path, monkeypatch)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         pm.gdb_convert_to_indexed(groot=y)
-        assert pm.gdataset_ls() == [y]
+        assert pm.gdataset_ls()[1:] == [y]
         # a track step with nothing to convert
         pm.gdb_convert_to_indexed(groot=y, convert_tracks=True, convert_intervals=True)
-        assert pm.gdataset_ls() == [y]
+        assert pm.gdataset_ls()[1:] == [y]
     # a track step that stops: what it converted before stopping cannot be told
     with monkeypatch.context() as m:
         def injected(*_args, **_kwargs):
@@ -590,7 +590,7 @@ def test_unloads_a_loaded_dataset_only_when_it_changed_it(tmp_path, monkeypatch)
         with pytest.warns(UserWarning, match="failed and may have changed it"), \
                 pytest.raises(RuntimeError, match="injected"):
             pm.gdb_convert_to_indexed(groot=y, convert_tracks=True)
-    assert pm.gdataset_ls() == []
+    assert pm.gdataset_ls()[1:] == []
     pm.gdataset_load(y)
 
     # a track step that converts a track (the genome step is skipped: Y is indexed)
@@ -605,7 +605,7 @@ def test_unloads_a_loaded_dataset_only_when_it_changed_it(tmp_path, monkeypatch)
     with pytest.warns(UserWarning, match="Y was converted, so it is no longer loaded as a dataset"):
         pm.gdb_convert_to_indexed(groot=y, convert_tracks=True)
     assert (Path(y) / "tracks" / "pt.track" / "track.idx").exists()
-    assert pm.gdataset_ls() == []
+    assert pm.gdataset_ls()[1:] == []
 
     # an interval step that converts an interval set
     copy_r_bigset("big1d", y)
@@ -614,7 +614,7 @@ def test_unloads_a_loaded_dataset_only_when_it_changed_it(tmp_path, monkeypatch)
     with pytest.warns(UserWarning, match="Y was converted, so it is no longer loaded as a dataset"):
         pm.gdb_convert_to_indexed(groot=y, convert_intervals=True)
     assert (Path(y) / "tracks" / "big1d.interv" / "intervals.idx").exists()
-    assert pm.gdataset_ls() == []
+    assert pm.gdataset_ls()[1:] == []
 
     # a failed conversion that could not put chrom_sizes.txt back
     q = unsorted_db(tmp_path / "Q")
@@ -639,7 +639,7 @@ def test_unloads_a_loaded_dataset_only_when_it_changed_it(tmp_path, monkeypatch)
             pm.gdb_convert_to_indexed(groot=q, validate=False)
     assert any("The conversion of" in str(w.message) and "Q failed and may have changed it" in str(w.message)
                for w in warned)
-    assert pm.gdataset_ls() == []
+    assert pm.gdataset_ls()[1:] == []
 
 
 def test_conversion_of_the_loaded_database_leaves_it_in_the_indexed_format(tmp_path):
@@ -670,13 +670,13 @@ def test_conversion_of_another_database_puts_the_session_back(tmp_path, steps):
     pm.gvtrack_create("v", "t", "avg")
     pm.gdir_create("sub", show_warnings=False)
     pm.gdir_cd("sub")
-    before = (pm._shared._GROOT, pm.gdir_cwd(), pm.gdataset_ls(), sorted(pm.gtrack_ls() or []), pm.gvtrack_ls())
+    before = (pm._shared._GROOT, pm.gdir_cwd(), pm.gdataset_ls()[1:], sorted(pm.gtrack_ls() or []), pm.gvtrack_ls())
     if steps == "validate":
         pm.gdb_convert_to_indexed(groot=other)
     else:
         pm.gdb_convert_to_indexed(groot=other, validate=False, convert_tracks=True, convert_intervals=True)
         assert (Path(other) / "tracks" / "o.track" / "track.idx").exists()
-    assert (pm._shared._GROOT, pm.gdir_cwd(), pm.gdataset_ls(), sorted(pm.gtrack_ls() or []), pm.gvtrack_ls()) == before
+    assert (pm._shared._GROOT, pm.gdir_cwd(), pm.gdataset_ls()[1:], sorted(pm.gtrack_ls() or []), pm.gvtrack_ls()) == before
     pm.gdir_cd("..")
     # the virtual track of the directory left comes back with it
     assert pm.gvtrack_ls() == ["v"]

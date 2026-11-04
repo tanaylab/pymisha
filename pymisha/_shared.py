@@ -819,54 +819,87 @@ def _canonic_scope(intervals):
     )
 
 
-def _warn_overlapping_iterator(iterator):
-    """Warn that overlapping iterator intervals were merged (R misha 5.11.18).
+def _warn_overlapping_iterator(iterator, rows):
+    """Warn when overlapping iterator intervals were merged into a returned row
+    (R misha's warn_merged_iterator, TrackExpressionScanner.cpp).
 
-    Results are unchanged - the merge always happened - but three iterator
-    intervals coming back as two rows is silent data loss unless it is said out
-    loud. Exact duplicates stay quiet: both copies map to the same row, so no
-    interval goes missing. An interval nested inside another counts as merged;
-    it widens no row, which is precisely why it used to disappear unnoticed.
-
-    ponytail: warns on the iterator alone, where misha also checks the scope
-    actually reaches the merged row. Over-warns when the scope excludes the
-    overlap; make it scope-aware if that shows up in practice.
+    *rows* are the rows actually scanned: the scope cut by the merged iterator
+    blocks. As in R, a merge is reported only when the caller can see it: a row
+    no single iterator interval contains (two intervals became one row), or an
+    interval the scope reaches that contains no row (swallowed by a bigger one).
+    So iterator=ivs with intervals=ivs, where the scope clips every row back to
+    its interval, stays silent, and exact duplicates do too.
     """
-    df = iterator[["chrom", "start", "end"]].drop_duplicates()
-    if len(df) < 2:
+    if len(iterator) < 2 or len(rows) == 0:
         return
-    df = df.sort_values(["chrom", "start", "end"], kind="mergesort")
-
-    pair = None          # first overlapping pair, for the message
-    block = None         # the merged row it lands in
+    itr = iterator[["chrom", "start", "end"]]
     n_blocks = 0
-    cur_chrom = cur_start = cur_end = None
-    for chrom, start, end in zip(df["chrom"], df["start"], df["end"], strict=True):
-        if cur_chrom == chrom and start < cur_end:
-            if pair is None:
-                pair = ((cur_chrom, cur_start, cur_end), (chrom, start, end))
-                block = [chrom, min(cur_start, start), max(cur_end, end)]
-            elif block is not None and block[0] == chrom and start < block[2]:
-                block[2] = max(block[2], end)
-            cur_start = min(cur_start, start)
-            cur_end = max(cur_end, end)
+    found = None  # (row, block chrom, block rows)
+    for chrom, g in itr.groupby("chrom", sort=False, observed=True):
+        s = g["start"].to_numpy(_numpy.int64)
+        e = g["end"].to_numpy(_numpy.int64)
+        o = _numpy.lexsort((e, s))
+        s, e = s[o], e[o]
+        pmax = _numpy.maximum.accumulate(e)
+        n_blocks += 1 + int(_numpy.sum(s[1:] >= pmax[:-1]))  # touching intervals stay apart
+        if found is not None:
             continue
-        n_blocks += 1
-        cur_chrom, cur_start, cur_end = chrom, start, end
+        r = rows[rows["chrom"] == chrom]
+        if len(r) == 0:
+            continue
+        rs = r["start"].to_numpy(_numpy.int64)
+        re_ = r["end"].to_numpy(_numpy.int64)
+        ro = _numpy.argsort(rs, kind="stable")
+        rs, re_ = rs[ro], re_[ro]
+        # (a) a row no single interval contains
+        k = _numpy.searchsorted(s, rs, side="right") - 1
+        covered = (k >= 0) & (pmax[_numpy.maximum(k, 0)] >= re_)
+        if not covered.all():
+            j = int(_numpy.flatnonzero(~covered)[0])
+            found = (chrom, int(rs[j]), int(re_[j]))
+            continue
+        # (b) an interval the scope reaches (it overlaps a row) that contains no row
+        rmax = _numpy.maximum.accumulate(re_)
+        rmin_suffix = _numpy.minimum.accumulate(re_[::-1])[::-1]
+        before = _numpy.searchsorted(rs, e, side="left") - 1
+        reached = (before >= 0) & (rmax[_numpy.maximum(before, 0)] > s)
+        first = _numpy.searchsorted(rs, s, side="left")
+        verbatim = (first < len(rs)) & (rmin_suffix[_numpy.minimum(first, len(rs) - 1)] <= e)
+        bad = _numpy.flatnonzero(reached & ~verbatim)
+        if bad.size:
+            i = int(bad[0])
+            # the row that swallowed it: the first one it overlaps
+            j = int(_numpy.flatnonzero((rs < e[i]) & (re_ > s[i]))[0])
+            found = (chrom, int(rs[j]), int(re_[j]))
 
+    if found is None:
+        return
+    chrom, r0, r1 = found
+    g = itr[itr["chrom"] == chrom]
+    s = g["start"].to_numpy(_numpy.int64)
+    e = g["end"].to_numpy(_numpy.int64)
+    o = _numpy.lexsort((e, s))
+    s, e = s[o], e[o]
+    # the first overlapping pair among the intervals that reach the row
+    pair = None
+    imax = None
+    for i in _numpy.flatnonzero((s < r1) & (e > r0)):
+        if imax is not None and s[i] < e[imax]:
+            pair = (imax, i)
+            break
+        if imax is None or e[i] > e[imax]:
+            imax = i
     if pair is None:
         return
-
-    (c1, s1, e1), (c2, s2, e2) = pair
+    a, b = pair
     _warnings.warn(
-        f"Overlapping intervals were used as an iterator: {len(df)} intervals "
+        f"Overlapping intervals were used as an iterator: {len(itr)} intervals "
         f"were merged into {n_blocks} non-overlapping "
-        f"block{'' if n_blocks == 1 else 's'}. For example {c1} {s1}-{e1} and "
-        f"{c2} {s2}-{e2} are reported as a single row {block[0]} {block[1]}-"
-        f"{block[2]}, so the results do not correspond one-to-one to the "
-        f"iterator intervals. To get one value per interval, call gextract() "
-        f"with the same intervals as the scope (its 'intervals' argument) and "
-        f"map the rows back with the intervalID column.",
+        f"block{'' if n_blocks == 1 else 's'}. For example {chrom} {s[a]}-{e[a]} and "
+        f"{chrom} {s[b]}-{e[b]} are reported as a single row {chrom} {r0}-{r1}, so the "
+        f"results do not correspond one-to-one to the iterator intervals. To get one value "
+        f"per interval, call gextract() with the same intervals as the scope (its "
+        f"'intervals' argument) and map the rows back with the intervalID column.",
         stacklevel=4,
     )
 
@@ -950,7 +983,6 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     if "chrom1" in iterator.columns:
         return intervals, iterator, None
 
-    _warn_overlapping_iterator(iterator)
 
     if len(iterator) == 0 or len(intervals) == 0:
         empty = _pandas.DataFrame({"chrom": _pandas.Series([], dtype=str),
@@ -990,6 +1022,7 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
         intervals = _canonic_scope(intervals)
 
     new_intervals, id_map = _intersect_scope_with_iterator(intervals, iterator)
+    _warn_overlapping_iterator(iterator, new_intervals)
     if len(new_intervals) == 0:
         empty = _pandas.DataFrame({"chrom": _pandas.Series([], dtype=str),
                                     "start": _pandas.Series([], dtype=int),
@@ -1053,8 +1086,20 @@ def _remap_interval_ids(df, id_map):
     return df
 
 
-def _iterated_intervals(intervals, iterator):
-    """Return intervals after applying iterator policy (includes intervalID)."""
+def _iterated_intervals(intervals, iterator, *, unlimited=False):
+    """Return intervals after applying iterator policy (includes intervalID).
+
+    *unlimited*: for the streaming summaries, which read these coordinates in
+    chunks; max_data_size limits results, not their working set."""
+    if unlimited:
+        # the C++ side reads max_data_size from the global CONFIG
+        prev = CONFIG.get("max_data_size")
+        CONFIG["max_data_size"] = 2**62
+        try:
+            return _iterated_intervals(intervals, iterator)
+        finally:
+            CONFIG["max_data_size"] = prev
+    cfg = CONFIG
     if isinstance(iterator, _pandas.DataFrame):
         new_intervals, new_iterator, id_map = _preprocess_intervals_iterator(
             intervals, iterator
@@ -1067,7 +1112,7 @@ def _iterated_intervals(intervals, iterator):
                 "intervalID": _pandas.Series([], dtype=int),
             })
         result = _pymisha.pm_iterate(
-            _df2pymisha(new_intervals), new_iterator, CONFIG
+            _df2pymisha(new_intervals), new_iterator, cfg
         )
         out = _pymisha2df(result)
         return _remap_interval_ids(out, id_map)
@@ -1075,7 +1120,7 @@ def _iterated_intervals(intervals, iterator):
         out = intervals.copy()
         out["intervalID"] = _numpy.arange(1, len(out) + 1)
         return out
-    result = _pymisha.pm_iterate(_df2pymisha(intervals), iterator, CONFIG)
+    result = _pymisha.pm_iterate(_df2pymisha(intervals), iterator, cfg)
     return _pymisha2df(result)
 
 
@@ -1410,7 +1455,8 @@ def _coerce_potts_model(model: Any, what: str) -> dict[str, Any]:
         )
     else:
         j_flat = _numpy.asarray(j_in, dtype=float)
-        if j_flat.ndim != 2 or j_flat.shape[0] != npair or (npair and j_flat.shape[1] != 16):
+        # every shape checked, also with no pairs (R's ncol test short-circuited there)
+        if j_flat.ndim != 2 or j_flat.shape[0] != npair or j_flat.shape[1] != 16:
             raise ValueError(f"{what}: a flat 'J' must be an {npair} x 16 numeric matrix")
         if not _numpy.isfinite(j_flat).all():
             raise ValueError(f"{what}: 'J' has non-finite entries")
@@ -1439,9 +1485,12 @@ def _coerce_potts_model(model: Any, what: str) -> dict[str, Any]:
     # PottsScorer::slid_answer() and anchor_value() can go on reading -inf as
     # "no anchor was scorable" instead of "the arithmetic overflowed", and so
     # that both entry points get it from the one validator they share.
-    worst = w * float(_numpy.abs(e).max()) + abs(intercept)
+    # The tight bound, as R: a window takes one energy per position and one
+    # coupling per pair, so sum each row's largest magnitude (W * max|e|
+    # overstated it by orders of magnitude and refused usable models).
+    worst = float(_numpy.abs(e).max(axis=1).sum()) + abs(intercept)
     if npair:
-        worst += npair * float(_numpy.abs(j_flat).max())
+        worst += float(_numpy.abs(j_flat).max(axis=1).sum())
     if not _numpy.isfinite(worst) or worst > _FLT_MAX:
         raise ValueError(
             f"{what}: the model's largest possible window score is {worst:.3g}, "

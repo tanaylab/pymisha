@@ -630,3 +630,23 @@ def test_gtrack_import_mappedseq_sparse_value_rparity(tmp_path):
         assert stats["total"]["total.dups"] == 2.0
     finally:
         pm.gdb_init(str(TEST_DB))
+
+
+@pytest.mark.parametrize("create", ["sparse", "dense"])
+@pytest.mark.parametrize("chrom,end,msg", [
+    ("chr7", 100, 'Chromosome "chr7" does not exist'),
+    ("chr2", 400000, "end coordinate exceeds chromosome boundaries"),
+])
+def test_gtrack_create_rejects_bad_chrom_or_end_like_r(tmp_path, create, chrom, end, msg):
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        iv = pd.DataFrame({"chrom": ["1", chrom, "2"], "start": [0, 0, 0], "end": [100, end, 100]})
+        with pytest.raises(ValueError, match=msg):
+            if create == "sparse":
+                pm.gtrack_create_sparse("bad_create", "", iv, [1.0, 2.0, 3.0])
+            else:
+                pm.gtrack_create_dense("bad_create", "", iv, [1.0, 2.0, 3.0], 10)
+        assert not pm.gtrack_exists("bad_create")
+    finally:
+        pm.gdb_init(str(TEST_DB))

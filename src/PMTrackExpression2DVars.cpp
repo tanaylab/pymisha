@@ -281,8 +281,9 @@ void PMTrackExpression2DVars::apply_agg_objects(
             case AGG_SAMPLE:
                 if (m == 0) continue;  // leave NaN
                 {
-                    std::uniform_int_distribution<size_t> dist(0, m - 1);
-                    result = static_cast<double>(qobj.vals[dist(m_rng)]);
+                    // not uniform_int_distribution, whose mapping differs
+                    // between C++ libraries (same seed, other values on macOS)
+                    result = static_cast<double>(qobj.vals[(size_t)(m_rng() % m)]);
                 }
                 break;
             default:

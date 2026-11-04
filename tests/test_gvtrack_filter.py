@@ -97,9 +97,12 @@ def test_gvtrack_filter_max_pos_abs_now_supported():
 
     query = pd.DataFrame({"chrom": ["chr1"], "start": [0], "end": [100]})
     result = pm.gextract("vt_filter_mpa", query, iterator=-1)
-    # Should return a value (the max is in [10, 100) which is unmasked)
+    # the position of the max over the unmasked [10, 100)
     val = float(result["vt_filter_mpa"].iloc[0])
-    assert not np.isnan(val) or True  # NaN is acceptable if no data in unmasked region
+    pm.gvtrack_create("vt_mpa_ref", "dense_track", func="max.pos.abs")
+    rest = pd.DataFrame({"chrom": ["chr1"], "start": [10], "end": [100]})
+    want = float(pm.gextract("vt_mpa_ref", rest, iterator=-1)["vt_mpa_ref"].iloc[0])
+    assert np.isfinite(want) and val == want
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +211,7 @@ def test_gvtrack_filter_quantile_partial_mask_matches_manual():
     raw_vals = raw_vals[~np.isnan(raw_vals)]
     expected_median = float(np.quantile(raw_vals, 0.5))
 
-    # Allow some tolerance due to streaming approximation vs exact
-    np.testing.assert_allclose(filtered_val, expected_median, rtol=0.15)
+    np.testing.assert_allclose(filtered_val, expected_median, rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -1422,3 +1424,36 @@ def test_gvtrack_filter_max_pos_relative_matches_abs_minus_start():
                 rel_vals[i], abs_vals[i] - starts[i], rtol=1e-8,
                 err_msg=f"Interval {i}: rel={rel_vals[i]} != abs={abs_vals[i]} - start={starts[i]}",
             )
+
+
+_PSSM = np.array([[0.7, 0.1, 0.1, 0.1], [0.1, 0.7, 0.1, 0.1], [0.1, 0.1, 0.7, 0.1], [0.1, 0.1, 0.1, 0.7]])
+
+
+@pytest.mark.parametrize("src,kw", [
+    ("dense_track", {"func": "max"}),
+    ("dense_track", {"func": "quantile", "params": 0.0}),
+    ("dense_track", {"func": "quantile", "params": 0.3}),
+    ("dense_track", {"func": "global.percentile"}),
+    ("dense_track", {"func": "global.percentile.min"}),
+    ("dense_track", {"func": "global.percentile.max"}),
+    (None, {"func": "kmer.count", "kmer": "CG"}),
+    (None, {"func": "kmer.frac", "kmer": "CG"}),
+    (None, {"func": "pwm", "pssm": _PSSM}),
+    (None, {"func": "pwm.max", "pssm": _PSSM}),
+    (None, {"func": "pwm.count", "pssm": _PSSM, "score_thresh": -6.0}),
+])
+def test_gvtrack_filter_mask_on_tail_equals_unfiltered_head(src, kw):
+    """With the mask over the interval's tail, the one unmasked part is the head,
+    so the filtered value must be the unfiltered value over the head - a check
+    that fails if the filter is dropped, unlike `notna().any()`."""
+    pm.gvtrack_clear()
+    pm.gvtrack_create("vt_f", src, **kw)
+    pm.gvtrack_create("vt_u", src, **kw)
+    pm.gvtrack_filter("vt_f", filter=pm.gintervals("chr1", 1500, 2000))
+    whole = pm.gintervals("chr1", 1000, 2000)
+    head = pm.gintervals("chr1", 1000, 1500)
+    got = pm.gextract("vt_f", whole, iterator=whole)["vt_f"].item()
+    want = pm.gextract("vt_u", head, iterator=head)["vt_u"].item()
+    pm.gvtrack_clear()
+    assert np.isfinite(want)
+    assert got == pytest.approx(want, rel=1e-6, abs=1e-9)

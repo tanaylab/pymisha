@@ -262,7 +262,7 @@ class TestGintervalsNeighborsEdgeCases:
         assert len(result) == 2
 
     def test_neighbors_sorted_by_query_then_distance(self):
-        """Results sorted by query interval, then by distance."""
+        """Results in query input order, then by distance, as in R."""
         intervs1 = make_intervals([
             ('1', 2000, 2100),  # query 2 (will be sorted after query 1)
             ('1', 1000, 1100),  # query 1
@@ -274,11 +274,11 @@ class TestGintervalsNeighborsEdgeCases:
             ('1', 2200, 2300),  # dist 100 from query 2
         ])
 
-        pm.gintervals_neighbors(intervs1, intervs2, maxneighbors=2)
+        result = pm.gintervals_neighbors(intervs1, intervs2, maxneighbors=2)
 
-        # Should be sorted by query, then distance
-        # Query 1 results first (sorted by chrom, start)
-        # Then query 2 results
+        # R misha 5.14.2: queries in input order, each one's neighbors by distance
+        assert result["qid"].tolist() == [2, 2, 1, 1]
+        assert result["dist"].tolist() == [100, 700, 50, 100]
 
 
 class TestGintervalsNeighborsDistanceCalculation:

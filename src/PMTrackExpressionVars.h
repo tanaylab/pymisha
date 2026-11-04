@@ -61,6 +61,7 @@ public:
 
         // Per-vtrack sequence fetcher (fork-safe: each vtrack owns its own)
         std::unique_ptr<GenomeSeqFetch> seqfetch;
+        int scorer_chromid{-1};     // chrom of the last scored interval
 
         // For value-based vtracks with a physical track source
         std::string src_track_name;
@@ -143,6 +144,13 @@ public:
     // this only with an explicit iterator; implicit iterator inference must
     // refuse it.
     bool has_mixed_track_types() const { return m_mixed_track_types; }
+    // a pwm / potts / kmer / masked vtrack (it reads sequence, has no bins)
+    bool has_sequence_vtracks() const {
+        for (const auto &v : m_vtrack_vars)
+            if (v.scorer)
+                return true;
+        return false;
+    }
 
     // Track path for the first track variable (for iterator selection)
     const std::string &first_track_path() const { return m_track_vars.front().track_path; }

@@ -294,7 +294,7 @@ def test_dataset_load_reload_idempotent(tmp_path):
         pm.gdataset_load(ds_path)
         assert "reload_track" in pm.gtrack_ls()
         # Should appear only once in the dataset list
-        assert pm.gdataset_ls().count(str(Path(ds_path).resolve())) == 1
+        assert pm.gdataset_ls()[1:].count(str(Path(ds_path).resolve())) == 1
     finally:
         pm.gdataset_unload(ds_path, validate=False)
 
@@ -314,7 +314,7 @@ def test_dataset_load_normalizes_paths(tmp_path):
     try:
         pm.gdataset_load(ds_path)
         norm = str(Path(ds_path).resolve())
-        assert norm in pm.gdataset_ls()
+        assert norm in pm.gdataset_ls()[1:]
         # Reload with resolved path should not error
         pm.gdataset_load(norm)
         assert "norm_track" in pm.gtrack_ls()
@@ -535,7 +535,7 @@ def test_dataset_unload_restores_shadowed_in_load_order(tmp_path):
 
 def test_dataset_ls_empty_initially():
     """gdataset_ls returns empty list when no datasets are loaded."""
-    assert pm.gdataset_ls() == []
+    assert pm.gdataset_ls()[1:] == []
 
 
 def test_dataset_ls_tracks_loaded_datasets(tmp_path):
@@ -544,12 +544,12 @@ def test_dataset_ls_tracks_loaded_datasets(tmp_path):
     ds2_path = _make_dataset(tmp_path, "ds_ls2", track_names=["ls_trk2"])
     try:
         pm.gdataset_load(ds1_path)
-        loaded = pm.gdataset_ls()
+        loaded = pm.gdataset_ls()[1:]
         assert len(loaded) == 1
         assert str(Path(ds1_path).resolve()) in loaded
 
         pm.gdataset_load(ds2_path)
-        loaded = pm.gdataset_ls()
+        loaded = pm.gdataset_ls()[1:]
         assert len(loaded) == 2
         assert str(Path(ds1_path).resolve()) in loaded
         assert str(Path(ds2_path).resolve()) in loaded
@@ -563,9 +563,9 @@ def test_dataset_ls_after_unload(tmp_path):
     ds_path = _make_dataset(tmp_path, "ds_ls_unload", track_names=["ls_unload_trk"])
     try:
         pm.gdataset_load(ds_path)
-        assert len(pm.gdataset_ls()) == 1
+        assert len(pm.gdataset_ls()[1:]) == 1
         pm.gdataset_unload(ds_path)
-        assert len(pm.gdataset_ls()) == 0
+        assert len(pm.gdataset_ls()[1:]) == 0
     finally:
         pm.gdataset_unload(ds_path, validate=False)
 
@@ -782,7 +782,7 @@ def test_multiple_datasets_simultaneous(tmp_path):
     try:
         for p in paths:
             pm.gdataset_load(p)
-        loaded = pm.gdataset_ls()
+        loaded = pm.gdataset_ls()[1:]
         assert len(loaded) == 3
         tracks = pm.gtrack_ls()
         for i in range(3):
@@ -811,7 +811,7 @@ def test_dataset_save_load_use_roundtrip(tmp_path):
     # Load the dataset (will collide with working DB, use force)
     pm.gdataset_load(str(ds_path), force=True)
     try:
-        assert str(ds_path.resolve()) in pm.gdataset_ls()
+        assert str(ds_path.resolve()) in pm.gdataset_ls()[1:]
         info = pm.gdataset_info(str(ds_path))
         assert info["is_loaded"] is True
         assert info["description"] == "Workflow test"
@@ -852,3 +852,67 @@ def test_gdb_reload_invalidates_dataset_scan_cache():
         )
     finally:
         pm.gdb_init(str(TEST_DB))
+
+
+# ==============================================================================
+# R test-dataset.R: gdataset.ls (:775, :784), gtrack.dataset on vectors (:925),
+# gtrack.ls / gintervals.ls with db (:1036, :1065)
+# ==============================================================================
+
+
+def test_dataset_ls_lists_the_working_db_first(tmp_path):
+    ds = _make_dataset(tmp_path, "ds_r_ls", track_names=["r_ls_trk"])
+    try:
+        pm.gdataset_load(ds)
+        assert pm.gdataset_ls() == [pm._shared._GROOT, str(Path(ds).resolve())]
+    finally:
+        pm.gdataset_unload(ds, validate=False)
+
+
+def test_dataset_ls_dataframe(tmp_path):
+    ds = _make_dataset(tmp_path, "ds_r_df", track_names=["r_df_trk"], interval_names=["r_df_iv"])
+    try:
+        pm.gdataset_load(ds)
+        df = pm.gdataset_ls(dataframe=True)
+        assert list(df.columns) == ["path", "tracks_total", "tracks_visible", "intervals_total",
+                                    "intervals_visible", "has_metadata", "writable"]
+        assert df["path"].tolist() == pm.gdataset_ls()
+        assert df["writable"].tolist() == [True, False]
+        counts = ["tracks_total", "tracks_visible", "intervals_total", "intervals_visible"]
+        assert df.iloc[1][counts].tolist() == [1, 1, 1, 1]
+        assert df.iloc[0]["tracks_visible"] == len(pm.gtrack_ls()) - 1
+        assert df.iloc[0]["intervals_visible"] == len(pm.gintervals_ls()) - 1
+        assert not df.iloc[1]["has_metadata"]
+    finally:
+        pm.gdataset_unload(ds, validate=False)
+
+
+def test_gtrack_and_gintervals_dataset_on_lists(tmp_path):
+    ds = _make_dataset(tmp_path, "ds_r_vec", track_names=["r_vec_trk"], interval_names=["r_vec_iv"])
+    try:
+        pm.gdataset_load(ds)
+        ds_norm = str(Path(ds).resolve())
+        groot = pm._shared._GROOT
+        assert pm.gtrack_dataset(["dense_track", "r_vec_trk", "nonexistent"]) == [groot, ds_norm, None]
+        assert pm.gintervals_dataset(["annotations", "r_vec_iv", "nonexistent"]) == [groot, ds_norm, None]
+    finally:
+        pm.gdataset_unload(ds, validate=False)
+
+
+def test_ls_filters_by_db(tmp_path, monkeypatch):
+    ds = _make_dataset(tmp_path, "ds_r_db", track_names=["r_db_trk"], interval_names=["r_db_iv"])
+    try:
+        pm.gdataset_load(ds)
+        groot = pm._shared._GROOT
+        working = pm.gtrack_ls(db=groot)
+        assert "dense_track" in working and "r_db_trk" not in working
+        assert pm.gtrack_ls(db=ds) == ["r_db_trk"]
+        monkeypatch.chdir(tmp_path)
+        assert pm.gtrack_ls(db="ds_r_db") == ["r_db_trk"]  # a relative path, normalized
+        assert pm.gtrack_ls("r_db", db=groot) is None
+        assert "annotations" in pm.gintervals_ls(db=groot)
+        assert "r_db_iv" not in pm.gintervals_ls(db=groot)
+        assert pm.gintervals_ls(db=ds) == ["r_db_iv"]
+        assert pm.gintervals_ls(db=str(tmp_path / "elsewhere")) == []
+    finally:
+        pm.gdataset_unload(ds, validate=False)

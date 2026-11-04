@@ -49,8 +49,9 @@ def gdb_init(path: str, userpath: str | None = None):
     path : str
         Path to the root directory of the genome database.
     userpath : str, optional
-        Path to a user-writable database root. New tracks and interval
-        sets will be created here. If None, defaults to ``path``.
+        Path to a user-writable database root. New tracks are created
+        here; interval sets are still saved under ``path``, as in misha.
+        If None, defaults to ``path``.
 
     Returns
     -------
@@ -68,7 +69,10 @@ def gdb_init(path: str, userpath: str | None = None):
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()  # initializes a real test DB
     """
-    db_path = Path(path).expanduser()
+    # absolute, so an os.chdir() later doesn't move the database
+    db_path = Path(os.path.abspath(Path(path).expanduser()))
+    if userpath:
+        userpath = os.path.abspath(Path(userpath).expanduser())
     if not db_path.exists():
         raise FileNotFoundError(f"Database path does not exist: {path}")
     # The database is read and checked first (its chromosomes, and its seq/genome.idx

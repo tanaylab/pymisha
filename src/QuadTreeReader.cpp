@@ -18,7 +18,7 @@ static constexpr int MAX_DEPTH = 100000;
 // -------------------------------------------------------------------
 // Helper: resolve kid pointer to (chunk_fpos, node_offset)
 // -------------------------------------------------------------------
-static inline void resolve_kid(const char *buf, int64_t chunk_fpos,
+static inline void resolve_kid(const char *buf, size_t len, int64_t chunk_fpos,
                                 int64_t kid_ptr,
                                 int64_t &out_chunk_fpos,
                                 int64_t &out_node_offset) {
@@ -30,15 +30,28 @@ static inline void resolve_kid(const char *buf, int64_t chunk_fpos,
         // Negative: absolute file position of another chunk
         int64_t cross_chunk_fpos = -kid_ptr;
         out_chunk_fpos = cross_chunk_fpos;
-        out_node_offset = get_chunk_top_node_offset(buf, cross_chunk_fpos);
+        out_node_offset = get_chunk_top_node_offset(buf, len, cross_chunk_fpos);
     }
 }
 
 // -------------------------------------------------------------------
 // Helper: read NodeBase at absolute offset
 // -------------------------------------------------------------------
-static inline const NodeBase *read_node_base(const char *buf, int64_t abs_offset) {
+static inline const NodeBase *read_node_base(const char *buf, size_t len, int64_t abs_offset) {
+    need_bytes(len, abs_offset, sizeof(NodeBase));
     return reinterpret_cast<const NodeBase *>(buf + abs_offset);
+}
+
+static inline const Leaf *read_leaf(const char *buf, size_t len, int64_t abs_offset, bool is_points) {
+    need_bytes(len, abs_offset, sizeof(Leaf));
+    const Leaf *leaf = reinterpret_cast<const Leaf *>(buf + abs_offset);
+    need_bytes(len, abs_offset, sizeof(Leaf) + (size_t)leaf->num_objs * (is_points ? sizeof(PointObj) : sizeof(RectObj)));
+    return leaf;
+}
+
+static inline const Node *read_node(const char *buf, size_t len, int64_t abs_offset) {
+    need_bytes(len, abs_offset, sizeof(Node));
+    return reinterpret_cast<const Node *>(buf + abs_offset);
 }
 
 // -------------------------------------------------------------------
@@ -91,13 +104,13 @@ void query_stats_node(const char *buf, size_t len,
     if (depth > MAX_DEPTH) return;
 
     int64_t abs_offset = chunk_fpos + node_offset;
-    const NodeBase *nb = read_node_base(buf, abs_offset);
+    const NodeBase *nb = read_node_base(buf, len, abs_offset);
 
     // Prune: no intersection with query
     if (!nb->arena.do_intersect(query)) return;
 
     if (nb->is_leaf) {
-        const Leaf *leaf = reinterpret_cast<const Leaf *>(buf + abs_offset);
+        const Leaf *leaf = read_leaf(buf, len, abs_offset, is_points);
         const char *objs_ptr = buf + abs_offset + sizeof(Leaf);
 
         if (is_points) {
@@ -137,14 +150,14 @@ void query_stats_node(const char *buf, size_t len,
         }
     } else {
         // Internal node: check each child quadrant
-        const Node *node = reinterpret_cast<const Node *>(buf + abs_offset);
+        const Node *node = read_node(buf, len, abs_offset);
         for (int iquad = 0; iquad < NUM_QUADS; ++iquad) {
             int64_t kid_chunk, kid_offset;
-            resolve_kid(buf, chunk_fpos, node->kid_ptr[iquad],
+            resolve_kid(buf, len, chunk_fpos, node->kid_ptr[iquad],
                         kid_chunk, kid_offset);
 
             int64_t kid_abs = kid_chunk + kid_offset;
-            const NodeBase *kid_nb = read_node_base(buf, kid_abs);
+            const NodeBase *kid_nb = read_node_base(buf, len, kid_abs);
 
             // Skip if child doesn't intersect query
             if (!kid_nb->arena.do_intersect(query)) continue;
@@ -177,13 +190,13 @@ void query_stats_node_band(const char *buf, size_t len,
     if (depth > MAX_DEPTH) return;
 
     int64_t abs_offset = chunk_fpos + node_offset;
-    const NodeBase *nb = read_node_base(buf, abs_offset);
+    const NodeBase *nb = read_node_base(buf, len, abs_offset);
 
     // Prune: no intersection with query
     if (!nb->arena.do_intersect(query)) return;
 
     if (nb->is_leaf) {
-        const Leaf *leaf = reinterpret_cast<const Leaf *>(buf + abs_offset);
+        const Leaf *leaf = read_leaf(buf, len, abs_offset, is_points);
         const char *objs_ptr = buf + abs_offset + sizeof(Leaf);
 
         if (is_points) {
@@ -228,14 +241,14 @@ void query_stats_node_band(const char *buf, size_t len,
         }
     } else {
         // Internal node
-        const Node *node = reinterpret_cast<const Node *>(buf + abs_offset);
+        const Node *node = read_node(buf, len, abs_offset);
         for (int iquad = 0; iquad < NUM_QUADS; ++iquad) {
             int64_t kid_chunk, kid_offset;
-            resolve_kid(buf, chunk_fpos, node->kid_ptr[iquad],
+            resolve_kid(buf, len, chunk_fpos, node->kid_ptr[iquad],
                         kid_chunk, kid_offset);
 
             int64_t kid_abs = kid_chunk + kid_offset;
-            const NodeBase *kid_nb = read_node_base(buf, kid_abs);
+            const NodeBase *kid_nb = read_node_base(buf, len, kid_abs);
 
             if (!kid_nb->arena.do_intersect(query)) continue;
 
@@ -283,13 +296,13 @@ void query_objects_node(const char *buf, size_t len,
     if (depth > MAX_DEPTH) return;
 
     int64_t abs_offset = chunk_fpos + node_offset;
-    const NodeBase *nb = read_node_base(buf, abs_offset);
+    const NodeBase *nb = read_node_base(buf, len, abs_offset);
 
     // Prune: no intersection with query
     if (!nb->arena.do_intersect(query)) return;
 
     if (nb->is_leaf) {
-        const Leaf *leaf = reinterpret_cast<const Leaf *>(buf + abs_offset);
+        const Leaf *leaf = read_leaf(buf, len, abs_offset, is_points);
         const char *objs_ptr = buf + abs_offset + sizeof(Leaf);
 
         if (is_points) {
@@ -327,14 +340,14 @@ void query_objects_node(const char *buf, size_t len,
             }
         }
     } else {
-        const Node *node = reinterpret_cast<const Node *>(buf + abs_offset);
+        const Node *node = read_node(buf, len, abs_offset);
         for (int iquad = 0; iquad < NUM_QUADS; ++iquad) {
             int64_t kid_chunk, kid_offset;
-            resolve_kid(buf, chunk_fpos, node->kid_ptr[iquad],
+            resolve_kid(buf, len, chunk_fpos, node->kid_ptr[iquad],
                         kid_chunk, kid_offset);
 
             int64_t kid_abs = kid_chunk + kid_offset;
-            const NodeBase *kid_nb = read_node_base(buf, kid_abs);
+            const NodeBase *kid_nb = read_node_base(buf, len, kid_abs);
 
             // Object queries must reach every spatially-overlapping subtree
             // that holds objects, whatever its stored stats say (a file
@@ -346,7 +359,7 @@ void query_objects_node(const char *buf, size_t len,
             // when spatially relevant.
             if (!kid_nb->arena.do_intersect(query)) continue;
             if (kid_nb->is_leaf) {
-                const Leaf *kid_leaf = reinterpret_cast<const Leaf *>(buf + kid_abs);
+                const Leaf *kid_leaf = read_leaf(buf, len, kid_abs, is_points);
                 if (kid_leaf->num_objs == 0) continue;
             }
             query_objects_node(buf, len, kid_chunk, kid_offset,
@@ -369,12 +382,12 @@ void query_objects_node_band(const char *buf, size_t len,
     if (depth > MAX_DEPTH) return;
 
     int64_t abs_offset = chunk_fpos + node_offset;
-    const NodeBase *nb = read_node_base(buf, abs_offset);
+    const NodeBase *nb = read_node_base(buf, len, abs_offset);
 
     if (!nb->arena.do_intersect(query)) return;
 
     if (nb->is_leaf) {
-        const Leaf *leaf = reinterpret_cast<const Leaf *>(buf + abs_offset);
+        const Leaf *leaf = read_leaf(buf, len, abs_offset, is_points);
         const char *objs_ptr = buf + abs_offset + sizeof(Leaf);
 
         if (is_points) {
@@ -422,20 +435,20 @@ void query_objects_node_band(const char *buf, size_t len,
             }
         }
     } else {
-        const Node *node = reinterpret_cast<const Node *>(buf + abs_offset);
+        const Node *node = read_node(buf, len, abs_offset);
         for (int iquad = 0; iquad < NUM_QUADS; ++iquad) {
             int64_t kid_chunk, kid_offset;
-            resolve_kid(buf, chunk_fpos, node->kid_ptr[iquad],
+            resolve_kid(buf, len, chunk_fpos, node->kid_ptr[iquad],
                         kid_chunk, kid_offset);
 
             int64_t kid_abs = kid_chunk + kid_offset;
-            const NodeBase *kid_nb = read_node_base(buf, kid_abs);
+            const NodeBase *kid_nb = read_node_base(buf, len, kid_abs);
 
             // See query_objects_node: prune on num_objs (cheap, on disk)
             // for leaves rather than occupied_area.
             if (!kid_nb->arena.do_intersect(query)) continue;
             if (kid_nb->is_leaf) {
-                const Leaf *kid_leaf = reinterpret_cast<const Leaf *>(buf + kid_abs);
+                const Leaf *kid_leaf = read_leaf(buf, len, kid_abs, is_points);
                 if (kid_leaf->num_objs == 0) continue;
             }
             // Check if child arena intersects band at all
@@ -459,7 +472,7 @@ QueryStat query_stats(const char *buf, size_t len,
                       int64_t qx1, int64_t qy1, int64_t qx2, int64_t qy2,
                       const DiagonalBand *band) {
     QueryStat stat;
-    int64_t top_node_offset = get_chunk_top_node_offset(buf, root_chunk_fpos);
+    int64_t top_node_offset = get_chunk_top_node_offset(buf, len, root_chunk_fpos);
 
     Rectangle query = {qx1, qy1, qx2, qy2};
 
@@ -482,7 +495,7 @@ QueryObjects query_objects(const char *buf, size_t len,
                            const DiagonalBand *band) {
     QueryObjects result;
     std::unordered_set<uint64_t> seen_ids;
-    int64_t top_node_offset = get_chunk_top_node_offset(buf, root_chunk_fpos);
+    int64_t top_node_offset = get_chunk_top_node_offset(buf, len, root_chunk_fpos);
 
     Rectangle query = {qx1, qy1, qx2, qy2};
 
@@ -510,7 +523,7 @@ BatchQueryStats query_stats_batch(const char *buf, size_t len,
     BatchQueryStats result;
     result.resize(n);
 
-    int64_t top_node_offset = get_chunk_top_node_offset(buf, root_chunk_fpos);
+    int64_t top_node_offset = get_chunk_top_node_offset(buf, len, root_chunk_fpos);
 
     for (size_t i = 0; i < n; ++i) {
         int64_t qx1 = rects[i * 4 + 0];

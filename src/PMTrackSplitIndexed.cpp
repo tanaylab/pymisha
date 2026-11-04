@@ -21,6 +21,7 @@
 #include <Python.h>
 
 #include "CRC64.h"
+#include "GenomeTrack.h"
 #include "TGLException.h"
 #include "TrackIndex.h"
 #include "pymisha.h"
@@ -103,8 +104,15 @@ PyObject *pm_track_split_indexed_to_per_chrom(PyObject *self, PyObject *args)
             }
 
             // Length=0 entries arise when the source had no per-chrom file at convert time.
-            // We still touch an output file (atomic via tmp+rename) so that downstream
-            // per-chrom invariants hold, but we write zero bytes.
+            // A per-chrom reader needs at least the format signature, so an empty sparse
+            // chrom gets a signature-only file (a 0-byte one is "Invalid format").
+            if (entry.length == 0 && idx.get_track_type() == MishaTrackType::SPARSE) {
+                const int32_t sig = GenomeTrack::FORMAT_SIGNATURES[GenomeTrack::SPARSE];
+                if (fwrite(&sig, sizeof(sig), 1, out_fp) != 1) {
+                    fclose(out_fp); fclose(dat_fp);
+                    verror("Failed to write %s: %s", out_path_tmp.c_str(), strerror(errno));
+                }
+            }
             if (entry.length > 0) {
                 if (fseeko(dat_fp, (off_t)entry.offset, SEEK_SET) != 0) {
                     fclose(out_fp); fclose(dat_fp);
@@ -131,9 +139,18 @@ PyObject *pm_track_split_indexed_to_per_chrom(PyObject *self, PyObject *args)
 
             // Per-file fsync + atomic rename: each per-chrom file is canonical db state;
             // accept N fsyncs (one per contig) for crash-safe individual files.
-            fflush(out_fp);
-            fsync(fileno(out_fp));
-            fclose(out_fp);
+            // A full disk shows up at flush or close: check before the rename,
+            // and before the source is removed below.
+            bool write_ok = fflush(out_fp) == 0 && fsync(fileno(out_fp)) == 0;
+            int write_errno = errno;
+            if (fclose(out_fp) != 0 && write_ok) {
+                write_ok = false;
+                write_errno = errno;
+            }
+            if (!write_ok) {
+                fclose(dat_fp);
+                verror("Failed to write %s: %s", out_path_tmp.c_str(), strerror(write_errno));
+            }
 
             if (rename(out_path_tmp.c_str(), out_path.c_str()) != 0) {
                 fclose(dat_fp);
@@ -317,23 +334,28 @@ PyObject *pm_track_pack_per_chrom_to_indexed(PyObject *self, PyObject *args)
             verror("Failed to update checksum");
         }
 
-        fflush(dat_fp); fflush(idx_fp);
-        fsync(fileno(dat_fp)); fsync(fileno(idx_fp));
-        fclose(dat_fp); fclose(idx_fp);
+        // A full disk shows up at flush or close; check it, and the size, while
+        // the result is still in the tmp files.
+        bool write_ok = fflush(dat_fp) == 0 && fflush(idx_fp) == 0 &&
+                        fsync(fileno(dat_fp)) == 0 && fsync(fileno(idx_fp)) == 0;
+        int write_errno = errno;
+        if (fclose(dat_fp) != 0 && write_ok) { write_ok = false; write_errno = errno; }
+        if (fclose(idx_fp) != 0 && write_ok) { write_ok = false; write_errno = errno; }
+        if (!write_ok)
+            verror("Failed to write %s: %s", dat_path_tmp.c_str(), strerror(write_errno));
+
+        struct stat dat_stat;
+        if (stat(dat_path_tmp.c_str(), &dat_stat) != 0)
+            verror("Failed to stat %s after pack: %s", dat_path_tmp.c_str(), strerror(errno));
+        if ((uint64_t)dat_stat.st_size != current_offset)
+            verror("track.dat size mismatch after pack: expected %llu bytes, got %llu bytes",
+                   (unsigned long long)current_offset,
+                   (unsigned long long)dat_stat.st_size);
 
         if (rename(dat_path_tmp.c_str(), dat_path.c_str()) != 0)
             verror("Failed to rename %s to %s: %s", dat_path_tmp.c_str(), dat_path.c_str(), strerror(errno));
         if (rename(idx_path_tmp.c_str(), idx_path.c_str()) != 0)
             verror("Failed to rename %s to %s: %s", idx_path_tmp.c_str(), idx_path.c_str(), strerror(errno));
-
-        // Validate track.dat size matches what we wrote, before destroying source files.
-        struct stat dat_stat;
-        if (stat(dat_path.c_str(), &dat_stat) != 0)
-            verror("Failed to stat %s after pack: %s", dat_path.c_str(), strerror(errno));
-        if ((uint64_t)dat_stat.st_size != current_offset)
-            verror("track.dat size mismatch after pack: expected %llu bytes, got %llu bytes",
-                   (unsigned long long)current_offset,
-                   (unsigned long long)dat_stat.st_size);
 
         // Note: per-chrom files are NOT removed. pymisha's set_vars dispatcher
         // currently checks per-chrom-file existence before delegating to the

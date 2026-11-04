@@ -102,7 +102,6 @@ class TestGsegmentEdgeCases:
 
     def test_intervals_set_out(self):
         """gsegment with intervals_set_out saves result and returns None."""
-        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         intervals = pm.gintervals(1, 0, 200000)
         set_name = "test.tmp_gsegment_out"
         try:
@@ -184,7 +183,6 @@ class TestGsegmentRParity:
 
     def test_gsegment_sparse_with_iterator_and_intervals_set_out(self):
         """Port of: gsegment with data size option and sampling for test.sparse."""
-        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         set_name = "test.tmp_gsegment_sparse_parity"
         try:
             pm.gsegment(

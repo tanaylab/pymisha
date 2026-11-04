@@ -9,14 +9,16 @@ inputs, exact R expected outputs.
 ``assert_matches_baseline`` is the normalizing comparator. Normalizations
 (learned from the code-review sweep, see docs/superpowers/PORTING_R_TESTS.md):
 
-* chrom columns -> ``str`` (R factor vs pymisha str/categorical).
+* chrom columns -> ``str`` (R factor vs pymisha str/categorical), names unchanged.
 * coordinate columns -> ``int64`` (R stores start/end as float, pymisha int).
-* ``intervalID`` -> rebased to its own minimum before compare (R is 1-based,
-  pymisha 0-based; rebasing preserves the grouping structure either way).
+* ``intervalID`` -> rebased to its own minimum, then compared (R is 1-based,
+  some pymisha functions 0-based).
 * expression value column names differ (``"a + b"`` sanitized differently) ->
   matched positionally, not by name.
 * sort by ``(chrom, start, end[, chrom2, start2, end2])`` before compare.
-* NaN-aware numeric compare (``equal_nan=True``) at relative tolerance 1e-5.
+* NaN-aware numeric compare (``equal_nan=True``) at relative tolerance 1e-5
+  (absolute 1e-12, so small values such as p-values are checked).
+* matrices / arrays compared column-major (R's storage order) only.
 * non-DataFrame baselines (vectors / lists) -> element-wise, order-preserving.
 """
 
@@ -93,19 +95,22 @@ def _coord_schema(df: pd.DataFrame) -> tuple[str, ...] | None:
     return None
 
 
-def _normalize_df(df: pd.DataFrame, coords: tuple[str, ...]) -> pd.DataFrame:
+def _normalize_df(df: pd.DataFrame, coords: tuple[str, ...], with_id: bool = False) -> pd.DataFrame:
     df = df.copy()
     for c in df.columns:
         if c in _CHROM_COLS or c.startswith("chrom"):
-            # Normalize chrom naming: R baselines store 'chr1'; pymisha may return
-            # '1' (per-chrom DB) or 'chr1' (indexed DB). Strip the prefix on both
-            # sides so the comparison is prefix-agnostic.  Also covers R's
-            # ``make.unique``-suffixed chrom columns (``chrom11``, ``chrom21``)
-            # that arise when 2D ``gintervals_neighbors`` cbinds two 2D sets.
-            df[c] = df[c].astype(str).str.replace(r"^chr", "", regex=True)
+            # Compared as strings, prefix included: a regression to alias names
+            # ("1" for chr1) must show. Also covers R's ``make.unique``-suffixed
+            # chrom columns (``chrom11``, ``chrom21``) from 2D neighbors.
+            df[c] = df[c].astype(str)
         elif c in _INT_COORD_COLS:
             df[c] = df[c].astype(np.int64)
-    return df.sort_values(list(coords), kind="mergesort").reset_index(drop=True)
+    keys = list(coords)
+    if with_id:
+        # R's intervalID is 1-based, some of pymisha's 0-based: rebase both
+        df["intervalID"] = df["intervalID"].astype(np.int64) - int(df["intervalID"].min())
+        keys.append("intervalID")
+    return df.sort_values(keys, kind="mergesort").reset_index(drop=True)
 
 
 def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, tol: float) -> None:
@@ -122,8 +127,11 @@ def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, t
             f"pymisha result has columns {list(py.columns)}"
         )
 
-    p = _normalize_df(py, coords)
-    b = _normalize_df(base, coords)
+    with_id = ("intervalID" in py.columns and "intervalID" in base.columns
+               and len(py) > 0 and len(base) > 0
+               and py["intervalID"].notna().all() and base["intervalID"].notna().all())
+    p = _normalize_df(py, coords, with_id)
+    b = _normalize_df(base, coords, with_id)
 
     if len(p) != len(b):
         raise AssertionError(
@@ -139,10 +147,8 @@ def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, t
             if not (p[c].to_numpy() == b[c].to_numpy()).all():
                 _raise_first_diff(p, b, c, baseline_id)
 
-    # intervalID is order-dependent bookkeeping (R is 1-based, pymisha 0-based;
-    # and its exact values depend on input/scope ordering, which legitimately
-    # differs between implementations). It is not part of the extracted data, so
-    # it is intentionally not asserted here - coordinates and values are.
+    if with_id and not (p["intervalID"].to_numpy() == b["intervalID"].to_numpy()).all():
+        _raise_first_diff(p, b, "intervalID", baseline_id)
 
     # value columns: everything that isn't a coord or intervalID, matched
     # positionally (R and pymisha sanitize expression column names differently).
@@ -182,8 +188,8 @@ def _assert_df_positional(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str
         py = py.copy()
         base = base.copy()
         for c in sort_cols:
-            py[c] = py[c].astype(str).str.replace(r"^chr", "", regex=True)
-            base[c] = base[c].astype(str).str.replace(r"^chr", "", regex=True)
+            py[c] = py[c].astype(str)
+            base[c] = base[c].astype(str)
         py = py.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
         base = base.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     for i in range(base.shape[1]):
@@ -240,7 +246,9 @@ def _assert_numeric_close(
         raise AssertionError(
             f"[{baseline_id}] {what}: shape differs pymisha={p.shape} vs R={b.shape}"
         )
-    if not np.allclose(p, b, rtol=tol, atol=tol, equal_nan=True):
+    # atol tiny, not tol: with atol=1e-5 any value below ~1e-5 (every p-value of
+    # a wilcox baseline) went unchecked.
+    if not np.allclose(p, b, rtol=tol, atol=1e-12, equal_nan=True):
         diff = np.abs(p - b)
         # ignore NaN-matched positions
         both_nan = np.isnan(p) & np.isnan(b)
@@ -331,12 +339,15 @@ def assert_matches_baseline(py_obj: Any, baseline_id: str, *, tol: float = _RTOL
     # vector / scalar baseline
     b = _coerce_vector(base)
     p = _coerce_vector(py_obj)
-    # R flattens matrices column-major; pymisha returns row-major 2D results.
-    # If the row-major flatten doesn't match, retry with column-major order.
-    is_2d = (
-        isinstance(py_obj, pd.DataFrame) and py_obj.shape[1] > 1
-    ) or (isinstance(py_obj, np.ndarray) and py_obj.ndim == 2)
-    if is_2d and p.shape == b.shape and not np.allclose(p, b, rtol=tol, atol=tol, equal_nan=True):
-        arr = py_obj.to_numpy(dtype=float) if isinstance(py_obj, pd.DataFrame) else py_obj.astype(float)
-        p = arr.ravel(order="F")
+    # R stores a matrix / array column-major: compare in that order only. (The
+    # old "row-major, else column-major" retry let a transposed result pass.)
+    if isinstance(py_obj, np.ndarray) and py_obj.ndim >= 2:
+        dim = (getattr(base, "attributes", None) or {}).get("dim")
+        if dim is not None and tuple(int(d) for d in dim) != py_obj.shape:
+            raise AssertionError(
+                f"[{baseline_id}] array shape differs: pymisha={py_obj.shape} vs R={tuple(int(d) for d in dim)}"
+            )
+        p = py_obj.astype(float).ravel(order="F")
+    elif isinstance(py_obj, pd.DataFrame) and py_obj.shape[1] > 1:
+        p = py_obj.to_numpy(dtype=float).ravel(order="F")  # an R matrix: by column
     _assert_numeric_close(p, b, tol, baseline_id, "vector")

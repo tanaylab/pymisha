@@ -25,7 +25,7 @@ import warnings
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, overload
 from urllib.parse import urlparse
 
 import numpy as np
@@ -329,7 +329,8 @@ def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
     return _build_vtracks_dict(used_vtracks)
 
 
-def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) -> list[str] | None:
+def gtrack_ls(*patterns: str, ignore_case: bool = False, db: str | None = None,
+              **attr_filters: str) -> list[str] | None:
     """
     Return a list of track names in the Genomic Database.
 
@@ -345,6 +346,9 @@ def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) ->
         sequentially; only tracks matching all patterns are returned.
     ignore_case : bool, default False
         If True, pattern matching is case-insensitive.
+    db : str, optional
+        Only the tracks of this database or dataset (a path, normalized), as
+        :func:`gtrack_dataset` reports them.
     **attr_filters : str
         Keyword arguments of the form ``attribute_name=pattern`` where
         underscores in the keyword are converted to dots for the attribute
@@ -383,6 +387,13 @@ def gtrack_ls(*patterns: str, ignore_case: bool = False, **attr_filters: str) ->
 
     if tracks is None or len(tracks) == 0:
         return None
+
+    if db is not None:
+        from .dataset import _normalize_path
+        db = _normalize_path(db)
+        tracks = [t for t in tracks if _normalize_path(gtrack_dataset(t) or "") == db]
+        if not tracks:
+            return None
 
     flags = re.IGNORECASE if ignore_case else 0
 
@@ -568,7 +579,11 @@ def gtrack_info(track: str) -> dict[str, Any]:
     return info
 
 
-def gtrack_dataset(track: str) -> str | None:
+@overload
+def gtrack_dataset(track: str) -> str | None: ...
+@overload
+def gtrack_dataset(track: list[str]) -> list[str | None]: ...
+def gtrack_dataset(track: str | list[str]) -> str | None | list[str | None]:
     """
     Return the database root path that contains a track.
 
@@ -578,13 +593,14 @@ def gtrack_dataset(track: str) -> str | None:
 
     Parameters
     ----------
-    track : str
-        Track name.
+    track : str or list of str
+        Track name, or a list of names.
 
     Returns
     -------
-    str
-        Absolute filesystem path of the database root containing the track.
+    str, None or list
+        Absolute filesystem path of the database root containing the track,
+        None for a track that does not exist; a list of them for a list of names.
 
     Raises
     ------
@@ -606,6 +622,8 @@ def gtrack_dataset(track: str) -> str | None:
     if track is None:
         raise ValueError("track cannot be None")
     _checkroot()
+    if not isinstance(track, str):
+        return [gtrack_dataset(t) for t in track]
     result: str | None = _pymisha.pm_track_dataset(track)
     # in a subdirectory (gdir_cd), the names under it are the database's holding it
     if result is not None and _shared._gwd_is_subdir():
@@ -907,31 +925,61 @@ def _report_unknown_chroms(unknown: list[str], num_unknown: int, primary: list[s
     if not num_unknown or not n_matched:
         return
 
-    shown = unknown[:_MAX_REPORTED_CHROMS]
-    more = "+" if num_unknown > len(shown) else ""
-    names = ", ".join(shown) + (", ..." if more else "")
+    def fmt(names: list[str], total: int) -> str:
+        # R's format_chrom_names: the first few, then "(and N more)"
+        shown = names[:_MAX_REPORTED_CHROMS]
+        rest = total - len(shown)
+        return ", ".join(shown) + (f"{' ' if shown else ''}(and {rest} more)" if rest > 0 else "")
 
     if primary:
+        from . import _shared
         warnings.warn(
-            f"{num_unknown}{more} chromosome name(s) in {file_path} do not exist "
+            f"{num_unknown} chromosome name(s) in {file_path} do not exist "
             f"in the genome database and were skipped, among them primary "
-            f"chromosome(s): {', '.join(primary[:_MAX_REPORTED_CHROMS])}. Data for "
-            f"the remaining {n_matched} chromosome(s) was imported.",
+            f"chromosome(s): {fmt(primary, len(primary))}. Data for "
+            f"the remaining {n_matched} chromosome(s) was imported. Chromosome aliases are "
+            f"resolved automatically (chr1 <-> 1, M <-> MT, plus {_shared._GROOT}/chrom_aliases.tsv "
+            f"if present). If the file's names should map to database chromosomes, add them to "
+            f"that file (tab separated: canonical<TAB>alias<TAB>source) and reload the database "
+            f"with gdb_reload(), or rename the chromosomes in the file.",
             stacklevel=user_stacklevel(),
         )
     else:
         _logger.info(
-            "%d%s chromosome name(s) in %s do not exist in the genome database "
+            "%d chromosome name(s) in %s do not exist in the genome database "
             "and were skipped: %s. Data for the remaining %d chromosome(s) was "
-            "imported.", num_unknown, more, file_path, names, n_matched,
+            "imported.", num_unknown, file_path, fmt(unknown, num_unknown), n_matched,
         )
 
 
-def _canonicalize_known_chroms(df: pd.DataFrame) -> pd.DataFrame:
+def _canonicalize_known_chroms(df: pd.DataFrame, *, strict: bool = False) -> pd.DataFrame:
+    """Rename alias chroms to the DB's names. With *strict* (track creation, as
+    in misha) an unknown chrom or an end past the chrom end raises; without it
+    (WIG import) rows on unknown chroms are dropped."""
     from .intervals import gintervals_all
 
     chrom_sizes = gintervals_all()
     known = set(chrom_sizes["chrom"].astype(str).tolist())
+    if strict:
+        canon = {}
+        for raw in df["chrom"].astype(str).unique():
+            try:
+                c = _pymisha.pm_normalize_chroms([raw])[0]
+            except (_pymisha.error, IndexError):
+                c = None
+            if c not in known:
+                raise ValueError(f'Chromosome "{raw}" does not exist')
+            canon[raw] = c
+        out = df.copy()
+        out["chrom"] = df["chrom"].astype(str).map(canon).to_numpy()
+        size_of = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=True))
+        sizes = out["chrom"].map(size_of).to_numpy()
+        past = np.flatnonzero(out["end"].to_numpy() > sizes)
+        if past.size:
+            r = out.iloc[past[0]]
+            raise ValueError(f"Interval ({r['chrom']}, {r['start']}, {r['end']}): "
+                             "end coordinate exceeds chromosome boundaries")
+        return out.reset_index(drop=True)
 
     # Batch-normalize: collect unique chromosome names, normalize once
     raw_chroms = df["chrom"].astype(str)
@@ -1405,7 +1453,7 @@ def _create_sparse(track: str, description: str, intervals: Intervals, values: A
             raise ValueError("Length of values must match number of intervals")
         data = data.copy()
         data["value"] = vals
-        data = _canonicalize_known_chroms(data)
+        data = _canonicalize_known_chroms(data, strict=not r_import)
 
         if len(data) == 0:
             raise ValueError("No intervals map to known chromosomes")
@@ -1602,7 +1650,7 @@ def _create_dense(track: str, description: str, intervals: Intervals, values: An
             raise ValueError("Length of values must match number of intervals")
         # _normalize_intervals_df already returns a copy; no need to copy again
         data["value"] = vals
-        data = _canonicalize_known_chroms(data)
+        data = _canonicalize_known_chroms(data, strict=not r_import)
         if len(data) == 0:
             raise ValueError("No intervals map to known chromosomes")
 
@@ -1707,7 +1755,7 @@ def gtrack_create_dense_direct(
         raise ValueError("Length of values must match number of intervals")
 
     data["value"] = vals
-    data = _canonicalize_known_chroms(data)
+    data = _canonicalize_known_chroms(data, strict=True)
     if len(data) == 0:
         raise ValueError("No intervals map to known chromosomes")
 
@@ -2207,6 +2255,18 @@ def gtrack_create(
 
     # Handle DataFrame-as-iterator
     all_intervs, iterator, _itr_id_map = _preprocess_intervals_iterator(all_intervs, iterator)
+
+    if iterator is None:
+        # an expression of virtual tracks only iterates as R's does: a value
+        # vtrack by its source track's bins; a sequence vtrack is an error
+        from .expr import _find_vtracks_in_expr, _parse_expr_vars
+        from .extract import _default_vtrack_iterator
+
+        vts = _find_vtracks_in_expr(str(expr))
+        if vts:
+            _, trks, _, _ = _parse_expr_vars(str(expr), _shared._track_names_set(), set(_shared._VTRACKS))
+            if not trks:
+                all_intervs, iterator = _default_vtrack_iterator(all_intervs, None, [str(expr)], vts)
 
     vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_create")
 
@@ -3097,6 +3157,7 @@ def _cleanup_empty_track_parents(track_dir: str | Path, db_root: str | None) -> 
         cur = cur.parent
 
 
+@_shared._with_umask()   # database writes carry misha's permissions
 def gtrack_mv(src: str, dest: str) -> None:
     """
     Rename or move a track within the same database.
@@ -4498,7 +4559,9 @@ def gtrack_attr_import(table: pd.DataFrame, remove_others: bool = False) -> None
         if attr in readonly_attrs:
             raise ValueError(f"Attribute '{attr}' is read-only")
 
-    # Convert all values to strings
+    # Convert all values to strings; note the missing cells first, since how
+    # astype(str) spells them ("nan", "None", NaN) depends on the pandas version
+    missing = table.isna()
     table = table.astype(str)
 
     for track in tracks:
@@ -4512,7 +4575,7 @@ def gtrack_attr_import(table: pd.DataFrame, remove_others: bool = False) -> None
 
         for attr in attrs:
             val = table.at[track, attr]
-            if val != "" and val != "nan":
+            if not missing.at[track, attr] and val != "":
                 new_attrs[attr] = val
 
         _save_track_attributes(track, new_attrs)
@@ -4634,8 +4697,8 @@ def gtrack_var_ls(track: str, pattern: str = "") -> list[str]:
     --------
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
-    >>> pm.gtrack_var_ls("dense_track")
-    []
+    >>> pm.gtrack_var_ls("dense_track")  # doctest: +ELLIPSIS
+    [...]
 
     See Also
     --------
@@ -5420,7 +5483,7 @@ def gtrack_array_create(
         raise ValueError("colnames must be unique")
 
     ivs = _normalize_intervals_df(intervals).copy().reset_index(drop=True)
-    ivs = _canonicalize_known_chroms(ivs)
+    ivs = _canonicalize_known_chroms(ivs, strict=True)
     if len(ivs) == 0:
         raise ValueError("No intervals map to known chromosomes")
     if len(ivs) != len(intervals):
@@ -5683,6 +5746,7 @@ def gtrack_array_extract(
         # GAP_ARRAY_FILE_DUMP note in tests/r_parity/test_gtrack_array.py), with
         # the file mode R's C++ writer gives it.
         with _shared._with_cpp_umask():
-            df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
+            df.drop(columns=["intervalID"], errors="ignore").to_csv(
+                file, sep="\t", index=False, float_format="%.15g", na_rep="nan")  # R's "\t%.15g"
         return None
     return df

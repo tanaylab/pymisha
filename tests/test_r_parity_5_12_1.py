@@ -132,8 +132,9 @@ class TestLiftover2DPoints:
                 pd.DataFrame({"chrom": chrom, "start": start, "end": start + 1}), chain)
             out_chrom = np.full(len(chrom), None, dtype=object)
             out_start = np.full(len(chrom), -1, dtype=np.int64)
-            out_chrom[lifted["intervalID"].to_numpy()] = lifted["chrom"].astype(str).to_numpy()
-            out_start[lifted["intervalID"].to_numpy()] = lifted["start"].to_numpy()
+            row = lifted["intervalID"].to_numpy() - 1  # 1-based, as R
+            out_chrom[row] = lifted["chrom"].astype(str).to_numpy()
+            out_start[row] = lifted["start"].to_numpy()
             return out_chrom, out_start
 
         c1, s1 = lift_pos(src.chrom1.to_numpy(), src.start1.to_numpy())

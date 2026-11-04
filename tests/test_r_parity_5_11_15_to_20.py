@@ -155,9 +155,9 @@ class TestOverlappingIteratorWarning:
         res, msgs = self._extract(it)
         assert len(res) == 2, "the overlapping pair must have merged"
         assert len(msgs) == 1
-        # Names the pair and the row it became, as R misha does.
-        assert "1 1000-2000 and 1 1500-2500" in msgs[0]
-        assert "single row 1 1000-2500" in msgs[0]
+        # Names the pair and the row it became, with the DB's chrom names, as R misha does.
+        assert "chr1 1000-2000 and chr1 1500-2500" in msgs[0]
+        assert "single row chr1 1000-2500" in msgs[0]
         assert "3 intervals were merged into 2" in msgs[0]
         assert "intervalID" in msgs[0]
 
@@ -169,6 +169,17 @@ class TestOverlappingIteratorWarning:
         res, msgs = self._extract(it)
         assert len(res) == 1
         assert len(msgs) == 1
+
+    def test_iterator_equal_to_scope_stays_silent(self):
+        # The scope clips every row back to its own interval, so nothing merged
+        # is visible; R 5.14.2 does not warn here either.
+        ivs = pd.DataFrame({"chrom": ["chrX", "chr1", "chr2", "chr1"], "start": [1, 2000, 4, 2015],
+                            "end": [10, 2020, 40, 2025]})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            res = pm.gextract("dense_track", intervals=ivs, iterator=ivs)
+        assert len(res) == 4
+        assert not [w for w in caught if "Overlapping intervals" in str(w.message)]
 
     def test_exact_duplicates_stay_silent(self):
         # Both copies come back as the same row, so no interval is missing.

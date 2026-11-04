@@ -336,7 +336,7 @@ class TestLoadChain:
         #                   end = chromsize - start = 500000 - 0 = 500000
         assert chain.iloc[0]["start"] == 499900
         assert chain.iloc[0]["end"] == 500000
-        assert chain.iloc[0]["strand"] == 1
+        assert chain.iloc[0]["strand"] == -1  # R: -1 is the minus strand
 
 
 # ===================================================================
@@ -415,7 +415,7 @@ class TestLiftover:
         assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 12000
         assert result.iloc[0]["end"] == 12500
-        assert result.iloc[0]["intervalID"] == 0
+        assert result.iloc[0]["intervalID"] == 1  # 1-based, as R
 
     def test_liftover_from_file(self):
         """Liftover directly from chain file path."""
@@ -430,15 +430,13 @@ class TestLiftover:
         assert result.iloc[0]["chrom"] == "chr1"
 
     def test_liftover_no_overlap(self):
-        """Interval not overlapping any chain returns empty."""
+        """A chromosome the chain does not have is an error, as in R; one it has
+        but at a position no block covers gives no rows."""
         chain = pm.gintervals_load_chain(CHAIN_FILE, tgt_overlap_policy="keep")
-        intervals = pd.DataFrame({
-            "chrom": ["chr99"],
-            "start": [0],
-            "end": [100],
-        })
-        result = pm.gintervals_liftover(intervals, chain)
-        assert len(result) == 0
+        with pytest.raises(ValueError, match="Source chromosome does not exist in the chain source genome"):
+            pm.gintervals_liftover(pd.DataFrame({"chrom": ["chr99"], "start": [0], "end": [100]}), chain)
+        both = pd.DataFrame({"chrom": ["chr99", "chr25"], "start": [0, 2000], "end": [100, 2500]})
+        assert (pm.gintervals_liftover(both, chain)["intervalID"] == 2).all()
 
     def test_liftover_multiple_blocks(self):
         """Source interval spanning multiple chain blocks maps to multiple targets."""
@@ -539,7 +537,7 @@ class TestLiftover:
         assert 2 in chain_ids
 
     def test_liftover_interval_id_tracks_source(self):
-        """intervalID corresponds to the 0-based index of the source interval."""
+        """intervalID is the 1-based row of the source interval, as in R."""
         chain = pm.gintervals_load_chain(CHAIN_FILE, tgt_overlap_policy="keep")
         intervals = pd.DataFrame({
             "chrom": ["chr25", "chr25"],
@@ -549,7 +547,7 @@ class TestLiftover:
         result = pm.gintervals_liftover(intervals, chain)
         # First interval maps via chain 1, second via chain 2
         ids = sorted(result["intervalID"].unique())
-        assert ids == [0, 1]
+        assert ids == [1, 2]
 
     def test_liftover_include_metadata(self):
         """include_metadata adds score column."""
@@ -844,21 +842,14 @@ class TestLiftoverOverlapPoliciesParity:
 
 
 class TestLiftoverValueColParity:
-    """R parity tests for value_col pass-through and agg chain behavior.
+    """value_col behavior and its interaction with the agg chain policy.
 
-    Ported from test-gintervals.liftover-agg.R.
-    In pymisha, gintervals_liftover passes value_col through without
-    aggregation. Aggregation is done via agg policy in load_chain or
-    in gtrack_liftover. These tests verify the pass-through and agg
-    chain interaction.
+    The full port of test-gintervals.liftover-agg.R is in
+    test_gintervals_liftover_agg.py.
     """
 
-    def test_value_col_passthrough_basic(self, tmp_path):
-        """value_col carries values through liftover mapping.
-
-        R: 'gintervals.liftover multi-target aggregation policies' (basic)
-        Source intervals with values map through 1:1 chain.
-        """
+    def test_value_col_overlapping_sources_are_aggregated(self, tmp_path):
+        """Overlapping lifted intervals are cut at their ends and averaged, as in R."""
         entries = [
             ({"score": 1000, "src_chrom": "srcA", "src_size": 400,
               "src_strand": "+", "src_start": 0, "src_end": 20,
@@ -880,12 +871,11 @@ class TestLiftoverValueColParity:
             src, path, src_overlap_policy="keep", tgt_overlap_policy="keep",
             value_col="value",
         )
-        assert "value" in result.columns
-        assert len(result) == 2
-        result = result.sort_values("start").reset_index(drop=True)
-        # Values are passed through from source intervals
-        assert result.loc[0, "value"] == 1.0
-        assert result.loc[1, "value"] == 3.0
+        assert result["start"].tolist() == [0, 5, 10]
+        assert result["end"].tolist() == [5, 10, 15]
+        assert result["value"].tolist() == [1.0, 2.0, 3.0]
+        # [5, 10) has two sources, so its intervalID is NA
+        assert result["intervalID"].isna().tolist() == [False, True, False]
 
     def test_value_col_nan_passthrough(self, tmp_path):
         """NaN values in value_col are passed through.
@@ -990,7 +980,7 @@ class TestLiftoverValueColParity:
         assert "intervalID" in result.columns
         assert "chain_id" in result.columns
         assert sorted(result["score"].tolist()) == [10.0, 20.0, 30.0]
-        assert sorted(result["intervalID"].tolist()) == [0, 1, 2]
+        assert sorted(result["intervalID"].tolist()) == [1, 2, 3]
         assert sorted(result["chain_id"].tolist()) == [1, 2, 3]
 
     def test_value_col_integer_type(self, tmp_path):
@@ -1227,7 +1217,7 @@ class TestLiftoverMappingParity:
         assert result.iloc[0]["chrom"] == "chr1"
         assert result.iloc[0]["start"] == 15
         assert result.iloc[0]["end"] == 30
-        assert result.iloc[0]["intervalID"] == 0
+        assert result.iloc[0]["intervalID"] == 1  # 1-based, as R
 
     def test_liftover_chain_with_gaps_splits_interval(self, tmp_path):
         """Interval spanning a chain gap produces 2 target intervals.
@@ -1282,10 +1272,10 @@ class TestLiftoverMappingParity:
         chain = pm.gintervals_load_chain(path, tgt_overlap_policy="keep")
 
         assert len(chain) == 1
-        # Target is forward -> strand=0 (forward in pymisha convention)
-        assert chain.iloc[0]["strand"] == 0
-        # Source is reverse -> strandsrc should indicate reverse
-        assert chain.iloc[0]["strandsrc"] == 1  # 1 = reverse in pymisha
+        # R's strands: 1 '+', -1 '-'
+        assert chain.iloc[0]["strand"] == 1
+        # Source is reverse
+        assert chain.iloc[0]["strandsrc"] == -1
 
     def test_liftover_mixed_strands(self, tmp_path):
         """Mixed strand chains are parsed correctly.
@@ -1316,11 +1306,11 @@ class TestLiftoverMappingParity:
         chrx_chain = chain[chain["chrom"] == "chrX"].iloc[0]
 
         # chr1: +/+ both forward
-        assert chr1_chain["strand"] == 0
-        assert chr1_chain["strandsrc"] == 0
+        assert chr1_chain["strand"] == 1
+        assert chr1_chain["strandsrc"] == 1
 
         # chrX: target is reverse strand -> flipped coordinates
-        assert chrx_chain["strand"] == 1  # reverse
+        assert chrx_chain["strand"] == -1  # reverse
 
     def test_liftover_value_col_preserves_through_mapping(self, tmp_path):
         """Value column is preserved through liftover mapping.
@@ -1366,7 +1356,7 @@ class TestLiftoverMappingParity:
         assert "intervalID" in result.columns
         assert "chain_id" in result.columns
         assert sorted(result["score"].tolist()) == [10.0, 20.0, 30.0]
-        assert sorted(result["intervalID"].tolist()) == [0, 1, 2]
+        assert sorted(result["intervalID"].tolist()) == [1, 2, 3]
         assert sorted(result["chain_id"].tolist()) == [1, 2, 3]
 
     def test_liftover_discard_yields_empty(self, tmp_path):

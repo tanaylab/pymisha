@@ -80,6 +80,8 @@ _EDIT_DISTANCE_PARAMS = {
     "bidirect", "prior", "extend", "strand", "direction",
 }
 _LSE_EDIT_DISTANCE_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_indels"}
+_EDIT_DISTANCE_FUNCS_MAX_EDITS = {"pwm.edit_distance", "pwm.edit_distance.pos", "pwm.max.edit_distance",
+                                  "pwm.edit_distance.lse", "pwm.edit_distance.lse.pos"}
 _N_MUTATIONS_PARAMS = _EDIT_DISTANCE_PARAMS - {"max_edits", "max_indels"}
 # The allowlist is deliberately wider than the parameters this family uses:
 # `width`, `pair_strength`, `attr` and `link` are accepted and ignored so that a
@@ -173,6 +175,12 @@ def _kmer_params(func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, An
     return kp
 
 
+def _quantile_param(payload: dict) -> float:
+    # 0 is a valid percentile; only a missing param defaults to the median.
+    q = payload.get("params")
+    return 0.5 if q is None else float(q)
+
+
 def _kmer_possible_positions(seg_df: _pandas.DataFrame, payload: dict) -> _numpy.ndarray:
     """R misha's ``KmerCounter::possible_positions`` for each part: the anchors in it whose
     k-mer fits in the sequence read for it (read k-1 bases past its end with extend, up to
@@ -253,6 +261,120 @@ def _convert_spat_range(config: dict) -> None:
 
 
 _DF_INTERVAL_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
+
+# R's TrackExpressionVars::Track_var::FUNC_NAMES (functions of a track source),
+# plus pymisha's aliases "mean" and "std" (same values as avg and stddev).
+_R_TRACK_FUNCS = {
+    "avg", "min", "max", "nearest", "stddev", "sum", "lse", "quantile",
+    "global.percentile", "global.percentile.min", "global.percentile.max",
+    "weighted.sum", "area", "pwm", "pwm.max", "pwm.max.pos", "pwm.count", "kmer.count", "kmer.frac",
+    "masked.count", "masked.frac",
+    "max.pos.abs", "max.pos.relative", "min.pos.abs", "min.pos.relative",
+    "exists", "size", "sample", "sample.pos.abs", "sample.pos.relative",
+    "first", "first.pos.abs", "first.pos.relative", "last", "last.pos.abs", "last.pos.relative",
+    "pwm.edit_distance", "pwm.edit_distance.pos", "pwm.max.edit_distance",
+    "pwm.edit_distance.lse", "pwm.edit_distance.lse.pos", "pwm.n_mutations",
+    "potts", "potts.max", "potts.max.pos", "potts.count",
+    "mean", "std",
+}
+# R's Value_var::FUNC_NAMES (a DataFrame source with a value column)
+_R_VALUE_FUNCS = {
+    "avg", "min", "max", "stddev", "sum", "lse", "quantile", "nearest", "exists", "size",
+    "first", "last", "sample", "first.pos.abs", "first.pos.relative", "last.pos.abs",
+    "last.pos.relative", "sample.pos.abs", "sample.pos.relative", "min.pos.abs",
+    "min.pos.relative", "max.pos.abs", "max.pos.relative", "mean", "std",
+}
+_R_2D_TYPES = {"rectangles", "points", "computed"}
+
+
+def _is_num(x: Any) -> bool:
+    return not isinstance(x, (bool, _numpy.bool_)) and isinstance(x, (int, float, _numpy.integer, _numpy.floating))
+
+
+def _check_edit_distance_args(kw: dict, func: str) -> None:
+    """R's checks on the pwm edit-distance vtracks' arguments, R's messages."""
+    for key, rname in (("score_min", "score.min"), ("score_max", "score.max")):
+        v = kw.get(key)
+        if v is not None and not _is_num(v):
+            raise ValueError(f"{rname} must be NULL or a single numeric value")
+    v = kw.get("max_indels")  # (the lse functions reject it as an unknown parameter)
+    if (v is not None and "max_indels" in _ACCEPTED_VTRACK_PARAMS.get(func, ())
+            and not (_is_num(v) and v >= 0 and v == int(v))):
+        raise ValueError("max_indels must be NULL or a non-negative integer")
+    v = kw.get("extend")
+    if v is not None and not isinstance(v, (bool, _numpy.bool_)) and not (_is_num(v) and v >= 0 and v == int(v)):
+        raise ValueError("extend must be TRUE, FALSE, or a non-negative integer")
+
+
+def _r_vtrack_checks(name: str, src: Any, func_lc: str, params: Any) -> None:
+    """R's checks on a value / interval vtrack's function and params, made at
+    gvtrack.create (R's TrackExpressionVars), with R's messages. Sequence
+    vtracks (no source) have their own checks."""
+    from .intervals import gintervals_exists
+    from .tracks import gtrack_exists, gtrack_info
+
+    if isinstance(params, (list, tuple, _numpy.ndarray)) and len(params) == 1:
+        params = params[0]  # R's length-1 vector
+
+    def no_params():
+        if params is not None:
+            raise ValueError(f"Virtual track {name}: function {func_lc} does not accept any parameters")
+
+    if isinstance(src, str) and gtrack_exists(src):
+        if func_lc not in _R_TRACK_FUNCS:
+            raise ValueError(f"Virtual track {name}: invalid function {func_lc} used for a virtual track")
+        ttype = str(gtrack_info(src).get("type", ""))
+        is_2d = ttype in _R_2D_TYPES
+        if ((not is_2d and func_lc in ("weighted.sum", "area"))
+                or (is_2d and func_lc in ("nearest", "stddev", "std", "sum", "lse", "quantile"))
+                or (ttype != "dense" and func_lc.startswith("global.percentile"))):
+            raise ValueError(f"Virtual track {name}: function {func_lc} is not supported by {ttype} tracks")
+        if func_lc == "quantile":
+            if params is None:
+                raise ValueError(f"Virtual track {name}: function quantile requires an additional "
+                                 "parameter (percentile) to be specified")
+            if isinstance(params, bool) or not isinstance(params, (int, float, _numpy.integer, _numpy.floating)):
+                raise ValueError(f"Virtual track {name}: invalid parameters used for function quantile")
+            if not 0 <= float(params) <= 1:
+                raise ValueError(f"Virtual track {name}: parameter (percentile) used for function quantile "
+                                 "is out of range")
+        elif func_lc in ("avg", "mean", "min", "max", "nearest", "stddev", "std", "sum", "lse",
+                         "global.percentile", "global.percentile.min", "global.percentile.max",
+                         "weighted.sum", "area", "exists", "size", "first", "last", "sample",
+                         "max.pos.abs", "max.pos.relative", "min.pos.abs", "min.pos.relative",
+                         "sample.pos.abs", "sample.pos.relative", "first.pos.abs",
+                         "first.pos.relative", "last.pos.abs", "last.pos.relative"):
+            no_params()
+        return
+
+    is_df = isinstance(src, _pandas.DataFrame)
+    is_set = isinstance(src, str) and gintervals_exists(src)
+    if not (is_df or is_set):
+        return
+    has_values = is_df and any(c not in _NON_VALUE_COLS for c in src.columns)
+    if func_lc in _DF_INTERVAL_FUNCS or not has_values:
+        if func_lc not in _DF_INTERVAL_FUNCS:
+            raise ValueError(f"Virtual track {name}: invalid function {func_lc} used with intervals")
+        if func_lc in ("distance.center", "distance.edge", "coverage"):
+            no_params()
+        elif params is not None:
+            if isinstance(params, bool) or not isinstance(params, (int, float, _numpy.integer, _numpy.floating)):
+                if func_lc == "neighbor.count":
+                    raise ValueError("neighbor.count requires 'params' to be a single numeric value")
+                raise ValueError(f"Virtual track {name}: invalid parameters used for function {func_lc}")
+            if float(params) < 0:
+                what = "margin" if func_lc == "distance" else "distance"
+                raise ValueError(f"Virtual track {name}, function {func_lc}: {what} cannot be a negative number")
+        return
+    if func_lc not in _R_VALUE_FUNCS:
+        raise ValueError(f"Virtual track {name}: invalid function {func_lc} used with value-based intervals")
+    if func_lc == "quantile":
+        if params is None:
+            raise ValueError(f"Virtual track {name}: function quantile requires percentile parameter")
+        if not 0 <= float(params) <= 1:
+            raise ValueError(f"Virtual track {name}: percentile must be between 0 and 1, got {params:g}")
+    else:
+        no_params()
 # Columns that never count as a "value" column when inferring a DataFrame source's
 # default function (mirrors R's TrackExpressionVars value-column detection).
 _NON_VALUE_COLS = {"chrom", "start", "end", "strand", "intervalID", "intervalID1", "intervalID2"}
@@ -633,16 +755,11 @@ def _compute_value_df_vtrack(
         # Extract matched arrays directly via advanced indexing (no list-of-tuples)
         m_starts = src_starts[m_idx]
         m_vals = src_vals[m_idx]
-        m_overlaps = total_ov[m_idx]
 
         if func in {"avg", "mean"}:
-            if has_filter:
-                weights = m_overlaps.astype(float)
-                wsum = float(weights.sum())
-                if wsum > 0:
-                    out[oi] = float((m_vals * weights).sum() / wsum)
-            else:
-                out[oi] = float(m_vals.mean())
+            # Unweighted, filtered or not, as R's value-based avg. (R counts an
+            # interval spanning a masked gap once per unmasked part; we count it once.)
+            out[oi] = float(m_vals.mean())
         elif func == "nearest":
             # If no overlap, nearest falls back to minimum distance.
             out[oi] = float(m_vals.mean())
@@ -658,7 +775,7 @@ def _compute_value_df_vtrack(
             if n_matched >= 2:
                 out[oi] = float(_numpy.std(m_vals, ddof=1))
         elif func == "quantile":
-            q = float(payload_eval.get("params", 0.5) or 0.5)
+            q = _quantile_param(payload_eval)
             out[oi] = float(_numpy.quantile(m_vals, q))
         elif func == "first":
             # min by (start, index) — use lexsort (sorts by last key first)
@@ -1033,7 +1150,7 @@ def _compute_filtered_quantile(
     filter_df: pd.DataFrame | None,
 ) -> np.ndarray:
     """Quantile under filter: extract raw bin values and compute exact quantile."""
-    percentile = float(payload_eval.get("params", 0.5) or 0.5)
+    percentile = _quantile_param(payload_eval)
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
     for orig_idx, raw_vals in groups.items():
         out[orig_idx] = float(_numpy.quantile(raw_vals, percentile))
@@ -1937,9 +2054,25 @@ def gvtrack_create(
     ...                   kmer="CG", strand=1)
     """
     _checkroot()
+    from .intervals import gintervals_exists
+    from .tracks import gtrack_exists
+
+    if gtrack_exists(vtrack_name):
+        raise ValueError(f"Cannot create virtual track: regular track named {vtrack_name} already exists")
+    if gintervals_exists(vtrack_name):
+        raise ValueError(f"Cannot create virtual track: intervals named {vtrack_name} already exists")
     if func is None:
         func = _infer_default_vtrack_func(src)
     func_lc = str(func).lower()
+    _r_vtrack_checks(vtrack_name, src, func_lc, params)
+    if func_lc in _EDIT_DISTANCE_FUNCS_MAX_EDITS or func_lc == "pwm.n_mutations":
+        from .sequence import _check_max_edits
+
+        _check_max_edits(kwargs.get("max_edits"))
+        _check_edit_distance_args(kwargs, func_lc)
+    if (sshift or eshift) and _vtrack_src_is_2d({"src": src}):
+        raise ValueError(f"Virtual track {vtrack_name}: 1D iterator modifier cannot be used with source "
+                         "that supports only 2D iterators")
 
     if isinstance(src, _pandas.DataFrame):
         from .intervals import _normalize_chroms
@@ -2355,11 +2488,24 @@ def gvtrack_iterator(vtrack_name: str, dim: int | None = None, sshift: int = 0, 
         raise KeyError(f"Virtual track not found: {vtrack_name}")
 
     cfg = _shared._VTRACKS[vtrack_name]
+    if _vtrack_src_is_2d(cfg):
+        raise ValueError(f"Virtual track {vtrack_name}: 1D iterator modifier cannot be used with source "
+                         "that supports only 2D iterators")
     if dim is not None:
         cfg['dim'] = dim
     cfg['sshift'] = sshift
     cfg['eshift'] = eshift
     _shared._VTRACKS[vtrack_name] = cfg
+
+
+def _vtrack_src_is_2d(cfg: dict) -> bool:
+    """Whether a vtrack's source is a 2D track (R's 2D-only iterator source)."""
+    src = cfg.get("src")
+    if not isinstance(src, str):
+        return False
+    from .tracks import gtrack_exists, gtrack_info
+
+    return gtrack_exists(src) and str(gtrack_info(src).get("type", "")) in _R_2D_TYPES
 
 
 def gvtrack_iterator_2d(
@@ -2420,6 +2566,9 @@ def gvtrack_iterator_2d(
         raise KeyError(f"Virtual track not found: {vtrack_name}")
 
     cfg = _shared._VTRACKS[vtrack_name]
+    if not _vtrack_src_is_2d(cfg):
+        raise ValueError(f"Virtual track {vtrack_name}: 2D iterator modifier cannot be used with source "
+                         "that supports only 1D iterators")
     cfg['itr_type'] = '2d'
     cfg['sshift1'] = sshift1
     cfg['eshift1'] = eshift1

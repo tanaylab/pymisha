@@ -196,6 +196,34 @@ def _group_intervals_by_chrom_pair(
     return chrom_pair_intervals
 
 
+def _check_seq_vtrack_iterator(exprs, used_vtracks) -> None:
+    """R's error for a sequence-based vtrack (no source track) with no iterator:
+    it has no bin size to iterate by."""
+    for vt in used_vtracks or ():
+        cfg = _shared._VTRACKS.get(vt)
+        if cfg is not None and cfg.get("src") is None:
+            expr = next((e for e in exprs if vt in str(e)), vt)
+            raise ValueError(
+                "Cannot implicitly determine iterator policy:\n"
+                f'track expression "{expr}" contains a sequence-based virtual track '
+                "(pwm, potts, kmer or masked) or tracks in different formats."
+            )
+
+
+def _default_vtrack_iterator(intervals, iterator, exprs, used_vtracks):
+    """R's default iterator for an expression whose only sources are vtracks:
+    a sequence vtrack is an error, a value vtrack iterates its source track's
+    bins (or array bins). Returns (intervals, iterator); intervals change only
+    for an array source, whose bins become the scope."""
+    if iterator is not None or not used_vtracks:
+        return intervals, iterator
+    _check_seq_vtrack_iterator(exprs, used_vtracks)
+    it = _infer_iterator_from_vtracks(used_vtracks)
+    if isinstance(it, str):
+        intervals, it, _ = _preprocess_intervals_iterator(intervals, it)
+    return intervals, it
+
+
 # Functions eligible for C++ inline vtrack evaluation (no filter required)
 _CPP_SEQ_FUNCS = {
     "pwm",
@@ -741,7 +769,6 @@ _2D_VTRACK_FUNCS = {
 }
 _2D_AGG_FUNCS = {"area", "weighted.sum", "min", "max", "avg"}
 _2D_OBJECT_FUNCS = {"exists", "size", "first", "last", "sample"}
-_2D_PERCENTILE_FUNCS = {"global.percentile"}
 
 # Funcs supported by PMTrackExpression2DVars::add_var (C++ scanner).
 # Verified by reading src/PMTrackExpression2DVars.cpp::parse_func.
@@ -1241,59 +1268,6 @@ def _gextract_2d_vtrack_objects(
             "intervalID": _numpy.arange(n, dtype=int),
         }
     )
-
-
-def _gextract_2d_vtrack_global_percentile(
-    track: str, col_name: str, intervals: pd.DataFrame, band: tuple[int, int] | None
-) -> pd.DataFrame:
-    """Extract global percentile ranks from a 2D track for 2D intervals.
-
-    Two-pass approach:
-    1. Extract aggregated values (avg) for each query interval.
-    2. Compute percentile rank of each value relative to the global
-       distribution of all non-NaN values.
-
-    Returns one row per query interval with the percentile rank (0-1).
-
-    Parameters
-    ----------
-    track : str
-        Physical 2D track name.
-    col_name : str
-        Column name for the percentile value in the output DataFrame.
-    intervals : DataFrame
-        2D intervals with chrom1/start1/end1/chrom2/start2/end2 columns.
-    band : tuple of (int, int) or None
-        Diagonal band filter ``(d1, d2)``.
-
-    Returns
-    -------
-    DataFrame
-        One row per query interval.
-    """
-    # Pass 1: get raw aggregated values (avg = weighted_sum / area) for each interval.
-    agg_df = _gextract_2d_vtrack_agg(track, col_name, intervals, band, "avg")
-    raw_values = agg_df[col_name].to_numpy(dtype=float, copy=False)
-
-    # Pass 2: compute percentile rank among all non-NaN values.
-    n = len(raw_values)
-    result_values = _numpy.full(n, _numpy.nan, dtype=float)
-    valid_mask = ~_numpy.isnan(raw_values)
-    valid_vals = raw_values[valid_mask]
-
-    if len(valid_vals) > 0:
-        # For each valid value, percentile = fraction of valid values that are
-        # strictly less than this value.
-        sorted_vals = _numpy.sort(valid_vals)
-        for i in range(n):
-            if valid_mask[i]:
-                v = raw_values[i]
-                # Number of values strictly less than v.
-                n_less = int(_numpy.searchsorted(sorted_vals, v, side="left"))
-                result_values[i] = n_less / len(sorted_vals)
-
-    agg_df[col_name] = result_values
-    return agg_df
 
 
 def _gextract_2d_via_scanner(
@@ -1856,7 +1830,6 @@ def _gextract_2d(
     # source's value, read as the avg over the cell.
     agg_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_AGG_FUNCS}
     obj_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_OBJECT_FUNCS}
-    pct_vtracks = {vt for vt in twod_vtracks if vtrack_funcs.get(vt, "") in _2D_PERCENTILE_FUNCS}
 
     if iterator is None and len(set(used_tracks) | {vtrack_to_track[vt] for vt in twod_vtracks}) > 1:
         raise ValueError(
@@ -1898,8 +1871,6 @@ def _gextract_2d(
             vdf = _gextract_2d_vtrack_agg(src_track, "v", shifted, band, func)
         elif vt_name in obj_vtracks:
             vdf = _gextract_2d_vtrack_objects(src_track, "v", shifted, band, func)
-        elif vt_name in pct_vtracks:
-            vdf = _gextract_2d_vtrack_global_percentile(src_track, "v", shifted, band)
         else:
             vdf = _gextract_2d_vtrack_agg(src_track, "v", shifted, band, "avg")
         values[_expr_safe_name(vt_name)] = _numpy.asarray(_scatter_shifted_values(vdf["v"], kept, n), dtype=float)
@@ -2145,6 +2116,36 @@ def _apply_intervals_join(
     )
 
 
+def _genome_order(df: pd.DataFrame, scope: pd.DataFrame | None) -> pd.DataFrame:
+    """Rows in R's order: R's gextract sorts the scope intervals by chromosome
+    and start and scans them in turn, so rows follow their scope interval's
+    genome position (ties by intervalID), each interval's rows in scan order."""
+    if (scope is None or "intervalID" not in df.columns or "start" not in scope.columns
+            or len(df) < 2 or df["intervalID"].isna().any()):
+        return df
+    from .intervals import _chrom_id_map
+
+    ids = df["intervalID"].to_numpy(dtype=_numpy.int64)
+    if ids.min() < 1 or ids.max() > len(scope):
+        return df
+    cmap = _chrom_id_map()
+    scope_chrom = _numpy.asarray(
+        _shared._with_canonical_chroms(scope[["chrom", "start", "end"]])["chrom"].astype(str).map(cmap)
+        .fillna(len(cmap)), dtype=_numpy.int64)
+    scope_start = scope["start"].to_numpy(dtype=_numpy.int64)
+    # the usual case - a scope in genome order, rows by interval - needs no sort
+    scope_sorted = bool(_numpy.all((_numpy.diff(scope_chrom) > 0)
+                                   | ((_numpy.diff(scope_chrom) == 0) & (_numpy.diff(scope_start) >= 0))))
+    if scope_sorted and bool(_numpy.all(_numpy.diff(ids) >= 0)):
+        return df
+    chrom_key = scope_chrom[ids - 1]
+    start_key = scope_start[ids - 1]
+    order = _numpy.lexsort((ids, start_key, chrom_key))  # stable: scan order within an interval
+    if (order == _numpy.arange(len(order))).all():
+        return df
+    return df.iloc[order].reset_index(drop=True)
+
+
 def _apply_extract_output(
     df: pd.DataFrame | None,
     file: str | None,
@@ -2193,6 +2194,9 @@ def _apply_extract_output(
             _write_parquet(None, file, value_names, int64_coords)
         return None
 
+    if not is_2d:
+        df = _genome_order(df, input_intervals)
+
     # Apply intervals_join FIRST, before file/intervals_set_out which read
     # from the post-processed result.
     df = _apply_intervals_join(df, input_intervals, intervals_join, is_2d=is_2d)
@@ -2217,7 +2221,8 @@ def _apply_extract_output(
         # and the expression columns (no intervalID; see R
         # GenomeTrackExtract.cpp), with the file mode R's C++ writer gives it.
         with _shared._with_cpp_umask():
-            df.drop(columns=["intervalID"], errors="ignore").to_csv(file, sep="\t", index=False)
+            df.drop(columns=["intervalID"], errors="ignore").to_csv(
+                file, sep="\t", index=False, float_format="%.15g", na_rep="nan")  # R's "\t%.15g"
         return None
 
     # R parity: with intervals.set.out R misha returns no result (an invisible 0)
@@ -2926,6 +2931,9 @@ def gextract(
                     intervals, iterator
                 )
 
+    if iterator is None and not used_tracks:
+        _check_seq_vtrack_iterator(exprs, used_vtracks)  # a physical track gives the iterator
+
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars
 
@@ -3045,7 +3053,9 @@ def gextract(
                     "Cannot implicitly determine iterator policy: track expressions do not contain any tracks."
                 )
         else:
-            iter_df = _iterated_intervals(intervals, iterator)
+            # intervalID as the branch above: the caller's scope row, not the
+            # row of the intersected scope a DataFrame/track iterator made
+            iter_df = _remap_interval_ids(_iterated_intervals(intervals, iterator), _itr_id_map)
 
     if iter_df is None or len(iter_df) == 0:
         return _apply_extract_output(
@@ -3279,6 +3289,9 @@ def gscreen(
     except UnsafeExpressionError as exc:
         raise ValueError(f"Unsafe expression '{expr}': {exc}") from exc
 
+    if not expr_tracks:
+        intervals, iterator = _default_vtrack_iterator(intervals, iterator, [expr], expr_vtracks)
+
     # Check if vtracks can go through C++ path
     cpp_vtracks = expr_vtracks and _can_vtracks_use_cpp(expr_vtracks) and not user_vars
 
@@ -3319,6 +3332,7 @@ def gscreen(
             track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
         iter_df = base_df[["chrom", "start", "end", "intervalID"]]
     else:
+        intervals, iterator = _default_vtrack_iterator(intervals, iterator, [expr], expr_vtracks)
         if iterator is None:
             raise ValueError(
                 f'Cannot implicitly determine iterator policy:\ntrack expression "{expr}" does not contain any tracks.'

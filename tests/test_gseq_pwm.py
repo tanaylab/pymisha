@@ -1222,3 +1222,18 @@ class TestScoreThreshCoercion:
         with pytest.raises(ValueError, match="score_thresh"):
             pm.gvtrack_create("vt_ed_nothresh", None, func="pwm.edit_distance",
                               pssm=pssm)
+
+
+@pytest.mark.parametrize("policy", ["average", "log_quarter"])
+def test_gseq_pwm_pos_ties_and_na_strand_match_r(policy):
+    """R misha 5.14.2: pos 4, 1, 4, NA and strand -1, -1, 1, NA. On a tie the
+    earlier start wins, then the forward strand; no scorable window gives NA."""
+    pssm = np.array([[1, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], float)
+    seqs = ["TTTCGTTAACGTT", "CGTTAACGTT", "ACGNACGTAC", "ACG"]
+    res = pm.gseq_pwm(seqs, pssm, mode="pos", bidirect=True, return_strand=True,
+                      neutral_chars_policy=policy)
+    np.testing.assert_array_equal(res["pos"], [4, 1, 4, np.nan])
+    assert res["strand"].tolist()[:3] == [-1, -1, 1]
+    assert pd.isna(res["strand"][3])
+    pos_only = pm.gseq_pwm(seqs, pssm, mode="pos", bidirect=True, neutral_chars_policy=policy)
+    np.testing.assert_array_equal(pos_only, [4, 1, 4, np.nan])

@@ -12,6 +12,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from . import _shared
 from ._log import get_logger
 from ._shared import _checkroot, _pymisha, _with_umask
@@ -278,18 +280,26 @@ def _dataset_chrom_order(
     return dataset_chroms, index_mismatch, index_unreadable
 
 
-def gdataset_ls() -> list[str]:
+def gdataset_ls(dataframe: bool = False) -> list[str] | pd.DataFrame:
     """
-    List currently loaded datasets.
+    List the working database and the loaded datasets.
 
-    Returns the normalized absolute paths of all datasets that have been
-    loaded into the current session via `gdataset_load`.
+    Returns the working database root followed by the normalized absolute
+    paths of the datasets loaded into the current session via `gdataset_load`.
+
+    Parameters
+    ----------
+    dataframe : bool, default False
+        If True, return a DataFrame with a row per path: ``path``,
+        ``tracks_total`` and ``intervals_total`` (what the path holds),
+        ``tracks_visible`` and ``intervals_visible`` (how many of those the
+        session resolves to it), ``has_metadata`` (a ``misha.yaml`` exists) and
+        ``writable`` (the working database only).
 
     Returns
     -------
-    list[str]
-        Normalized absolute paths of loaded datasets. Empty list if no
-        datasets are loaded.
+    list[str] or DataFrame
+        The working database root, then the loaded datasets.
 
     See Also
     --------
@@ -300,11 +310,30 @@ def gdataset_ls() -> list[str]:
     --------
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
-    >>> pm.gdataset_ls()
-    []
+    >>> len(pm.gdataset_ls())
+    1
     """
     _checkroot()
-    return list(_shared._GDATASETS)
+    groot = _shared._GROOT
+    assert groot is not None
+    paths = [groot, *_shared._GDATASETS]
+    if not dataframe:
+        return paths
+    from collections import Counter
+
+    from .intervals import gintervals_dataset, gintervals_ls
+    from .tracks import gtrack_dataset, gtrack_ls
+    tracks_at = Counter(_normalize_path(d) for t in gtrack_ls() or [] if (d := gtrack_dataset(t)))
+    intervals_at = Counter(_normalize_path(d) for i in gintervals_ls() if (d := gintervals_dataset(i)))
+    return pd.DataFrame({
+        "path": paths,
+        "tracks_total": [len(_scan_tracks(p)) for p in paths],
+        "tracks_visible": [tracks_at[_normalize_path(p)] for p in paths],
+        "intervals_total": [len(_scan_intervals(p)) for p in paths],
+        "intervals_visible": [intervals_at[_normalize_path(p)] for p in paths],
+        "has_metadata": [os.path.exists(os.path.join(p, "misha.yaml")) for p in paths],
+        "writable": [p == groot for p in paths],
+    })
 
 
 def gdataset_load(path: str, force: bool = False, verbose: bool = False):
@@ -426,18 +455,21 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
                 "read other chromosomes"
             )
 
-    # Use C++ track cache for existing tracks (avoids redundant Python
-    # filesystem scans of the working db, user root, and loaded datasets).
-    existing_tracks = set(_pymisha.pm_track_names())
-
-    # For intervals, use cached scans (C++ backend doesn't cache intervals).
+    # The working db and user root are scanned afresh: every save changes them,
+    # and pm_track_names() lists only the names under a gdir_cd directory.
+    # Loaded datasets keep their cached scans.
+    existing_tracks: set[str] = set()
     existing_intervals: set[str] = set()
     _sync_dataset_scan_cache()
-    for db in [groot] + ([_shared._UROOT] if _shared._UROOT else []) + list(_shared._GDATASETS):
+    for db in [groot] + ([_shared._UROOT] if _shared._UROOT else []):
+        existing_tracks |= _scan_tracks(db)
+        existing_intervals |= _scan_intervals(db)
+    for db in _shared._GDATASETS:
         cached = _DATASET_SCAN_CACHE.get(db)
         if cached is None:
             cached = (_scan_tracks(db), _scan_intervals(db))
             _DATASET_SCAN_CACHE[db] = cached
+        existing_tracks |= cached[0]
         existing_intervals |= cached[1]
 
     track_collisions = dataset_tracks & existing_tracks

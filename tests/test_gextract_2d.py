@@ -53,20 +53,27 @@ class TestGextract2dBasic:
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
         result = pm.gextract("rects_track", intervals)
         assert result is not None
-        # R misha returns 76 rows for this query on the test DB
+        # R misha 5.14.2 on the test DB: 76 rows; sums of the value and two
+        # coordinate columns, and the first rows by (start1, start2)
         assert len(result) == 76
+        assert result["rects_track"].sum() == pytest.approx(335608)
+        assert result["start1"].sum() == 19361087
+        assert result["end2"].sum() == 18719114
+        first = result.sort_values(["start1", "start2"]).head(3)
+        assert first["start1"].tolist() == [5786, 23858, 25933]
+        assert first["rects_track"].tolist() == pytest.approx([7346, 7492, 7613])
 
     def test_extract_narrow_window(self):
         """Extract with narrow 2D interval returns intersecting objects."""
         intervals = pm.gintervals_2d("1", 0, 100000, "1", 300000, 400000)
         result = pm.gextract("rects_track", intervals)
-        if result is not None and len(result) > 0:
-            # All results must *intersect* the query rectangle
-            # (not necessarily be fully contained)
-            assert (result["start1"] < 100000).all()
-            assert (result["end1"] > 0).all()
-            assert (result["start2"] < 400000).all()
-            assert (result["end2"] > 300000).all()
+        assert result is not None and len(result) > 0
+        # All results must *intersect* the query rectangle
+        # (not necessarily be fully contained)
+        assert (result["start1"] < 100000).all()
+        assert (result["end1"] > 0).all()
+        assert (result["start2"] < 400000).all()
+        assert (result["end2"] > 300000).all()
 
     def test_extract_non_overlapping_returns_empty(self):
         """Extract from region with no 2D track objects returns None."""

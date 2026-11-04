@@ -237,7 +237,7 @@ class TestIntervalsIteratorCrossFunctions:
         assert "chrom" in result.columns
         assert "start" in result.columns
         assert "end" in result.columns
-        assert "intervalID" in result.columns
+        assert "intervalID" not in result.columns  # as R
         assert len(result) == 3
         assert list(result["start"]) == [0, 600, 1200]
         assert list(result["end"]) == [600, 1200, 1800]

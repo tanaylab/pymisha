@@ -132,6 +132,9 @@ class TestPmLiftoverTrackEndToEnd:
 
     @staticmethod
     def _build_chain_dict(chain_df):
+        # the C++ layer takes the internal strands (0 '+', 1 '-'), not R's (1, -1)
+        from pymisha.liftover import _chain_from_r
+        chain_df = _chain_from_r(chain_df)
         return {
             "chrom":     chain_df["chrom"].to_numpy(dtype=object),
             "start":     chain_df["start"].to_numpy(dtype=np.int64),

@@ -71,10 +71,11 @@ void MemQuadTree::insert_into_node(int64_t node_idx,
     }
 
     // Internal node: recurse into every kid the obj_rect intersects.
-    Node &node_ref = m_nodes[node_idx];  // re-bind in case of vector reallocation
     Rectangle obj_rect = m_objs[obj_idx].rect;
     for (int iquad = 0; iquad < NUM_QUADS; ++iquad) {
-        int64_t kid = node_ref.kid_idx[iquad];
+        // Index m_nodes afresh each time: the recursive insert below can split
+        // a leaf, and its emplace_back reallocates m_nodes.
+        int64_t kid = m_nodes[node_idx].kid_idx[iquad];
         Rectangle kid_arena = m_nodes[kid].arena;
         Rectangle inter = obj_rect.intersect(kid_arena);
         if (inter.is_non_empty_area())

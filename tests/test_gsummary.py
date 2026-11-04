@@ -93,7 +93,7 @@ def test_gsummary_vtrack_streaming_uses_stable_variance(monkeypatch):
     monkeypatch.setattr(
         pm_summary._shared,
         "_iterated_intervals",
-        lambda intervals, iterator: iter_df,
+        lambda intervals, iterator, **kw: iter_df,
     )
 
     result = pm_summary._gsummary_vtrack_streaming(

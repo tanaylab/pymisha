@@ -1,12 +1,12 @@
 """Parity port of R misha ``test-gcis_decay.R`` (3 regressions)."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
-import pytest
 
 import pymisha as pm
 
-from .baseline import assert_matches_baseline
+from .baseline import assert_matches_baseline, load_baseline
 
 
 def _domain():
@@ -27,9 +27,12 @@ def test_gcis_decay_2():
     assert_matches_baseline(pm.gcis_decay("test.rects", [k * 1000 for k in range(21)], dom, dom), "gcis_decay.2")
 
 
-@pytest.mark.xfail(reason="gcompute_strands_autocorr reads a multi-GB external export file", strict=False)
 def test_gcompute_strands_autocorr_1():
+    """R returns list(<4 stats>, <bin/corr data frame>); pymisha a (dict, DataFrame)."""
     res = pm.gcompute_strands_autocorr(
         "/net/mraid20/export/tgdata/db/tgdb/misha_snapshot/input_files/s_7_export.txt", 1, 50
     )
-    assert_matches_baseline(res, "gcompute_strands_autocorr.1")
+    base = load_baseline("gcompute_strands_autocorr.1")
+    np.testing.assert_allclose(list(res[0].values()), np.asarray(base[0], dtype=float), rtol=1e-6)
+    pd.testing.assert_frame_equal(res[1].reset_index(drop=True), base[1].reset_index(drop=True),
+                                  check_dtype=False, rtol=1e-6)

@@ -183,11 +183,15 @@ class TestGintervalsSave2dCoordValidation:
             pm.gintervals_save(iv, "test_save_2d_inv")
         assert not pm.gintervals_exists("test_save_2d_inv")
 
-    def test_zero_width_rectangle_rejected(self):
+    def test_zero_width_rectangle_saved_1bp_wide(self):
+        # R misha 5.14.2's .gintervals.save_file widens a point (start == end) by 1
         iv = _2d("1", 1000, 1000, "1", 0, 1000)
-        with pytest.raises(ValueError, match="start coordinate must be lesser than end"):
-            pm.gintervals_save(iv, "test_save_2d_zero")
-        assert not pm.gintervals_exists("test_save_2d_zero")
+        pm.gintervals_save(iv, "test_save_2d_zero")
+        try:
+            got = pm.gintervals_load("test_save_2d_zero")
+            assert (got["start1"].item(), got["end1"].item()) == (1000, 1001)
+        finally:
+            pm.gintervals_rm("test_save_2d_zero", force=True)
 
     def test_beyond_chromosome_rejected(self):
         iv = _2d("1", 0, 1_000_000_000, "1", 0, 1000)

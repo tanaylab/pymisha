@@ -459,8 +459,9 @@ def test_gseq_pwm_spat_bounds_agree_on_all_three_paths(strand, spatial, bounds, 
                                    dtype=float)
             monkeypatch.setattr(mod, fn, orig)
             # the minus strand alone is kept off the C++ path, which counts
-            # spatial bins from the reverse complement's start
-            assert bool(calls) == (path != "cpp" or strand != "minus"), path
+            # spatial bins from the reverse complement's start; so is "pos",
+            # whose C++ tie rule is the vtrack's, not gseq.pwm's
+            assert bool(calls) == (path != "cpp" or (strand != "minus" and mode != "pos")), path
         want = np.asarray(pm.gseq_pwm([s[lo:hi] for s in seqs], pssm, mode=mode, **mkw),
                           dtype=float)
         if mode == "pos":

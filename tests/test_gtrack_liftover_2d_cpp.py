@@ -37,7 +37,7 @@ def _make_chain_df(rows):
 
 def _identity_chain(src_chrom="chr1", tgt_chrom="1", length=1000, chain_id=1):
     """Identity chain: src [0, length) maps to tgt [0, length) on + strand."""
-    return _make_chain_df([[tgt_chrom, 0, length, 0, src_chrom, 0, length, 0, chain_id, 1000.0]])
+    return _make_chain_df([[tgt_chrom, 0, length, 1, src_chrom, 0, length, 1, chain_id, 1000.0]])
 
 
 def _lift(tmp_path, pairs, chain, is_points=False):
@@ -136,7 +136,7 @@ class TestLiftover2DNegStrand:
         # A negative-strand block src [0, 100) -> tgt [0, 100) reflects an interval:
         # src [10, 30) -> tgt [100 - 30, 100 - 10) = [70, 90), and the y-dim
         # src [20, 40) -> [60, 80).
-        chain = _make_chain_df([["1", 0, 100, 1, "chr1", 0, 100, 0, 1, 1000.0]])
+        chain = _make_chain_df([["1", 0, 100, -1, "chr1", 0, 100, 1, 1, 1000.0]])  # R strands
         rows = _lift(tmp_path, {"chr1-chr1": [(10, 20, 30, 40, 1.5)]}, chain)
         assert rows == [("chr1", "chr1", 70, 60, 90, 80, 1.5)]
 

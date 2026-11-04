@@ -248,9 +248,26 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
             entries.push_back(idx_entry);
         }
 
-        fflush(dat_fp);
-        fsync(fileno(dat_fp));
-        fclose(dat_fp);
+        // Check the write (a full disk shows up at flush or close) and the size
+        // BEFORE renaming over anything: until then the old track is intact.
+        bool write_ok = fflush(dat_fp) == 0 && fsync(fileno(dat_fp)) == 0;
+        int write_errno = errno;
+        if (fclose(dat_fp) != 0 && write_ok) {
+            write_ok = false;
+            write_errno = errno;
+        }
+        if (!write_ok)
+            TGLError<GenomeTrack>("Failed to write %s: %s", dat_path_tmp.c_str(), strerror(write_errno));
+
+        struct stat dat_stat;
+        if (stat(dat_path_tmp.c_str(), &dat_stat) != 0) {
+            TGLError<GenomeTrack>("Failed to stat %s after conversion", dat_path_tmp.c_str());
+        }
+        if ((uint64_t)dat_stat.st_size != current_offset) {
+            TGLError<GenomeTrack>("track.dat size mismatch: expected %llu bytes, got %llu bytes",
+                                  (unsigned long long)current_offset,
+                                  (unsigned long long)dat_stat.st_size);
+        }
 
         // Write index file via TrackIndex2D
         TrackIndex2D::write_index(idx_path_tmp, track_type, entries);
@@ -263,17 +280,6 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
         if (rename(idx_path_tmp.c_str(), idx_path.c_str()) != 0) {
             TGLError<GenomeTrack>("Failed to rename %s to %s: %s",
                                   idx_path_tmp.c_str(), idx_path.c_str(), strerror(errno));
-        }
-
-        // Verify track.dat size
-        struct stat dat_stat;
-        if (stat(dat_path.c_str(), &dat_stat) != 0) {
-            TGLError<GenomeTrack>("Failed to stat %s after conversion", dat_path.c_str());
-        }
-        if ((uint64_t)dat_stat.st_size != current_offset) {
-            TGLError<GenomeTrack>("track.dat size mismatch: expected %llu bytes, got %llu bytes",
-                                  (unsigned long long)current_offset,
-                                  (unsigned long long)dat_stat.st_size);
         }
 
         // Remove old per-pair files if requested, also those that the packed ones hid

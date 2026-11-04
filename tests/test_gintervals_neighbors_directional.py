@@ -46,7 +46,7 @@ class TestGintervalsNeighborsUpstream:
         assert len(result) >= 2
 
         # Check first query's upstream neighbor
-        q1_results = result[(result["chrom"] == "1") & (result["start"] == 5000)]
+        q1_results = result[(result["chrom"] == "chr1") & (result["start"] == 5000)]  # DB names, as in R
         assert len(q1_results) > 0
         # Upstream distance should be negative for + strand (target is left of query)
         assert all(q1_results["dist"] <= 0)
@@ -289,26 +289,13 @@ class TestDirectionalNeighborsEdgeCases:
         # Should find target at 3000
         assert result is not None
 
-    def test_zero_strand_treated_as_positive(self):
-        """Strand=0 (unstranded) should be treated as + strand."""
-        query = pd.DataFrame({
-            "chrom": ["1"],
-            "start": [5000],
-            "end": [5100],
-            "strand": [0]  # unstranded
-        })
-
-        targets = pd.DataFrame({
-            "chrom": ["1", "1"],
-            "start": [3000, 7000],
-            "end": [3100, 7100]
-        })
-
-        upstream = pm.gintervals_neighbors_upstream(query, targets)
-        downstream = pm.gintervals_neighbors_downstream(query, targets)
-
-        # With strand=0 treated as +, upstream should find 3000, downstream should find 7000
-        assert upstream is not None or downstream is not None
+    def test_zero_strand_is_an_error(self):
+        """R test-directional-neighbors.R:98: the strand must be -1 or 1."""
+        query = pd.DataFrame({"chrom": ["1"], "start": [5000], "end": [5100], "strand": [0]})
+        targets = pd.DataFrame({"chrom": ["1", "1"], "start": [3000, 7000], "end": [3100, 7100]})
+        for f in (pm.gintervals_neighbors_upstream, pm.gintervals_neighbors_downstream):
+            with pytest.raises(ValueError, match="Invalid strand value 0 at row 1. Strand must be -1 or 1."):
+                f(query, targets)
 
     def test_empty_query_intervals(self):
         """Empty query intervals return None."""

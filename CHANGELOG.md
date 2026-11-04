@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.16.0 (2026-11-04)
+
+### Breaking
+
+* `gextract` (and the functions built on it) returns rows in genome order, as R does, instead of the input's order.
+* IDs are 1-based as in R: `intervalID` from `gintervals_liftover`, and the `gintervals_canonic` mapping. Chain strands are R's `1` / `-1` in `gintervals_load_chain`, `gintervals_as_chain` and the chain frames they accept.
+* A sequence-based vtrack (pwm, kmer, masked, ...) with no iterator and no bin size is an error, as in R, instead of a guessed iterator.
+* `gvtrack_create`, `gvtrack_iterator`, `gintervals_neighbors`, the edit-distance PWM functions and liftover check their arguments as R does, with R's messages.
+* `global.percentile` vtracks on 2D tracks are an error, as in R.
+* `gdataset_ls()` lists the working database first, then the loaded datasets, as R does.
+* `gtrack_2d_import_contacts` writes the contacts in coordinate order, so the track's bytes no longer depend on the C++ library (R misha gets the same change).
+* `gintervals_liftover(value_col=...)` now aggregates as R misha does: overlapping lifted intervals are cut at their ends and each piece takes `multi_target_agg` (with `params`, `na_rm`, `min_n`) over the intervals covering it. Previously these four arguments were ignored and values were passed through.
+* `gintervals_normalize` follows R: an odd size puts the extra base on the right, and results are clipped at the chromosome ends instead of shifted.
+* `gtrack_create_sparse` / `gtrack_create_dense` (and the other track-creating functions) raise on an unknown chromosome or an interval past the chromosome end, as R does, instead of dropping or storing it.
+* `gvtrack_create` refuses the name of an existing track or interval set, as R does.
+* `gseq_pwm(mode="pos")` breaks ties as R's `gseq.pwm` (higher score, then earlier start, then forward strand), and `return_strand=True` gives NA where no window could be scored.
+* A filtered value-based (DataFrame source) `avg` vtrack is the plain mean of the intervals left after masking, as without a filter.
+
+### New features
+
+* `gintervals_liftover` lifts 2D intervals, as R does.
+* `gpartition` works over a 2D scope (with `band`), as R does.
+* `gtrack_ls(db=)` and `gintervals_ls(db=)` list one database's or dataset's objects; `gdataset_ls(dataframe=True)` gives per-path counts; `gtrack_dataset` and `gintervals_dataset` accept a list of names.
+
+### Bug fixes
+
+* Integer chromosome columns (e.g. a BED file read by pandas) no longer map every row to the first chromosome.
+* `gdist` with two or more expressions returns the counts in the right cells (the array was filled in the wrong order).
+* Spatial `pwm` / `pwm.max` vtracks are right on every chromosome of a multi-chromosome scan, not only the first.
+* A filtered `quantile` vtrack with `params=0` gives the minimum, not the median.
+* `glookup` without an iterator no longer merges overlapping scope intervals; `intervalID` refers to the caller's rows.
+* `gintervals_intersect` and `gintervals_union` canonicalize their inputs first, so row order and overlaps no longer change the result.
+* Multitasking no longer splits an interval that lies inside one iterator bin into two rows; results no longer depend on the number of processes.
+* `gsynth_train` without an iterator counts every position (it counted almost none), and no longer leaks the arrays it returns.
+* `gpartition` accepts integer numpy breaks.
+* Ctrl-C during `gcor` stops it instead of silently rescanning.
+* `gintervals_rm`, `gintervals_exists` and the other interval-set functions reject absolute paths, which could delete files outside the database.
+* A relative database path given to `gdb_init` keeps working after `os.chdir()`.
+* Interval sets with point intervals (start == end) are saved 1 bp long, as in R; such sets were unusable.
+* Crashes fixed: 2D `gintervals_neighbors` with many overlapping targets (now an error, as in R), `pwm.edit_distance` on motifs of about 30 bp or more, a bad fragment-ends file in `gtrack_2d_import_contacts`, and truncated 2D track files. Any other C++ exception becomes a Python error instead of aborting.
+* An overlapping 2D scope is an error, as in R, instead of using unbounded memory.
+* `gintervals_neighbors` with an infinite `maxdist` finds neighbors (it found none on x86).
+* A full disk while converting a 2D track to indexed format, or splitting an indexed track per chromosome, leaves the original track intact instead of a truncated or deleted one.
+* Copying an indexed sparse track with an empty chromosome into a per-chromosome database gives a readable track.
+* Multitasked `gpartition` and interval summaries / quantiles no longer mix up the workers' results.
+* WIG and bedGraph coordinates are read as integers, as R does; "nan" or fractional coordinates are errors.
+* `gtrack_attr_import` skips missing cells instead of storing "nan".
+* `gintervals_save` and `gtrack_mv` create namespace directories with the configured permissions.
+* `gdataset_load` sees every track and interval set of the working database when checking for collisions, also after `gdir_cd` or a save.
+* `ggenome_implant` rejects `line_width < 1`, and `gsynth_replace_kmer` with a target equal to its replacement does nothing (both used to run forever).
+* `gintervals_annotate` and `gintervals_neighbors` report the database's chromosome names, as R does.
+* Constant expressions (`"1"`, `"1 > 0"`) work in `gextract`, `gscreen`, `gsummary` and track creation.
+* `file=` output writes numbers with 15 significant digits and NaN as `nan`, as R does.
+* The overlapping-iterator warning is given only when a merged row is visible in the result, as in R.
+* Neighbor and `gseq_pwm_edits` ties no longer depend on the platform's C++ library.
+
 ## v0.15.3 (2026-11-03)
 
 ### Bug fixes

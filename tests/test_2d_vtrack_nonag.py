@@ -10,7 +10,6 @@ import shutil
 
 import _pymisha
 import numpy as np
-import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -450,111 +449,12 @@ class TestSample:
 
 
 class TestGlobalPercentile:
-    """Test the 'global.percentile' function on 2D virtual tracks."""
+    """R test-vtrack.R:368-450: global.percentile* is not supported by 2D tracks."""
 
-    def test_global_percentile_basic(self, rects_track):
-        """global.percentile returns values in [0, 1)."""
-        pm.gvtrack_create("vt_gpct", rects_track, func="global.percentile")
-        intervals = pm.gintervals_2d(
-            chroms1=["1", "1", "1"],
-            starts1=[0, 900, 100],
-            ends1=[600, 2100, 200],
-            chroms2=["1", "1", "1"],
-            starts2=[0, 900, 200],
-            ends2=[700, 2100, 300],
-        )
-        # the intervals overlap, and an iterator must not: one at a time
-        result = pd.concat([pm.gextract("vt_gpct", intervals.iloc[[i]], iterator=intervals.iloc[[i]])
-                            for i in range(len(intervals))])
-
-        assert len(result) == 3
-        vals = result["vt_gpct"].to_numpy(dtype=float)
-        valid = vals[~np.isnan(vals)]
-        assert len(valid) == 3
-        # All values should be in [0, 1]
-        assert np.all(valid >= 0.0)
-        assert np.all(valid <= 1.0)
-
-    def test_global_percentile_ordering(self, rects_track):
-        """Intervals with higher avg values should have higher percentile ranks."""
-        pm.gvtrack_create("vt_gpct_o", rects_track, func="global.percentile")
-        pm.gvtrack_create("vt_avg_o", rects_track, func="avg")
-
-        intervals = pm.gintervals_2d(
-            chroms1=["1", "1", "1"],
-            starts1=[0, 900, 100],
-            ends1=[600, 2100, 200],
-            chroms2=["1", "1", "1"],
-            starts2=[0, 900, 200],
-            ends2=[700, 2100, 300],
-        )
-
-        res_pct = pm.gextract("vt_gpct_o", intervals, iterator=intervals)
-        res_avg = pm.gextract("vt_avg_o", intervals, iterator=intervals)
-
-        assert res_pct is not None
-        assert res_avg is not None
-
-        pct_vals = res_pct.sort_values("start1").reset_index(drop=True)["vt_gpct_o"].to_numpy()
-        avg_vals = res_avg.sort_values("start1").reset_index(drop=True)["vt_avg_o"].to_numpy()
-
-        # Higher avg should have higher or equal percentile
-        valid_mask = ~np.isnan(pct_vals) & ~np.isnan(avg_vals)
-        pct_valid = pct_vals[valid_mask]
-        avg_valid = avg_vals[valid_mask]
-
-        # Sort by avg and check percentiles are non-decreasing
-        sort_idx = np.argsort(avg_valid)
-        sorted_pct = pct_valid[sort_idx]
-        for i in range(1, len(sorted_pct)):
-            assert sorted_pct[i] >= sorted_pct[i - 1]
-
-    def test_global_percentile_nan_for_no_intersection(self, rects_track):
-        """global.percentile returns NaN when no objects intersect."""
-        pm.gvtrack_create("vt_gpct_nan", rects_track, func="global.percentile")
-        intervals = pm.gintervals_2d("1", 400000, 500000, "1", 400000, 500000)
-        result = pm.gextract("vt_gpct_nan", intervals, iterator=intervals)
-
-        assert result is not None
-        assert len(result) == 1
-        assert np.isnan(result["vt_gpct_nan"].iloc[0])
-
-    def test_global_percentile_single_interval(self, rects_track):
-        """global.percentile with a single interval returns 0.0 (no values are strictly less)."""
-        pm.gvtrack_create("vt_gpct_1", rects_track, func="global.percentile")
-        intervals = pm.gintervals_2d("1", 0, 600, "1", 0, 700)
-        result = pm.gextract("vt_gpct_1", intervals, iterator=intervals)
-
-        assert result is not None
-        assert len(result) == 1
-        # With only one valid value, percentile should be 0.0
-        assert result["vt_gpct_1"].iloc[0] == pytest.approx(0.0)
-
-    def test_global_percentile_points_track(self, points_track):
-        """global.percentile works on points tracks."""
-        pm.gvtrack_create("vt_gpct_p", points_track, func="global.percentile")
-        intervals = pm.gintervals_2d(
-            chroms1=["1", "1"],
-            starts1=[0, 4000],
-            ends1=[300, 6000],
-            chroms2=["1", "1"],
-            starts2=[0, 4000],
-            ends2=[300, 6000],
-        )
-        result = pm.gextract("vt_gpct_p", intervals, iterator=intervals)
-
-        assert result is not None
-        assert len(result) == 2
-        vals = result["vt_gpct_p"].to_numpy(dtype=float)
-        valid = vals[~np.isnan(vals)]
-        assert len(valid) == 2
-        assert np.all(valid >= 0.0)
-        assert np.all(valid <= 1.0)
-
-
-# ===========================================================================
-# Tests: band filter with non-aggregation functions
-# ===========================================================================
+    @pytest.mark.parametrize("func_name", ["global.percentile", "global.percentile.min", "global.percentile.max"])
+    def test_global_percentile_on_2d_is_an_error(self, rects_track, func_name):
+        with pytest.raises(ValueError, match=f"function {func_name} is not supported by rectangles tracks"):
+            pm.gvtrack_create("vt_gpct", rects_track, func=func_name)
 
 
 class TestBandFilter:
@@ -687,7 +587,7 @@ class TestOutputShape:
 class TestVtrackCreation:
     """Test that gvtrack_create accepts the new function names for 2D tracks."""
 
-    @pytest.mark.parametrize("func_name", ["exists", "size", "first", "last", "sample", "global.percentile"])
+    @pytest.mark.parametrize("func_name", ["exists", "size", "first", "last", "sample"])
     def test_create_with_nonag_func(self, rects_track, func_name):
         """gvtrack_create should accept non-aggregation function names for 2D tracks."""
         vt_name = f"vt_create_{func_name.replace('.', '_')}"

@@ -250,10 +250,11 @@ WindowResult compute_window_edits_detailed(
             sorted_positions.push_back(i);
         }
     }
-    std::sort(sorted_positions.begin(), sorted_positions.end(),
-              [&positions](int a, int b) {
-                  return positions[a].gain > positions[b].gain;
-              });
+    // stable: equal gains keep position order under every C++ library
+    std::stable_sort(sorted_positions.begin(), sorted_positions.end(),
+                     [&positions](int a, int b) {
+                         return positions[a].gain > positions[b].gain;
+                     });
 
     double acc = 0.0;
     int edits = mandatory_edits;

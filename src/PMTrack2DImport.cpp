@@ -916,9 +916,15 @@ void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
         if (*endptr)
             verror("Error reading fragment ends file %s, line %ld: invalid %s", fends_fname, (long)lineno, FENDS_COLS[COL_FEND]);
 
-        chromids.resize(fendid + 1);
-        coords.resize(fendid + 1);
-        defined.resize(fendid + 1);
+        if (fendid < 0)
+            verror("Error reading fragment ends file %s, line %ld: %s is out of range", fends_fname, (long)lineno, FENDS_COLS[COL_FEND]);
+
+        // Grow only: ids need not be sorted, and shrinking drops earlier ones.
+        if ((uint64_t)fendid >= chromids.size()) {
+            chromids.resize(fendid + 1);
+            coords.resize(fendid + 1);
+            defined.resize(fendid + 1);
+        }
         defined[fendid] = true;
 
         // Use chromosome name as-is (no forced chr prefix)
@@ -1090,7 +1096,12 @@ void write_contacts_pair(const ImportArgs &args, const PairFiles &pair_files, bo
             }
         });
 
-        for (Contacts::const_iterator icontact = contacts.begin(); icontact != contacts.end(); ++icontact) {
+        // Insert in coordinate order, not hash order: the hash order depends on the
+        // C++ runtime library, and so did the file's bytes.
+        vector<pair<pair<uint64_t, uint64_t>, double>> sorted_contacts(contacts.begin(), contacts.end());
+        sort(sorted_contacts.begin(), sorted_contacts.end());
+
+        for (auto icontact = sorted_contacts.cbegin(); icontact != sorted_contacts.cend(); ++icontact) {
             int64_t coord1 = icontact->first.first;
             int64_t coord2 = icontact->first.second;
             float value = icontact->second;

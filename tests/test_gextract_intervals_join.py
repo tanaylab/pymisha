@@ -125,7 +125,7 @@ def test_intervals_join_intervals_2d_scope():
     # gscreen/gextract before we test the feature under test.
     intervs = pm.gintervals_2d(
         chroms1=["1", "1"],
-        starts1=[0, 100000],
+        starts1=[0, 300000],   # disjoint: an overlapping 2D scope is an error, as in R
         ends1=[250000, 500000],
         chroms2=["1", "1"],
         starts2=[0, 200000],

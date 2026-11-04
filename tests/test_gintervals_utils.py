@@ -101,11 +101,11 @@ class TestGiteratorIntervals:
             widths = result["end"] - result["start"]
             assert all(widths <= bin_size)
 
-    def test_has_interval_id(self):
-        """Result should contain intervalID column."""
+    def test_no_interval_id(self):
+        """As R, the result is the iterator intervals only (no intervalID)."""
         intervs = pm.gintervals("chr1", [0, 500], [200, 700])
         result = pm.giterator_intervals(intervals=intervs, iterator=50)
-        assert "intervalID" in result.columns
+        assert list(result.columns) == ["chrom", "start", "end"]
 
     def test_interval_relative_aligns_to_interval_start(self):
         """interval_relative=True starts bins from each interval start."""
@@ -187,7 +187,6 @@ class TestGintervalsRbind:
             pm.gintervals_rbind(i1, i2)
 
     def test_intervals_set_out_saves_result_and_returns_none(self):
-        pytest.importorskip("pyreadr", reason="pyreadr required to save interval sets")
         i1 = pm.gintervals("chr1", [100, 300], [200, 400])
         i1["score"] = [1.0, 2.0]
         i2 = pm.gintervals("chr2", 500, 650)

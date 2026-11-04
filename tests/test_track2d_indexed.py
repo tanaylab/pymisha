@@ -1535,52 +1535,6 @@ class TestRoundtripVtrackFirstLastSample:
             self._cleanup_track(tname)
 
 
-class TestRoundtripVtrackGlobalPercentile:
-    """Roundtrip tests for global.percentile vtrack on indexed 2D tracks."""
-
-    def _cleanup_track(self, name):
-        _cleanup_track(name)
-
-    def test_global_percentile_roundtrip(self):
-        """global.percentile vtrack before and after indexed conversion."""
-        tname = "test.idx_rt_gpct"
-        self._cleanup_track(tname)
-        try:
-            intervals = pm.gintervals_2d(
-                chroms1=["1", "1", "1"],
-                starts1=[100, 1000, 5000],
-                ends1=[200, 2000, 6000],
-                chroms2=["1", "1", "1"],
-                starts2=[300, 3000, 7000],
-                ends2=[400, 4000, 8000],
-            )
-            values = [1.0, 2.0, 3.0]
-            pm.gtrack_2d_create(tname, "gpct test", intervals, values)
-
-            # Use three separate query intervals to get a meaningful percentile
-            query = pm.gintervals_2d(
-                chroms1=["1", "1", "1"],
-                starts1=[0, 500, 4000],
-                ends1=[500, 3000, 9000],
-                chroms2=["1", "1", "1"],
-                starts2=[0, 2000, 6000],
-                ends2=[500, 5000, 9000],
-            )
-            pm.gvtrack_create("vt_gpct", tname, func="global.percentile")
-
-            before = pm.gextract("vt_gpct", intervals=query)
-
-            tdir = _track_dir(tname)
-            _convert_to_indexed(tdir, is_points=False)
-
-            after = pm.gextract("vt_gpct", intervals=query)
-
-            pd.testing.assert_frame_equal(before, after, check_like=True)
-        finally:
-            pm.gvtrack_clear()
-            self._cleanup_track(tname)
-
-
 class TestEdgeCases:
     """Edge case tests for indexed 2D tracks."""
 

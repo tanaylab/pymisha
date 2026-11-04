@@ -98,7 +98,9 @@ static void parse_intervals(PMDataFrame &df,
 
 // Helper: Sort intervals by chromosome and start
 static void sort_intervals(vector<GInterval> &intervals) {
-    sort(intervals.begin(), intervals.end());
+    // stable: equal intervals keep their input order on every platform, so
+    // neighbor ties don't depend on the C++ library
+    stable_sort(intervals.begin(), intervals.end());
 }
 
 // Helper: Get original index from interval
@@ -135,6 +137,10 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
             TGLError("maxneighbors must be >= 1");
         }
 
+        // Clamp to a bound past any genome: (int64_t)inf is undefined (INT64_MIN on
+        // x86, so an infinite maxdist matched nothing) and llabs(INT64_MIN) overflows.
+        mindist = std::max(-1e18, std::min(1e18, mindist));
+        maxdist = std::max(-1e18, std::min(1e18, maxdist));
         if (mindist > maxdist) {
             TGLError("mindist must be <= maxdist");
         }

@@ -1,5 +1,5 @@
 {
-  "misha": "5.12.1",
+  "misha": "5.14.4",
   "empty_query": {
     "queries": {
       "chrom1": ["chr1", "chr2", "chr1", "chr1", "chrX"],
@@ -466,77 +466,77 @@
     "contacts": {
       "chr1-chr1": {
         "size": 5460,
-        "sha256": "82b5b4aaf5247ddeda6881c25f22d5506896091027fccdb17f6b813c4c8d7366"
+        "sha256": "c4e4794c413a26823fcf9df448f08943c9970005905f8a72c3e36f5bea9482a0"
       },
       "chr1-chr2": {
         "size": 6156,
-        "sha256": "049beb1ad23ec9239fa85838b978836b025a223e84117e5750e41c288a3ef2ee"
+        "sha256": "0b24af1d2a918d42263abfc4e7ca7d42fe58bf427832a687f05f852c42334389"
       },
       "chr1-chrX": {
         "size": 5836,
-        "sha256": "3a7b9649eb723024863a1809ea126fe2a7b1c50a846f704aa528b05c475641cf"
+        "sha256": "c4fe267563cdfa24e9b7dbf1ee634cecdd2e00fc3e8cfafd9ea13db55cc04293"
       },
       "chr2-chr1": {
         "size": 6156,
-        "sha256": "8a169b78bfe8767b1f2739fc16465a4120dd106281198e21e91e91db69d0fe5c"
+        "sha256": "abbcb7e0951f1ab9f2b3c666a2f55b815f34e3202a542c2f5841c2bfdeccba34"
       },
       "chr2-chr2": {
         "size": 5804,
-        "sha256": "fe2d384e395cdcc22c741b18fccd783d4d6b60390c30310bd065b1c792846c19"
+        "sha256": "32f79eaef41eba2b73e49f4f2e13607b8ea46031afc126d236ddf3d0cd82006b"
       },
       "chr2-chrX": {
         "size": 6316,
-        "sha256": "1c9bf667240951182eef42306877e6bf305805f12b913341f53210c3a7346142"
+        "sha256": "3b9d07c3661245631c3bf2c0771d7cc31bc3e43eabee37c7d4bef5716ce05a72"
       },
       "chrX-chr1": {
         "size": 5836,
-        "sha256": "a4b060a529fd681ce09e47d88c3b6915be851056804274bfcbc1845e32b0390f"
+        "sha256": "daeafd1ec311236497d98763798d8a23ceac9b6050b98f5ec449c280389d6a83"
       },
       "chrX-chr2": {
         "size": 6316,
-        "sha256": "0a051c95690ba29fe86aae2bca17950e0e685ceb36bab92c51b6b86324960fd6"
+        "sha256": "7d137ee16cd18cb8baeb210d9b42e16ee3bf8b3f3affdda8e51e3a4b50d04af3"
       },
       "chrX-chrX": {
         "size": 6636,
-        "sha256": "e0d2d2fc62e58e2387b0d569da2e03a456122622e58ea5739f68f08eb52fbab8"
+        "sha256": "dc8f15668fde570333e55be24125917dd5a940a25065aa1fd7c9489e5137b5dc"
       }
     },
     "contacts_split": {
       "chr1-chr1": {
         "size": 5524,
-        "sha256": "6edae5cd15bf5fd8ffb913bcc50a906552f6c3c773edaba432038985978162e1"
+        "sha256": "23196d2c551c5fbac8f1141058a23ef54b5c49648dad45716062d7a328b9cc33"
       },
       "chr1-chr2": {
         "size": 6220,
-        "sha256": "c54c82dd417df3f16abcb01b3d049fb0b50ea4d8537be8e1b0b832bd5588cb5a"
+        "sha256": "43a198f4207e624715cbce0e96f188d5582411312f53a2910f6b584abb227c0e"
       },
       "chr1-chrX": {
         "size": 5900,
-        "sha256": "f3165da697c13d90e9e001f8744319ea4b12eda1ae2b822f9fdae118391a5507"
+        "sha256": "b09549871f43571d20fd97281fb092bb93903aaccecfc2dca2b247c7206b141f"
       },
       "chr2-chr1": {
         "size": 6220,
-        "sha256": "c94ed2076552875a72bb40fb6fa126a7cd9d3f7093d9c39a508079b1b835f5e8"
+        "sha256": "e70f923401aaa11711f772744721e67a10704cf209e9ddc6bc003d20352d1b4c"
       },
       "chr2-chr2": {
         "size": 5868,
-        "sha256": "881730eb3a28eb1f5649ea38778a85ab31fe1ba8b271c4645ba472a85c68c12d"
+        "sha256": "0283d00d18a6ac753b738a1f54ee20655e1a971fd936c7d9b01d0e15b8bfc9bb"
       },
       "chr2-chrX": {
         "size": 6380,
-        "sha256": "4f90e0e4201d5919a0ee0d1a10939cf1da156906ead2379045fa25289f3019fd"
+        "sha256": "531376d0ae4109b59a05cebd67f4f56c98df0012f57c2a6d7cea8e2ee5d80a68"
       },
       "chrX-chr1": {
         "size": 5900,
-        "sha256": "efeef614dd50399ec857c28faa27e7501d76ab037765f8755048ff58752cc0c9"
+        "sha256": "6f4de017cde17f8a9783bf9136e4c4dc866a22c80dfebd5a9590bd37be10f2b5"
       },
       "chrX-chr2": {
         "size": 6380,
-        "sha256": "d3b7a883a8718a8da2978c5b91684d158cccd7cc77affcdd5028bc277d9044d4"
+        "sha256": "5d0bc349ba8b746e7ff33b71a6b0df3dc29a9d3126d7f02149156325f82b2c30"
       },
       "chrX-chrX": {
         "size": 6700,
-        "sha256": "96e90521b60b4adcfedc6cfd9fd106b9aa1ef270ef81b4efb29e22769fcd7697"
+        "sha256": "f67a7eac19558fa47f9ca43035f92a23155b0d5d6fb2b2dd1c03b4411a97fda2"
       }
     },
     "types": {

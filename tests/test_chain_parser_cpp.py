@@ -236,7 +236,7 @@ class TestMalformedInput:
     def test_bad_header_field_count(self, tmp_path):
         path = str(tmp_path / "bad_hdr.chain")
         Path(path).write_text("chain 100 chr25 +\n\n")
-        with pytest.raises(ValueError, match="13 fields"):
+        with pytest.raises(ValueError, match="line 1: invalid file format"):
             _call(path)
 
     def test_bad_source_size_zero(self, tmp_path):
@@ -245,7 +245,7 @@ class TestMalformedInput:
             "chain 100 chr25 0 + 0 100 1 500000 + 0 100 1\n"
             "100\n\n"
         )
-        with pytest.raises(ValueError, match="source chrom size"):
+        with pytest.raises(ValueError, match="invalid format of reference chrom size"):
             _call(path)
 
     def test_inconsistent_source_size(self, tmp_path):
@@ -265,7 +265,7 @@ class TestMalformedInput:
             "chain 100 chr25 100000 ? 0 100 1 500000 + 0 100 1\n"
             "100\n\n"
         )
-        with pytest.raises(ValueError, match="source strand"):
+        with pytest.raises(ValueError, match="invalid format of reference strand"):
             _call(path)
 
     def test_target_size_mismatch_db(self, tmp_path):
@@ -275,7 +275,7 @@ class TestMalformedInput:
             "chain 100 chr25 100000 + 0 100 1 999999 + 0 100 1\n"
             "100\n\n"
         )
-        with pytest.raises(ValueError, match="target chrom size"):
+        with pytest.raises(ValueError, match=r"query chrom size \(999999\) differs from what have been defined in the database"):
             _call(path)
 
     def test_target_start_out_of_range(self, tmp_path):
@@ -284,13 +284,13 @@ class TestMalformedInput:
             "chain 100 chr25 100000 + 0 100 1 500000 + 999999 1000000 1\n"
             "100\n\n"
         )
-        with pytest.raises(ValueError, match="target start"):
+        with pytest.raises(ValueError, match="query start coordinate exceeds chromosome size"):
             _call(path)
 
     def test_block_outside_chain(self, tmp_path):
         path = str(tmp_path / "no_chain.chain")
         Path(path).write_text("500\n100\n")
-        with pytest.raises(ValueError, match="outside chain"):
+        with pytest.raises(ValueError, match="line 1: invalid file format"):
             _call(path)
 
     def test_bad_block_size_zero(self, tmp_path):
@@ -299,7 +299,7 @@ class TestMalformedInput:
             "chain 100 chr25 100000 + 0 100 1 500000 + 0 100 1\n"
             "0\n\n"
         )
-        with pytest.raises(ValueError, match="block size"):
+        with pytest.raises(ValueError, match="line 2: invalid size"):
             _call(path)
 
     def test_negative_dt_rejected(self, tmp_path):

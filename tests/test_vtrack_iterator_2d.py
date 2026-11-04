@@ -23,7 +23,7 @@ class TestGvtrackIterator2d:
 
     def test_sets_2d_iterator_defaults(self):
         """Setting 2D iterator with defaults stores zero shifts."""
-        pm.gvtrack_create("vt1", "dense_track")
+        pm.gvtrack_create("vt1", "rects_track")
         pm.gvtrack_iterator_2d("vt1")
         info = pm.gvtrack_info("vt1")
         assert info.get("itr_type") == "2d"
@@ -34,7 +34,7 @@ class TestGvtrackIterator2d:
 
     def test_sets_custom_shifts(self):
         """Setting 2D iterator with custom shifts stores them."""
-        pm.gvtrack_create("vt2", "dense_track")
+        pm.gvtrack_create("vt2", "rects_track")
         pm.gvtrack_iterator_2d("vt2", sshift1=-100, eshift1=100, sshift2=-200, eshift2=200)
         info = pm.gvtrack_info("vt2")
         assert info["itr_type"] == "2d"
@@ -48,19 +48,12 @@ class TestGvtrackIterator2d:
         with pytest.raises(KeyError):
             pm.gvtrack_iterator_2d("nonexistent")
 
-    def test_overwrites_previous_iterator(self):
-        """Setting 2D iterator replaces any previous 1D iterator."""
+    def test_1d_source_rejected(self):
+        """R test-vtrack.R:869: a 2D iterator modifier on a 1D source is an error."""
         pm.gvtrack_create("vt3", "dense_track")
-        pm.gvtrack_iterator("vt3", sshift=-50, eshift=50)
-        info1 = pm.gvtrack_info("vt3")
-        assert info1.get("sshift") == -50
-
-        pm.gvtrack_iterator_2d("vt3", sshift1=10, eshift2=20)
-        info2 = pm.gvtrack_info("vt3")
-        assert info2["itr_type"] == "2d"
-        assert info2["sshift1"] == 10
-        assert info2["eshift2"] == 20
-
+        with pytest.raises(ValueError, match="2D iterator modifier cannot be used with source that "
+                                             "supports only 1D iterators"):
+            pm.gvtrack_iterator_2d("vt3", sshift1=10, eshift2=20)
 
 class TestGvtrackIterator2dExtraction:
     """Test that 2D iterator shifts are applied during extraction."""
@@ -264,10 +257,9 @@ class TestGvtrackIterator2dExtraction:
     def test_1d_shift_still_rejected(self):
         """1D iterator shifts on a 2D vtrack should still be rejected."""
         pm.gvtrack_create("vt_1d", "rects_track", func="avg")
-        pm.gvtrack_iterator("vt_1d", sshift=100, eshift=100)
-        intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        with pytest.raises(ValueError, match="does not support 1D iterator shifts"):
-            pm.gextract("vt_1d", intervals)
+        with pytest.raises(ValueError, match="1D iterator modifier cannot be used with source that "
+                                             "supports only 2D iterators"):
+            pm.gvtrack_iterator("vt_1d", sshift=100, eshift=100)
 
 
 class TestDimProjectionOver2DIterator:

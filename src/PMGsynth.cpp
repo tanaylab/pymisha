@@ -346,7 +346,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
                     int bin_idx = -1;
                     if (!bins.empty() &&
                         pos >= bins[bin_cursor].first &&
-                        pos < bins[bin_cursor].first + iter_size) {
+                        pos - bins[bin_cursor].first < iter_size) {  // no overflow when iter_size is INT64_MAX
                         bin_idx = bins[bin_cursor].second;
                     }
 
@@ -487,17 +487,7 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
         }
         PMPY py_marginal_fallbacks(PyLong_FromLong(marginal_fallbacks), true);
 
-        py_counts_list.to_be_stolen();
-        py_cdf_list.to_be_stolen();
-        py_pbk.to_be_stolen();
-        py_total.to_be_stolen();
-        py_masked.to_be_stolen();
-        py_n.to_be_stolen();
-        py_k.to_be_stolen();
-        py_num_kmers.to_be_stolen();
-        py_prior.to_be_stolen();
-        py_marginal_fallbacks.to_be_stolen();
-
+        // PyDict_SetItemString adds its own reference; the PMPY holders drop theirs.
         PyDict_SetItemString(result, "counts", py_counts_list);
         PyDict_SetItemString(result, "cdf", py_cdf_list);
         PyDict_SetItemString(result, "per_bin_kmers", py_pbk);
@@ -1055,8 +1045,9 @@ PyObject *pm_gsynth_replace_kmer(PyObject *self, PyObject *args)
                 // Convert to uppercase for matching
                 for (auto &c : seq) c = toupper(c);
 
-                // Iteratively replace
-                bool found_any = true;
+                // Iteratively replace. Replacing a k-mer by itself changes
+                // nothing (and would match forever), so it is a no-op.
+                bool found_any = target != replacement;
                 while (found_any) {
                     found_any = false;
                     for (size_t i = 0; i + kmer_len <= seq.size(); ++i) {

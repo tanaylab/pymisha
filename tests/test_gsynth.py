@@ -3118,3 +3118,12 @@ class TestGsynthPreserveN:
         for i, c in enumerate(ref_slice):
             if c in "Nn":
                 assert seq[i] == c
+
+
+def test_gsynth_train_default_iterator_counts_every_position():
+    """iterator=None is sent to C++ as INT64_MAX; bin_start + INT64_MAX used to
+    overflow, so positions outside the first bin were dropped."""
+    iv = pm.gintervals(["chr1"], [1000], [11000])
+    model = pm.gsynth_train(intervals=iv, k=5)
+    # both strands, minus the k-mer context at each end and any N
+    assert model.total_kmers > 0.9 * 2 * 10000

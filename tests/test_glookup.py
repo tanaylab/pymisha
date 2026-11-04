@@ -48,9 +48,16 @@ class TestGlookupBasic:
             intervals=intervals
         )
 
-        assert result is not None
-        assert isinstance(result, pd.DataFrame)
-        assert "value" in result.columns
+        # each row's value is lookup_table[bin of expr 1, bin of expr 2]
+        vals = pm.gextract(["dense_track", "2 * dense_track"], intervals)
+        x, y = vals.iloc[:, 3].to_numpy(float), vals.iloc[:, 4].to_numpy(float)
+        i = np.searchsorted(breaks1, x, side="left") - 1
+        j = np.searchsorted(breaks2, y, side="left") - 1
+        ok = (i >= 0) & (i < 5) & (j >= 0) & (j < 3)
+        want = np.full(len(x), np.nan)
+        want[ok] = lookup_table[i[ok], j[ok]]
+        assert ok.any()
+        np.testing.assert_array_equal(result["value"].to_numpy(float), want)
 
     def test_glookup_returns_intervalID(self):
         """Result has intervalID column for tracking."""
@@ -238,3 +245,13 @@ class TestGlookup2D:
             band_result["value"].dropna().to_numpy(dtype=float),
             lookup_table,
         ).all()
+
+
+def test_glookup_does_not_merge_overlapping_scope_like_r():
+    """R misha 5.14.2: 4 rows, intervalIDs 2, 4, 3, 1 (the caller's rows, genome order)."""
+    a = pd.DataFrame({"chrom": ["chrX", "chr1", "chr2", "chr1"],
+                      "start": [1, 2000, 4, 2015], "end": [10, 2020, 40, 2025]})
+    res = pm.glookup(np.array([0, 10, 20]), "dense_track", [0, 0.1, 0.2, 1], intervals=a)
+    assert res["intervalID"].tolist() == [2, 4, 3, 1]
+    assert res["start"].tolist() == [2000, 2015, 4, 1]
+    assert res["end"].tolist() == [2020, 2025, 40, 10]

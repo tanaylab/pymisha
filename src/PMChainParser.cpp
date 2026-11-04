@@ -139,8 +139,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
             if (!strcmp(toks[0], "chain")) {
                 if (ntok != 13) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: expected 13 fields in chain "
-                        "header, got %zu", path, lineno, ntok);
+                        "Chain file %s, line %ld: invalid file format", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -168,7 +167,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 src_size = strtoll(toks[3], &endp, 10);
                 if (*endp || src_size <= 0) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: invalid source chrom size", path, lineno);
+                        "Chain file %s, line %ld: invalid format of reference chrom size", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -179,8 +178,8 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                         src_chrom_sizes.emplace(src_chrom, src_size);
                     } else if (it->second != src_size) {
                         PyErr_Format(PyExc_ValueError,
-                            "Chain file %s, line %ld: source chrom size (%lld) "
-                            "differs from previous (%lld)",
+                            "Chain file %s, line %ld: reference chrom size (%lld) "
+                            "differs from previous value (%lld)",
                             path, lineno, (long long)src_size, (long long)it->second);
                         cleanup_line();
                         fclose(fp);
@@ -192,8 +191,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 else if (!strcmp(toks[4], "-")) src_strand = 1;
                 else {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: invalid source strand '%s'",
-                        path, lineno, toks[4]);
+                        "Chain file %s, line %ld: invalid format of reference strand", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -201,8 +199,9 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
 
                 src_start = strtoll(toks[5], &endp, 10);
                 if (*endp || src_start < 0 || src_start >= src_size) {
-                    PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: source start out of range",
+                    PyErr_Format(PyExc_ValueError, *endp || src_start < 0
+                        ? "Chain file %s, line %ld: invalid value of reference start coordinate"
+                        : "Chain file %s, line %ld: reference start coordinate exceeds chromosome size",
                         path, lineno);
                     cleanup_line();
                     fclose(fp);
@@ -210,8 +209,11 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 }
                 src_end = strtoll(toks[6], &endp, 10);
                 if (*endp || src_end <= src_start || src_end > src_size) {
-                    PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: source end out of range",
+                    PyErr_Format(PyExc_ValueError, *endp
+                        ? "Chain file %s, line %ld: invalid value of reference end coordinate"
+                        : src_end <= src_start
+                        ? "Chain file %s, line %ld: reference end coordinate is less or equal than the start coordinate"
+                        : "Chain file %s, line %ld: reference end coordinate exceeds chromosome size",
                         path, lineno);
                     cleanup_line();
                     fclose(fp);
@@ -229,8 +231,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 int64_t tgt_size_decl = strtoll(toks[8], &endp, 10);
                 if (*endp || tgt_size_decl <= 0) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: invalid target chrom size",
-                        path, lineno);
+                        "Chain file %s, line %ld: invalid format of query chrom size", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -248,8 +249,8 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 int64_t db_size = (int64_t)chromkey.get_chrom_size(tgt_chromid);
                 if (tgt_size_decl != db_size) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: target chrom size (%lld) "
-                        "differs from database (%lld)",
+                        "Chain file %s, line %ld: query chrom size (%lld) "
+                        "differs from what have been defined in the database (%lld)",
                         path, lineno, (long long)tgt_size_decl, (long long)db_size);
                     cleanup_line();
                     fclose(fp);
@@ -262,8 +263,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 else if (!strcmp(toks[9], "-")) tgt_strand = 1;
                 else {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: invalid target strand '%s'",
-                        path, lineno, toks[9]);
+                        "Chain file %s, line %ld: invalid format of query strand", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -271,8 +271,9 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
 
                 tgt_start = strtoll(toks[10], &endp, 10);
                 if (*endp || tgt_start < 0 || tgt_start >= tgt_size) {
-                    PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: target start out of range",
+                    PyErr_Format(PyExc_ValueError, *endp || tgt_start < 0
+                        ? "Chain file %s, line %ld: invalid value of query start coordinate"
+                        : "Chain file %s, line %ld: query start coordinate exceeds chromosome size",
                         path, lineno);
                     cleanup_line();
                     fclose(fp);
@@ -280,8 +281,12 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 }
                 tgt_end = strtoll(toks[11], &endp, 10);
                 if (*endp || tgt_end <= tgt_start || tgt_end > tgt_size) {
-                    PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: target end out of range",
+                    // R's wording, "reference" included, for the query end too
+                    PyErr_Format(PyExc_ValueError, *endp
+                        ? "Chain file %s, line %ld: invalid value of reference end coordinate"
+                        : tgt_end <= tgt_start
+                        ? "Chain file %s, line %ld: reference end coordinate is less or equal than the start coordinate"
+                        : "Chain file %s, line %ld: reference end coordinate exceeds chromosome size",
                         path, lineno);
                     cleanup_line();
                     fclose(fp);
@@ -291,7 +296,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 chain_id = strtoll(toks[12], &endp, 10);
                 if (*endp) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: invalid chain id",
+                        "Chain file %s, line %ld: invalid chain ID",
                         path, lineno);
                     cleanup_line();
                     fclose(fp);
@@ -306,16 +311,14 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
 
             if (!in_chain) {
                 PyErr_Format(PyExc_ValueError,
-                    "Chain file %s, line %ld: alignment block outside chain",
-                    path, lineno);
+                    "Chain file %s, line %ld: invalid file format", path, lineno);
                 cleanup_line();
                 fclose(fp);
                 return nullptr;
             }
             if (ntok != 1 && ntok != 3) {
                 PyErr_Format(PyExc_ValueError,
-                    "Chain file %s, line %ld: expected 1 or 3 fields in block "
-                    "line, got %zu", path, lineno, ntok);
+                    "Chain file %s, line %ld: invalid file format", path, lineno);
                 cleanup_line();
                 fclose(fp);
                 return nullptr;
@@ -325,7 +328,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
             int64_t size = strtoll(toks[0], &endp, 10);
             if (*endp || size <= 0) {
                 PyErr_Format(PyExc_ValueError,
-                    "Chain file %s, line %ld: invalid block size", path, lineno);
+                    "Chain file %s, line %ld: invalid size", path, lineno);
                 cleanup_line();
                 fclose(fp);
                 return nullptr;
@@ -368,8 +371,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 int64_t dt = strtoll(toks[1], &endp, 10);
                 if (*endp || dt < 0) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: negative or invalid dt",
-                        path, lineno);
+                        "Chain file %s, line %ld: invalid block gaps", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;
@@ -377,8 +379,7 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
                 int64_t dq = strtoll(toks[2], &endp, 10);
                 if (*endp || dq < 0) {
                     PyErr_Format(PyExc_ValueError,
-                        "Chain file %s, line %ld: negative or invalid dq",
-                        path, lineno);
+                        "Chain file %s, line %ld: invalid block gaps", path, lineno);
                     cleanup_line();
                     fclose(fp);
                     return nullptr;

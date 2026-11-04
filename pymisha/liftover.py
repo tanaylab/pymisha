@@ -7,8 +7,9 @@ UCSC terminology note: In UCSC chain format, 't' fields (tName, tStart, tEnd)
 are "target/reference" and 'q' fields are "query". Misha reverses this:
 UCSC target = misha source (chromsrc), UCSC query = misha target (chrom).
 
-Strand note: intervals APIs use {-1,0,1}, while chain-derived columns
-(`strand`, `strandsrc`) use {0,1} where 0='+' and 1='-'.
+Strand note: a chain DataFrame (`strand`, `strandsrc`) uses R's {1,-1} for
+'+'/'-'. Internally the chain code uses {0,1} (0='+', 1='-'): _chain_to_r /
+_chain_from_r convert at the public boundary.
 """
 
 from __future__ import annotations
@@ -198,8 +199,7 @@ def _parse_chain_file_python(
             if parts[0] == "chain":
                 if len(parts) != 13:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: expected 13 fields "
-                        f"in chain header, got {len(parts)}"
+                        f"Chain file {path}, line {lineno}: invalid file format"
                     )
 
                 chain_score = float(parts[1])
@@ -217,15 +217,15 @@ def _parse_chain_file_python(
                 src_size = int(parts[3])
                 if src_size <= 0:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: invalid source chrom size"
+                        f"Chain file {path}, line {lineno}: invalid format of reference chrom size"
                     )
 
                 # Validate source chrom size consistency
                 if src_chrom in src_chrom_sizes:
                     if src_chrom_sizes[src_chrom] != src_size:
                         raise ValueError(
-                            f"Chain file {path}, line {lineno}: source chrom size "
-                            f"({src_size}) differs from previous ({src_chrom_sizes[src_chrom]})"
+                            f"Chain file {path}, line {lineno}: reference chrom size "
+                            f"({src_size}) differs from previous value ({src_chrom_sizes[src_chrom]})"
                         )
                 else:
                     src_chrom_sizes[src_chrom] = src_size
@@ -237,19 +237,22 @@ def _parse_chain_file_python(
                     src_strand = 1
                 else:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: invalid source strand '{src_strand_str}'"
+                        f"Chain file {path}, line {lineno}: invalid format of reference strand"
                     )
 
                 src_start = int(parts[5])
                 src_end = int(parts[6])
-                if src_start < 0 or src_start >= src_size:
+                if src_start < 0:
+                    raise ValueError(f"Chain file {path}, line {lineno}: invalid value of reference start coordinate")
+                if src_start >= src_size:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: source start out of range"
-                    )
-                if src_end <= src_start or src_end > src_size:
+                        f"Chain file {path}, line {lineno}: reference start coordinate exceeds chromosome size")
+                if src_end <= src_start:
+                    raise ValueError(f"Chain file {path}, line {lineno}: reference end coordinate is less or "
+                                     "equal than the start coordinate")
+                if src_end > src_size:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: source end out of range"
-                    )
+                        f"Chain file {path}, line {lineno}: reference end coordinate exceeds chromosome size")
 
                 # Target (UCSC query) fields — normalize chrom name
                 tgt_chrom_raw = parts[7]
@@ -268,8 +271,8 @@ def _parse_chain_file_python(
                 db_size = db_chrom_sizes[tgt_chrom]
                 if tgt_size != db_size:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: target chrom size "
-                        f"({tgt_size}) differs from database ({db_size})"
+                        f"Chain file {path}, line {lineno}: query chrom size "
+                        f"({tgt_size}) differs from what have been defined in the database ({db_size})"
                     )
 
                 tgt_strand_str = parts[9]
@@ -279,19 +282,23 @@ def _parse_chain_file_python(
                     tgt_strand = 1
                 else:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: invalid target strand '{tgt_strand_str}'"
+                        f"Chain file {path}, line {lineno}: invalid format of query strand"
                     )
 
                 tgt_start_raw = int(parts[10])
                 tgt_end_raw = int(parts[11])
-                if tgt_start_raw < 0 or tgt_start_raw >= tgt_size:
+                if tgt_start_raw < 0:
+                    raise ValueError(f"Chain file {path}, line {lineno}: invalid value of query start coordinate")
+                if tgt_start_raw >= tgt_size:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: target start out of range"
-                    )
-                if tgt_end_raw <= tgt_start_raw or tgt_end_raw > tgt_size:
+                        f"Chain file {path}, line {lineno}: query start coordinate exceeds chromosome size")
+                # R's wording, "reference" included, for the query end too
+                if tgt_end_raw <= tgt_start_raw:
+                    raise ValueError(f"Chain file {path}, line {lineno}: reference end coordinate is less or "
+                                     "equal than the start coordinate")
+                if tgt_end_raw > tgt_size:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: target end out of range"
-                    )
+                        f"Chain file {path}, line {lineno}: reference end coordinate exceeds chromosome size")
                 tgt_start = tgt_start_raw
 
                 chain_id = int(parts[12])
@@ -303,13 +310,12 @@ def _parse_chain_file_python(
             # Alignment block line (1 or 3 fields)
             if not in_chain:
                 raise ValueError(
-                    f"Chain file {path}, line {lineno}: alignment block outside chain"
+                    f"Chain file {path}, line {lineno}: invalid file format"
                 )
 
             if len(parts) not in (1, 3):
                 raise ValueError(
-                    f"Chain file {path}, line {lineno}: expected 1 or 3 fields "
-                    f"in block line, got {len(parts)}"
+                    f"Chain file {path}, line {lineno}: invalid file format"
                 )
 
             if skip_chain:
@@ -319,7 +325,7 @@ def _parse_chain_file_python(
             size = int(parts[0])
             if size <= 0:
                 raise ValueError(
-                    f"Chain file {path}, line {lineno}: invalid block size"
+                    f"Chain file {path}, line {lineno}: invalid size"
                 )
 
             # Compute source coordinates (handle negative strand)
@@ -355,7 +361,7 @@ def _parse_chain_file_python(
                 dq = int(parts[2])
                 if dt < 0 or dq < 0:
                     raise ValueError(
-                        f"Chain file {path}, line {lineno}: negative gap values"
+                        f"Chain file {path}, line {lineno}: invalid block gaps"
                     )
                 cur_src_pos += size + dt
                 cur_tgt_pos += size + dq
@@ -1156,6 +1162,59 @@ def _resolve_cluster_policy(df: pd.DataFrame, policy: str) -> pd.DataFrame:
 # Public API: gintervals_load_chain
 # ===================================================================
 
+def _chain_to_r(chain: pd.DataFrame) -> pd.DataFrame:
+    """Chain strands as R gives them: 1 for '+', -1 for '-' (internally 0 / 1)."""
+    out = chain.copy()
+    for c in ("strand", "strandsrc"):
+        if c in out.columns:
+            out[c] = np.where(out[c].to_numpy() == 1, -1, 1).astype(np.int64)
+    return out
+
+
+def _chain_from_r(chain: pd.DataFrame) -> pd.DataFrame:
+    """A chain DataFrame's R strands (1 / -1) as the internal 0 / 1. 0 is read
+    as '+' too, so a chain written with the old {0, 1} plus strand still works."""
+    out = chain.copy()
+    for c in ("strand", "strandsrc"):
+        if c in out.columns:
+            out[c] = (out[c].to_numpy() == -1).astype(np.int64)
+    return out
+
+
+def _check_chain_src(chain: pd.DataFrame, path: str, src_groot: str) -> None:
+    """R's src_groot check: the chains' source chromosomes exist in that
+    database and their source ends fit (the session's database is restored)."""
+    import gzip
+
+    from .db import _temporary_db_root
+    from .intervals import gintervals_all
+
+    with _temporary_db_root(src_groot):
+        allc = gintervals_all()
+        sizes = dict(zip(allc["chrom"].astype(str), allc["end"].astype(np.int64), strict=True))
+        canon = {}
+        for c in pd.unique(chain["chromsrc"].astype(str)):
+            try:
+                cc = _pymisha.pm_normalize_chroms([c])[0]
+            except (_pymisha.error, IndexError):
+                cc = None
+            if cc not in sizes:
+                raise ValueError(f"Chromosome {c} does not exist in the database. "
+                                 f"Known chromosomes: {', '.join(sizes)}.")
+            canon[c] = cc
+    ends = chain.groupby("chain_id", sort=False)[["chromsrc", "endsrc"]].agg({"chromsrc": "first", "endsrc": "max"})
+    past = [cid for cid, r in ends.iterrows() if r["endsrc"] > sizes[canon[str(r["chromsrc"])]]]
+    if past:
+        line = 0
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt") as fh:
+            for i, ln in enumerate(fh, 1):
+                if ln.startswith("chain") and ln.split()[-1] == str(past[0]):
+                    line = i
+                    break
+        raise ValueError(f"Chain file {path}, line {line}: reference end coordinate exceeds chromosome size")
+
+
 def gintervals_load_chain(
     file: str,
     src_overlap_policy: str = "error",
@@ -1215,8 +1274,9 @@ def gintervals_load_chain(
         - ``"best_cluster_sum"`` -- best cluster sum strategy.
         - ``"best_cluster_max"`` -- best cluster max strategy.
     src_groot : str, optional
-        Path to the source genome database root for validating source
-        chromosomes and coordinates. Not yet implemented.
+        Path to the source genome database root. When given, every chain's
+        source chromosome must exist there and its source end must fit in it,
+        as in misha.
     min_score : float, optional
         Minimum alignment score threshold. Chains with scores below this
         value are filtered out before overlap resolution.
@@ -1294,6 +1354,8 @@ def gintervals_load_chain(
     blocks = _parse_chain_file(file, db_chrom_sizes, min_score=min_score)
 
     chain = _empty_chain_df() if blocks is None else pd.DataFrame(blocks)[_EMPTY_CHAIN_COLS]
+    if src_groot is not None:
+        _check_chain_src(chain, file, src_groot)
 
     # Handle overlaps via dispatcher (C++ by default; pure-Python under
     # PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE=1). Convert the current chain
@@ -1310,7 +1372,10 @@ def gintervals_load_chain(
     if min_score is not None:
         chain.attrs["min_score"] = min_score
 
-    return chain
+    # rows in target order, as R returns them
+    out = _sort_by_chrom(_chain_to_r(chain), ["chrom", "start", "end"]).reset_index(drop=True)
+    out.attrs = dict(chain.attrs)
+    return out
 
 
 # ===================================================================
@@ -1383,9 +1448,9 @@ def gintervals_as_chain(
     >>> import pandas as pd
     >>> import pymisha as pm
     >>> chain_data = pd.DataFrame({
-    ...     "chrom": ["1"], "start": [1000], "end": [2000], "strand": [0],
+    ...     "chrom": ["1"], "start": [1000], "end": [2000], "strand": [1],
     ...     "chromsrc": ["chr25"], "startsrc": [5000], "endsrc": [6000],
-    ...     "strandsrc": [0], "chain_id": [1], "score": [1000.0],
+    ...     "strandsrc": [1], "chain_id": [1], "score": [1000.0],
     ... })
     >>> chain = pm.gintervals_as_chain(chain_data)
     >>> chain.attrs["tgt_overlap_policy"]
@@ -1410,10 +1475,32 @@ def gintervals_as_chain(
             f"got '{tgt_overlap_policy}'"
         )
 
+    if min_score is not None and not (isinstance(min_score, (int, float, np.integer, np.floating))
+                                      and not isinstance(min_score, bool)):
+        raise ValueError("min_score must be a single numeric value")
+    # R's column checks (gintervals.as_chain)
+    num = pd.api.types.is_numeric_dtype
+    if not (num(intervals["start"]) and num(intervals["end"])):
+        raise ValueError("start and end columns must be numeric")
+    if not (num(intervals["startsrc"]) and num(intervals["endsrc"])):
+        raise ValueError("startsrc and endsrc columns must be numeric")
+    for col in ("strand", "strandsrc"):
+        if not num(intervals[col]) or pd.api.types.is_bool_dtype(intervals[col]):
+            raise ValueError(f"{col} column must be numeric")
+    if not num(intervals["chain_id"]):
+        raise ValueError("chain_id column must be integer or numeric")
+    if not num(intervals["score"]):
+        raise ValueError("score column must be numeric")
+    for col in ("strand", "strandsrc"):
+        v = intervals[col].to_numpy(dtype=float)
+        if ((v != np.trunc(v)) | (v < -1) | (v > 1)).any():
+            raise ValueError(f"{col} values must be -1, 0, or 1")
+
     if tgt_overlap_policy == "auto":
         tgt_overlap_policy = "auto_score"
 
     result = intervals.copy()
+    result["chain_id"] = result["chain_id"].astype(np.int64)  # as R's as.integer
     result.attrs["src_overlap_policy"] = src_overlap_policy
     result.attrs["tgt_overlap_policy"] = tgt_overlap_policy
     if min_score is not None:
@@ -1901,6 +1988,21 @@ def gintervals_liftover(
     if intervals is None or chain is None:
         raise ValueError("intervals and chain are required")
 
+    nth = 0
+    if value_col is not None:
+        if not isinstance(value_col, str):
+            raise ValueError("value_col must be a single character string specifying the column name")
+        if value_col not in intervals.columns:
+            raise ValueError(f"value_col '{value_col}' not found in intervals")
+        if not isinstance(na_rm, (bool, np.bool_)):
+            raise ValueError("na_rm must be a single non-NA logical value")
+        if min_n is not None and (
+            isinstance(min_n, bool) or not isinstance(min_n, (int, float, np.integer, np.floating))
+            or not np.isfinite(min_n) or min_n < 0 or min_n != int(min_n)
+        ):
+            raise ValueError("min_n must be None or a non-negative integer")
+        nth = _nth_param(multi_target_agg, params)
+
     # Load chain if file path
     if isinstance(chain, str):
         chain_df = gintervals_load_chain(
@@ -1913,6 +2015,16 @@ def gintervals_liftover(
         # a target chromosome named by an alias (such as "1" for chr1) is the
         # database's chromosome, as in misha
         chain_df = _with_canonical_chroms(chain)
+    chain_df = _chain_from_r(chain_df)
+
+    if "chrom1" in intervals.columns:
+        return _liftover_2d(intervals, chain_df)
+
+    # as R (IntervalsLiftover.cpp): intervals none of which is on a chromosome of
+    # the chain's source genome are an error, not an empty result
+    if len(intervals) and not chain_df.empty and not set(intervals["chrom"].astype(str)) & set(
+            chain_df["chromsrc"].astype(str)):
+        raise ValueError("Source chromosome does not exist in the chain source genome")
 
     if chain_df.empty:
         cols = ["chrom", "start", "end", "intervalID", "chain_id"]
@@ -1953,17 +2065,87 @@ def gintervals_liftover(
     ).lower() in ("1", "true", "yes"):
         result = _resolve_cluster_policy(result, effective_tgt_policy)
 
-    # Canonic merging: merge adjacent target blocks from same intervalID + chain_id
-    if canonic:
-        result = _canonic_merge(result, include_metadata, value_col)
-
     helper_cols = [c for c in ("__src_start", "__src_end") if c in result.columns]
     if helper_cols:
         result = result.drop(columns=helper_cols)
 
-    # Sort by target coordinates, a chromosome by its id
-    return _sort_by_chrom(result, ["chrom", "start", "end"])
+    if value_col is not None:
+        result = _aggregate_lifted(
+            result, value_col, multi_target_agg, na_rm, min_n, nth, include_metadata,
+            drop_ids=tgt_overlap_policy == "agg",
+        )
 
+    # Canonic merging: merge adjacent target blocks from same intervalID + chain_id
+    if canonic:
+        # R's canonic pass leaves the rows by intervalID, chain_id, target
+        result = _canonic_merge(result, include_metadata, value_col)
+    elif value_col is not None:
+        # R's aggregation sweeps each target chromosome
+        result = _sort_by_chrom(result, ["chrom", "start", "end"])
+    else:
+        result = _r_mapping_order(result, intervals)
+    # R's intervalID is 1-based
+    if "intervalID" in result.columns:
+        result["intervalID"] = result["intervalID"] + 1
+    return result.reset_index(drop=True)
+
+
+def _liftover_2d(intervals: pd.DataFrame, chain_df: pd.DataFrame) -> pd.DataFrame:
+    """R's 2D gintervals.liftover: each side mapped on its own, every target piece of
+    side 1 paired with every one of side 2. Rows on a chromosome the chain does not
+    map are dropped; the rest are walked in R's order (sorted by source chromosome
+    pair) and each one's pieces in chain order. No aggregation, metadata or
+    canonic merging, as in R."""
+    cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
+    # R numbers the source chromosomes in the order the chain names them
+    src_id = {c: i for i, c in enumerate(dict.fromkeys(chain_df["chromsrc"].astype(str)))}
+    c1 = intervals["chrom1"].astype(str).map(src_id).to_numpy(dtype=float)
+    c2 = intervals["chrom2"].astype(str).map(src_id).to_numpy(dtype=float)
+    rows = np.flatnonzero(~np.isnan(c1) & ~np.isnan(c2))
+    if len(intervals) and not len(rows):
+        raise ValueError("Source chromosome does not exist in the chain source genome")
+    rows = rows[_pymisha.pm_r_2d_sort_order(c1[rows].astype(np.int64), c2[rows].astype(np.int64))]
+    n = len(rows)
+
+    def side(k):
+        src = pd.DataFrame({
+            "chrom": intervals[f"chrom{k}"].astype(str).to_numpy()[rows],
+            "start": intervals[f"start{k}"].to_numpy(np.int64)[rows],
+            "end": intervals[f"end{k}"].to_numpy(np.int64)[rows],
+        })
+        m = _map_intervals_vectorized(src, chain_df, False, None) if n else src.iloc[:0].assign(intervalID=[])
+        m = m.iloc[np.argsort(m["intervalID"].to_numpy(np.int64), kind="stable")]
+        cnt = np.bincount(m["intervalID"].to_numpy(np.int64), minlength=n)
+        return m, cnt, np.cumsum(cnt) - cnt
+
+    m1, n1, off1 = side(1)
+    m2, n2, off2 = side(2)
+    k = n1 * n2
+    src = np.repeat(np.arange(n), k)
+    within = np.arange(k.sum()) - np.repeat(np.cumsum(k) - k, k)
+    a = off1[src] + within // n2[src]
+    b = off2[src] + within % n2[src]
+    return pd.DataFrame({
+        "chrom1": m1["chrom"].to_numpy()[a], "start1": m1["start"].to_numpy(np.int64)[a],
+        "end1": m1["end"].to_numpy(np.int64)[a],
+        "chrom2": m2["chrom"].to_numpy()[b], "start2": m2["start"].to_numpy(np.int64)[b],
+        "end2": m2["end"].to_numpy(np.int64)[b],
+        "intervalID": rows[src] + 1,  # R's intervalID is the 1-based input row
+    }, columns=[*cols, "intervalID"])
+
+
+def _r_mapping_order(result: pd.DataFrame, intervals: pd.DataFrame) -> pd.DataFrame:
+    """Rows in the order R's gintervals.liftover maps them: the source intervals
+    sorted (source chromosome, then start), each one's pieces in chain order."""
+    if len(result) < 2:
+        return result
+    iid = result["intervalID"].to_numpy(np.int64)
+    src_chrom = intervals["chrom"].astype(str).to_numpy()[iid]
+    src_start = intervals["start"].to_numpy(np.int64)[iid]
+    src_chrom_rank = pd.Index(sorted(set(src_chrom))).get_indexer(src_chrom)
+    # stable: within one source interval, the mapper already gives R's chain order
+    order = np.lexsort((iid, src_start, src_chrom_rank))
+    return result.iloc[order]
 
 
 def _canonic_merge(
@@ -1975,7 +2157,7 @@ def _canonic_merge(
 
     Uses vectorized numpy operations for group detection and aggregation.
     """
-    if df.empty:
+    if df.empty or "intervalID" not in df.columns or "chain_id" not in df.columns:
         return df
 
     # Sort by intervalID, chain_id, chrom, start
@@ -2015,6 +2197,86 @@ def _canonic_merge(
     return merged.reset_index(drop=True)
 
 
+def _aggregate_lifted(
+    df: pd.DataFrame,
+    value_col: str,
+    agg: str,
+    na_rm: bool,
+    min_n: int | None,
+    nth: int,
+    include_metadata: bool,
+    *,
+    drop_ids: bool,
+) -> pd.DataFrame:
+    """R's value_col aggregation in gintervals.liftover (IntervalsLiftover.cpp).
+
+    Per target chrom, the lifted intervals are cut at every start/end, each
+    piece takes the aggregate of the intervals covering it, and adjacent pieces
+    with the same value, intervalID and chain_id are merged. intervalID /
+    chain_id (and score) are NA where the contributors disagree; a column that is
+    all NA is dropped, and both are dropped under tgt_overlap_policy="agg".
+
+    ponytail: a Python loop per piece, fine for typical interval sets; move it to
+    C++ (as R's IntervalsLiftover.cpp) if million-interval lifts become common.
+    """
+    cols = ["chrom", "start", "end", "intervalID", "chain_id"] + (["score"] if include_metadata else []) + [value_col]
+    if df.empty:
+        return df[cols].drop(columns=["intervalID", "chain_id"] if drop_ids else [])
+    nan = float("nan")
+    out: dict[str, list] = {c: [] for c in cols}
+    for chrom, g in df.groupby("chrom", sort=False, observed=True):
+        starts = g["start"].to_numpy(np.int64)
+        ends = g["end"].to_numpy(np.int64)
+        vals = g[value_col].to_numpy(float)
+        iids = g["intervalID"].to_numpy(np.int64)
+        cids = g["chain_id"].to_numpy(np.int64)
+        scores = g["score"].to_numpy(float) if include_metadata else np.full(len(g), nan)
+        breaks = np.unique(np.concatenate([starts, ends]))
+        covering: list[list[int]] = [[] for _ in range(len(breaks) - 1)]
+        for i, k0 in enumerate(np.searchsorted(breaks, starts)):
+            for k in range(k0, np.searchsorted(breaks, ends[i])):
+                covering[k].append(i)
+        for k, idx in enumerate(covering):
+            if not idx:
+                continue
+            s, e = int(breaks[k]), int(breaks[k + 1])
+            contribs = [
+                {"value": vals[i], "overlap_len": float(e - s), "coverage_frac": 1.0, "start": s, "end": e,
+                 "is_na": bool(np.isnan(vals[i])), "chain_id": (int(cids[i]) << 32) ^ int(iids[i])}
+                for i in idx
+            ]
+            v = _aggregate_value_for_bin(contribs, agg, na_rm, min_n, nth)
+            v = nan if np.isnan(v) else float(np.float32(v))  # R stores the value as float
+            iid = int(iids[idx[0]]) if all(iids[i] == iids[idx[0]] for i in idx) else None
+            cid = int(cids[idx[0]]) if all(cids[i] == cids[idx[0]] for i in idx) else None
+            sc = nan
+            if include_metadata:
+                same = True
+                for i in idx:
+                    if np.isnan(sc):
+                        sc = scores[i]
+                    elif sc != scores[i]:
+                        same = False
+                sc = sc if same else nan
+            if out["start"] and out["chrom"][-1] == chrom and out["end"][-1] == s \
+                    and out["intervalID"][-1] == iid and out["chain_id"][-1] == cid \
+                    and (out[value_col][-1] == v or (np.isnan(out[value_col][-1]) and np.isnan(v))) \
+                    and (not include_metadata or out["score"][-1] == sc
+                         or (np.isnan(out["score"][-1]) and np.isnan(sc))):
+                out["end"][-1] = e
+                continue
+            for c, x in zip(cols, [chrom, s, e, iid, cid] + ([sc] if include_metadata else []) + [v], strict=True):
+                out[c].append(x)
+    res = pd.DataFrame(out)
+    for c in ("intervalID", "chain_id"):
+        ids = res[c]
+        if drop_ids or ids.isna().all():
+            res = res.drop(columns=c)
+        else:
+            res[c] = ids.astype("int64") if ids.notna().all() else ids.astype("Int64")
+    return res
+
+
 # ===================================================================
 # Public API: gtrack_liftover
 # ===================================================================
@@ -2044,6 +2306,8 @@ def _nth_param(multi_target_agg: str, params: dict[str, Any] | int | None) -> in
         raise ValueError("params must be supplied for 'nth' aggregation (e.g. params=2 or params={'n': 2})")
     n: Any = params
     if isinstance(params, dict):
+        if not params:
+            raise ValueError("params list must contain an element 'n' for 'nth'")
         if "n" in params:
             n = params["n"]
         elif len(params) == 1:
@@ -2866,6 +3130,7 @@ def gtrack_liftover(
         raise TypeError("chain must be a file path string or a chain DataFrame")
     else:
         chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+    chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
 
     chain_dict = {
@@ -3076,6 +3341,7 @@ def _gtrack_liftover_python(
         chain = _with_canonical_chroms(chain)
     else:
         raise TypeError("chain must be a file path string or a chain DataFrame")
+    chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
 
     # Read source track
@@ -3101,19 +3367,17 @@ def _gtrack_liftover_python(
 
     # Liftover source intervals to target coordinates: the pieces R's
     # map_interval gives, not merged (R does not merge touching pieces)
-    lifted = gintervals_liftover(
-        src_data[["chrom", "start", "end", "value"]].copy(),
-        chain,
-        value_col="value" if "value" in src_data.columns else None,
-    )
-
-    # If gintervals_liftover didn't carry values (shouldn't happen with value_col),
-    # merge values back via intervalID.
-    if "value" not in lifted.columns and "intervalID" in lifted.columns:
-        lifted = lifted.merge(
-            src_data[["value"]].reset_index().rename(columns={"index": "intervalID"}),
-            on="intervalID", how="left",
-        )
+    # No value_col: that would aggregate overlapping pieces, as gintervals.liftover
+    # does; the track aggregation below needs every piece. Values follow by
+    # intervalID, the 0-based row of src_data.
+    # chain is in the internal strand encoding here; gintervals_liftover takes R's.
+    # Its intervalID is 1-based; keep the 0-based row of src_data from here on.
+    lifted = gintervals_liftover(src_data[["chrom", "start", "end"]].copy(), _chain_to_r(chain))
+    if "intervalID" in lifted.columns:
+        lifted["intervalID"] = lifted["intervalID"] - 1
+    if "value" in src_data.columns and "intervalID" in lifted.columns:
+        lifted = lifted.assign(
+            value=src_data["value"].to_numpy()[lifted["intervalID"].to_numpy(np.int64)])
 
     if len(lifted) == 0:
         _create_empty_lifted_track(track, description, created_by, src_type,
@@ -3240,6 +3504,7 @@ def _gtrack_liftover_2d(
         raise TypeError("chain must be a file path string or a chain DataFrame")
     else:
         chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+    chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
 
     effective_tgt_policy = chain.attrs.get("tgt_overlap_policy", tgt_overlap_policy)

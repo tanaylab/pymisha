@@ -99,19 +99,18 @@ class TestClipping:
         assert out["end2"][0] == 300    # clipped at scope end2
 
     def test_two_scope_rects_can_both_hit_same_object(self, rects_track):
-        """Two scope rects that each intersect the same track object yield two emissions."""
-        # Both scope rects intersect R1 (100-300, 200-400).
-        # scope[0]: (0-1000, 0-1000) intersects R1 => clip (100, 200, 300, 400)
-        # scope[1]: (0-1000, 250-1000) intersects R1 => clip (100, 250, 300, 400)
-        # R2 (500-700, 600-800) also intersects both scope rects.
-        # => 2 objects x 2 scope rects = 4 total emissions.
+        """Two (disjoint) scope rects that each intersect the same track object yield two emissions."""
+        # The scope is split at y=300, through R1 (100-300, 200-400):
+        # scope[0]: (0-1000, 0-300) clips R1 to (100, 200, 300, 300)
+        # scope[1]: (0-1000, 300-1000) clips R1 to (100, 300, 300, 400), and holds R2 (500-700, 600-800)
+        # => 3 emissions. (An overlapping 2D scope is an error, as in R.)
         scope = _scope([
-            (0, 0, 1_000, 0, 0, 1_000),
-            (0, 0, 1_000, 0, 250, 1_000),
+            (0, 0, 1_000, 0, 0, 300),
+            (0, 0, 1_000, 0, 300, 1_000),
         ])
         out = _pymisha.pm_test_track_rects_iterator(rects_track, scope, None)
-        # R1 hits scope[0] and scope[1]; R2 hits scope[0] and scope[1] => 4 emissions.
-        assert len(out["start1"]) == 4
+        assert len(out["start1"]) == 3
+        assert sorted(zip(out["start2"], out["end2"])) == [(200, 300), (300, 400), (600, 800)]
 
 
 class TestBand:

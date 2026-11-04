@@ -13,7 +13,7 @@ import urllib.request
 import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, cast, overload
 
 import pandas as pd
 
@@ -127,6 +127,7 @@ def _intervals_dir(intervals_set: str, db: str | None = None) -> Path:
     under the working directory."""
     from . import _shared
 
+    validate_dotted_name(intervals_set, "intervals set name")  # an absolute path would escape the DB
     if db is None and not _shared._gwd_is_subdir():
         db = gintervals_dataset(intervals_set)
     return Path(_shared._names_dir(db)) / f"{intervals_set.replace('.', '/')}.interv"
@@ -137,6 +138,10 @@ def _interv_file(intervals_set: str) -> Path | None:
     does not exist."""
     from . import _shared
 
+    try:
+        validate_dotted_name(intervals_set, "intervals set name")
+    except ValueError:
+        return None  # e.g. an absolute path, which would escape the DB
     if _shared._gwd_is_subdir():
         base = Path(_shared._names_dir())
     else:
@@ -2038,13 +2043,19 @@ def gintervals_union(
         raise ValueError("intervals1 and intervals2 cannot be None")
     assert isinstance(intervals1, pd.DataFrame)
     assert isinstance(intervals2, pd.DataFrame)
+    if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
+        raise ValueError("Expecting 1D intervals while receiving 2D intervals")  # as R
 
     if len(intervals1) == 0 and len(intervals2) == 0:
         return None
-    if len(intervals1) == 0:
-        return _sort_intervals(intervals2[['chrom', 'start', 'end']].copy())
-    if len(intervals2) == 0:
-        return _sort_intervals(intervals1[['chrom', 'start', 'end']].copy())
+    if len(intervals1) == 0 or len(intervals2) == 0:
+        # R's gintervunion unifies the overlaps of the non-empty side too
+        other = intervals2 if len(intervals1) == 0 else intervals1
+        canon = gintervals_canonic(other[['chrom', 'start', 'end']].copy())
+        assert isinstance(canon, pd.DataFrame)
+        out = canon[['chrom', 'start', 'end']].reset_index(drop=True)
+        out.attrs = {}  # canonic's row mapping does not apply to a union
+        return out
 
     _checkroot()
     result = _pymisha.pm_intervals_union(
@@ -2104,6 +2115,11 @@ def gintervals_intersect(
     intervals2 = _resolve_intervals(intervals2)
     if intervals1 is None or intervals2 is None:
         raise ValueError("intervals1 and intervals2 cannot be None")
+    is2d1, is2d2 = _is_2d_intervals_df(intervals1), _is_2d_intervals_df(intervals2)
+    if is2d1 != is2d2:
+        raise ValueError("Cannot intersect 1D intervals with 2D intervals")  # as R
+    if is2d1:
+        return gintervals_2d_intersect(intervals1, intervals2)
 
     if len(intervals1) == 0 or len(intervals2) == 0:
         return None
@@ -2167,6 +2183,8 @@ def gintervals_diff(
         raise ValueError("intervals1 and intervals2 cannot be None")
     assert isinstance(intervals1, pd.DataFrame)
     assert isinstance(intervals2, pd.DataFrame)
+    if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
+        raise ValueError("Expecting 1D intervals while receiving 2D intervals")  # as R
 
     if len(intervals1) == 0:
         return None
@@ -2214,8 +2232,8 @@ def gintervals_canonic(
     and is properly sorted.
 
     A ``mapping`` attribute is attached to the result DataFrame mapping
-    each original interval index to the canonical interval index:
-    ``result.attrs['mapping']``.
+    each original interval to the 1-based row of its canonical interval, as
+    R's ``mapping`` attribute: ``result.attrs['mapping']``.
 
     Parameters
     ----------
@@ -2268,7 +2286,8 @@ def gintervals_canonic(
         return None
 
     result = _pandas.DataFrame(result_dict)
-    result.attrs['mapping'] = mapping
+    # 1-based, as R's "mapping" attribute
+    result.attrs['mapping'] = _numpy.asarray(mapping, dtype=_numpy.int64) + 1
     return result
 
 
@@ -2438,13 +2457,16 @@ def _neighbors_2d_via_cpp_nn(
             continue
         q_pos_arr = np.asarray(q_pos, dtype=np.int64)
         t_pos_arr = np.asarray(t_pos, dtype=np.int64)
-        res = _pymisha.pm_neighbors_2d(
-            qx1[q_pos_arr], qy1[q_pos_arr], qx2[q_pos_arr], qy2[q_pos_arr],
-            tx1[t_pos_arr], ty1[t_pos_arr], tx2[t_pos_arr], ty2[t_pos_arr],
-            int(maxneighbors),
-            int(mindist1), int(maxdist1),
-            int(mindist2), int(maxdist2),
-        )
+        try:
+            res = _pymisha.pm_neighbors_2d(
+                qx1[q_pos_arr], qy1[q_pos_arr], qx2[q_pos_arr], qy2[q_pos_arr],
+                tx1[t_pos_arr], ty1[t_pos_arr], tx2[t_pos_arr], ty2[t_pos_arr],
+                int(maxneighbors),
+                int(mindist1), int(maxdist1),
+                int(mindist2), int(maxdist2),
+            )
+        except _pymisha.error as e:
+            raise _pymisha.error(f"intervals2 on {key[0]} x {key[1]}: {e}") from None
         if len(res["q_local_idx"]) == 0:
             continue
         q_local = res["q_local_idx"]
@@ -2840,6 +2862,13 @@ def gintervals_neighbors(
             stacklevel=2,
         )
 
+    if use_intervals1_strand and isinstance(intervals1, _pandas.DataFrame) and "strand" in intervals1.columns:
+        strands = intervals1["strand"].to_numpy()
+        bad = _numpy.flatnonzero(~_numpy.isin(strands, (-1, 1)))
+        if bad.size:  # as R (GenomeTrackFindNeighbors.cpp)
+            raise ValueError(f"Invalid strand value {strands[bad[0]]:g} at row {bad[0] + 1}. "
+                             "Strand must be -1 or 1.")
+
     if len(intervals1) == 0:
         if intervals_set_out is not None:
             return None
@@ -2848,6 +2877,11 @@ def gintervals_neighbors(
         if intervals_set_out is not None:
             return None
         return None
+
+    # the database's chrom names in the output (chr1, not an alias such as "1"), as in R
+    intervals1 = intervals1.assign(chrom=_normalize_chroms(intervals1["chrom"].astype(str).tolist()))
+    if len(intervals2):
+        intervals2 = intervals2.assign(chrom=_normalize_chroms(intervals2["chrom"].astype(str).tolist()))
 
     result = _pymisha.pm_find_neighbors(
         _df2pymisha(intervals1),
@@ -3093,7 +3127,7 @@ def gintervals_neighbors_directional(
     return {"upstream": upstream, "downstream": downstream}
 
 
-def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
+def gintervals_ls(pattern: str = "", ignore_case: bool = False, db: str | None = None) -> list[str]:
     """
     List named interval sets in the database.
 
@@ -3104,6 +3138,9 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
         Empty string matches all sets.
     ignore_case : bool, default False
         If True, pattern matching is case-insensitive.
+    db : str, optional
+        Only the sets of this database or dataset (a path, normalized), as
+        :func:`gintervals_dataset` reports them.
 
     Returns
     -------
@@ -3151,6 +3188,10 @@ def gintervals_ls(pattern: str = "", ignore_case: bool = False) -> list[str]:
         interval_set_names = list(seen)
 
     interval_sets: list[str] = sorted(set(interval_set_names))
+    if db is not None:
+        from .dataset import _normalize_path
+        db = _normalize_path(db)
+        interval_sets = [s for s in interval_sets if _normalize_path(gintervals_dataset(s) or "") == db]
 
     # Apply pattern filter
     if pattern:
@@ -3304,7 +3345,11 @@ def gintervals_path(name: str) -> str:
     return str(path)
 
 
-def gintervals_dataset(intervals: str | None = None) -> str | None:
+@overload
+def gintervals_dataset(intervals: str | None = None) -> str | None: ...
+@overload
+def gintervals_dataset(intervals: list[str]) -> list[str | None]: ...
+def gintervals_dataset(intervals: str | list[str] | None = None) -> str | None | list[str | None]:
     """
     Return the database/dataset root path for a named interval set.
 
@@ -3313,14 +3358,15 @@ def gintervals_dataset(intervals: str | None = None) -> str | None:
 
     Parameters
     ----------
-    intervals : str
-        Name of the interval set (e.g. ``"annotations"``).
+    intervals : str or list of str
+        Name of the interval set (e.g. ``"annotations"``), or a list of names.
 
     Returns
     -------
-    str or None
+    str, None or list
         The root path of the database/dataset containing the interval
-        set, or ``None`` if the set is not found.
+        set, or ``None`` if the set is not found; a list of them for a list
+        of names.
 
     Raises
     ------
@@ -3343,6 +3389,8 @@ def gintervals_dataset(intervals: str | None = None) -> str | None:
     if intervals is None:
         raise ValueError("intervals cannot be None")
     _checkroot()
+    if not isinstance(intervals, str):
+        return [gintervals_dataset(i) for i in intervals]
     from . import _shared
     assert _shared._GROOT is not None
 
@@ -4013,9 +4061,6 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     path_part = intervals_set.replace(".", "/")
     interv_path = Path(_shared._names_dir()) / f"{path_part}.interv"
 
-    # Ensure parent directory exists
-    interv_path.parent.mkdir(parents=True, exist_ok=True)
-
     # Validate intervals
     if intervals is None or len(intervals) == 0:
         raise ValueError("Cannot save empty intervals")
@@ -4039,6 +4084,9 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
         # Normalize chromosome names
         df["chrom1"] = _normalize_chroms(df["chrom1"].astype(str).tolist())
         df["chrom2"] = _normalize_chroms(df["chrom2"].astype(str).tolist())
+        # a point (start == end) is saved as 1 bp, as R's .gintervals.save_file does
+        for a, b in (("start1", "end1"), ("start2", "end2")):
+            df[b] = df[b].where(df[a] != df[b], df[b] + 1)
         # Reject bad coordinates before they reach the disk. Every query path
         # validates its 2D frames, but a saved set is read back later (and by
         # other processes), so an unvalidated write persists the corruption
@@ -4063,11 +4111,16 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
         # Ensure start/end are float (R numeric)
         df["start"] = df["start"].astype(float)
         df["end"] = df["end"].astype(float)
+        # a point (start == end) is saved as 1 bp, as R's .gintervals.save_file
+        # does; a 0-length interval makes every later use of the set fail
+        df["end"] = df["end"].where(df["start"] != df["end"], df["end"] + 1)
 
     # Save using the native R-serialize writer (drops the pyreadr/librdata
     # dependency at runtime and is ~50x faster on million-row data frames
     # because we avoid the Python <-> librdata bridge per row).
     from ._r_serialize import write_dataframe
+    with _shared._with_umask():   # a namespace directory carries misha's permissions too
+        interv_path.parent.mkdir(parents=True, exist_ok=True)
     write_dataframe(str(interv_path), df)
 
     # Register the new interval-set name in the C++ cache so it shows up
@@ -5271,7 +5324,7 @@ def giterator_intervals(
     Returns
     -------
     DataFrame
-        DataFrame with columns ``chrom``, ``start``, ``end``, ``intervalID``.
+        DataFrame with columns ``chrom``, ``start``, ``end`` (as R, no ``intervalID``).
 
     Raises
     ------
@@ -5378,7 +5431,7 @@ def giterator_intervals(
                 res = gextract(itr, intervals=intervals, iterator=itr, band=band)
                 if res is None or len(res) == 0:
                     return None
-                cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "intervalID"]
+                cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]  # no intervalID, as R
                 df2d = res[cols].drop_duplicates().reset_index(drop=True)
                 if intervals_set_out is not None:
                     gintervals_save(df2d, intervals_set_out)
@@ -5432,6 +5485,7 @@ def giterator_intervals(
         units = _gextract_2d_units(intervals, itr, _validate_band(band))
         if units is None or len(units) == 0:
             return None
+        units = units.drop(columns=["intervalID"], errors="ignore")  # as R
         if intervals_set_out is not None:
             gintervals_save(units, intervals_set_out)
             return None
@@ -5466,6 +5520,9 @@ def giterator_intervals(
         bin_size = int(itr)
         sizes = df["end"] - df["start"]
         df = df[sizes >= bin_size].reset_index(drop=True)
+
+    if df is not None:
+        df = df.drop(columns=["intervalID"], errors="ignore")  # R returns the intervals only
 
     if intervals_set_out is not None:
         if df is None or len(df) == 0:
@@ -5614,7 +5671,7 @@ def gintervals_mark_overlaps(
     canon = gintervals_canonic(intervals, unify_touching_intervals)
     if canon is None:
         result = intervals.copy()
-        result[group_col] = 0
+        result[group_col] = 1
         return result
 
     mapping = canon.attrs.get("mapping")
@@ -5993,27 +6050,17 @@ def gintervals_normalize(
     # Compute new intervals
     starts = intervals["start"].values.astype(_numpy.int64)
     ends = intervals["end"].values.astype(_numpy.int64)
-    chroms = intervals["chrom"].to_numpy()
+    # an alias such as "1" is the database's chr1, as in misha
+    chroms = _numpy.asarray(_normalize_chroms(intervals["chrom"].astype(str).tolist()), dtype=object)
 
-    centers = (starts + ends) / 2.0
-    half = size / 2.0
-
-    new_starts = _numpy.floor(centers - half).astype(_numpy.int64)
+    # As R's gintervals_normalize (GenomeIntervalUtils.cpp): integer center, an
+    # odd size's extra bp on the right, and the result clipped (not shifted) at
+    # the chromosome ends.
+    new_starts = (starts + ends) // 2 - size // 2
     new_ends = new_starts + size
-
-    # Clamp to chromosome boundaries (vectorized; preserves the original
-    # sequential low-then-high clamp order so the high clamp sees the
-    # already-low-clamped ends).
-    chrom_sz = (
-        _pandas.Series(chroms).astype(str).map(chrom_sizes).fillna(0)
-        .to_numpy().astype(_numpy.int64)
-    )
-    low = new_starts < 0
-    new_ends = _numpy.where(low, _numpy.minimum(size, chrom_sz), new_ends)
-    new_starts = _numpy.where(low, 0, new_starts)
-    high = new_ends > chrom_sz
-    new_starts = _numpy.where(high, _numpy.maximum(0, chrom_sz - size), new_starts)
-    new_ends = _numpy.where(high, chrom_sz, new_ends)
+    chrom_sz = _pandas.Series(chroms).map(chrom_sizes).to_numpy().astype(_numpy.int64)
+    new_starts = _numpy.maximum(new_starts, 0)
+    new_ends = _numpy.minimum(new_ends, chrom_sz)
 
     # Build result preserving extra columns
     result = _pandas.DataFrame({
@@ -6321,6 +6368,7 @@ def gintervals_rm(intervals_set: str, force: bool = False) -> None:
     from . import _shared
     assert _shared._GROOT is not None
 
+    validate_dotted_name(intervals_set, "intervals set name")  # an absolute path would escape the DB
     # under the working directory (gdir_cd), as R misha does
     path_part = intervals_set.replace(".", "/")
     interv_path = Path(_shared._names_dir()) / f"{path_part}.interv"

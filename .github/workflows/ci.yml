@@ -40,6 +40,10 @@ jobs:
       - name: Run tests
         run: pytest tests/ -x -q --override-ini="addopts=" -n auto --dist loadscope --cov=pymisha --cov-report=term-missing
 
+      # The package's docstring examples; `pytest tests/` never collects them.
+      - name: Run doctests
+        run: pytest pymisha/ -q --doctest-modules -p no:cacheprovider
+
   libcxx-headers:
     # Compile every translation unit against clang/libc++. conda-forge's macOS
     # toolchain stopped supplying standard headers transitively in Sep 2026, and

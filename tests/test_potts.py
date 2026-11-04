@@ -678,3 +678,22 @@ def test_bidirect_false_requires_an_explicit_strand():
         pm.gseq_potts("ACGT", m, mode="max", bidirect=False)
     pm.gseq_potts("ACGT", m, mode="max", bidirect=False, strand=1)
     pm.gseq_potts("ACGT", m, mode="max", bidirect=True)  # 0 is fine here
+
+
+def test_flat_J_is_shape_checked_without_pairs():  # R test-potts.R:694
+    m = potts_ref_model(2, npair_mode="none", seed=3)
+    bad = dict(m, J=np.zeros((0, 3)))
+    with pytest.raises(ValueError, match="16"):
+        pm.gseq_potts(["AC"], bad, mode="max", bidirect=False, strand=1)
+
+
+def test_float_bound_is_the_per_position_sum():  # R test-potts.R:707
+    m = potts_ref_model(20, npair_mode="none", seed=17)
+    m["e"][:] = 0
+    m["e"][0, 0] = 1e38
+    s = "A" * 20
+    assert pm.gseq_potts([s], m, mode="max", bidirect=False, strand=1)[0] == pytest.approx(1e38, rel=1e-6)
+    over = dict(m, e=m["e"].copy())
+    over["e"][1, 0] = 3.4e38
+    with pytest.raises(ValueError, match="single-precision"):
+        pm.gseq_potts([s], over, mode="max", bidirect=False, strand=1)

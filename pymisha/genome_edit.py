@@ -132,6 +132,9 @@ def ggenome_implant(
             raise ValueError(f"intervals must have a '{col}' column")
     if len(intervals) == 0:
         raise ValueError("intervals is empty")
+    # as R; a width of 0 wrote newlines until the disk filled
+    if line_width is None or isinstance(line_width, bool) or int(line_width) < 1:
+        raise ValueError("'line_width' must be a positive integer")
 
     # --- resolve donor sequences -------------------------------------------
     if isinstance(donor, str):

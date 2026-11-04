@@ -49,7 +49,7 @@ def restore_db():
     old_root = pm._shared._GROOT
     old_user = pm._shared._UROOT
     yield
-    for ds in list(pm.gdataset_ls()):
+    for ds in list(pm.gdataset_ls()[1:]):
         with contextlib.suppress(Exception):
             pm.gdataset_unload(ds, validate=False)
     if old_root is None:

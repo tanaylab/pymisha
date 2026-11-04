@@ -510,6 +510,23 @@ def _numpy_logsumexp(arr: _numpy.ndarray) -> float:
     return float(m + _numpy.log(_numpy.sum(_numpy.exp(finite - m))))
 
 
+def _check_max_edits(max_edits: object) -> None:
+    """R's check (gseq.pwm_edits and the pwm edit-distance vtracks)."""
+    if max_edits is None:
+        return
+    if (isinstance(max_edits, bool) or not isinstance(max_edits, (int, float, _numpy.integer, _numpy.floating))
+            or max_edits < 1 or max_edits != int(max_edits)):
+        raise ValueError("max_edits must be NULL or a positive integer")
+
+
+def _pos_strand_frame(pos: object, strand: object) -> _pandas.DataFrame:
+    """gseq_pwm's (pos, strand) result; the strand is NA where pos is, as in R."""
+    p = _numpy.asarray(pos, dtype=float)
+    s = _pandas.Series(_numpy.asarray(strand, dtype=_numpy.int64), dtype="Int64")
+    s[_numpy.isnan(p)] = _pandas.NA
+    return _pandas.DataFrame({"pos": p, "strand": s})
+
+
 def _pwm_score_batch_vectorized(
     seqs: list[str],
     log_pssm: _numpy.ndarray,
@@ -711,18 +728,19 @@ def _pwm_score_batch_vectorized(
                 results[i] = non_nan.max()
 
         elif mode == "pos":
-            best_score = -_numpy.inf
-            best_pos = _numpy.nan
-            best_strand = 0
+            # R's gseq.pwm (GseqString.cpp): the higher score, then the
+            # earlier start, then the forward strand.
+            best = None
             for dirs, scores in all_scores:
                 finite_mask = _numpy.isfinite(scores)
                 if not finite_mask.any():
                     continue
-                idx = _numpy.argmax(scores)
-                if scores[idx] > best_score:
-                    best_score = scores[idx]
-                    best_pos = float(idx + 1)  # 1-based
-                    best_strand = int(dirs[0])
+                idx = int(_numpy.argmax(scores))  # earliest best window on this strand
+                key = (-scores[idx], idx, -int(dirs[0]))
+                if best is None or key < best:
+                    best = key
+            best_pos = _numpy.nan if best is None else float(best[1] + 1)  # 1-based
+            best_strand = 0 if best is None else -best[2]
             results[i] = best_pos
             if strand_results is not None:
                 strand_results[i] = best_strand
@@ -1190,7 +1208,7 @@ def gseq_pwm(
         gap_chars is None
         and neutral_chars is None
         and neutral_chars_policy == "log_quarter"
-        and not (return_strand and mode == "pos")
+        and mode != "pos"  # its tie rule is the pwm.max.pos vtrack's, not gseq.pwm's
         and not extend
         and (bidirect or strand != -1)
     )
@@ -1394,7 +1412,7 @@ def gseq_pwm(
             if mode == "pos" and lo:   # NaN stays NaN
                 r = (r[0] + lo, r[1]) if isinstance(r, tuple) else r + lo
             if return_strand and mode == "pos":
-                return _pandas.DataFrame({"pos": r[0], "strand": r[1]})
+                return _pos_strand_frame(r[0], r[1])
             return r
 
     # --- Slow path: per-sequence scoring ---
@@ -1434,7 +1452,7 @@ def gseq_pwm(
             results.append(sr)
 
     if return_strand and mode == "pos":
-        return _pandas.DataFrame({"pos": results, "strand": strand_results})
+        return _pos_strand_frame(results, strand_results)
 
     return _numpy.array(results, dtype=float)
 
@@ -1732,6 +1750,8 @@ def gseq_pwm_edits(
     if isinstance(seqs, str):
         seqs = [seqs]
     seqs = [str(s) if s is not None else "" for s in seqs]
+
+    _check_max_edits(max_edits)
 
     # Validate max_indels
     if max_indels is not None:

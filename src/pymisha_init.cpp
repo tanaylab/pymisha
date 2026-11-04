@@ -13,9 +13,11 @@
 #include <numpy/arrayobject.h>
 #include <numpy/npy_math.h>
 #include <stdlib.h>
+#include <exception>
 #include <string>
 #include "BufferedFile.h"
 #include "PMDb.h"
+#include "pymisha.h"
 
 PyObject *g_module;
 PyObject *s_pm_err;
@@ -34,7 +36,18 @@ static PyObject *gcall(PyObject *self, PyObject *args)
     const std::string outer = BufferedFile::write_error();
     BufferedFile::set_write_error("");
 
-    PyObject *res = F(self, args);
+    PyObject *res;
+    try {
+        res = F(self, args);
+    } catch (const std::exception &e) {
+        // Entry points catch TGLException and bad_alloc; anything else (a
+        // length_error, out_of_range, ...) must not reach std::terminate.
+        PyMisha::handle_error(e.what());
+        res = NULL;
+    } catch (...) {
+        PyMisha::handle_error("Unknown C++ exception");
+        res = NULL;
+    }
 
     const std::string mine = BufferedFile::write_error();
     BufferedFile::set_write_error(outer.c_str());
@@ -123,6 +136,7 @@ PyObject *pm_quadtree_query_stats(PyObject *self, PyObject *args);
 PyObject *pm_quadtree_query_objects(PyObject *self, PyObject *args);
 PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args);
 PyObject *pm_neighbors_2d(PyObject *self, PyObject *args);
+PyObject *pm_r_2d_sort_order(PyObject *self, PyObject *args);
 PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
 PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args);
@@ -233,6 +247,7 @@ static PyMethodDef module_methods[] = {
     {"pm_quadtree_query_objects", gcall<pm_quadtree_query_objects>, METH_VARARGS, "Query quad-tree for matching objects"},
     {"pm_quadtree_query_stats_batch", gcall<pm_quadtree_query_stats_batch>, METH_VARARGS, "Batch query quad-tree stats for N rectangles"},
     {"pm_neighbors_2d", gcall<pm_neighbors_2d>, METH_VARARGS, "2D NN iteration on one chrom-pair via in-memory quadtree (Phase NN)"},
+    {"pm_r_2d_sort_order", gcall<pm_r_2d_sort_order>, METH_VARARGS, "Row order of R's sort of 2D intervals by chromosome pair"},
     {"pm_track2d_convert_to_indexed", gcall<pm_track2d_convert_to_indexed>, METH_VARARGS, "Convert 2D track per-pair files to indexed format"},
     {"pm_track2d_index_info", gcall<pm_track2d_index_info>, METH_VARARGS, "Get 2D track index info"},
     {"pm_gseq_pwm_edits", gcall<pm_gseq_pwm_edits>, METH_VARARGS, "Get detailed PWM edit distance information"},

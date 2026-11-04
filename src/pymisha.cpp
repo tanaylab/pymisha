@@ -424,8 +424,11 @@ int PyMisha::read_multitask_fifo(void *buf, size_t bytes)
 
         check_kids_state(false);
 
-        if (eof_reached && s_running_pids.empty())
-            return readlen;
+        // Every caller reads a fixed-size message and none checks the length,
+        // so running out of data is an error, not a short read.
+        if (eof_reached && s_running_pids.empty() && readlen < bytes)
+            verror("Multitasking: a child process ended before sending all of its result "
+                   "(%lu of %lu bytes)", (unsigned long)readlen, (unsigned long)bytes);
     }
     return readlen;
 }

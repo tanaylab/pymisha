@@ -68,8 +68,8 @@ void parse_kv_args(const char *line, size_t header_skip, StepDecl &decl,
         else if (key == "start") {
             char *endp = nullptr;
             long long n = strtoll(val.c_str(), &endp, 10);
-            if (*endp) verror("Malformed %s line at %s:%ld - invalid start=%s",
-                               kind, path, lineno, val.c_str());
+            if (*endp || n < 1) verror("Malformed %s line at %s:%ld - invalid start=%s",
+                                         kind, path, lineno, val.c_str());
             decl.start = (int64_t)n;
             decl.has_start = true;
         }
@@ -92,6 +92,17 @@ void parse_kv_args(const char *line, size_t header_skip, StepDecl &decl,
 }
 
 // Strip leading whitespace and return true if line is blank or a comment / header.
+// A coordinate as R's Wig::str2coord reads it: an integer >= base, made 0-based.
+// (Parsing it as a double let "nan" through as INT64_MIN and "0.9" as 0.)
+int64_t wig_coord(const char *str, int64_t base, const char *what, const char *path, long lineno)
+{
+    char *endp = nullptr;
+    long long c = strtoll(str, &endp, 10);
+    if (endp == str || *endp || c < base)
+        verror("Cannot parse %s at %s:%ld - '%s'", what, path, lineno, str);
+    return (int64_t)c - base;
+}
+
 bool is_skip_line(const char *line)
 {
     while (*line && isspace((unsigned char)*line)) ++line;
@@ -232,15 +243,13 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 // BedGraph: chrom start end value. As in misha, a bedGraph line is one whatever
                 // section it follows, and it ends that section.
                 char *endp = nullptr;
-                double s_f = strtod(toks[1], &endp);
-                if (*endp) verror("Cannot parse BedGraph start at %s:%ld - '%s'", path, lineno, toks[1]);
-                double e_f = strtod(toks[2], &endp);
-                if (*endp) verror("Cannot parse BedGraph end at %s:%ld - '%s'", path, lineno, toks[2]);
+                int64_t s_i = wig_coord(toks[1], 0, "BedGraph start", path, lineno);
+                int64_t e_i = wig_coord(toks[2], 0, "BedGraph end", path, lineno);
                 double v = strtod(toks[3], &endp);
                 if (*endp) verror("Cannot parse BedGraph value at %s:%ld - '%s'", path, lineno, toks[3]);
                 chrom.push_back(std::string(toks[0]));
-                start.push_back((int64_t)s_f);
-                end.push_back((int64_t)e_f);
+                start.push_back(s_i);
+                end.push_back(e_i);
                 value.push_back(v);
                 step.push_back(0);
                 mode = MODE_NONE;
@@ -264,9 +273,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
             }
             if (mode == MODE_VAR && ntok >= 2) {
                 char *endp = nullptr;
-                double pos_f = strtod(toks[0], &endp);
-                if (*endp) verror("Cannot parse variableStep position at %s:%ld - '%s'", path, lineno, toks[0]);
-                int64_t pos0 = (int64_t)pos_f - 1; // WIG 1-based
+                int64_t pos0 = wig_coord(toks[0], 1, "variableStep position", path, lineno); // WIG 1-based
                 double v = strtod(toks[1], &endp);
                 if (*endp) verror("Cannot parse variableStep value at %s:%ld - '%s'", path, lineno, toks[1]);
                 chrom.push_back(cur_chrom);

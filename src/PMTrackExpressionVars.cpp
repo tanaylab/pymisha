@@ -648,6 +648,15 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval)) {
                 vvar.values[idx] = std::nan("");
             } else {
+                // The pwm/potts sliding caches are keyed by position only; R
+                // clears them in TrackExpressionVars::start_chrom.
+                if (eval.chromid != vvar.scorer_chromid) {
+                    if (auto *pwm = dynamic_cast<PWMScorer *>(vvar.scorer.get()))
+                        pwm->invalidate_cache();
+                    else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get()))
+                        potts->invalidate_cache();
+                    vvar.scorer_chromid = eval.chromid;
+                }
                 vvar.values[idx] = vvar.scorer->score_interval(eval, chromkey);
             }
         } else if (!vvar.src_track_name.empty()) {

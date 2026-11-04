@@ -48,8 +48,24 @@ inline void build_scope_qtree(RectsQuadTree &qtree, const std::vector<GInterval2
 {
     qtree.reset(0, 0, (int64_t)chromkey.get_chrom_size(scope[first].chromid1),
                 (int64_t)chromkey.get_chrom_size(scope[first].chromid2));
-    for (size_t i = first; i < last; ++i)
-        qtree.insert(RectsQuadTree::ValueType(scope[i].start1, scope[i].start2, scope[i].end1, scope[i].end2, 0));
+    for (size_t i = first; i < last; ++i) {
+        const GInterval2D &iv = scope[i];
+        // R's GIntervals2D::verify_no_overlaps: an overlapping 2D scope is an
+        // error (iterating one made the tree, and memory, grow without bound).
+        Rectangle rect(iv.start1, iv.start2, iv.end1, iv.end2);
+        if (qtree.do_intersect(rect)) {
+            Rectangles hit;
+            std::vector<uint64_t> hit_idx;
+            qtree.intersect(rect, hit, hit_idx);
+            const GInterval2D &other = scope[first + hit_idx[0]];
+            TGLError("Intervals (%s, %ld, %ld, %s, %ld, %ld) and (%s, %ld, %ld, %s, %ld, %ld) overlap",
+                     chromkey.id2chrom(iv.chromid1).c_str(), (long)iv.start1, (long)iv.end1,
+                     chromkey.id2chrom(iv.chromid2).c_str(), (long)iv.start2, (long)iv.end2,
+                     chromkey.id2chrom(other.chromid1).c_str(), (long)other.start1, (long)other.end1,
+                     chromkey.id2chrom(other.chromid2).c_str(), (long)other.start2, (long)other.end2);
+        }
+        qtree.insert(RectsQuadTree::ValueType(iv.start1, iv.start2, iv.end1, iv.end2, 0));
+    }
 }
 
 // R's m_scope_qtree.intersect(rect[, band], ...): the scope intervals that rect meets,

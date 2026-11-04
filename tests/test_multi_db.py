@@ -30,7 +30,7 @@ def _restore_root():
     """Ensure we always restore root to TEST_DB after each test."""
     yield
     # Unload all loaded datasets and restore root
-    for ds in list(pm.gdataset_ls()):
+    for ds in list(pm.gdataset_ls()[1:]):
         pm.gdataset_unload(ds, validate=False)
     pm.gdb_init(str(TEST_DB))
 
@@ -58,7 +58,7 @@ class TestMultiDbSetup:
         pm.gsetroot(db1)
         pm.gdataset_load(db2)
 
-        assert len(pm.gdataset_ls()) == 1  # 1 loaded dataset (db2)
+        assert len(pm.gdataset_ls()[1:]) == 1  # 1 loaded dataset (db2)
         tracks = pm.gtrack_ls()
         assert "track1" in tracks
         assert "track2" in tracks
@@ -81,7 +81,7 @@ class TestMultiDbSetup:
         pm.gdataset_load(db_empty)
         pm.gdataset_load(db2)
 
-        assert len(pm.gdataset_ls()) == 2
+        assert len(pm.gdataset_ls()[1:]) == 2
         tracks = pm.gtrack_ls()
         assert "track1" in tracks
         assert "track2" in tracks
@@ -509,7 +509,7 @@ class TestMultiDbMultipleDatasets:
         pm.gdataset_load(db_ds2)
         pm.gdataset_load(db_ds3)
 
-        assert len(pm.gdataset_ls()) == 3
+        assert len(pm.gdataset_ls()[1:]) == 3
         tracks = pm.gtrack_ls()
         assert "track_a" in tracks
         assert "track_b" in tracks

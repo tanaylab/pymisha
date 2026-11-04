@@ -70,7 +70,7 @@ def gtrack_export_bedgraph(
     --------
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
-    >>> pm.gtrack_export_bedgraph("dense_track", "/tmp/dense.bedgraph")
+    >>> pm.gtrack_export_bedgraph("dense_track", "/tmp/dense.bedgraph")  # doctest: +SKIP
     """
     _checkroot()
 

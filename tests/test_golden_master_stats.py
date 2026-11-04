@@ -166,14 +166,14 @@ cat("P90:", q["90%"], "\\n", sep="")
         intervals = pm.gintervals("1", 0, 10000)
 
         # Get pymisha result
-        py_result = pm.gcor("dense_track", "dense_track * 2 + 0.1", intervals=intervals)
+        py_result = pm.gcor("dense_track", "dense_track * dense_track - 0.3 * dense_track", intervals=intervals)
 
         # Get R result
         r_code = f'''
 library(misha)
 gdb.init("{TESTDB}")
 intervals <- gintervals("1", 0, 10000)
-result <- gcor("dense_track", "dense_track * 2 + 0.1", intervals)
+result <- gcor("dense_track", "dense_track * dense_track - 0.3 * dense_track", intervals)
 cat("Cor:", result, "\\n", sep="")
 '''
         stdout, stderr = run_r_code(r_code)

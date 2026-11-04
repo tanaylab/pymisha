@@ -305,8 +305,6 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
     // arbitrary input layouts (non-int64 numeric, lists, integer chroms,
     // pandas Series with Arrow backing, etc.). Same semantics as the
     // original implementation.
-    PyObject *last_obj_slow = nullptr;
-    int last_id_slow = -1;
     for (Py_ssize_t i = 0; i < len; ++i) {
         PMPY chrom_val(PySequence_GetItem(py_chrom, i), true);
         PMPY start_val(PySequence_GetItem(py_start, i), true);
@@ -317,15 +315,9 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
             TGLError("Failed to get interval values at index %ld", (long)i);
         }
 
-        int chromid;
-        PyObject *cobj = (PyObject *)chrom_val;
-        if (cobj == last_obj_slow) {
-            chromid = last_id_slow;
-        } else {
-            chromid = resolve_chrom_id(cobj, chromkey);
-            last_obj_slow = cobj;
-            last_id_slow = chromid;
-        }
+        // No pointer cache here: chrom_val is a new reference freed at the end
+        // of each row, so the next row's object can reuse its address.
+        int chromid = resolve_chrom_id((PyObject *)chrom_val, chromkey);
 
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
@@ -1018,8 +1010,9 @@ static void split_intervals_by_range(const std::vector<GInterval> &intervals,
                 int64_t aligned_end = (chunk_end / split_align) * split_align;
                 if (aligned_end <= seg_start)
                     aligned_end = ((seg_start / split_align) + 1) * split_align;
-                if (aligned_end < seg_end_total)
-                    chunk_end = aligned_end;
+                // No bin boundary left inside the interval: don't cut it at an
+                // unaligned point, or one iterator bin becomes two rows.
+                chunk_end = aligned_end < seg_end_total ? aligned_end : seg_end_total;
             }
 
             if (chunk_end <= seg_start)
@@ -2850,11 +2843,19 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
                         uint64_t count;
                     } header{start, sub.size()};
 
-                    PyMisha::write_multitask_fifo(&header, sizeof(header));
-                    if (!kid_values.empty()) {
-                        PyMisha::write_multitask_fifo(kid_values.data(),
-                                                      kid_values.size() * sizeof(double));
+                    // One message per kid: hold the lock across all of it, or kids
+                    // interleave their fields in the FIFO.
+                    PyMisha::lock_multitask_fifo();
+                    try {
+                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
+                        if (!kid_values.empty())
+                            PyMisha::write_multitask_fifo_unlocked(kid_values.data(),
+                                                                   kid_values.size() * sizeof(double));
+                    } catch (...) {
+                        PyMisha::unlock_multitask_fifo();
+                        throw;
                     }
+                    PyMisha::unlock_multitask_fifo();
 
                     _exit(0);
                 }
@@ -3039,11 +3040,19 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
                         uint64_t estimated;
                     } header{start, sub.size(), estimated ? 1ULL : 0ULL};
 
-                    PyMisha::write_multitask_fifo(&header, sizeof(header));
-                    if (!kid_quantiles.empty()) {
-                        PyMisha::write_multitask_fifo(kid_quantiles.data(),
-                                                      kid_quantiles.size() * sizeof(double));
+                    // One message per kid: hold the lock across all of it, or kids
+                    // interleave their fields in the FIFO.
+                    PyMisha::lock_multitask_fifo();
+                    try {
+                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
+                        if (!kid_quantiles.empty())
+                            PyMisha::write_multitask_fifo_unlocked(kid_quantiles.data(),
+                                                                   kid_quantiles.size() * sizeof(double));
+                    } catch (...) {
+                        PyMisha::unlock_multitask_fifo();
+                        throw;
                     }
+                    PyMisha::unlock_multitask_fifo();
 
                     _exit(0);
                 }
@@ -3947,13 +3956,22 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
 
                     // Write number of results first, then each result
                     size_t count = kid_result.size();
-                    PyMisha::write_multitask_fifo(&count, sizeof(count));
-                    for (const auto &pi : kid_result) {
-                        PyMisha::write_multitask_fifo(&pi.chromid, sizeof(pi.chromid));
-                        PyMisha::write_multitask_fifo(&pi.start, sizeof(pi.start));
-                        PyMisha::write_multitask_fifo(&pi.end, sizeof(pi.end));
-                        PyMisha::write_multitask_fifo(&pi.bin, sizeof(pi.bin));
+                    // One message per kid: hold the lock across all of it, or kids
+                    // interleave their fields in the FIFO.
+                    PyMisha::lock_multitask_fifo();
+                    try {
+                        PyMisha::write_multitask_fifo_unlocked(&count, sizeof(count));
+                        for (const auto &pi : kid_result) {
+                            PyMisha::write_multitask_fifo_unlocked(&pi.chromid, sizeof(pi.chromid));
+                            PyMisha::write_multitask_fifo_unlocked(&pi.start, sizeof(pi.start));
+                            PyMisha::write_multitask_fifo_unlocked(&pi.end, sizeof(pi.end));
+                            PyMisha::write_multitask_fifo_unlocked(&pi.bin, sizeof(pi.bin));
+                        }
+                    } catch (...) {
+                        PyMisha::unlock_multitask_fifo();
+                        throw;
                     }
+                    PyMisha::unlock_multitask_fifo();
                     _exit(0);
                 }
             }
@@ -4167,9 +4185,11 @@ PyObject *pm_intervals_union(PyObject *self, PyObject *args) {
         convert_py_intervals(py_intervs1, intervs1);
         convert_py_intervals(py_intervs2, intervs2);
 
-        // Both must be sorted
+        // Both must be canonic, as R makes them (GenomeIntervalUtils.cpp)
         intervals_sort(intervs1);
         intervals_sort(intervs2);
+        intervals_unify_overlaps(intervs1);
+        intervals_unify_overlaps(intervs2);
 
         // Merge-sort the two sets
         std::vector<GInterval> result;
@@ -4234,9 +4254,11 @@ PyObject *pm_intervals_intersect(PyObject *self, PyObject *args) {
         convert_py_intervals(py_intervs1, intervs1);
         convert_py_intervals(py_intervs2, intervs2);
 
-        // Both must be sorted
+        // Both must be canonic, as R makes them (GenomeIntervalUtils.cpp)
         intervals_sort(intervs1);
         intervals_sort(intervs2);
+        intervals_unify_overlaps(intervs1);
+        intervals_unify_overlaps(intervs2);
 
         std::vector<GInterval> result;
 
@@ -4329,9 +4351,11 @@ PyObject *pm_intervals_diff(PyObject *self, PyObject *args) {
         convert_py_intervals(py_intervs1, intervs1);
         convert_py_intervals(py_intervs2, intervs2);
 
-        // Both must be sorted
+        // Both must be canonic, as R makes them (GenomeIntervalUtils.cpp)
         intervals_sort(intervs1);
         intervals_sort(intervs2);
+        intervals_unify_overlaps(intervs1);
+        intervals_unify_overlaps(intervs2);
 
         std::vector<GInterval> result;
 
@@ -4822,7 +4846,9 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
             dims.push_back(bins_manager.get_bin_finder(i).get_numbins());
         }
 
-        PMPY py_result(PyArray_SimpleNew(dims.size(), dims.data(), NPY_DOUBLE), true);
+        // BinsManager flattens with the first expression varying fastest (R's
+        // column-major order), so the array must be Fortran-ordered.
+        PMPY py_result(PyArray_EMPTY(dims.size(), dims.data(), NPY_DOUBLE, 1), true);
         if (!py_result) verror("Failed to create result array");
 
         double *result_data = (double *)PyArray_DATA((PyArrayObject *)(PyObject *)py_result);
@@ -5106,9 +5132,21 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         // canonicalising those would merge adjacent bins into one, which is a
         // different answer from misha's. Verified against R: a two-bin touching
         // iterator must stay two bins whatever the scope looks like.
+        // R's gbintransform sorts the scope but does not merge overlaps, and
+        // reports each row's intervalID as the caller's row.
+        std::vector<uint64_t> orig_idx;  // sorted position -> caller's row
         if (iterator_policy != -1) {
-            intervals_sort(intervals);
-            intervals_unify_overlaps(intervals);
+            orig_idx.resize(intervals.size());
+            for (size_t i = 0; i < orig_idx.size(); ++i)
+                orig_idx[i] = i;
+            std::stable_sort(orig_idx.begin(), orig_idx.end(), [&](uint64_t a, uint64_t b) {
+                return intervals_compare_by_start(intervals[a], intervals[b]);
+            });
+            std::vector<GInterval> sorted;
+            sorted.reserve(intervals.size());
+            for (uint64_t i : orig_idx)
+                sorted.push_back(intervals[i]);
+            intervals.swap(sorted);
         }
 
         if (intervals.empty()) {
@@ -5251,6 +5289,10 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         }
 
         g_pymisha->verify_max_data_size(result.intervals.size(), "Result");
+
+        for (auto &id : result.interval_ids)  // 1-based
+            if (id >= 1 && id <= orig_idx.size())
+                id = orig_idx[id - 1] + 1;
 
         PMPY result_df = build_lookup_df(result);
         result_df.to_be_stolen();
@@ -5576,6 +5618,9 @@ static CorSummary compute_cor_pearson(const std::string &expr1, const std::strin
         return summary;
     } catch (TGLException &) {
         // Fall through to separate-scanner approach for mixed track types
+        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
+            throw;
+        summary = CorSummary();  // drop what the combined scan already counted
     }
 
     // Separate scanners for mixed track types: extract both then correlate
@@ -5662,6 +5707,10 @@ static SpearmanSummary compute_cor_spearman_exact(const std::string &expr1, cons
         }
     } catch (TGLException &) {
         // Mixed track types fallback.
+        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
+            throw;
+        pairs.clear();  // drop what the combined scan already counted
+        total_bins = 0;
         std::vector<double> vals1, vals2;
         {
             PMTrackExprScanner scanner;
@@ -5724,6 +5773,10 @@ static void collect_cor_spearman_exact_pairs(const std::string &expr1, const std
         return;
     } catch (TGLException &) {
         // Mixed track types fallback.
+        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
+            throw;
+        pairs.clear();  // drop what the combined scan already counted
+        total_bins = 0;
     }
 
     std::vector<double> vals1, vals2;
@@ -5817,6 +5870,13 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
         }
     } catch (TGLException &) {
         // Mixed track types fallback.
+        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
+            throw;
+        summary.n = 0;  // drop what the combined scan already sampled
+        non_nan = 0;
+        pair_sampler.reset();
+        x_sampler.reset();
+        y_sampler.reset();
         std::vector<double> vals1, vals2;
         {
             PMTrackExprScanner scanner;
@@ -7725,9 +7785,18 @@ PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
         PMGenomeTrack2D track;
         track.init(track_name);
 
-        for (auto &kv : by_pair) {
-            const PairKey2 &key = kv.first;
-            const std::vector<int64_t> &idxs = kv.second;
+        // Visit the pairs in chrom order, not hash order: the sample draws
+        // follow the visit order, which must not depend on the C++ library.
+        std::vector<PairKey2> keys;
+        keys.reserve(by_pair.size());
+        for (const auto &kv : by_pair)
+            keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end(), [](const PairKey2 &a, const PairKey2 &b) {
+            return a.c1 != b.c1 ? a.c1 < b.c1 : a.c2 < b.c2;
+        });
+
+        for (const PairKey2 &key : keys) {
+            const std::vector<int64_t> &idxs = by_pair[key];
 
             bool have_data = track.set_chrom_pair(key.c1, key.c2);
             if (!have_data) continue;
@@ -7762,8 +7831,9 @@ PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
                     break;
                 case F_SAMPLE:
                     if (m > 0) {
-                        std::uniform_int_distribution<size_t> dist(0, m - 1);
-                        size_t pick = dist(rng);
+                        // not uniform_int_distribution, whose mapping differs
+                        // between C++ libraries (same seed, other values on macOS)
+                        size_t pick = (size_t)(rng() % m);
                         out[orig_idx] = static_cast<double>(qresult.vals[pick]);
                     }
                     break;
@@ -8243,6 +8313,30 @@ PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
     }
     x_hi += 1; y_hi += 1;
 
+    // R's gintervals.neighbors refuses overlapping 2D targets
+    // (GIntervals2D::verify_no_overlaps). The caller adds the chrom pair.
+    try {
+        RectsQuadTree check;
+        check.reset(x_lo, y_lo, x_hi, y_hi);
+        for (npy_intp i = 0; i < nt; ++i) {
+            ::Rectangle r(tx1[i], ty1[i], tx2[i], ty2[i]);
+            if (check.do_intersect(r)) {
+                Rectangles hit;
+                std::vector<uint64_t> hit_idx;
+                check.intersect(r, hit, hit_idx);
+                const npy_intp j = (npy_intp)hit_idx[0];
+                PyErr_Format(s_pm_err, "overlapping 2D intervals: (%lld, %lld, %lld, %lld) and (%lld, %lld, %lld, %lld)",
+                             (long long)tx1[i], (long long)tx2[i], (long long)ty1[i], (long long)ty2[i],
+                             (long long)tx1[j], (long long)tx2[j], (long long)ty1[j], (long long)ty2[j]);
+                return NULL;
+            }
+            check.insert(RectsQuadTree::ValueType(tx1[i], ty1[i], tx2[i], ty2[i], 0));
+        }
+    } catch (TGLException &e) {
+        PyErr_SetString(s_pm_err, e.msg());
+        return NULL;
+    }
+
     memqt::MemQuadTree tree;
     tree.init(x_lo, y_lo, x_hi, y_hi);
     for (npy_intp i = 0; i < nt; ++i) {
@@ -8294,4 +8388,37 @@ PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
     }
 
     return _emit_neighbors_2d_result(out_q, out_t, out_d1, out_d2);
+}
+
+// The order in which R sorts 2D intervals by chromosome pair (r_2d_sort_order, which
+// reproduces GIntervals2D::sort's std::sort), for the Python code that must walk them
+// as R does. Takes the chromosome ids of the two sides, returns the row indices.
+PyObject *pm_r_2d_sort_order(PyObject *self, PyObject *args) {
+    PyObject *c1_obj, *c2_obj;
+    if (!PyArg_ParseTuple(args, "OO", &c1_obj, &c2_obj))
+        return NULL;
+    PMPY c1(PyArray_FROM_OTF(c1_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY), true);
+    PMPY c2(PyArray_FROM_OTF(c2_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY), true);
+    if (!*c1 || !*c2)
+        return NULL;
+    npy_intp n = PyArray_SIZE((PyArrayObject *)*c1);
+    if (PyArray_SIZE((PyArrayObject *)*c2) != n) {
+        PyErr_SetString(PyExc_ValueError, "chromid arrays differ in length");
+        return NULL;
+    }
+    const int64_t *a = (const int64_t *)PyArray_DATA((PyArrayObject *)*c1);
+    const int64_t *b = (const int64_t *)PyArray_DATA((PyArrayObject *)*c2);
+    std::vector<GInterval2D> intervs;
+    intervs.reserve(n);
+    for (npy_intp i = 0; i < n; ++i)
+        intervs.push_back(GInterval2D((int)a[i], 0, 1, (int)b[i], 0, 1));
+    std::vector<size_t> order = r_2d_sort_order(intervs);
+    npy_intp dims[1] = { n };
+    PyObject *out = PyArray_SimpleNew(1, dims, NPY_INT64);
+    if (!out)
+        return NULL;
+    int64_t *o = (int64_t *)PyArray_DATA((PyArrayObject *)out);
+    for (npy_intp i = 0; i < n; ++i)
+        o[i] = (int64_t)order[i];
+    return out;
 }

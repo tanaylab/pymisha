@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 #include <unordered_set>
+#include "TGLException.h"
 
 namespace quadtree {
 
@@ -218,11 +219,21 @@ struct QueryObjects {
 // Returns: num_objs, root_chunk_fpos
 // The signature (int32_t at offset 0) should already be read by the caller.
 // buffer starts at the signature.
+// Every offset read from a 2D track file is checked against its length: a
+// truncated or corrupt file is an error, not a read past the mapping.
+inline void need_bytes(size_t len, int64_t off, size_t n) {
+    if (off < 0 || (uint64_t)off > len || n > len - (uint64_t)off)
+        TGLError("Truncated or corrupt 2D track file: %zu bytes needed at offset %lld of %zu",
+                 n, (long long)off, len);
+}
+
 inline void parse_header(const char *buf, size_t len,
                          uint64_t &num_objs, int64_t &root_chunk_fpos) {
     // After int32 signature (4 bytes): uint64 num_objs, int64 root_chunk_fpos
+    need_bytes(len, 0, 12);
     memcpy(&num_objs, buf + 4, sizeof(uint64_t));
     if (num_objs > 0) {
+        need_bytes(len, 12, 8);
         memcpy(&root_chunk_fpos, buf + 12, sizeof(int64_t));
     } else {
         root_chunk_fpos = 0;
@@ -231,7 +242,8 @@ inline void parse_header(const char *buf, size_t len,
 
 // Get the top_node_offset from a chunk header.
 // Chunk format: [int64 chunk_size] [int64 top_node_offset] [data...]
-inline int64_t get_chunk_top_node_offset(const char *buf, int64_t chunk_fpos) {
+inline int64_t get_chunk_top_node_offset(const char *buf, size_t len, int64_t chunk_fpos) {
+    need_bytes(len, chunk_fpos, 16);
     int64_t top_node_offset;
     memcpy(&top_node_offset, buf + chunk_fpos + 8, sizeof(int64_t));
     return top_node_offset;
