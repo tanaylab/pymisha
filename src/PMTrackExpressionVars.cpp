@@ -1057,6 +1057,9 @@ void PMTrackExpressionVars::register_value_funcs(GenomeTrack1D *t, const std::st
         if (func == "nearest") t->register_function(GenomeTrack1D::NEAREST);
         if (func == "lse") t->register_function(GenomeTrack1D::LSE);
     }
+    // An array track computes lse in calc_vals (sparse collects it in extract instead)
+    if (type == GenomeTrack::ARRAYS && func == "lse")
+        t->register_function(GenomeTrack1D::LSE);
 }
 
 // ---- extract_dense_last: read an already-computed last_<func>() from a dense reader ----
@@ -1274,9 +1277,10 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
 
     if (func == "avg" || func == "mean") return track1d->last_avg();
     if (func == "sum") return track1d->last_sum();
-    // Dense LSE uses the sliding reducer (registered above); sparse LSE falls
-    // through to the dedicated collect-and-reduce branch below.
-    if (func == "lse" && fixed_bin) return track1d->last_lse();
+    // Dense LSE uses the sliding reducer (registered above) and an array track
+    // computes it in calc_vals; sparse LSE falls through to the dedicated
+    // collect-and-reduce branch below.
+    if (func == "lse" && (fixed_bin || !sparse)) return track1d->last_lse();
     if (func == "min") return track1d->last_min();
     if (func == "max") return track1d->last_max();
     if (func == "stddev" || func == "std") return track1d->last_stddev();

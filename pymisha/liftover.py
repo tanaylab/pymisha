@@ -347,11 +347,13 @@ def _parse_chain_file_python(
             b_chrom.append(tgt_chrom)
             b_start.append(block_tgt_start)
             b_end.append(block_tgt_end)
-            b_strand.append(tgt_strand)
+            # liftover reads only the target strand, as the orientation relative to the source
+            # (R misha 5.15): fold the source strand in
+            b_strand.append(tgt_strand ^ src_strand)
             b_chromsrc.append(src_chrom)
             b_startsrc.append(block_src_start)
             b_endsrc.append(block_src_end)
-            b_strandsrc.append(src_strand)
+            b_strandsrc.append(0)
             b_chain_id.append(chain_id)
             b_score.append(chain_score)
 
@@ -1171,13 +1173,35 @@ def _chain_to_r(chain: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _preloaded_chain(chain: pd.DataFrame, min_score: float | None) -> pd.DataFrame:
+    """A pre-loaded chain as liftover uses it (R misha 5.15): an alias names the
+    database's chromosome, and min_score is applied. A chain from
+    gintervals_load_chain / gintervals_as_chain carries its own min_score, which
+    replaces the argument; a row with an NA score is dropped."""
+    attrs = dict(chain.attrs)
+    if "src_overlap_policy" in attrs and "tgt_overlap_policy" in attrs:
+        min_score = attrs.get("min_score")
+    out = _with_canonical_chroms(chain)
+    if min_score is not None:
+        out = out[out["score"].to_numpy(dtype=float) >= min_score]
+    out.attrs = attrs
+    return out
+
+
 def _chain_from_r(chain: pd.DataFrame) -> pd.DataFrame:
     """A chain DataFrame's R strands (1 / -1) as the internal 0 / 1. 0 is read
-    as '+' too, so a chain written with the old {0, 1} plus strand still works."""
+    as '+' too, so a chain written with the old {0, 1} plus strand still works.
+    As in R misha 5.15, liftover reads only the target strand, as the orientation
+    of the target relative to the source: a block is reversed when exactly one of
+    strand and strandsrc is -1, so the source strand is folded into strand."""
     out = chain.copy()
-    for c in ("strand", "strandsrc"):
-        if c in out.columns:
-            out[c] = (out[c].to_numpy() == -1).astype(np.int64)
+    rev = (out["strand"].to_numpy() == -1) if "strand" in out.columns else None
+    if "strandsrc" in out.columns:
+        src_rev = out["strandsrc"].to_numpy() == -1
+        rev = src_rev if rev is None else rev ^ src_rev
+        out["strandsrc"] = np.zeros(len(out), dtype=np.int64)
+    if rev is not None:
+        out["strand"] = rev.astype(np.int64)
     return out
 
 
@@ -2014,7 +2038,7 @@ def gintervals_liftover(
     else:
         # a target chromosome named by an alias (such as "1" for chr1) is the
         # database's chromosome, as in misha
-        chain_df = _with_canonical_chroms(chain)
+        chain_df = _preloaded_chain(chain, min_score)
     chain_df = _chain_from_r(chain_df)
 
     if "chrom1" in intervals.columns:
@@ -3129,7 +3153,7 @@ def gtrack_liftover(
     elif not isinstance(chain, pd.DataFrame):
         raise TypeError("chain must be a file path string or a chain DataFrame")
     else:
-        chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+        chain = _preloaded_chain(chain, min_score)   # an alias names the database's chromosome
     chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
 
@@ -3338,7 +3362,7 @@ def _gtrack_liftover_python(
     elif isinstance(chain, pd.DataFrame):
         # Pre-loaded chain — policies are already baked in. An alias names the
         # database's chromosome.
-        chain = _with_canonical_chroms(chain)
+        chain = _preloaded_chain(chain, min_score)
     else:
         raise TypeError("chain must be a file path string or a chain DataFrame")
     chain = _chain_from_r(chain)
@@ -3503,7 +3527,7 @@ def _gtrack_liftover_2d(
     elif not isinstance(chain, pd.DataFrame):
         raise TypeError("chain must be a file path string or a chain DataFrame")
     else:
-        chain = _with_canonical_chroms(chain)   # an alias names the database's chromosome
+        chain = _preloaded_chain(chain, min_score)   # an alias names the database's chromosome
     chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
 

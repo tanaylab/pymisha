@@ -748,15 +748,14 @@ void write_pair(const ImportArgs &args, const PairFiles &pair_files, bool are_al
 
 //------------------------------- gtrack_2d_import_contacts (GTrack2DImportContacts.cpp) -------------
 
-typedef unordered_map<pair<uint64_t, uint64_t>, double> Contacts;
-
 const int64_t CONTACT_RECORD_SIZE = 2 * sizeof(int64_t) + sizeof(float);
 
-// Peak memory of building a chromosome pair, in bytes per contact (see pair_mem): the hash map that sums the
-// duplicates plus the quad trees, which hold every contact twice (mirrored in a cis pair, one tree per
-// orientation in a trans pair). Measured by R misha as the peak RSS of a serial import of one pair of 2M - 40M
-// Hi-C-like contacts: at most 202.7 bytes a contact, cis and trans alike. Rounded up to a multiple of 8.
-const uint64_t CONTACT_MEM = 208;
+// Peak memory of building a chromosome pair, in bytes per contact (see pair_mem): the sorted vector of the
+// records that sums the duplicates plus the quad trees, which hold every contact twice (mirrored in a cis pair,
+// one tree per orientation in a trans pair). Measured by R misha (5.15.1) as the peak RSS of a serial import of
+// one pair of 2M - 40M Hi-C-like contacts: at most 167.3 bytes a contact (cis, no duplicates; trans and
+// duplicates need less). Rounded up to a multiple of 8.
+const uint64_t CONTACT_MEM = 168;
 
 unsigned read_header(BufferedFile &file, const char *fname, const char *ftype, const char *colnames[], int num_cols, vector<int> &fcol_idx)
 {
@@ -1078,33 +1077,51 @@ void write_contacts_pair(const ImportArgs &args, const PairFiles &pair_files, bo
         qtree_serializer2.begin(file2, 0, 0, size2, size1, (unsigned)num_subtrees, false, TRACK_CHUNK_SIZE, TRACK_NUM_CHUNKS);
     }
 
-    // Read the contacts of a subtree, sum up the duplicates and insert them to StatQuadTreeCachedSerializer.
+    struct Contact {
+        uint64_t coord1;
+        uint64_t coord2;
+        float value;
+    };
+
+    // Read the contacts of a subtree, sum up the duplicates and insert them to StatQuadTreeCachedSerializer
+    // in coordinate order, as R misha 5.15.1 does. A hash map used to sum them, and its iteration order, which
+    // depends on the C++ library, decided the bytes of the track files. Sorting needs less memory than the map did.
     for (const vector<string> &srcs : subtree_sources(args, pair_files, num_subtrees)) {
-        Contacts contacts;
+        uint64_t num_records = 0;
 
+        for (const string &fname : srcs) {
+            struct stat st;
+
+            if (stat(fname.c_str(), &st))
+                verror("Accessing an intermediate file %s: %s\n", fname.c_str(), strerror(errno));
+            num_records += st.st_size / CONTACT_RECORD_SIZE;
+        }
+
+        vector<Contact> contacts;
+        contacts.reserve(num_records);
         for_each_contact(srcs, [&](int64_t coord1, int64_t coord2, float value) {
-            pair<uint64_t, uint64_t> key(coord1, coord2);
-            Contacts::iterator icontact = contacts.find(key);
-
-            if (icontact == contacts.end())
-                contacts[key] = value;
-            else {
-                if (!allow_duplicates)
-                    verror("Duplicated contact (%s, %ld)-(%s, %ld)", args.chromkey->id2chrom(chromid1).c_str(), (long)coord1,
-                           args.chromkey->id2chrom(chromid2).c_str(), (long)coord2);
-                icontact->second += value;
-            }
+            contacts.push_back(Contact{(uint64_t)coord1, (uint64_t)coord2, value});
         });
 
-        // Insert in coordinate order, not hash order: the hash order depends on the
-        // C++ runtime library, and so did the file's bytes.
-        vector<pair<pair<uint64_t, uint64_t>, double>> sorted_contacts(contacts.begin(), contacts.end());
-        sort(sorted_contacts.begin(), sorted_contacts.end());
+        // stable: the duplicates of a contact are summed in the order they were read
+        stable_sort(contacts.begin(), contacts.end(), [](const Contact &a, const Contact &b) {
+            return a.coord1 < b.coord1 || (a.coord1 == b.coord1 && a.coord2 < b.coord2);
+        });
 
-        for (auto icontact = sorted_contacts.cbegin(); icontact != sorted_contacts.cend(); ++icontact) {
-            int64_t coord1 = icontact->first.first;
-            int64_t coord2 = icontact->first.second;
-            float value = icontact->second;
+        for (size_t i = 0; i < contacts.size(); ) {
+            int64_t coord1 = contacts[i].coord1;
+            int64_t coord2 = contacts[i].coord2;
+            double sum = contacts[i].value;
+            size_t j = i + 1;
+
+            for (; j < contacts.size() && contacts[j].coord1 == contacts[i].coord1 && contacts[j].coord2 == contacts[i].coord2; ++j)
+                sum += contacts[j].value;
+
+            if (j - i > 1 && !allow_duplicates)
+                verror("Duplicated contact (%s, %ld)-(%s, %ld)", args.chromkey->id2chrom(chromid1).c_str(), (long)coord1,
+                       args.chromkey->id2chrom(chromid2).c_str(), (long)coord2);
+
+            float value = sum;
 
             qtree_serializer1.insert(PointsQuadTree::ValueType(coord1, coord2, value));
 
@@ -1113,6 +1130,7 @@ void write_contacts_pair(const ImportArgs &args, const PairFiles &pair_files, bo
             else if (num_subtrees == 1 && coord1 != coord2)
                 qtree_serializer1.insert(PointsQuadTree::ValueType(coord2, coord1, value));
 
+            i = j;
             check_interrupt();
         }
 

@@ -1,5 +1,5 @@
-# Regenerate tests/test_data/2d_r_parity from R misha (5.14.4 or later, with gtrack.2d.import_contacts
-# writing the contacts in coordinate order: misha branch fix/contacts-sorted-order).
+# Regenerate tests/test_data/2d_r_parity from R misha (5.15.1 or later: earlier versions wrote the
+# contacts of gtrack.2d.import_contacts in an order that depends on the C++ library).
 #
 # tests/test_2d_r_parity.py checks pymisha's 2D functions against what R misha
 # returns on pymisha's own test database (tests/testdb/trackdb/test, whose

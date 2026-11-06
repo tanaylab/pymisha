@@ -93,8 +93,9 @@ def test_unaligned_no_forbid_has_cg(plain_model):
 def test_aligned_byte_identical(forbid_cg_model):
     """Aligned-interval output unchanged by the fix.
 
-    Compares against the fixture pinned in DF.1 (sampled on the unfixed
-    v0.1.53 build immediately before applying the bin-lookup change).
+    Compares against a pinned sample. Re-pinned for 0.16.1: a 0D model now trains on the
+    whole scope (R misha 5.15); it had learned only the first iterator bin of each interval,
+    here a 200 bp telomeric repeat.
     """
     seq = _sample_seq(forbid_cg_model, 0, 2000)  # start mod 200 == 0
     pinned = FIXTURE.read_text()

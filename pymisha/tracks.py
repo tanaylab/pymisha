@@ -2299,7 +2299,7 @@ def gtrack_create(
         raise
 
 
-def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
+def _load_pssm_from_db(pssmset: str, pssmid: int) -> tuple[NumpyArray, bool]:
     """Load a PSSM matrix from the database's pssms/ directory.
 
     Reads ``GROOT/pssms/{pssmset}.key`` and ``GROOT/pssms/{pssmset}.data``.
@@ -2313,8 +2313,10 @@ def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
 
     Returns
     -------
-    numpy.ndarray
-        PSSM matrix of shape (L, 4) with columns A, C, G, T.
+    tuple of (numpy.ndarray, bool)
+        PSSM matrix of shape (L, 4) with columns A, C, G, T, and whether it is
+        bidirectional (the key file's third column). Both files are
+        whitespace-separated, as R's PssmSet::read reads them.
     """
     import numpy as np
 
@@ -2334,14 +2336,14 @@ def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
     # Verify the pssmid exists in the key file
     pssmid = int(pssmid)
     found = False
+    bidirect = True
     with open(key_file) as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 1 and int(parts[0]) == pssmid:
+            parts = line.split()
+            if parts and int(parts[0]) == pssmid:
                 found = True
+                if len(parts) >= 3:
+                    bidirect = int(parts[2]) != 0
                 break
     if not found:
         raise ValueError(f"PSSM id {pssmid} not found in {key_file}")
@@ -2350,10 +2352,7 @@ def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
     positions = {}
     with open(data_file) as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
+            parts = line.split()
             if len(parts) < 6:
                 continue
             row_id = int(parts[0])
@@ -2371,7 +2370,7 @@ def _load_pssm_from_db(pssmset: str, pssmid: int) -> NumpyArray:
     for pos, (a, c, g, t) in positions.items():
         pssm[pos] = [a, c, g, t]
 
-    return pssm
+    return pssm, bidirect
 
 
 def gtrack_create_pwm_energy(
@@ -2452,7 +2451,7 @@ def gtrack_create_pwm_energy(
     if iterator <= 0:
         raise ValueError("iterator must be a positive integer")
 
-    pssm = _load_pssm_from_db(pssmset, int(pssmid))
+    pssm, bidirect = _load_pssm_from_db(pssmset, int(pssmid))
 
     # Create a temporary PWM virtual track and extract values.
     # The vtrack path uses C++ pm_vtrack_compute for scoring (already fast)
@@ -2462,7 +2461,7 @@ def gtrack_create_pwm_energy(
 
     vtrack_name = f"_pm_pwm_tmp_{track}"
     try:
-        gvtrack_create(vtrack_name, None, func="pwm", pssm=pssm, prior=float(prior))
+        gvtrack_create(vtrack_name, None, func="pwm", pssm=pssm, prior=float(prior), bidirect=bidirect)
         all_intervs = gintervals_all()
         df = gextract(vtrack_name, intervals=all_intervs, iterator=iterator)
         if df is None or len(df) == 0:

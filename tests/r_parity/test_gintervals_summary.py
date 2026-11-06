@@ -97,4 +97,7 @@ def test_gintervals_summary(baseline_id, request):
     fn, xfail_reason = _CASES[baseline_id]
     if xfail_reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=xfail_reason, strict=True))
-    assert_matches_baseline(fn(), baseline_id)
+    # The snapshots' Std dev predates R misha 5.15, whose accurate formula moves single values
+    # by up to ~2e-5 relative; R's own expect_regression still passes them by the mean
+    # relative difference, so that is how Std dev is compared here.
+    assert_matches_baseline(fn(), baseline_id, mean_rel_cols=("Std dev",))

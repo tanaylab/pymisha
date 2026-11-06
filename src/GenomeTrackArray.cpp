@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 
 #include "GenomeTrackArray.h"
@@ -196,17 +197,19 @@ float GenomeTrackArray::get_sliced_val(uint64_t idx)
         case S_STDDEV: {
             if (m_array_vals.size() <= 1)
                 return std::numeric_limits<float>::quiet_NaN();
-            long double mean_square_sum = 0;
-            double sum = 0;
+            // unbiased standard deviation, sqrt(sum((x-mean)^2) / (N-1)), from sums shifted by the first
+            // value, as R misha 5.15: sum(x^2) - N*mean^2 cancels when the variance is small relative to mean^2
+            double shift = m_array_vals.front().val;
+            double shifted_sum = 0;
+            double shifted_sq_sum = 0;
             for (const auto &av : m_array_vals) {
-                sum += av.val;
-                // R computes val*val in float32 (catastrophic rounding at large
-                // magnitudes); reproduce it bit-for-bit (do NOT widen to double).
-                mean_square_sum += av.val * av.val;
+                double d = av.val - shift;
+                shifted_sum += d;
+                shifted_sq_sum += d * d;
             }
             double N = m_array_vals.size();
-            double avg = sum / N;
-            return (float)std::sqrt(mean_square_sum / (N - 1) - (avg * avg) * (N / (N - 1)));
+            double sq_dev_sum = shifted_sq_sum - shifted_sum * shifted_sum / N;
+            return (float)std::sqrt(std::max(sq_dev_sum, 0.) / (N - 1));
         }
         case S_SUM: {
             double sum = 0;
@@ -256,20 +259,27 @@ float GenomeTrackArray::get_sliced_val(uint64_t idx)
         return s_max == -std::numeric_limits<float>::max() ? std::numeric_limits<float>::quiet_NaN() : s_max;
     }
     case S_STDDEV: {
-        double mean_square_sum = 0;
-        double sum = 0;
+        // unbiased standard deviation from sums shifted by the first value, as R misha 5.15
+        double shift = 0;
+        double shifted_sum = 0;
+        double shifted_sq_sum = 0;
         double N = 0;
         for (uint64_t islice = 0; islice < m_slice.size(); ++islice) {
             float v = get_array_val(islice);
-            // R accumulates val*val computed in float32 here (the same one-pass
-            // formula as the no-slice path); match it bit-for-bit.
-            if (!std::isnan(v)) { ++N; sum += v; mean_square_sum += v * v; }
+            if (!std::isnan(v)) {
+                if (!N)
+                    shift = v;
+                ++N;
+                double d = v - shift;
+                shifted_sum += d;
+                shifted_sq_sum += d * d;
+            }
             if (m_array_hints[islice] >= m_array_vals.size()) break;
         }
         if (N <= 1)
             return std::numeric_limits<float>::quiet_NaN();
-        double avg = sum / N;
-        return (float)std::sqrt(mean_square_sum / (N - 1) - (avg * avg) * (N / (N - 1)));
+        double sq_dev_sum = shifted_sq_sum - shifted_sum * shifted_sum / N;
+        return (float)std::sqrt(std::max(sq_dev_sum, 0.) / (N - 1));
     }
     case S_SUM: {
         double sum = 0;
@@ -308,6 +318,7 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
     double sum = 0;
     double stddev_mean = 0;
     double stddev_m2 = 0;
+    double lse = -std::numeric_limits<double>::infinity();  // log-sum-exp of the values
     m_last_min = std::numeric_limits<float>::max();
     m_last_max = -std::numeric_limits<float>::max();
     if (has_function(MAX_POS))
@@ -328,12 +339,12 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
         if (v < m_last_min) {
             m_last_min = v;
             if (has_function(MIN_POS))
-                m_last_min_pos = cur.start;
+                m_last_min_pos = std::max(cur.start, interval.start);  // clipped to the iterator start, as R misha 5.15
         }
         if (v > m_last_max) {
             m_last_max = v;
             if (has_function(MAX_POS))
-                m_last_max_pos = cur.start;
+                m_last_max_pos = std::max(cur.start, interval.start);  // clipped to the iterator start, as R misha 5.15
         }
 
         if (has_function(EXISTS))
@@ -341,11 +352,11 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
         if (has_function(FIRST) && std::isnan(m_last_first))
             m_last_first = v;
         if (has_function(FIRST_POS) && std::isnan(m_last_first_pos))
-            m_last_first_pos = cur.start;
+            m_last_first_pos = std::max(cur.start, interval.start);  // clipped to the iterator start, as R misha 5.15
         if (has_function(LAST))
             m_last_last = v;
         if (has_function(LAST_POS))
-            m_last_last_pos = cur.start;
+            m_last_last_pos = std::max(cur.start, interval.start);  // clipped to the iterator start, as R misha 5.15
 
         ++num_vs;
         if (has_function(STDDEV)) {
@@ -356,10 +367,16 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
         }
         if (m_use_quantile)
             m_sp.add(v, s_rnd_func);
+        if (has_function(LSE)) {
+            const double hi = std::max(lse, (double)v), lo = std::min(lse, (double)v);
+            lse = std::isinf(lo) ? hi : hi + std::log1p(std::exp(lo - hi));
+        }
     }
 
     if (has_function(SIZE))
         m_last_size = num_vs;
+    if (has_function(LSE))
+        m_last_lse = num_vs > 0 ? (float)lse : std::numeric_limits<float>::quiet_NaN();
 
     m_last_sum = (float)sum;
     if (num_vs > 0)

@@ -1871,7 +1871,9 @@ class TestValueBasedVtracksPartialGaps:
         q = pd.DataFrame({"chrom": ["chr1"], "start": [50], "end": [200]})
         res = pm.gextract("vb_fpr", q, iterator=-1)
 
-        np.testing.assert_allclose(res["vb_fpr"].values, [50.0])
+        # the value's position is its start clipped to the unmasked part it is read in
+        # ([120, 200)), relative to the iterator start: 120 - 50, as R misha 5.15
+        np.testing.assert_allclose(res["vb_fpr"].values, [70.0])
 
     def test_value_based_coverage_ignores_value_column(self):
         """Coverage function with value column ignores the value (R line 451-470).

@@ -396,3 +396,24 @@ def test_parallel_gtrack_2d_import_contacts_is_converted_in_an_indexed_database(
     res = import_both_ways(lambda track: pm.gtrack_2d_import_contacts(track, "test", files))
     assert os.path.exists(os.path.join(_track_dir("imp_parallel"), "track.idx"))
     expect_same_both_ways(res)
+
+
+def test_gtrack_2d_import_contacts_writes_the_same_bytes_whatever_the_order_of_the_input_rows(import_db):
+    # R misha 5.15.1 test-gtrack.2d.import-parallel.R
+    d = random_intervals(20000, seed=11, unknown=0)
+    shuffled = d.sample(frac=1, random_state=12)
+    saved = {k: _shared.CONFIG.get(k) for k in ("multitasking", "max_processes", "max_data_size")}
+    try:
+        for mds in (None, 1000):
+            _set_options(False, mds)
+            md5 = {}
+            for name, x in (("a", d), ("b", shuffled)):
+                if pm.gtrack_exists("imp_order"):
+                    pm.gtrack_rm("imp_order", force=True)
+                files = write_slices(x, [1], f"order_{name}", import_db)
+                pm.gtrack_2d_import_contacts("imp_order", "test", files)
+                md5[name] = track_files_md5("imp_order")
+            assert len(md5["a"]) > 0
+            assert md5["b"] == md5["a"]
+    finally:
+        _shared.CONFIG.update(saved)

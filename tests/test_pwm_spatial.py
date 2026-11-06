@@ -227,9 +227,9 @@ class TestPwmSpatialRange:
         """spat_min/spat_max keep the anchors whose motif lies in positions
         spat_min..spat_max (1-based) of the interval, with or without
         spat_factor and with either bound alone: the same numbers as scoring
-        that window on its own. On the minus strand the scan runs over the
-        reverse complement, so the positions count from the interval's 3' end,
-        as in R. *.pos reports from the interval start, so it is shifted."""
+        that window on its own. On the minus strand too the positions count
+        from the interval's 5' start, as in R misha 5.15 (before, from its 3'
+        end). *.pos reports from the interval start, so it is shifted."""
         rng = np.random.RandomState(60427)
         pssm = rng.random((8, 4))
         pssm /= pssm.sum(axis=1, keepdims=True)
@@ -245,7 +245,7 @@ class TestPwmSpatialRange:
                "max": {"spat_max": hi}}[bounds]
         first = rkw.get("spat_min", 1)
         last = rkw.get("spat_max", e - s)
-        window = (e - last, e - first + 1) if strand == "minus" else (s + first - 1, s + last)
+        window = (s + first - 1, s + last)
 
         iv = pm.gintervals("1", s, e)
         sub = pm.gintervals("1", *window)
@@ -496,7 +496,8 @@ class TestPwmSpatialRangeMatchesPrego:
     ])
     _SPAT = [0.02, 0.03, 0.10, 0.10, 0.11, 0.11, 0.11, 0.10, 0.10, 0.03, 0.02]
     _R_MISHA = {
-        "spatial": [-16.785676956176758, -16.855157852172852, -16.977926254272461],
+        # R misha 5.15.1: the spatial anchors scored per strand union, as the pwm vtrack's other paths
+        "spatial": [-16.785676956176758, -16.85513687133789, -16.977922439575195],
         "nospatial": [-14.202239990234375, -14.28255558013916, -14.303085327148438],
     }
     _PREGO = {

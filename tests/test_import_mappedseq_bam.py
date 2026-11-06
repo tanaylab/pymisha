@@ -133,7 +133,8 @@ def _start_background(cmd: str) -> subprocess.Popen:
 
 
 def _stop(proc: subprocess.Popen) -> None:
-    with contextlib.suppress(ProcessLookupError):
+    # PermissionError: macOS refuses to signal a group left with only zombies
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
     proc.wait()
 

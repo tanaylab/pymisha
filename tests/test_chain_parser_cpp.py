@@ -210,7 +210,9 @@ class TestMinScoreAndStrand:
         # src_strand=-: block_src_start = 100000 - 0 - 100 = 99900, end = 100000
         assert out["startsrc"][0] == 99900
         assert out["endsrc"][0] == 100000
-        assert out["strandsrc"][0] == 1
+        # the source strand is folded into strand (R misha 5.15): internal 1 is '-'
+        assert out["strand"][0] == 1
+        assert out["strandsrc"][0] == 0
 
     def test_multi_block_with_gaps(self, tmp_path):
         """3-block chain: verify cursors advance with dt/dq."""

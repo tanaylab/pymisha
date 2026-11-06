@@ -209,7 +209,8 @@ _CASES: dict[str, tuple] = {
     "vtrack.tracktype_test.array_slice_col135_avg_regression": (_slice(["col1", "col3", "col5"], "avg"), None),
     "vtrack.tracktype_test.array_slice_col135_min_regression": (_slice(["col1", "col3", "col5"], "min"), None),
     "vtrack.tracktype_test.array_slice_col135_max_regression": (_slice(["col1", "col3", "col5"], "max"), None),
-    "vtrack.tracktype_test.array_slice_col13568_stddev_regression": (_slice(["col1", "col3", "col5", "col6", "col8"], "stddev"), None),
+    # _v2, as R 5.15: the first snapshot was taken with a stddev formula that cancelled at large values
+    "vtrack.tracktype_test.array_slice_col13568_stddev_regression_v2": (_slice(["col1", "col3", "col5", "col6", "col8"], "stddev"), None),
     "vtrack.tracktype_test.array_slice_col13568_sum_regression": (_slice(["col1", "col3", "col5", "col6", "col8"], "sum"), None),
     "vtrack.tracktype_test.array_slice_col13568_quantile_0.4_regression": (_slice(["col1", "col3", "col5", "col6", "col8"], "quantile", 0.4), None),
     "vtrack.tracktype_test.fixedbin_iterator_dim0_sshift-130_eshift224_regression": (_iter_dim(dim=0, sshift=-130, eshift=224), None),

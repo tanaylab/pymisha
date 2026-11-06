@@ -886,7 +886,9 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
         py_mask,
         float(pseudocount),
         int(k),
-        _resolve_iter_size(iterator),
+        # 0D: one iter_start per interval, so no bin-size bound (as gsynth_sample); bounding it
+        # trained only the first bin of each interval (R misha 5.15 trains the whole scope)
+        _ITER_SIZE_NO_CONSTRAINT if not parsed_specs else _resolve_iter_size(iterator),
         "uniform",
         None,
     )
@@ -1403,7 +1405,9 @@ def gsynth_train(
         py_mask,
         float(pseudocount),
         int(k),
-        _resolve_iter_size(iterator),
+        # 0D: one iter_start per interval, so no bin-size bound (as gsynth_sample); bounding it
+        # trained only the first bin of each interval (R misha 5.15 trains the whole scope)
+        _ITER_SIZE_NO_CONSTRAINT if not parsed_specs else _resolve_iter_size(iterator),
         str(prior_mode),
         prior_arg_for_cpp,
     )

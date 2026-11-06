@@ -113,7 +113,8 @@ def _normalize_df(df: pd.DataFrame, coords: tuple[str, ...], with_id: bool = Fal
     return df.sort_values(keys, kind="mergesort").reset_index(drop=True)
 
 
-def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, tol: float) -> None:
+def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, tol: float,
+                       mean_rel_cols: tuple[str, ...] = ()) -> None:
     coords = _coord_schema(base)
     if coords is None:
         # No coordinate schema (e.g. a stat table). Fall back to positional
@@ -161,7 +162,9 @@ def _assert_df_matches(py: pd.DataFrame, base: pd.DataFrame, baseline_id: str, t
         )
     for pc, bc in zip(p_vals, b_vals, strict=True):
         what = f"value col py[{pc}] vs R[{bc}]"
-        if pd.api.types.is_numeric_dtype(b[bc].dtype):
+        if bc in mean_rel_cols:
+            _assert_mean_rel_close(p[pc].to_numpy(), b[bc].to_numpy(), tol, baseline_id, what)
+        elif pd.api.types.is_numeric_dtype(b[bc].dtype):
             _assert_numeric_close(p[pc].to_numpy(), b[bc].to_numpy(), tol, baseline_id, what)
         else:
             # Non-numeric value column (e.g. gene names): compare as strings.
@@ -261,6 +264,21 @@ def _assert_numeric_close(
         )
 
 
+def _assert_mean_rel_close(
+    p: np.ndarray, b: np.ndarray, tol: float, baseline_id: str, what: str
+) -> None:
+    """R's own expect_regression comparison (waldo): NaNs in the same places and the mean
+    relative difference of the rest within tol, not every element."""
+    p = np.asarray(p, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if p.shape != b.shape or not (np.isnan(p) == np.isnan(b)).all():
+        raise AssertionError(f"[{baseline_id}] {what}: shape or NaN positions differ")
+    ok = ~np.isnan(b)
+    rel = np.abs(p[ok] - b[ok]).mean() / np.abs(b[ok]).mean() if ok.any() else 0.0
+    if rel >= tol:
+        raise AssertionError(f"[{baseline_id}] {what}: mean relative difference {rel:.3g}")
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -294,7 +312,8 @@ def assert_matches_list_baseline(py_obj: dict[str, Any], baseline_id: str, *, to
             _assert_numeric_close(_coerce_vector(p), _coerce_vector(b), tol, f"{baseline_id}[{key}]", "vector")
 
 
-def assert_matches_baseline(py_obj: Any, baseline_id: str, *, tol: float = _RTOL) -> None:
+def assert_matches_baseline(py_obj: Any, baseline_id: str, *, tol: float = _RTOL,
+                            mean_rel_cols: tuple[str, ...] = ()) -> None:
     """Assert ``py_obj`` matches R's frozen ``.rds`` baseline for ``baseline_id``.
 
     Mirrors R's ``expect_regression`` (tolerance 1e-5) with cross-implementation
@@ -316,7 +335,7 @@ def assert_matches_baseline(py_obj: Any, baseline_id: str, *, tol: float = _RTOL
                 f"[{baseline_id}] R baseline is a DataFrame but pymisha returned "
                 f"{type(py_obj).__name__}"
             )
-        _assert_df_matches(py_obj, base, baseline_id, tol)
+        _assert_df_matches(py_obj, base, baseline_id, tol, mean_rel_cols)
         return
 
     # string-sequence baseline (e.g. gvtrack.ls, gtrack.ls -> R character vector).

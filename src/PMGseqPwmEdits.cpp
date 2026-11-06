@@ -878,8 +878,19 @@ WindowResult find_best_window_edits(
     const int L = pssm.length();
     const bool has_score_min = !std::isnan(score_min);
     const bool has_score_max = !std::isnan(score_max);
-    const bool has_score_filter = has_score_min || has_score_max;
+    // The L-length pre-score is no filter with indels, whose alignment can use L +- D bases
+    // (R misha c37d5441, as PWMEditDistanceScorer::compute_interval).
+    const bool has_score_filter = (has_score_min || has_score_max) && (max_indels == 0);
     const int seqlen = static_cast<int>(seq.length());
+
+    // A window holding N or any other non-ACGT base is not a candidate, as in the pwm vtrack (R misha
+    // 5.15.0): acgt_run[j] is the number of consecutive ACGT bases from j, and a window (or an indel
+    // alignment) at offset j may use only those.
+    std::vector<int> acgt_run(seqlen + 1, 0);
+    for (int j = seqlen - 1; j >= 0; --j) {
+        acgt_run[j] = base_to_index(seq[j]) < 4 ? acgt_run[j + 1] + 1 : 0;
+    }
+    const int min_span = std::max(1, L - std::max(0, max_indels));
 
     // direction=below + bidirectional: a genomic substitution affects both
     // strands, so the answer is bounded by the *harder* strand at each
@@ -895,8 +906,11 @@ WindowResult find_best_window_edits(
     auto evaluate_window = [&](int s0, bool reverse) -> WindowResult {
         WindowResult wr;
         wr.n_edits = -1;
+        if (s0 < 0 || s0 >= seqlen || std::min(seqlen - s0, acgt_run[s0]) < min_span) {
+            return wr;
+        }
         const char* window_start = seq.data() + s0;
-        int seq_avail = seqlen - s0;
+        int seq_avail = std::min(seqlen - s0, acgt_run[s0]);
         if (has_score_filter && seq_avail >= L) {
             float logp = 0.0f;
             for (int i = 0; i < L; i++) {

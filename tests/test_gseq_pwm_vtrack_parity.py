@@ -363,7 +363,8 @@ def test_log_quarter_charges_an_n_log_quarter_on_both_strands(route, mode, monke
     orig = _pymisha.pm_pwm_score_strings
     monkeypatch.setattr(_pymisha, "pm_pwm_score_strings",
                         lambda *a, **k: calls.append(1) or orig(*a, **k))
-    kw = dict(_PATHS[route], neutral_chars_policy="log_quarter")
+    # N is scored only when listed as neutral (by default its windows are left out, R misha 5.15)
+    kw = dict(_PATHS[route], neutral_chars_policy="log_quarter", neutral_chars=["N", "n", "*"])
     got = pm.gseq_pwm([seq], pssm, mode=mode, bidirect=True, prior=0.01, **kw)[0]
     assert not calls, "a sequence with an N reached the C++ path"
     assert got == pytest.approx(want, rel=1e-12)

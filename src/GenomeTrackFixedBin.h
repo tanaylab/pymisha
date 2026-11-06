@@ -44,6 +44,14 @@ public:
 	}
 
 	unsigned get_bin_size() const { return m_bin_size; }
+
+	bool item_at(int chromid, int64_t coord, int64_t &start, int64_t &end) override {
+		if (!m_bin_size)
+			return false;
+		start = coord - coord % m_bin_size;
+		end = start + m_bin_size;
+		return true;
+	}
 	int64_t  get_num_samples() const { return m_num_samples; }
 
 	void goto_bin(uint64_t bin);

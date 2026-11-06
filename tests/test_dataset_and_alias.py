@@ -916,3 +916,21 @@ def test_ls_filters_by_db(tmp_path, monkeypatch):
         assert pm.gintervals_ls(db=str(tmp_path / "elsewhere")) == []
     finally:
         pm.gdataset_unload(ds, validate=False)
+
+
+def test_scan_intervals_does_not_walk_into_track_dirs(tmp_path):
+    """Only namespace dirs are walked: walking every `.track` dir (one file per chromosome)
+    made gdataset_load take over half an hour on a 55k-track database over NFS."""
+    from pymisha.dataset import _scan_intervals
+
+    tracks = tmp_path / "tracks"
+    (tracks / "ns" / "deep").mkdir(parents=True)
+    (tracks / "top.interv").write_text("")
+    (tracks / "ns" / "deep" / "inner.interv").write_text("")
+    (tracks / "ns" / "big.interv").mkdir()  # a big set is a directory
+    (tracks / "ns" / "big.interv" / "chr1").write_text("")
+    (tracks / "ns" / "t.track").mkdir()
+    (tracks / "ns" / "t.track" / "decoy.interv").write_text("")  # inside a track: not a set
+    (tracks / ".trash.x").mkdir()
+    (tracks / ".trash.x" / "gone.interv").write_text("")
+    assert _scan_intervals(str(tmp_path)) == {"top", "ns.deep.inner", "ns.big"}

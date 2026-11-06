@@ -387,12 +387,13 @@ class TestGseqPwmEditsZeroProbAndN:
         assert all(r["score_before"] < -100)
         assert all(r["score_after"] > r["score_before"])
 
-    def test_n_base_is_mandatory_edit(self):
+    def test_a_window_holding_n_is_not_a_candidate(self):
+        # R misha 5.15 (test-gseq-pwm-edits.R:379): as in the pwm vtrack, "NC" has no
+        # window, so no row (an N used to be a mandatory edit)
         pssm = _create_test_pssm()
         r = pm.gseq_pwm_edits("NC", pssm, score_thresh=-0.5,
                                prior=0, bidirect=False)
-        assert len(r) > 0
-        assert any(r["ref"] == "N")
+        assert len(r) == 0
 
     def test_all_n_unreachable(self):
         """All-N sequence with impossible threshold -> empty."""
@@ -4273,8 +4274,9 @@ class TestVtrackDirectionBelowMaxEdits:
 
 
 class TestVtrackDirectionBelowMaxEditsAllN:
-    """Regression: all-N window + direction='below' + max_edits must be 0,
-    not NaN.
+    """An all-N region has no window to score: NaN, as R misha 5.15 (which
+    leaves out every window holding N or another non-ACGT base). Before, an N
+    was scored at the column's best for direction='below', so this gave 0.
 
     The sliding-window N-count prefilter (``use_n_skip``) is only sound for
     direction='above' with substitutions only: an N is not a mandatory edit
@@ -4291,7 +4293,7 @@ class TestVtrackDirectionBelowMaxEditsAllN:
     def teardown_method(self):
         _remove_all_vtracks()
 
-    def test_all_n_below_max_edits_is_zero_not_nan(self):
+    def test_all_n_below_max_edits_is_nan(self):
         import os
         hg38_root = os.path.expanduser("~/hg38")
         if not os.path.isdir(hg38_root):
@@ -4328,17 +4330,11 @@ class TestVtrackDirectionBelowMaxEditsAllN:
         result = pm.gextract(["edist_below_none", "edist_below_1"],
                              interval, iterator=interval)
 
-        # R misha (5.10.3+) returns 0 for both max_edits=None and
-        # max_edits=1 on this exact case.
-        npt.assert_allclose(result["edist_below_none"].iloc[0], 0, atol=1e-6)
-        npt.assert_allclose(
-            result["edist_below_1"].iloc[0], 0, atol=1e-6,
-            err_msg="N-skip prefilter incorrectly pruned an all-N window "
-                    "under direction='below' + max_edits, returning NaN "
-                    "instead of 0",
-        )
+        # R misha 5.15 (test-pwm-edit-distance-below-n-skip.R:42): NA for both
+        assert np.isnan(result["edist_below_none"].iloc[0])
+        assert np.isnan(result["edist_below_1"].iloc[0])
 
-    def test_all_n_below_max_edits_with_indels_is_zero_not_nan(self):
+    def test_all_n_below_max_edits_with_indels_is_nan(self):
         """Same case with indels enabled - the guard's other new clause.
 
         The fixed guard is
@@ -4387,12 +4383,8 @@ class TestVtrackDirectionBelowMaxEditsAllN:
         result = pm.gextract(["edist_below_ind_none", "edist_below_ind_1"],
                              interval, iterator=interval)
 
-        npt.assert_allclose(result["edist_below_ind_none"].iloc[0], 0, atol=1e-6)
-        npt.assert_allclose(
-            result["edist_below_ind_1"].iloc[0], 0, atol=1e-6,
-            err_msg="N-skip prefilter incorrectly pruned an all-N window "
-                    "under direction='below' + max_edits + max_indels",
-        )
+        assert np.isnan(result["edist_below_ind_none"].iloc[0])
+        assert np.isnan(result["edist_below_ind_1"].iloc[0])
 
 
 class TestVtrackDirectionBelowBidirectional:
@@ -5742,10 +5734,13 @@ class TestVtrackLseDirectionBelowBidirectional:
         if not np.isnan(bidi):
             assert bidi >= 0
 
-        # If at least one strand reachable, bidi should be too
-        if not np.isnan(fwd) or not np.isnan(rev):
-            assert not np.isnan(bidi), \
-                "Bidirectional should be reachable when at least one strand is"
+        # As R misha 5.15 (test-pwm-edit-distance-below.R:1797): the bidirectional
+        # version targets the strand-combined LSE, at least each strand's own. Each
+        # strand alone can be pushed below this threshold, but no 50 bp sequence
+        # brings the combined score that low, so the answer is NA.
+        assert not np.isnan(fwd)
+        assert not np.isnan(rev)
+        assert np.isnan(bidi)
 
 
 class TestVtrackLseDirectionBelowMaxEdits:

@@ -21,7 +21,7 @@ TEST_DB = TESTDB_ROOT
 class TestLoadPssmFromDb:
     def test_load_pssm_0(self):
         """Load PSSM id 0 — ATTAAT motif with flanking uniform."""
-        pssm = _load_pssm_from_db("pssm", 0)
+        pssm, _ = _load_pssm_from_db("pssm", 0)
         assert pssm.shape == (32, 4)
         # Position 13 should be A-enriched (0.785)
         np.testing.assert_allclose(pssm[13], [0.785, 0.071, 0.071, 0.071])
@@ -30,7 +30,7 @@ class TestLoadPssmFromDb:
 
     def test_load_pssm_1(self):
         """Load PSSM id 1 — longer motif."""
-        pssm = _load_pssm_from_db("pssm", 1)
+        pssm, _ = _load_pssm_from_db("pssm", 1)
         assert pssm.shape == (33, 4)
         # Position 14: strong C signal (0.921)
         assert pssm[14, 1] == pytest.approx(0.921, abs=0.001)
@@ -48,7 +48,7 @@ class TestLoadPssmFromDb:
     def test_all_pssm_ids(self):
         """All 8 PSSMs (ids 0-7) should load without error."""
         for pid in range(8):
-            pssm = _load_pssm_from_db("pssm", pid)
+            pssm, _ = _load_pssm_from_db("pssm", pid)
             assert pssm.ndim == 2
             assert pssm.shape[1] == 4
             # Rows should sum to ~1.0
@@ -195,7 +195,7 @@ class TestGtrackCreatePwmEnergy:
 
     def test_consistency_with_vtrack_extract(self):
         """Track values should match direct PWM vtrack extraction."""
-        pssm = _load_pssm_from_db("pssm", 1)
+        pssm, _ = _load_pssm_from_db("pssm", 1)
         prior = 0.01
         iterator = 200
 
@@ -320,7 +320,7 @@ class TestGtrackCreatePwmEnergyIndexed:
         assert pm.gtrack_exists("test_pwm_idx_rt")
 
         # Extract and verify values match a fresh vtrack computation
-        pssm = _load_pssm_from_db("pssm", 0)
+        pssm, _ = _load_pssm_from_db("pssm", 0)
         pm.gvtrack_create("_vt_check", None, func="pwm", pssm=pssm, prior=0.01)
         try:
             intervals = pm.gintervals(["chr1"], [0], [500])

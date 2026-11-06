@@ -139,11 +139,12 @@ def test_pwm_max_pos_aggregates_across_a_filters_parts_by_score_not_index(spatia
 @pytest.mark.parametrize("strand", ["bidirect", "minus"])
 def test_spatial_pwm_max_pos_ranks_the_parts_by_the_score_its_position_won_with(strand):
     # R ranks the parts by PWMScorer::get_last_max_score(): the best per-anchor
-    # score INCLUDING its spatial weight, bins counted from the part's start on
-    # either strand of a bidirect scan. pymisha used to rebuild that from two
-    # single-strand pwm.max scans, and the reverse one read the reverse
-    # complement, whose bins count from the 3' end - so with weights that are
-    # not symmetric over a part it named a part R does not.
+    # score INCLUDING its spatial weight, bins counted from the part's 5' start
+    # on either strand (R misha 5.15 counts them so on the minus strand too).
+    # pymisha used to rebuild that from two single-strand pwm.max scans, and
+    # the reverse one read the reverse complement, whose bins count from the
+    # 3' end - so with weights that are not symmetric over a part it named a
+    # part R does not.
     pssm = _filter_agg_pssm()
     w = pssm.shape[0]
     spat, sbin = [0.5, 1.0, 2.0, 1.0, 0.5], 100
@@ -162,7 +163,8 @@ def test_spatial_pwm_max_pos_ranks_the_parts_by_the_score_its_position_won_with(
         best = -np.inf
         for i in range(len(seq) - w + 1):
             win = [code[b] for b in seq[i:i + w]]
-            sw = lspat[min(i // sbin, len(spat) - 1)]
+            fwd_pos = (len(seq) - w - i) if strand == "minus" else i  # the anchor's offset from the 5' start
+            sw = lspat[min(fwd_pos // sbin, len(spat) - 1)]
             rc = sum(logp[w - 1 - j, 3 - win[j]] for j in range(w))
             fwd = sum(logp[j, win[j]] for j in range(w))
             best = max(best, (max(fwd, rc) if strand == "bidirect" else fwd) + sw)
@@ -321,8 +323,9 @@ def test_a_filtered_pwm_count_separates_counted_nothing_from_nothing_to_count():
         pm.gvtrack_filter("t", filter=narrow_mask)
         assert math.isnan(_one("t", iv)), f"no anchor in any part {fn}"
 
-        # An N part is scorable and merely hopeless - a PSSM charges an N the
-        # mean of its column - so this is a real count of zero and must stay 0.
+        # An N part holds anchors, none of them scorable (a window with an N is
+        # not scored, R misha 5.15), so the count is a real 0; pwm and pwm.max
+        # are -inf, and pwm.max.pos has no window to name.
         _remove_all_vtracks()
         pm.gvtrack_create("t", None, fn, pssm=pssm, bidirect=False, strand=1,
                           extend=True, prior=0.01, score_thresh=_TH)
@@ -330,5 +333,7 @@ def test_a_filtered_pwm_count_separates_counted_nothing_from_nothing_to_count():
         got = _one("t", gap)
         if fn == "pwm.count":
             assert got == 0, f"assembly gap {fn}"
+        elif fn == "pwm.max.pos":
+            assert math.isnan(got), f"assembly gap {fn}"
         else:
-            assert not math.isnan(got), f"assembly gap {fn}"
+            assert got == -math.inf, f"assembly gap {fn}"

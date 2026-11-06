@@ -128,8 +128,8 @@ class TestPwmScoreStringsEdgeCases:
         seqs = ["NNNNNNNN"]
         result = _pymisha.pm_pwm_score_strings(seqs, pssm, 0.01, "lse")
         assert result.shape == (1,)
-        # N's should produce some score (not crash)
-        assert np.isfinite(result[0])
+        # no window holding N is scored (R misha 5.15): no window at all
+        assert np.isneginf(result[0])
 
     def test_lowercase_input(self):
         pssm = _make_simple_pssm()

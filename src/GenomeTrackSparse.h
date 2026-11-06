@@ -36,6 +36,11 @@ public:
     void write_next_interval(const GInterval &interval, float val);
 
     const std::vector<GInterval> &get_intervals();
+
+    bool item_at(int, int64_t coord, int64_t &start, int64_t &end) override {
+        const std::vector<GInterval> &intervs = get_intervals();
+        return interval_at(intervs.begin(), intervs.end(), coord, start, end);
+    }
     const std::vector<float> &get_vals();
 
 protected:
@@ -150,15 +155,15 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
             if (v < m_last_min) {
                 m_last_min = v;
                 if (has_function(MIN_POS))
-                    m_last_min_pos = cur.start;
+                    m_last_min_pos = std::max(cur.start, interval.start);
             } else if (has_function(MIN_POS) && v == m_last_min) {
-                if (std::isnan(m_last_min_pos) || cur.start < m_last_min_pos)
-                    m_last_min_pos = cur.start;
+                if (std::isnan(m_last_min_pos) || std::max(cur.start, interval.start) < m_last_min_pos)
+                    m_last_min_pos = std::max(cur.start, interval.start);
             }
             if (v > m_last_max) {
                 m_last_max = v;
                 if (has_function(MAX_POS))
-                    m_last_max_pos = cur.start;
+                    m_last_max_pos = std::max(cur.start, interval.start);
             }
 
             if (m_use_quantile)
@@ -171,18 +176,18 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
                 m_last_first = v;
 
             if (has_function(FIRST_POS) && std::isnan(m_last_first_pos))
-                m_last_first_pos = cur.start;
+                m_last_first_pos = std::max(cur.start, interval.start);
 
             if (has_function(LAST))
                 m_last_last = v;
 
             if (has_function(LAST_POS))
-                m_last_last_pos = cur.start;
+                m_last_last_pos = std::max(cur.start, interval.start);
 
             if (has_function(SAMPLE))
                 all_values.push_back(v);
             if (has_function(SAMPLE_POS))
-                all_positions.push_back(cur.start);
+                all_positions.push_back(std::max(cur.start, interval.start));
 
             ++num_vs;
             if (has_function(STDDEV)) {

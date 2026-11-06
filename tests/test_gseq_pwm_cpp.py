@@ -376,13 +376,14 @@ class TestEdgeCases:
         # Pure-DNA sequence (no N's) should still match between paths
         np.testing.assert_allclose(cpp[2], py[2], rtol=1e-4)
 
-    def test_all_n_sequence_returns_finite(self):
-        """Sequence of all N's produces finite scores (no crash)."""
+    def test_all_n_sequence_has_no_window(self):
+        """A sequence of all N's has no scorable window: -inf on both paths, as
+        R misha 5.15 (no window holding N is scored)."""
         seqs = ["NNNNNNNNNN"]
         cpp = _cpp_score(seqs, self.pssm, bidirect=False, strand=1)
         py = _py_score(seqs, self.pssm, bidirect=False, strand=1)
-        assert np.all(np.isfinite(cpp))
-        assert np.all(np.isfinite(py))
+        assert np.all(np.isneginf(cpp))
+        assert np.all(np.isneginf(py))
 
     def test_empty_sequence_list(self):
         """Empty list of sequences."""

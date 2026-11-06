@@ -86,7 +86,10 @@ def _scan_intervals(root: str) -> set[str]:
     suffixes = (".interv", ".interv2d")
     # os.walk (not rglob): it ignores scandir errors, so a misha `.trash.*`
     # removal-target that vanishes mid-walk doesn't raise FileNotFoundError.
-    # Prune dotted dirs (incl. `.trash.*`) and don't descend into set dirs.
+    # Descend only into namespace dirs: a name with a dot is a track, a set
+    # (bigset dir), `.trash.*` or other dotted dir, none of which holds sets.
+    # Walking into the `.track` dirs listed every chromosome file of every
+    # track: half an hour on a 55k-track database over NFS.
     for cur_dir, dirs, files in os.walk(tracks_dir):
         rel_dir = Path(cur_dir).relative_to(tracks_dir)
         # An interval set is either a `.interv` file (small) or dir (bigset).
@@ -96,7 +99,7 @@ def _scan_intervals(root: str) -> set[str]:
                     name = str(rel_dir / entry)[:-len(suffix)].replace("/", ".").replace("\\", ".")
                     names.add(name)
                     break
-        dirs[:] = [d for d in dirs if not d.startswith(".") and not d.endswith(suffixes)]
+        dirs[:] = [d for d in dirs if "." not in d]
     return names
 
 

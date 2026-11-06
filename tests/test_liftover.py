@@ -1272,10 +1272,10 @@ class TestLiftoverMappingParity:
         chain = pm.gintervals_load_chain(path, tgt_overlap_policy="keep")
 
         assert len(chain) == 1
-        # R's strands: 1 '+', -1 '-'
-        assert chain.iloc[0]["strand"] == 1
-        # Source is reverse
-        assert chain.iloc[0]["strandsrc"] == -1
+        # R's strands: 1 '+', -1 '-'. A reversed source is reported folded into strand
+        # (strand = target XOR source) with strandsrc 1, as R misha 5.15 does
+        assert chain.iloc[0]["strand"] == -1
+        assert chain.iloc[0]["strandsrc"] == 1
 
     def test_liftover_mixed_strands(self, tmp_path):
         """Mixed strand chains are parsed correctly.

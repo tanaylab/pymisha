@@ -1,5 +1,5 @@
 {
-  "misha": "5.14.4",
+  "misha": "5.15.1",
   "empty_query": {
     "queries": {
       "chrom1": ["chr1", "chr2", "chr1", "chr1", "chrX"],

@@ -902,8 +902,10 @@ def _extract_values_direct(
     calls pm_extract directly and returns just the value array.
     Falls back to _extract_expr_values for complex cases.
     """
-    # Fall back for band or 2D intervals
-    if band is not None or _is_2d_intervals(intervals):
+    # Fall back for band, 2D intervals, or an iterator pm_extract does not take
+    # (a track name or intervals, which gextract resolves)
+    if (band is not None or _is_2d_intervals(intervals)
+            or not (iterator is None or isinstance(iterator, (int, float, _numpy.integer, _numpy.floating)))):
         return _extract_expr_values(expr, intervals, iterator=iterator, band=band)
 
     # Check for virtual tracks
@@ -1346,7 +1348,9 @@ def gintervals_summary(
                 valid_id = (id_arr >= 1) & (id_arr <= n)
                 if valid_id.any():
                     sub = result.loc[valid_id, ["intervalID", col]].copy()
-                    sub["_sq"] = sub[col] * sub[col]
+                    # squared deviations from each interval's mean: R misha 5.15's accurate
+                    # Std dev (the one-pass sum(x^2) - N*mean^2 cancels for large values)
+                    sub["_sq"] = (sub[col] - sub.groupby("intervalID")[col].transform("mean")) ** 2
                     grouped = sub.groupby("intervalID")
                     total_counts = grouped.size()
                     stats = grouped[col].agg(["min", "max", "sum", "mean", "count"])
@@ -1355,14 +1359,9 @@ def gintervals_summary(
                     cnt = stats["count"].to_numpy(dtype=float)
                     ssum = stats["sum"].to_numpy(dtype=float)
                     ssq = sumsq.to_numpy(dtype=float)
-                    # R's gintervals.summary uses the one-pass unbiased variance
-                    # sqrt(sum(x^2)/(N-1) - N*mean^2/(N-1)). For a single bin
-                    # (N=1) this is sqrt(inf-inf)=NaN, matching R's frozen output;
-                    # pandas' two-pass std differs by ~1e-5 and trips tolerance.
+                    # unbiased: sqrt(sum((x-mean)^2) / (N-1)); a single value gives 0/0 = NaN, as R
                     with _numpy.errstate(invalid="ignore", divide="ignore"):
-                        mean = ssum / cnt
-                        var = ssq / (cnt - 1.0) - (mean * mean) * (cnt / (cnt - 1.0))
-                        std = _numpy.sqrt(var)
+                        std = _numpy.sqrt(ssq / (cnt - 1.0))
                     out.iloc[idx, out.columns.get_loc("Total intervals")] = total_counts.to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("NaN intervals")] = total_counts.to_numpy(dtype=float) - cnt
                     out.iloc[idx, out.columns.get_loc("Min")] = stats["min"].to_numpy(dtype=float)

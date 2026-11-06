@@ -359,11 +359,13 @@ PyObject *pm_parse_chain_file(PyObject *self, PyObject *args)
             b_chrom.push_back(tgt_chrom);
             b_start.push_back(block_tgt_start);
             b_end.push_back(block_tgt_end);
-            b_strand.push_back(tgt_strand);
+            // Liftover reads only the target strand, as the orientation of the target relative to the
+            // source (R misha 5.15): fold the source strand in
+            b_strand.push_back(tgt_strand ^ src_strand);
             b_chromsrc.push_back(src_chrom);
             b_startsrc.push_back(block_src_start);
             b_endsrc.push_back(block_src_end);
-            b_strandsrc.push_back(src_strand);
+            b_strandsrc.push_back(0);
             b_chain_id.push_back(chain_id);
             b_score.push_back(chain_score);
 

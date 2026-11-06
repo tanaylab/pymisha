@@ -158,16 +158,18 @@ def test_edit_distance_max_indels_checks():  # test-pwm-edit-distance.R:822, tes
 
 @pytest.mark.parametrize("func", ["pwm.edit_distance", "pwm.edit_distance.lse"])
 def test_edit_distance_integer_extend(func):  # test-pwm-edit-distance.R:2133-2237
-    """R 5.14.2: 0 is FALSE, a positive integer extends like TRUE."""
+    """R 5.15.1: 0 is FALSE, a positive integer extends like TRUE. The lse version
+    targets the strand-combined score (bidirect), so its counts differ."""
     pssm = np.array([[.7, .1, .1, .1], [.1, .7, .1, .1], [.1, .1, .7, .1], [.1, .1, .1, .7]])
     iv = pm.gintervals(["chr1"] * 11, list(range(200, 301, 10)), list(range(205, 306, 10)))
     vals = {}
     for e in (True, False, 0, 1, 5):
         pm.gvtrack_create("v", None, func, pssm=pssm, score_thresh=-4, extend=e)
         vals[e] = pm.gextract("v", iv, iterator=iv)["v"].tolist()
-    assert vals[False] == [1, 1, 3, 1, 2, 1, 2, 2, 1, 2, 2]
+    lse = func.endswith(".lse")
+    assert vals[False] == [1, 1, 3, 1, 2, 1, 2, 2, 0 if lse else 1, 2, 2]
     assert vals[0] == vals[False]
-    assert vals[True] == vals[1] == vals[5] == [1] * 11
+    assert vals[True] == vals[1] == vals[5] == ([1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1] if lse else [1] * 11)
 
 
 @pytest.mark.parametrize("func,want", [("pwm.edit_distance", 1.0), ("pwm.n_mutations", 1.0),

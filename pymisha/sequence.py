@@ -1106,8 +1106,12 @@ def gseq_pwm(
     gap_chars : list of str or None
         Characters treated as gaps. Default ``["-", "."]``.
     neutral_chars : list of str or None
-        Characters treated as unknown/ambiguous bases.
-        Default ``["N", "n", "*"]``.
+        Characters to score as unknown bases, by ``neutral_chars_policy``,
+        instead of leaving their windows out. Default: none, as in R misha
+        5.15, so a window holding N or any other non-ACGT base is not scored
+        (an interval with no scorable window gives -inf, or NaN for
+        ``mode="pos"``). Pass ``["N", "n", "*"]`` for the scores of earlier
+        versions.
     neutral_chars_policy : str, default ``"average"``
         How to score neutral characters:
 
@@ -1372,7 +1376,7 @@ def gseq_pwm(
     if gap_chars is None:
         gap_chars = ["-", "."]
     if neutral_chars is None:
-        neutral_chars = ["N", "n", "*"]
+        neutral_chars = []
 
     gap_set = frozenset(gap_chars)
     # Uppercase neutral chars so they match uppercased sequence

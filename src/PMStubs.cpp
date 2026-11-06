@@ -2039,40 +2039,61 @@ struct SummaryStats {
     double total{0};
     double minval{std::numeric_limits<double>::max()};
     double maxval{-std::numeric_limits<double>::max()};
-    double mean_square_sum{0};
+    // For the standard deviation (R misha 5.15): sums of (x - shift) and (x - shift)^2,
+    // shifted by the first value. Unshifted, sum(x^2) - N*mean^2 cancels catastrophically
+    // when the variance is small relative to mean^2.
+    double shift{0};
+    double shifted_sum{0};
+    double shifted_sq_sum{0};
 
     void update(double v) {
         ++num_bins;
         if (!std::isnan(v)) {
+            if (!num_non_nan)
+                shift = v;
             ++num_non_nan;
             total += v;
             minval = std::min(minval, v);
             maxval = std::max(maxval, v);
-            mean_square_sum += v * v;
+            double d = v - shift;
+            shifted_sum += d;
+            shifted_sq_sum += d * d;
         }
     }
 
     double mean() const { return total / num_non_nan; }
 
-    double stdev() const {
-        double mean_val = mean();
-        // Clamp tiny negatives from catastrophic cancellation (the two terms
-        // are close when variance is small relative to mean^2); return 0
-        // instead of NaN on nearly-constant input.
-        double var = mean_square_sum / (num_non_nan - 1) -
-                     (mean_val * mean_val) * (num_non_nan / (num_non_nan - 1));
-        return var > 0 ? std::sqrt(var) : 0;
+    // sum((x - mean)^2)
+    double sq_dev_sum() const {
+        double s = shifted_sq_sum - shifted_sum * shifted_sum / num_non_nan;
+        return s > 0 ? s : 0;
     }
 
+    // unbiased standard deviation: sqrt(sum((x-mean)^2) / (N-1))
+    double stdev() const { return std::sqrt(sq_dev_sum() / (num_non_nan - 1)); }
+
     void merge(const SummaryStats &other) {
-        num_bins += other.num_bins;
-        num_non_nan += other.num_non_nan;
-        total += other.total;
-        mean_square_sum += other.mean_square_sum;
         if (other.num_non_nan > 0) {
+            if (!num_non_nan) {
+                shift = other.shift;
+                shifted_sum = other.shifted_sum;
+                shifted_sq_sum = other.shifted_sq_sum;
+            } else {
+                // Combine (mean, sum of squared deviations) pairwise (Chan et al.), then store
+                // the result relative to this summary's shift
+                double n1 = num_non_nan, n2 = other.num_non_nan, n = n1 + n2;
+                // mean2 - mean1, without forming the means themselves (they may be large)
+                double delta = (other.shift - shift) + (other.shifted_sum / n2 - shifted_sum / n1);
+                double sq = sq_dev_sum() + other.sq_dev_sum() + delta * delta * n1 * n2 / n;
+                shifted_sum = shifted_sum + other.shifted_sum + n2 * (other.shift - shift);
+                shifted_sq_sum = sq + shifted_sum * shifted_sum / n;
+            }
             minval = std::min(minval, other.minval);
             maxval = std::max(maxval, other.maxval);
         }
+        num_bins += other.num_bins;
+        num_non_nan += other.num_non_nan;
+        total += other.total;
     }
 };
 

@@ -271,11 +271,14 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 
 	// optimization of the most common case when the expression iterator starts at 0 and steps by bin_size
 	if (interval.start == m_cur_coord && interval.end == m_cur_coord + m_bin_size) {
-		if (read_next_bin(m_last_avg)) {
+		const bool have_bin = read_next_bin(m_last_avg);
+		if (have_bin) {
 			m_cached_bin_idx = (int64_t)(interval.start / m_bin_size);
 			m_cached_bin_val = m_last_avg;
 			m_cache_valid = true;
-
+		}
+		// A stored NaN is a bin without a value: no exists/size count, no positions (R misha 5.15.0).
+		if (have_bin && !std::isnan(m_last_avg)) {
 			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))
@@ -344,7 +347,8 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 			m_cur_coord = (sbin + 1) * m_bin_size;
 		}
 
-		if (have_value) {
+		// A stored NaN is a bin without a value: no exists/size count, no positions (R misha 5.15.0).
+		if (have_value && !std::isnan(m_last_avg)) {
 			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))

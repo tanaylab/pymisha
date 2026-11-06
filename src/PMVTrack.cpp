@@ -1058,7 +1058,11 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     }
                 }
                 if (vals.empty()) {
-                    set_nan(i);
+                    // nothing to count: exists and size are 0, as R (not NaN)
+                    if (func == "exists" || func == "size")
+                        out[i] = 0;
+                    else
+                        set_nan(i);
                     continue;
                 }
 

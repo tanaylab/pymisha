@@ -1874,13 +1874,19 @@ def gintervals_force_range(
         ``pmax``/``pmin`` fast path instead of looping per row.
         """
         chrom_vals = chrom_series.astype(str).tolist()
+        # each name on its own, so an unknown one (left as given; the map below drops
+        # it) does not keep an alias such as "1" from naming chr1, as in R misha 5.15
+        uniq = list(dict.fromkeys(chrom_vals))
         try:
-            chrom_vals = _normalize_chroms(chrom_vals)
+            names = dict(zip(uniq, _normalize_chroms(uniq), strict=True))
         except (_pymisha.error, ValueError):
-            # Unknown names stay as given; the map below drops them anyway.
-            _logger.debug("could not normalize chromosome names; using them as given",
-                          exc_info=True)
-        chrom_arr = _numpy.asarray(chrom_vals, dtype=object)
+            names = {}
+            for c in uniq:
+                try:
+                    names[c] = _normalize_chroms([c])[0]
+                except (_pymisha.error, ValueError):
+                    names[c] = c
+        chrom_arr = _numpy.asarray([names[c] for c in chrom_vals], dtype=object)
 
         sizes = pd.Series(chrom_arr).map(chrom_sizes)
         in_db = sizes.notna().to_numpy()
@@ -2862,12 +2868,14 @@ def gintervals_neighbors(
             stacklevel=2,
         )
 
+    strand_col = None  # (position, original values) of a strand column given as labels
     if use_intervals1_strand and isinstance(intervals1, _pandas.DataFrame) and "strand" in intervals1.columns:
-        strands = intervals1["strand"].to_numpy()
-        bad = _numpy.flatnonzero(~_numpy.isin(strands, (-1, 1)))
-        if bad.size:  # as R (GenomeTrackFindNeighbors.cpp)
-            raise ValueError(f"Invalid strand value {strands[bad[0]]:g} at row {bad[0] + 1}. "
-                             "Strand must be -1 or 1.")
+        orig = intervals1["strand"]
+        mapped = _r_strand_values(orig)
+        if mapped is not orig:
+            # the C++ reads +-1; each output row gets its query's own label back through __pm_row
+            strand_col = (list(intervals1.columns).index("strand"), len(intervals1.columns), orig)
+            intervals1 = intervals1.assign(strand=mapped, __pm_row=_numpy.arange(len(intervals1)))
 
     if len(intervals1) == 0:
         if intervals_set_out is not None:
@@ -2894,6 +2902,12 @@ def gintervals_neighbors(
     )
 
     df = _pymisha2df(result)
+    if strand_col is not None and df is not None:
+        pos, row_pos, orig = strand_col
+        rows = df.iloc[:, row_pos].to_numpy(dtype=_numpy.int64)
+        df.isetitem(pos, _pandas.Series(orig.to_numpy()[rows], index=df.index, dtype=orig.dtype))
+        df = df.iloc[:, [i for i in range(df.shape[1]) if i != row_pos]]
+        intervals1 = intervals1.drop(columns="__pm_row")
 
     if (
         na_if_notfound
@@ -2920,6 +2934,26 @@ def gintervals_neighbors(
             gintervals_save(df, intervals_set_out)
         return None
     return df
+
+
+def _r_strand_values(col: _pandas.Series) -> _pandas.Series:
+    """A strand column as R's gintervals.neighbors reads it (get_strand_value):
+    labels (strings or a Categorical, read by its labels) "+"/"1" are 1,
+    "-"/"-1" are -1 and anything else, NA too, is 1; booleans are 1 / -1; numbers
+    must be -1 or 1. Returns *col* itself when it is already numeric."""
+    if col.dtype == bool:
+        return _pandas.Series(_numpy.where(col.to_numpy(), 1, -1), index=col.index)
+    if isinstance(col.dtype, _pandas.CategoricalDtype) or col.dtype == object or _pandas.api.types.is_string_dtype(col):
+        def label(v: Any) -> Any:  # a number's label is R's as.character of it ("-1", not "-1.0")
+            return f"{v:g}" if isinstance(v, (int, float, _numpy.number)) and not isinstance(v, bool) else v
+        labels = col.astype(object).to_numpy()
+        return _pandas.Series([-1 if label(v) in ("-", "-1") else 1 for v in labels], index=col.index)
+    vals = col.to_numpy()
+    bad = _numpy.flatnonzero(~_numpy.isin(_numpy.trunc(vals), (-1, 1)))
+    if bad.size:  # as R (GenomeTrackFindNeighbors.cpp)
+        v = vals[bad[0]]
+        raise ValueError(f"Invalid strand value {v:g} at row {bad[0] + 1}. Strand must be -1 or 1.")
+    return col
 
 
 def _is_2d_intervals_df(intervals: Any) -> bool:
@@ -5324,7 +5358,9 @@ def giterator_intervals(
     Returns
     -------
     DataFrame
-        DataFrame with columns ``chrom``, ``start``, ``end`` (as R, no ``intervalID``).
+        DataFrame with columns ``chrom``, ``start``, ``end``, in genome order, as
+        R. With ``interval_relative=True`` it also has ``intervalID``, the
+        1-based row of the input interval each bin comes from.
 
     Raises
     ------
@@ -5509,6 +5545,9 @@ def giterator_intervals(
 
         result = _pymisha.pm_iterate(_df2pymisha(intervals), itr, cfg)
     df = _pymisha2df(result)
+    if df is not None:
+        from .extract import _genome_order
+        df = _genome_order(df, intervals)  # rows by genome position, as R
     df = _remap_interval_ids(df, _itr_id_map)
 
     if (
@@ -5521,8 +5560,9 @@ def giterator_intervals(
         sizes = df["end"] - df["start"]
         df = df[sizes >= bin_size].reset_index(drop=True)
 
-    if df is not None:
-        df = df.drop(columns=["intervalID"], errors="ignore")  # R returns the intervals only
+    if df is not None and not interval_relative:
+        # R returns the intervals only; with interval_relative, intervalID is the input row (R misha 5.15)
+        df = df.drop(columns=["intervalID"], errors="ignore")
 
     if intervals_set_out is not None:
         if df is None or len(df) == 0:
@@ -5805,8 +5845,7 @@ def gintervals_annotate(
     annotation_intervals = annotation_intervals.copy()
 
     # Track original order
-    if keep_order:
-        intervals["_orig_order"] = _numpy.arange(len(intervals))
+    intervals["_orig_order"] = _numpy.arange(len(intervals))
 
     # Determine annotation columns
     basic_cols = {"chrom", "start", "end", "chrom1", "start1", "end1",
@@ -5865,96 +5904,38 @@ def gintervals_annotate(
             result[col_name] = [fill] * n
         if dist_column is not None:
             result[dist_column] = _numpy.nan
-        if keep_order and "_orig_order" in result.columns:
-            result = result.drop(columns=["_orig_order"])
-        return result
+        return result.drop(columns=["_orig_order"])
 
     # Apply tie-breaking when maxneighbors > 1
-    if tie_method != "first" and maxneighbors > 1 and "_orig_order" in nbrs.columns:
-        # Determine neighbor coordinate column name
-        # C++ appends "1" suffix when column names collide with query columns
-        if tie_method == "min.start":
-            tie_col = "start1" if "start1" in nbrs.columns else "start"
-        else:  # min.end
-            tie_col = "end1" if "end1" in nbrs.columns else "end"
-        nbrs = nbrs.sort_values(
-            ["_orig_order", "dist", tie_col],
-            na_position="last",
-        ).reset_index(drop=True)
+    # as R misha 5.15: the neighbors result split by position (query columns, annotation
+    # columns, distance), so a column name the two share cannot be confused
+    n1, n2 = len(intervals.columns), len(annotation_intervals.columns)
+    query_part = nbrs.iloc[:, :n1].copy()
+    query_part.columns = intervals.columns
+    ann_part = nbrs.iloc[:, n1:n1 + n2].copy()
+    ann_part.columns = annotation_intervals.columns
+    dist = nbrs.iloc[:, n1 + n2].to_numpy(dtype=float)
+    if tie_method != "first" and maxneighbors > 1:
+        tie = ann_part["start" if tie_method == "min.start" else "end"].to_numpy()
+        order = _numpy.lexsort((tie, _numpy.abs(dist), query_part["_orig_order"].to_numpy()))
+        query_part, ann_part, dist = query_part.iloc[order], ann_part.iloc[order], dist[order]
 
-    # Map annotation columns from neighbor result to output
-    # The neighbor result has columns from both intervals1 and intervals2
-    # Annotation columns from intervals2 may appear with "1" suffix if name conflicts
-    result = nbrs.copy()
-
-    # Build the annotation column mapping: src_col in result -> output name
-    ann_col_map: dict[str, str | None] = {}  # output_name -> actual column in result
-    for i, src_col in enumerate(annotation_columns):
-        # gintervals_neighbors appends "1" suffix when columns conflict
-        actual_col = src_col
-        if src_col in intervals.columns:
-            # The annotation column has been suffixed by neighbors
-            candidate = src_col + "1"
-            if candidate in result.columns:
-                actual_col = candidate
-        if actual_col not in result.columns:
-            actual_col = src_col + "1"
-        ann_col_map[column_names[i]] = actual_col if actual_col in result.columns else None
-
-    # Build final output: start with original interval columns
-    out_cols = [c for c in intervals.columns if c != "_orig_order"]
-    if overwrite:
-        out_cols = [c for c in out_cols if c not in column_names]
-
-    output = _pandas.DataFrame()
-    for col in out_cols:
-        if col in result.columns:
-            output[col] = result[col].to_numpy()
-
-    # Add annotation columns with proper names
-    for out_name, mapped_col in ann_col_map.items():
-        if mapped_col is not None:
-            output[out_name] = result[mapped_col].to_numpy()
-        else:
-            if isinstance(na_value, dict) and out_name in na_value:
-                output[out_name] = na_value[out_name]
-            else:
-                output[out_name] = na_value
-
-    # Add distance column
-    if dist_column is not None and "dist" in result.columns:
-        output[dist_column] = result["dist"].values
-
-    # Per-row no-neighbor-in-range: query intervals that matched no neighbor got
-    # NA dist and NA annotation columns from gintervals_neighbors; fill na_value
-    # (the whole-empty and beyond-threshold cases are handled separately). R M9.
-    if "dist" in result.columns:
-        not_found = result["dist"].isna().to_numpy()
-        if not_found.any():
-            for out_name in ann_col_map:
-                if out_name in output.columns:
-                    fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
-                    output.loc[not_found, out_name] = fill
-
-    # Apply distance threshold
-    if max_dist < float("inf") and dist_column is not None and dist_column in output.columns:
-        beyond = output[dist_column].abs() > max_dist
-        for out_name in ann_col_map:
-            if out_name in output.columns:
-                fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
-                output.loc[beyond, out_name] = fill
-
-    # Restore original order. Use a stable sort so that when maxneighbors > 1 the
-    # per-query neighbor ordering established above (by dist, then the min.start /
-    # min.end tie column) is preserved among rows sharing an _orig_order.
-    if keep_order and "_orig_order" in result.columns:
-        output["_orig_order"] = result["_orig_order"].values
+    to_fill = _numpy.isnan(dist)
+    if _numpy.isfinite(max_dist):
+        to_fill |= _numpy.abs(dist) > max_dist
+    replaced = set(column_names) | ({dist_column} if dist_column is not None else set())
+    output = query_part[[c for c in query_part.columns if c not in replaced]].reset_index(drop=True)
+    for src_col, out_name in zip(annotation_columns, column_names, strict=True):
+        col = ann_part[src_col].reset_index(drop=True)
+        if to_fill.any():
+            fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
+            col = col.where(~to_fill, other=fill)
+        output[out_name] = col
+    if dist_column is not None:
+        output[dist_column] = dist
+    if keep_order:
         output = output.sort_values("_orig_order", kind="stable").reset_index(drop=True)
-        output = output.drop(columns=["_orig_order"])
-    elif "_orig_order" in output.columns:
-        output = output.drop(columns=["_orig_order"])
-
-    return output
+    return output.drop(columns=["_orig_order"])
 
 
 def gintervals_normalize(

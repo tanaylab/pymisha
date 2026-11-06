@@ -343,72 +343,49 @@ PyObject *pm_intervals_random(PyObject *self, PyObject *args)
             v.resize(v.empty() ? 0 : out + 1);
         }
 
-        // Build valid segments per chromosome.
-        //
-        // Without filter: a single segment per chrom of length
-        // (chrom_end - dfe) - (chrom_start + dfe), where `length` counts
-        // the number of valid start positions. Sampling draws a start in
-        // [seg_start, seg_start + (length - size)] so we keep length as the
-        // raw range and rely on the sampling step's `seg.length - size`.
-        // This matches R 5.6.30's fix (commit 1b41bceb): chromosomes whose
-        // length exactly equals `size + 2 * dfe` must yield exactly one
-        // valid start position.
+        // Build the valid segments per chromosome, as ranges of valid START positions (R misha
+        // 5.15): a start s is valid when [s, s + size) keeps dist_from_edge from both chromosome
+        // ends and overlaps no filter interval. The filter intervals above are already the
+        // ranges of starts they forbid (left-expanded by size - 1). seg.length is the number of
+        // starts, and every start is equally likely, so segments are weighted by it.
         vector<ValidSegment> segments;
         segments.reserve(chrom_ids.size());
 
+        auto add_segment = [&](int cid, int64_t from, int64_t to) {  // starts [from, to)
+            if (to <= from)
+                return;
+            ValidSegment seg;
+            seg.chromid = cid;
+            seg.start = from;
+            seg.length = to - from;
+            seg.cum_prob = 0.0;
+            segments.push_back(seg);
+        };
+
         for (size_t i = 0; i < chrom_ids.size(); ++i) {
             int cid = chrom_ids[i];
-            int64_t cstart = chrom_starts[i];
-            int64_t cend = chrom_ends[i];
-
-            int64_t valid_start = cstart + dfe;
-            int64_t valid_end = cend - dfe;  // exclusive
-            if (valid_end - valid_start < size) {
+            int64_t starts_from = chrom_starts[i] + dfe;
+            int64_t starts_to = chrom_ends[i] - dfe - size + 1;  // exclusive
+            if (starts_to <= starts_from)
                 continue;  // too short
-            }
 
             auto it = filter_by_chrom.find(cid);
             if (it == filter_by_chrom.end() || it->second.empty()) {
-                ValidSegment seg;
-                seg.chromid = cid;
-                seg.start = valid_start;
-                seg.length = valid_end - valid_start;
-                seg.cum_prob = 0.0;
-                segments.push_back(seg);
+                add_segment(cid, starts_from, starts_to);
                 continue;
             }
 
-            // Subtract sorted+merged filter from [valid_start, valid_end).
-            int64_t cur = valid_start;
+            // Subtract the sorted, merged forbidden start ranges from [starts_from, starts_to).
+            int64_t cur = starts_from;
             for (const StartEnd &f : it->second) {
-                int64_t f_start = std::max(f.start, valid_start);
-                int64_t f_end = std::min(f.end, valid_end);
-                if (f_end <= cur) continue;        // entirely before current sweep
-                if (f_start >= valid_end) break;   // entirely after segment
-                if (f_start > cur) {
-                    int64_t seg_len = f_start - cur;
-                    if (seg_len >= size) {
-                        ValidSegment seg;
-                        seg.chromid = cid;
-                        seg.start = cur;
-                        seg.length = seg_len;
-                        seg.cum_prob = 0.0;
-                        segments.push_back(seg);
-                    }
-                }
-                if (f_end > cur) cur = f_end;
+                int64_t f_start = std::max(f.start, starts_from);
+                int64_t f_end = std::min(f.end, starts_to);
+                if (f_end <= cur) continue;          // entirely before the current sweep
+                if (f_start >= starts_to) break;     // entirely after the range
+                add_segment(cid, cur, f_start);
+                cur = f_end;
             }
-            if (valid_end > cur) {
-                int64_t seg_len = valid_end - cur;
-                if (seg_len >= size) {
-                    ValidSegment seg;
-                    seg.chromid = cid;
-                    seg.start = cur;
-                    seg.length = seg_len;
-                    seg.cum_prob = 0.0;
-                    segments.push_back(seg);
-                }
-            }
+            add_segment(cid, cur, starts_to);
         }
 
         if (segments.empty()) {
@@ -416,16 +393,13 @@ PyObject *pm_intervals_random(PyObject *self, PyObject *args)
                      (long long)size, (long long)dfe);
         }
 
-        // Compute cumulative probabilities (weight = segment length).
-        double total_length = 0.0;
-        for (const auto &s : segments) total_length += (double)s.length;
-        if (!(total_length > 0.0)) {
-            TGLError("No valid genomic positions for random intervals");
-        }
+        // Cumulative probabilities, weight = number of starts.
+        double total_starts = 0.0;
+        for (const auto &seg : segments) total_starts += (double)seg.length;
         double running = 0.0;
-        for (auto &s : segments) {
-            running += (double)s.length / total_length;
-            s.cum_prob = running;
+        for (auto &seg : segments) {
+            running += (double)seg.length / total_starts;
+            seg.cum_prob = running;
         }
         // Anchor the last to exactly 1.0 to avoid floating-point miss.
         segments.back().cum_prob = 1.0;
@@ -449,11 +423,10 @@ PyObject *pm_intervals_random(PyObject *self, PyObject *args)
                                             : (size_t)(it - cum.begin());
             const ValidSegment &seg = segments[idx];
 
-            // Valid start range: [seg.start, seg.start + (seg.length - size)] inclusive.
-            int64_t range = seg.length - size;  // >= 0 by construction
+            // A start in [seg.start, seg.start + seg.length).
             double u2 = u01(rng);
-            int64_t offset = (range == 0) ? 0 : (int64_t)(u2 * (double)(range + 1));
-            if (offset > range) offset = range;  // guard for u2 == 1.0 edge
+            int64_t offset = (int64_t)(u2 * (double)seg.length);
+            if (offset >= seg.length) offset = seg.length - 1;  // guard for u2 == 1.0 edge
 
             int64_t s = seg.start + offset;
             int64_t e = s + size;

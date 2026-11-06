@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.17.0 (2026-11-06)
+
+Follows R misha 5.15.0 / 5.15.1. Several results change; recompute anything that depends on them.
+
+### Breaking
+
+* PWM scoring never uses a window holding N or another non-ACGT base, in every function: the pwm vtracks (`pwm.max.pos` and spatially weighted `pwm`/`pwm.max` used to charge N the column mean and score IUPAC codes as matches), `gseq_pwm`, the edit-distance vtracks, `gseq_pwm_edits` and `gtrack_create_pwm_energy`. `gseq_pwm` now defaults to no `neutral_chars`; pass `neutral_chars=["N", "n", "*"]` for the old scores. An interval with no scorable window gives -inf (NaN for positions).
+* With `bidirect=False, strand=-1`, `spat_factor`/`spat_bin` and `spat_min`/`spat_max` count from the interval's 5' start, as with `strand=1`.
+* `pwm.edit_distance.lse` and `.lse.pos` with `bidirect=True` target the strand-combined score.
+* Filtered virtual tracks count each value once even when the filter splits its bin or interval: `sum`, `size`, `lse` and `quantile` change, `avg` is the mean of the unmasked values and `stddev` their sample standard deviation.
+* `*.pos` functions of sparse, value-based and array tracks clip to the start of the iterator interval (and, with a filter, to the unmasked part they read).
+* `gintervals_liftover` and `gtrack_liftover` use the source strand of a chain; `gintervals_load_chain` reports such blocks with the strands combined in `strand` and `strandsrc` 1. The `min_score` of a pre-loaded chain is applied, and a chain row with an NA score is dropped.
+* `giterator_intervals(interval_relative=True)` returns `intervalID`, the input row; rows are in genome order.
+
+### New features
+
+* Value-based virtual tracks support `sample.pos.abs`/`sample.pos.relative`, and `lse` with a filter.
+
+### Bug fixes
+
+* `gsummary`, `gintervals_summary` and the array `stddev` slice function compute the standard deviation accurately when values are large relative to their spread (it could be 0 or orders of magnitude off).
+* `gintervals_random` on large genomes gives every valid start the same chance; it weighted chromosomes by length, never drew a chromosome's last start, and with a filter skipped short gaps and the starts before each filter interval.
+* `gintervals_neighbors(use_intervals1_strand=True)` and the upstream/downstream helpers read a strand column of labels ("+"/"-", a Categorical, booleans), as R does; they raised an error.
+* `gintervals_annotate` takes the annotation and distance by position when the query shares column names with them, `max_dist` blanks the right column, and `tie_method` orders neighbors by absolute distance, with `keep_order=False` too.
+* Dense tracks: `exists`, `size` and the `*.pos` functions give no value for a NaN bin when the iterator interval lies inside one bin.
+* Edit-distance virtual tracks work with a filter (they gave NaN).
+* Value-based `exists` and `size` are 0, not NaN, where no value overlaps.
+* An `lse` virtual track on an array track gives the log-sum-exp of the values (it gave NaN).
+* `gsynth_train` without dimensions trains on the whole scope, not the first bin of each interval.
+* `gseq_pwm_edits` does not use `score_min`/`score_max` as a pre-filter with indels, as R.
+* `gtrack_create_pwm_energy` reads the PSSM key file's bidirect column and whitespace-separated files, as R.
+* `gintervals_force_range` keeps intervals on an alias chromosome (e.g. "1") next to an unknown one.
+* `gbins_summary` accepts a track name as iterator.
+* `gdataset_load` no longer lists every file of every track of the working database when it looks for interval sets: on the lab's hg38 database (55k tracks, over NFS) it took more than half an hour, now a few seconds.
+
+### Performance
+
+* `gtrack_2d_import_contacts` is about twice as fast and needs about 20% less memory: it sorts the contacts instead of hashing them, as R misha 5.15.1 does. The track files are the same as in 0.16.0. With `allow_duplicates=False` the error names the duplicate with the lowest coordinates.
+
 ## v0.16.0 (2026-11-04)
 
 ### Breaking
