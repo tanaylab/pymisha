@@ -4,6 +4,7 @@ targets are this DB's chr1/chr2/chrX)."""
 
 import json
 import os
+import sys
 
 import pandas as pd
 import pytest
@@ -12,6 +13,11 @@ import pymisha as pm
 
 with open(os.path.join(os.path.dirname(__file__), "test_data", "liftover_2d_r_5_14_2.json")) as fh:
     CASES = json.load(fh)
+
+# R and pymisha sort the source intervals by chromosome pair with std::sort, and
+# libc++ (macOS) orders the rows of one pair differently from libstdc++, in R too.
+# There the same rows are checked instead.
+LIBSTDCXX = sys.platform != "darwin"
 
 
 @pytest.mark.parametrize("name", list(CASES))
@@ -31,6 +37,9 @@ def test_liftover_2d_matches_r(name, tmp_path):
         assert got.empty
         return
     assert list(got.columns) == list(want.columns)
+    if not LIBSTDCXX:
+        got = got.astype({"chrom1": str, "chrom2": str}).sort_values(list(want.columns)).reset_index(drop=True)
+        want = want.sort_values(list(want.columns)).reset_index(drop=True)
     for col in want.columns:
         if col.startswith("chrom"):
             assert got[col].astype(str).tolist() == want[col].tolist(), col

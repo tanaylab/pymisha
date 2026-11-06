@@ -30,7 +30,7 @@ jobs:
 
   build_wheels_macos:
     name: Build wheels on macOS
-    runs-on: macos-14
+    runs-on: macos-latest
     # macOS builds are best-effort: python.org rate limits (429) on
     # GitHub's shared runners frequently cause transient failures.
     # Publishing proceeds with Linux wheels + sdist if macOS fails.

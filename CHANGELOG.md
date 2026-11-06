@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.17.1 (2026-11-06)
+
+The same code as 0.17.0, which was not published: its macOS build asked for a runner GitHub has retired.
+
 ## v0.17.0 (2026-11-06)
 
 Follows R misha 5.15.0 / 5.15.1. Several results change; recompute anything that depends on them.
