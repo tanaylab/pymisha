@@ -35,6 +35,9 @@ void PMGenomeTrack2D::init(const std::string &track_name)
 
     // Load the indexed-format 2D index once, if present. It's cached globally
     // by TrackIndex2D::get_track_index_2d so this is cheap on repeat calls.
+    // A cached index whose track.idx another session replaced since is dropped
+    // first, once per track and call, as misha does where it reads a track's type.
+    TrackIndex2D::drop_stale_index(m_track_path);
     m_index = TrackIndex2D::get_track_index_2d(m_track_path);
 
     // Determine track type. For per-pair-file tracks, GenomeTrack::get_type

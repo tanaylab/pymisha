@@ -75,7 +75,8 @@ public:
 			bool   link;                // a symlink; one named only by the other dimension's names is ignored
 		};
 
-		// converting: count the files next to an intervals set's index as without it, as a conversion packs them
+		// converting: count the files next to an index (of an intervals set, or of a track being converted again)
+		// as without it, as a conversion packs them
 		ChromFiles(const GenomeChromKey &chromkey, const string &dir, bool converting = false);
 
 		const string &dir() const { return m_dir; }
@@ -155,6 +156,7 @@ public:
 protected:
 	// Track index cache (thread-safe)
 	static std::map<std::string, std::shared_ptr<TrackIndex>> s_index_cache;
+	static std::map<std::string, std::string> s_index_stamp; // track.idx stamp (index_file_stamp) when cached
 	static std::mutex s_cache_mutex;
 
 public:
@@ -170,6 +172,11 @@ public:
 	// GenomeTrack::invalidate_index_cache / clear_index_cache (defect F, 5.11.20).
 	static void invalidate_index_cache(const std::string &track_dir);
 	static void clear_index_cache();
+
+	// Drop the cached TrackIndex for `track_dir` if its track.idx was replaced since it was cached
+	// (by another session) or is gone. Returns true if it was dropped. For a reader that got a size
+	// or signature error: it reads once more with the index as it is now.
+	static bool drop_stale_index(const std::string &track_dir);
 
 protected:
 	// Helper to extract track directory from a per-chrom filename

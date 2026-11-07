@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+import math
+import numbers
 import os
 import re
 import socket
@@ -20,7 +22,9 @@ from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
     _checkroot,
+    _chrom_names,
     _chunk_slices,
+    _config_multitasking,
     _config_no_mt,
     _df2pymisha,
     _iterated_intervals,
@@ -70,9 +74,10 @@ def _resolve_exprs_for_scanner(exprs: list[str]) -> list[tuple[str, str, object,
     for expr in exprs:
         if expr in track_names_now and expr not in vtrack_names_now:
             # COMPUTED 2D tracks need the Python read path (the C++ scanner
-            # has no Computer2D port yet).
+            # has no Computer2D port yet); a 1D track is refused there.
             try:
-                if gtrack_info(expr).get("type") == "computed":
+                info = gtrack_info(expr)
+                if info.get("type") == "computed" or int(info.get("dimensions", 1) or 1) != 2:
                     return None
             except (_pymisha.error, ValueError):
                 _logger.debug("no track info for %r; leaving it to the legacy path", expr,
@@ -181,8 +186,8 @@ def _group_intervals_by_chrom_pair(
 
     Returns dict mapping (c1, c2) -> [(interval_idx, s1, e1, s2, e2), ...].
     """
-    c1_arr = intervals["chrom1"].astype(str).values
-    c2_arr = intervals["chrom2"].astype(str).values
+    c1_arr = _chrom_names(intervals["chrom1"], "chrom1").to_numpy()
+    c2_arr = _chrom_names(intervals["chrom2"], "chrom2").to_numpy()
     s1_arr = intervals["start1"].values
     e1_arr = intervals["end1"].values
     s2_arr = intervals["start2"].values
@@ -274,8 +279,8 @@ _CPP_VALUE_FUNCS = {
 }
 
 # Column-reduction functions supported by an array-slice virtual track in C++
-# (GenomeTrackArray::SliceFunctions). "stdev" is R's spelling of "stddev".
-_CPP_ARRAY_SLICE_FUNCS = {"avg", "min", "max", "sum", "stddev", "stdev", "quantile"}
+# (GenomeTrackArray::SliceFunctions).
+_CPP_ARRAY_SLICE_FUNCS = {"avg", "min", "max", "sum", "stddev", "quantile"}
 
 
 def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
@@ -398,8 +403,6 @@ def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[st
                 # lookup also assumes ascending order).
                 slice_cols = sorted({int(c) for c in slice_cols})
             sfunc = str(cfg.get("func", "avg")).lower()
-            if sfunc == "stdev":
-                sfunc = "stddev"
             spec = {
                 "src": cfg.get("src"),
                 "func": "avg",
@@ -498,14 +501,31 @@ def _find_2d_track_file(track_path: str, c1: str, c2: str) -> str | None:
 
 
 def _validate_band(band: tuple[int, int] | tuple[float, float] | list[int] | None) -> tuple[int, int] | None:
-    """Validate band parameter. Returns (d1, d2) tuple or None."""
+    """Validate band parameter. Returns (d1, d2) tuple or None.
+
+    As R: each distance a finite number within +-1e18, an integer as is and a
+    fraction rounded half away from zero."""
     if band is None:
         return None
-    if not hasattr(band, "__len__") or len(band) != 2:
+    if isinstance(band, (str, bytes)) or not hasattr(band, "__len__") or len(band) != 2:
         raise ValueError("band must be a sequence of length 2: (d1, d2)")
-    d1, d2 = int(band[0]), int(band[1])
+    dists: list[int] = []
+    for v in band:
+        if v is None or v is _pandas.NA:
+            v = float("nan")
+        if isinstance(v, (bool, _numpy.bool_)) or not isinstance(v, numbers.Real):
+            raise ValueError("Invalid format of band argument")
+        if isinstance(v, numbers.Integral):
+            ok = abs(int(v)) <= 10**18
+        else:
+            v = float(v)
+            ok = math.isfinite(v) and abs(v) <= 1e18
+        if not ok:
+            raise ValueError("Invalid band argument: band distances must be finite numbers between -1e18 and 1e18")
+        dists.append(int(v) if isinstance(v, numbers.Integral) else int(v + 0.5) if v > 0 else int(v - 0.5))
+    d1, d2 = dists
     if d1 >= d2:
-        raise ValueError(f"band d1 ({d1}) must be less than d2 ({d2})")
+        raise ValueError("Invalid band argument: distance1 exceeds distance2")
     return (d1, d2)
 
 
@@ -706,14 +726,14 @@ def _gextract_2d_single(
     intervals = _with_canonical_chroms(intervals)
     cmap = _chrom_id_map()
     chrom1_ids = (
-        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        _pandas.Series(_chrom_names(intervals["chrom1"], "chrom1").to_numpy())
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)
         .to_numpy()
     )
     chrom2_ids = (
-        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        _pandas.Series(_chrom_names(intervals["chrom2"], "chrom2").to_numpy())
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)
@@ -863,13 +883,17 @@ def _resolve_2d_vtrack_source(vtrack_name: str) -> tuple[str, dict[str, int], st
     if cfg is None:
         raise ValueError(f"Unknown virtual track '{vtrack_name}'")
 
+    # R's messages: sequence, interval and value based vtracks and 1D track sources need dim=
     src = cfg.get("src")
     if not isinstance(src, str):
-        raise ValueError(f"2D extraction for virtual track '{vtrack_name}' requires a physical 2D track source")
+        raise ValueError(f"Virtual track {vtrack_name}: 2D iterator is used without explicit dimension projection")
 
     info = gtrack_info(src)
     if int(info.get("dimensions", 1) or 1) != 2:
-        raise ValueError(f"Virtual track '{vtrack_name}' does not reference a 2D track source")
+        raise ValueError(
+            f"Virtual track {vtrack_name}: 2D iterator is applied to a 1D track {src} "
+            "without explicit dimension projection"
+        )
 
     func = str(cfg.get("func", "avg")).lower()
     params = cfg.get("params")
@@ -967,8 +991,8 @@ def _apply_2d_shifts(
         # NaN here means the frame was never checked. Raise the normal message.
         _verify_2d_intervals(intervals)
 
-    chrom1 = intervals["chrom1"].astype(str).to_numpy()
-    chrom2 = intervals["chrom2"].astype(str).to_numpy()
+    chrom1 = _chrom_names(intervals["chrom1"], "chrom1").to_numpy()
+    chrom2 = _chrom_names(intervals["chrom2"], "chrom2").to_numpy()
 
     np.maximum(start1, 0.0, out=start1)
     np.maximum(start2, 0.0, out=start2)
@@ -1231,14 +1255,14 @@ def _gextract_2d_vtrack_objects(
     intervals = _with_canonical_chroms(intervals)
     cmap = _chrom_id_map()
     chrom1_ids = (
-        _pandas.Series(intervals["chrom1"].astype(str).to_numpy())
+        _pandas.Series(_chrom_names(intervals["chrom1"], "chrom1").to_numpy())
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)
         .to_numpy()
     )
     chrom2_ids = (
-        _pandas.Series(intervals["chrom2"].astype(str).to_numpy())
+        _pandas.Series(_chrom_names(intervals["chrom2"], "chrom2").to_numpy())
         .map(cmap)
         .fillna(-1)
         .astype(_numpy.int32)
@@ -1353,7 +1377,7 @@ def _gextract_2d_via_scanner(
             # Normalize chr-prefix to match the DB's storage convention; see the
             # rationale on the IntervalsPolicy / TrackRectsPolicy chrom mapping
             # block below.
-            chrom_strs = _normalize_chroms(df["chrom"].astype(str).tolist())
+            chrom_strs = _normalize_chroms(_chrom_names(df["chrom"]).tolist())
             chromids = _numpy.array(
                 [cmap.get(c, -1) for c in chrom_strs], dtype=_numpy.int32
             )
@@ -1428,7 +1452,7 @@ def _2d_frame_to_scanner_dict(intervals: pd.DataFrame) -> dict[str, Any]:
 
     def _ids(col: str) -> Any:
         return (
-            _pandas.Series(_normalize_chroms(intervals[col].astype(str).tolist()))
+            _pandas.Series(_normalize_chroms(_chrom_names(intervals[col], col).tolist()))
             .map(cmap)
             .fillna(-1)
             .astype(_numpy.int32)
@@ -1564,6 +1588,7 @@ def _gextract_2d(
     from .tracks import gtrack_info
 
     band = _validate_band(band)
+    explicit_iterator = iterator is not None
 
     # R parity: R's IntervalConverter runs GInterval2D::verify() on every
     # converted interval; validate the scope here so every dispatch branch
@@ -1703,11 +1728,7 @@ def _gextract_2d(
             )
 
             if _iter_type not in ("rectangles", "points", "computed"):
-                raise ValueError(
-                    f"Invalid iterator: {iterator!r} is a 1D track (type={_iter_type!r}). "
-                    "A 2D rectangles or points track is required when using a track "
-                    "name as iterator for 2D extraction."
-                )
+                raise ValueError("1D iterator is used along with 2D intervals")
 
             # 2D rects/points/computed track confirmed. Route if all expressions
             # are bare physical tracks or supported reducing 2D vtracks (a
@@ -1803,6 +1824,8 @@ def _gextract_2d(
     for tname in used_tracks:
         info = gtrack_info(tname)
         if int(info.get("dimensions", 1) or 1) != 2:
+            if explicit_iterator:
+                raise ValueError(f"2D iterator is applied to a 1D track {tname} without explicit dimension projection")
             raise ValueError(f"Track '{tname}' is not a 2D track (type: {info.get('type')})")
 
     # Separate vtracks into dim-projected (1D source + dim set) vs 2D vtracks.
@@ -1953,7 +1976,7 @@ def giterator_intervals_2d(
     expr: str | list[str],
     intervals: pd.DataFrame | str | None = None,
     iterator: Iterator | str = None,
-    colnames: list[str] | None = None,
+    colnames: str | list[str] | None = None,
     band: tuple[int, int] | None = None,
 ) -> collections.abc.Generator[pd.DataFrame, None, None]:
     """Iterate over 2D intervals, yielding extracted data one interval at a time.
@@ -1980,7 +2003,7 @@ def giterator_intervals_2d(
     iterator : int or str, optional
         Track expression iterator.  Passed through to the underlying
         extraction engine.
-    colnames : list of str, optional
+    colnames : str or list of str, optional
         Column names for expression values.  Must match the number of
         expressions.
     band : tuple of (int, int), optional
@@ -2008,6 +2031,8 @@ def giterator_intervals_2d(
     _checkroot()
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
+    if isinstance(colnames, str):
+        colnames = [colnames]
 
     if intervals is None:
         from .intervals import _gintervals_2d_all
@@ -2241,7 +2266,7 @@ def _parquet_int64_coords(scope: Any) -> bool:
     big = set(genome.loc[genome["end"] > 2**31 - 1, "chrom"].astype(str))
     if not big or not isinstance(scope, pd.DataFrame) or "chrom" not in scope.columns:
         return False
-    chroms = list(pd.unique(scope["chrom"].astype(str)))
+    chroms = list(pd.unique(_chrom_names(scope["chrom"]).to_numpy()))
     try:
         chroms = _pymisha.pm_normalize_chroms(chroms)
     except _pymisha.error:
@@ -2699,7 +2724,7 @@ def gextract(
     expr: str | list[str],
     intervals: pd.DataFrame | str | None = None,
     iterator: Iterator | str = None,
-    colnames: list[str] | None = None,
+    colnames: str | list[str] | None = None,
     band: tuple[int, int] | tuple[float, float] | None = None,
     vars: dict[str, Any] | None = None,
     intervals_join: str = "id",
@@ -2724,7 +2749,7 @@ def gextract(
         Genomic scope (chrom/start/end DataFrame or intervals set name).
         If None, uses ALLGENOME. For 2D tracks, pass 2D intervals (with
         chrom1/start1/end1/chrom2/start2/end2 columns).
-    colnames : list of str, optional
+    colnames : str or list of str, optional
         Column names for expression values. Must match the number of
         expressions. If None, uses expression strings.
     iterator : int or str, optional
@@ -2806,6 +2831,8 @@ def gextract(
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
+    if isinstance(colnames, str):
+        colnames = [colnames]
 
     if intervals_join not in ("id", "intervals", "none"):
         raise ValueError(
@@ -2832,9 +2859,11 @@ def gextract(
     intervals_set_out = kwargs.get("intervals_set_out")
 
     if intervals is None:
-        from .intervals import gintervals_all
+        from .expr import _expr_is_2d
+        from .intervals import _whole_genome_2d, gintervals_all
 
-        intervals = gintervals_all()
+        # the whole genome in the dimension of the iterator, as R's .misha$ALLGENOME
+        intervals = _whole_genome_2d() if _expr_is_2d(exprs, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, exprs, iterator, band)
@@ -2959,7 +2988,7 @@ def gextract(
             # core-clamped worker count it would actually fork.
             _max_procs = _effective_max_procs(_cfg)
             use_parallel = (
-                _cfg.get("multitasking")
+                _config_multitasking(_cfg)
                 and _max_procs > 1
                 and not callable(progress)
                 and file is None
@@ -2982,7 +3011,7 @@ def gextract(
                     # iterator: intervalIDs are sequential indices into the
                     # intersected scope and _remap_interval_ids relies on that.
                     _serial_cfg = _cfg
-                    if _itr_id_map is not None and _cfg.get("multitasking"):
+                    if _itr_id_map is not None and _config_multitasking(_cfg):
                         _serial_cfg = dict(_cfg)
                         _serial_cfg["multitasking"] = False
                     result = _pymisha.pm_extract(
@@ -3225,9 +3254,9 @@ def gscreen(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all, gintervals_all
+        from .intervals import _whole_genome_2d, gintervals_all
 
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+        intervals = _whole_genome_2d() if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 

@@ -674,10 +674,11 @@ WindowResult compute_window_edits_detailed_with_indels(
                         optional.push_back(&ap);
                     }
                 }
-                std::sort(optional.begin(), optional.end(),
-                          [](const AlignedPos* a, const AlignedPos* b) {
-                              return a->gain > b->gain;
-                          });
+                // stable: equal gains keep alignment order under every C++ library
+                std::stable_sort(optional.begin(), optional.end(),
+                                 [](const AlignedPos* a, const AlignedPos* b) {
+                                     return a->gain > b->gain;
+                                 });
 
                 double acc = 0.0;
                 subs_needed = mandatory_subs;
@@ -728,10 +729,11 @@ WindowResult compute_window_edits_detailed_with_indels(
                         optional.push_back(&ap);
                     }
                 }
-                std::sort(optional.begin(), optional.end(),
-                          [](const AlignedPos* a, const AlignedPos* b) {
-                              return a->gain > b->gain;
-                          });
+                // stable: equal gains keep alignment order under every C++ library
+                std::stable_sort(optional.begin(), optional.end(),
+                                 [](const AlignedPos* a, const AlignedPos* b) {
+                                     return a->gain > b->gain;
+                                 });
                 double acc = 0.0;
                 double remaining_gap = indel_gap;
                 int extra = 0;

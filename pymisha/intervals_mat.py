@@ -14,7 +14,7 @@ _COORD_COLS = ("chrom", "start", "end")
 def gintervals_to_mat(
     df: pd.DataFrame,
     id_col: str | None = None,
-    value_cols: list[str] | None = None,
+    value_cols: str | list[str] | None = None,
     labels: bool = True,
 ) -> pd.DataFrame:
     """Pivot intervals + value columns into a DataFrame indexed by intervals.
@@ -29,7 +29,7 @@ def gintervals_to_mat(
         Column name whose values become the leading row index level. If
         ``None`` (default), the index is a 3-level MultiIndex of
         ``(chrom, start, end)``.
-    value_cols : list of str, optional
+    value_cols : str or list of str, optional
         Columns to keep as values. If ``None`` (default), auto-detect: all
         non-coord, non-``intervalID`` numeric columns. Non-numeric
         auto-detect columns raise ``TypeError``; pass *value_cols*
@@ -67,6 +67,8 @@ def gintervals_to_mat(
     has_interval_id = "intervalID" in df.columns
     identity_cols = list(_COORD_COLS) + (["intervalID"] if has_interval_id else [])
 
+    if isinstance(value_cols, str):
+        value_cols = [value_cols]
     if value_cols is None:
         value_cols = [c for c in df.columns if c not in identity_cols]
         non_numeric = [c for c in value_cols if not pd.api.types.is_numeric_dtype(df[c])]

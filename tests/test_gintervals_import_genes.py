@@ -118,12 +118,19 @@ class TestInputValidation:
                 simple_genes_file, annots_file=simple_annots_file
             )
 
-    def test_annots_names_not_list_raises(self, simple_genes_file, simple_annots_file):
-        with pytest.raises(ValueError, match="annots_names.*must be a list"):
+    def test_annots_names_string_is_one_name(self, simple_genes_file, simple_annots_file):
+        # as in R: one name, here for a file of three columns
+        with pytest.raises(ValueError, match=r"does not match annots_names length \(1\)"):
             pm.gintervals_import_genes(
                 simple_genes_file,
                 annots_file=simple_annots_file,
                 annots_names="single_string",
+            )
+        with pytest.raises(ValueError, match="annots_names.*must be a list"):
+            pm.gintervals_import_genes(
+                simple_genes_file,
+                annots_file=simple_annots_file,
+                annots_names=5,
             )
 
 

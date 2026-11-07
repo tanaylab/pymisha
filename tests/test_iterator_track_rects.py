@@ -153,7 +153,7 @@ def test_gextract_track_rects_1d_iterator_raises():
     """When iterator= is a 1D track (not a 2D rectangles/points track),
     gextract raises ValueError (R parity: R raises an error in this case)."""
     intervals = _full_1x1_scope()
-    with pytest.raises(ValueError, match="1D track"):
+    with pytest.raises(ValueError, match="^1D iterator is used along with 2D intervals$"):
         pm.gextract("rects_track", intervals=intervals, iterator="dense_track")
 
 

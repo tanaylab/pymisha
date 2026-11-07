@@ -141,6 +141,9 @@ def gdb_reload():
     """
     _checkroot()
     _pymisha.pm_dbreload()
+    # the track indexes read so far, as R's gdb.reload(rescan = TRUE) drops them: a track another
+    # session replaced is read from its files on disk
+    _pymisha.pm_clear_dir_caches()
     # Python-side dataset scan cache must be cleared on reload; the C++
     # side rescans tracks via pm_dbreload but the Python cache of track/
     # interval-set names per groot becomes stale. (R 5.6.30 c82b01f0.)

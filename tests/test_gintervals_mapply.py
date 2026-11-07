@@ -83,14 +83,15 @@ class TestGintervalsMapply:
             pymisha.gintervals_mapply(np.nanmax, intervals=intervals)
 
     def test_with_iterator(self):
-        """Works with explicit iterator."""
+        """With an explicit iterator, as R: one row per interval, the function
+        getting the values of the iterator bins in it."""
         intervals = pymisha.gintervals(["1"], [0], [50000])
         result = pymisha.gintervals_mapply(
-            np.nanmean, "dense_track", intervals=intervals,
+            len, "dense_track", intervals=intervals,
             iterator=10000
         )
-        # With a 10000-bin iterator on a 50000 interval, we get 5 sub-intervals
-        assert len(result) == 5
+        # a 10000-bin iterator on a 50000 interval: 5 values
+        assert result["value"].tolist() == [5.0]
 
     def test_strand_reversal(self):
         """Negative strand reverses the values passed to function."""
@@ -140,16 +141,16 @@ class TestGintervalsMapply:
         )
         assert result["value"].iloc[0] == 42.0
 
-    def test_enable_gapply_intervals_passes_row(self):
-        """R parity: enable_gapply_intervals=True passes the iterator
-        interval as a `gapply_intervals` kwarg (PyMisha analogue of R's
+    def test_enable_gapply_intervals_passes_bins(self):
+        """R parity: enable_gapply_intervals=True passes the iterator bins of
+        the interval as a `gapply_intervals` DataFrame kwarg (R's
         GAPPLY.INTERVALS)."""
         intervals = pymisha.gintervals(["1", "2"], [0, 0], [10000, 10000])
 
-        seen: list[dict] = []
+        seen: list = []
 
         def fn(arr, gapply_intervals=None):
-            seen.append(dict(gapply_intervals))
+            seen.append(gapply_intervals)
             return float(np.nanmax(arr)) if len(arr) else float("nan")
 
         pymisha.gintervals_mapply(
@@ -157,8 +158,11 @@ class TestGintervalsMapply:
             enable_gapply_intervals=True,
         )
         assert len(seen) == 2
-        assert set(seen[0]) >= {"chrom", "start", "end"}
-        assert seen[0]["chrom"] in ("chr1", "chr2")
+        for gi, chrom in zip(seen, ("chr1", "chr2"), strict=True):
+            assert list(gi.columns) == ["chrom", "start", "end"]
+            assert len(gi) == 200  # 50 bp bins
+            assert set(gi["chrom"]) == {chrom}
+            assert gi["start"].iloc[0] == 0 and gi["end"].iloc[-1] == 10000
 
 
 class TestGintervalsMapplyIntervalsSetOut:

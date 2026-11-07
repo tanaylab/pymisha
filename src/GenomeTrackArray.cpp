@@ -319,6 +319,8 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
     double stddev_mean = 0;
     double stddev_m2 = 0;
     double lse = -std::numeric_limits<double>::infinity();  // log-sum-exp of the values
+    std::vector<float> sample_vals;      // values and positions that "sample" and "sample.pos" draw from
+    std::vector<double> sample_positions;
     m_last_min = std::numeric_limits<float>::max();
     m_last_max = -std::numeric_limits<float>::max();
     if (has_function(MAX_POS))
@@ -357,6 +359,10 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
             m_last_last = v;
         if (has_function(LAST_POS))
             m_last_last_pos = std::max(cur.start, interval.start);  // clipped to the iterator start, as R misha 5.15
+        if (has_function(SAMPLE))
+            sample_vals.push_back(v);
+        if (has_function(SAMPLE_POS))
+            sample_positions.push_back(std::max(cur.start, interval.start));
 
         ++num_vs;
         if (has_function(STDDEV)) {
@@ -388,6 +394,12 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
             m_last_min_pos = std::numeric_limits<double>::quiet_NaN();
     }
 
+    // One uniform draw each, as for sparse tracks
+    if (has_function(SAMPLE) && !sample_vals.empty())
+        m_last_sample = sample_vals[std::min((size_t)(s_rnd_func() * sample_vals.size()), sample_vals.size() - 1)];
+    if (has_function(SAMPLE_POS) && !sample_positions.empty())
+        m_last_sample_pos = sample_positions[std::min((size_t)(s_rnd_func() * sample_positions.size()), sample_positions.size() - 1)];
+
     if (has_function(STDDEV))
         m_last_stddev = num_vs > 1
             ? (float)std::sqrt(stddev_m2 / (double)(num_vs - 1))
@@ -414,6 +426,9 @@ void GenomeTrackArray::read_interval(const GInterval &interval)
         m_last_last = std::numeric_limits<float>::quiet_NaN();
     if (has_function(LAST_POS))
         m_last_last_pos = std::numeric_limits<double>::quiet_NaN();
+    // also for the intervals that return before calc_vals()
+    m_last_lse = m_last_sample = std::numeric_limits<float>::quiet_NaN();
+    m_last_sample_pos = std::numeric_limits<double>::quiet_NaN();
     if (m_use_quantile)
         m_sp.reset();
 

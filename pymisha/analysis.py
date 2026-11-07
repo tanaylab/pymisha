@@ -11,7 +11,11 @@ import pandas as pd
 
 from ._shared import (
     CONFIG,
+    _check_breaks,
+    _check_flag,
+    _check_intervals_strand,
     _checkroot,
+    _chrom_names,
     _df2pymisha,
     _pymisha,
     _pymisha2df,
@@ -123,6 +127,7 @@ def gsegment(
     ['chrom', 'start', 'end']
     """
     _checkroot()
+    _check_flag(onetailed, "onetailed")
 
     if intervals is None:
         from .intervals import gintervals_all
@@ -208,6 +213,7 @@ def gwilcox(expr: str, winsize1: int, winsize2: int, maxpval: float = 0.05, onet
     True
     """
     _checkroot()
+    _check_flag(onetailed, "onetailed")
 
     if intervals is None:
         from .intervals import gintervals_all
@@ -472,7 +478,7 @@ def gcis_decay(
         ``"track + 0"``) are also accepted - their value is ignored and
         the referenced track's contact coordinates are used.
     breaks : array_like
-        Sorted break points defining distance bins.
+        Strictly increasing break points defining distance bins.
         Example: ``breaks=[x1, x2, x3]`` creates bins ``(x1, x2]`` and
         ``(x2, x3]``.
     src : DataFrame
@@ -522,6 +528,7 @@ def gcis_decay(
     2
     """
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
 
     if expr is None or breaks is None or src is None or domain is None:
         raise ValueError(
@@ -536,11 +543,11 @@ def gcis_decay(
     from .extract import _find_2d_track_file, _validate_band
     from .intervals import _normalize_chroms
 
-    breaks = [float(b) for b in breaks]
-    if len(breaks) < 2:
-        raise ValueError("breaks must have at least 2 elements")
-
     breaks_arr = _numpy.asarray(breaks, dtype=_numpy.float64)
+    _check_breaks(breaks_arr)
+    _check_intervals_strand(src, "Source intervals: ")
+    _check_intervals_strand(domain, "Domain intervals: ")
+    breaks = breaks_arr.tolist()
     n_bins = len(breaks) - 1
     intra_dist = _numpy.zeros(n_bins, dtype=_numpy.float64)
     inter_dist = _numpy.zeros(n_bins, dtype=_numpy.float64)
@@ -548,10 +555,10 @@ def gcis_decay(
     # Normalize chromosome names in src and domain
     src = src.copy()
     if "chrom" in src.columns:
-        src["chrom"] = _normalize_chroms(src["chrom"].astype(str).tolist())
+        src["chrom"] = _normalize_chroms(_chrom_names(src["chrom"]).tolist())
     domain = domain.copy()
     if "chrom" in domain.columns:
-        domain["chrom"] = _normalize_chroms(domain["chrom"].astype(str).tolist())
+        domain["chrom"] = _normalize_chroms(_chrom_names(domain["chrom"]).tolist())
 
     # Build per-chrom lookup structures
     src_per_chrom = _unify_overlaps_per_chrom(src)
@@ -573,10 +580,10 @@ def gcis_decay(
     # scope (a pymisha extension) reads the whole contacts of each of its
     # chromosomes, up to the end of its last interval there.
     if intervals is None:
-        from .intervals import _gintervals_2d_all
+        from .intervals import _whole_genome_2d
 
         # only its intra-chromosomal pairs are used
-        intervals = _gintervals_2d_all("diagonal")
+        intervals = _whole_genome_2d(cis=True)
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -586,8 +593,8 @@ def gcis_decay(
 
         if isinstance(intervals, pd.DataFrame) and _is_2d_intervals(intervals):
             scope = intervals.copy()
-            scope["chrom1"] = _normalize_chroms(scope["chrom1"].astype(str).tolist())
-            scope["chrom2"] = _normalize_chroms(scope["chrom2"].astype(str).tolist())
+            scope["chrom1"] = _normalize_chroms(_chrom_names(scope["chrom1"], "chrom1").tolist())
+            scope["chrom2"] = _normalize_chroms(_chrom_names(scope["chrom2"], "chrom2").tolist())
             scope = scope[scope["chrom1"] == scope["chrom2"]]
             if len(scope) == 0:
                 return
@@ -602,7 +609,7 @@ def gcis_decay(
         if not isinstance(intervals, pd.DataFrame):
             raise ValueError(f"Invalid intervals: {intervals!r}")
         intervals_df = intervals.copy()
-        intervals_df["chrom"] = _normalize_chroms(intervals_df["chrom"].astype(str).tolist())
+        intervals_df["chrom"] = _normalize_chroms(_chrom_names(intervals_df["chrom"]).tolist())
         # chrom -> max end of the intervals
         chrom_sizes: dict[str, int] = {}
         if len(intervals_df) > 0:

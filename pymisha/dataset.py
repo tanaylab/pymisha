@@ -487,6 +487,16 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
         msg = "Cannot load dataset with collisions. Use force=True to override.\n" + "\n".join(msgs)
         raise ValueError(msg)
 
+    # A name that would be a track in one loaded database and an interval set in another, which
+    # force does not resolve. (In a subdirectory, gdir_cd, the session lists names under the
+    # working directory only, and the load adds none.)
+    if not _shared._gwd_is_subdir():
+        cross = ((set(_pymisha.pm_track_names()) | dataset_tracks)
+                 & (set(_pymisha.pm_interv_names()) | dataset_intervals))
+        if cross:
+            names = ", ".join(f"'{x}'" for x in sorted(cross))
+            raise ValueError(f"Cannot load dataset '{path}': {names} would be both a track and an interval set")
+
     # Update datasets list (load order)
     _shared._GDATASETS.append(path_norm)
     if dataset_chroms is not None:
@@ -673,6 +683,10 @@ def gdataset_save(
 
     for src, dst in interval_pairs:
         _copy_or_link(src, dst, symlinks=symlinks)
+        # a small set's attributes are in a file next to it (a big set's are inside its directory)
+        src_attr = src.with_suffix(".iattr")
+        if not src.is_dir() and src_attr.exists():
+            _copy_or_link(src_attr, dst.with_suffix(".iattr"), symlinks=symlinks)
 
     metadata = {
         "description": description,

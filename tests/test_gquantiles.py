@@ -27,7 +27,7 @@ def test_gquantiles_accepts_scalar_percentile():
 
 def test_gquantiles_rejects_out_of_range_percentiles():
     intervals = pm.gintervals_all()
-    with pytest.raises(ValueError, match=r"percentiles must be within \[0, 1\]"):
+    with pytest.raises(ValueError, match=r"Percentile \(-0.1\) is not in \[0, 1\] range"):
         pm.gquantiles("dense_track", [-0.1, 1.1], intervals)
 
 

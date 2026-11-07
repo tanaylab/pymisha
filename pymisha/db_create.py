@@ -523,6 +523,16 @@ def _convert_genome_to_indexed(
 
 
 def _interval_set_is_2d(intervals_dir: Path) -> bool:
+    """Whether a big interval set is 2D, by the columns of its .meta (a contig's name may
+    have a dash); by its file names (a pair's has a dash) when the .meta cannot be read."""
+    from .intervals import _decode_intervals_meta
+
+    try:
+        _, zeroline = _decode_intervals_meta(intervals_dir / ".meta")
+        return "chrom1" in zeroline.columns
+    except Exception:
+        _logger.debug("could not read %s; deciding by its file names", intervals_dir / ".meta",
+                      exc_info=True)
     for entry in intervals_dir.iterdir():
         if entry.name in {
             ".meta",

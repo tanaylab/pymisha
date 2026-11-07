@@ -288,7 +288,7 @@ def test_file_without_records_imports_an_empty_track(bigwig_db, tmp_path, name, 
 def test_records_none_of_whose_chromosomes_exist_still_fail(bigwig_db, tmp_path):
     f = tmp_path / "unknown.bedGraph"
     f.write_text("chrZ\t0\t10\t1\n")
-    with pytest.raises(ValueError, match="No intervals map to known chromosomes"):
+    with pytest.raises(ValueError, match="None of the chromosome names in .* exist in the genome database"):
         pm.gtrack_import("unknown", "", str(f), binsize=10)
     f = tmp_path / "empty.bed"   # an empty BED file fails in misha too
     f.write_text("")

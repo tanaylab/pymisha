@@ -430,11 +430,12 @@ class TestLiftover:
         assert result.iloc[0]["chrom"] == "chr1"
 
     def test_liftover_no_overlap(self):
-        """A chromosome the chain does not have is an error, as in R; one it has
-        but at a position no block covers gives no rows."""
+        """No interval on a chromosome the chain has gives no rows with a warning,
+        as in R; one it has but at a position no block covers gives no rows."""
         chain = pm.gintervals_load_chain(CHAIN_FILE, tgt_overlap_policy="keep")
-        with pytest.raises(ValueError, match="Source chromosome does not exist in the chain source genome"):
-            pm.gintervals_liftover(pd.DataFrame({"chrom": ["chr99"], "start": [0], "end": [100]}), chain)
+        with pytest.warns(UserWarning, match="is a source chromosome of the chain"):
+            got = pm.gintervals_liftover(pd.DataFrame({"chrom": ["chr99"], "start": [0], "end": [100]}), chain)
+        assert got.empty
         both = pd.DataFrame({"chrom": ["chr99", "chr25"], "start": [0, 2000], "end": [100, 2500]})
         assert (pm.gintervals_liftover(both, chain)["intervalID"] == 2).all()
 

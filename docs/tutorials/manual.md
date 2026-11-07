@@ -1005,6 +1005,8 @@ print(pm.CONFIG['max_data_size'])   # Default: 10,000,000
 pm.CONFIG['max_data_size'] = 1000000
 ```
 
+`None` or `float('inf')` means no limit. A negative or NaN value is an error, as is a `pm.CONFIG['multitasking']` that is not `True` or `False`.
+
 Some functions such as `pm.gscreen()` or `pm.gextract()` consume memory proportional to `max_data_size` in multitasking mode.
 
 !!! tip

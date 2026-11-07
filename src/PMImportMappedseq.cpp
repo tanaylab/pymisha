@@ -399,7 +399,7 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         const auto &chromkey = g_pmdb->chromkey();
         const uint32_t num_chroms = (uint32_t)chromkey.get_num_chroms();
 
-        // Chrom name -> index map; exact names, as R matches them
+        // Chrom name -> index map; aliases (1, MT, chrom_aliases.tsv) are added as they are met
         std::unordered_map<std::string, int> str2chrom;
         str2chrom.reserve(num_chroms);
         std::vector<int64_t> chrom_ends(num_chroms);
@@ -476,10 +476,16 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
                             }
                         }
 
+                        int chrom_idx;
                         auto istr2chrom = str2chrom.find(str[CHROM_COL]);
-                        if (istr2chrom == str2chrom.end())
-                            break;
-                        int chrom_idx = istr2chrom->second;
+                        if (istr2chrom != str2chrom.end())
+                            chrom_idx = istr2chrom->second;
+                        else {
+                            chrom_idx = chromkey.find_chromid(str[CHROM_COL]);
+                            if (chrom_idx < 0)
+                                break;
+                            str2chrom[str[CHROM_COL]] = chrom_idx;
+                        }
                         int64_t chrom_end = chrom_ends[chrom_idx];
 
                         int64_t coord = strtoll(str[COORD_COL].c_str(), &endptr, 10);

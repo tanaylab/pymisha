@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import math as _math
+import numbers
 import warnings as _warnings
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -14,8 +16,11 @@ from . import _shared
 from ._log import get_logger
 from ._shared import (
     CONFIG,
+    _check_breaks_na,
+    _check_intervals_strand,
     _check_spat_bounds,
     _checkroot,
+    _chrom_names,
     _coerce_score_thresh,
     _df2pymisha,
     _numpy,
@@ -442,9 +447,23 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_EDIT_DISTANCE_FUNCS
 )
 
-_GLOBAL_PERCENTILE_CACHE: dict[tuple[str, str, int], np.ndarray] = {}
+# Each value is kept with the stamp of the track it came from (_source_stamp), and read again
+# once another session replaced the track.
+_GLOBAL_PERCENTILE_CACHE: dict[tuple[str, str, int], tuple[Any, np.ndarray]] = {}
 # Cache of a track's frozen pv.percentiles table: src -> (bins, breaks) or None.
-_PV_TABLE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray] | None] = {}
+_PV_TABLE_CACHE: dict[tuple[str, str], tuple[Any, tuple[np.ndarray, np.ndarray] | None]] = {}
+
+
+def _source_stamp(src: str) -> Any:
+    """The stamp of track src (_shared._track_stamp), with that of its vars/pv.percentiles;
+    None for what is not a track."""
+    try:
+        path = _pymisha.pm_track_path(src)
+    except _pymisha.error:
+        return None
+    if not path:
+        return None
+    return _shared._track_stamp(path), _shared._file_stamp(f"{path}/vars/pv.percentiles")
 
 
 def _canonicalize_filter_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -456,7 +475,7 @@ def _canonicalize_filter_df(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("filter must have columns: chrom, start, end")
 
     filt = df[["chrom", "start", "end"]].copy()
-    filt["chrom"] = _normalize_chroms(filt["chrom"].astype(str).tolist())
+    filt["chrom"] = _normalize_chroms(_chrom_names(filt["chrom"]).tolist())
     filt["start"] = _pandas.to_numeric(filt["start"], errors="coerce").astype("Int64")
     filt["end"] = _pandas.to_numeric(filt["end"], errors="coerce").astype("Int64")
     filt = filt.dropna(subset=["start", "end"]).copy()
@@ -544,30 +563,6 @@ def _filter_stats(filter_df: pd.DataFrame | None) -> dict[str, int] | None:
     return {"num_chroms": chroms, "total_bases": total}
 
 
-def _subtract_masks(start: int, end: int, masks: list[tuple[int, int]] | None) -> list[tuple[int, int]]:
-    if not masks:
-        return [(start, end)]
-    segs = [(start, end)]
-    for mstart, mend in masks:
-        if mend <= start:
-            continue
-        if mstart >= end:
-            break
-        updated = []
-        for s, e in segs:
-            if mend <= s or mstart >= e:
-                updated.append((s, e))
-                continue
-            if mstart > s:
-                updated.append((s, mstart))
-            if mend < e:
-                updated.append((mend, e))
-        segs = updated
-        if not segs:
-            break
-    return segs
-
-
 def _build_unmasked_segments(
     intervals: pd.DataFrame,
     payload: dict[str, Any],
@@ -587,7 +582,7 @@ def _build_unmasked_segments(
 
     # --- Vectorized path (no mask) ---
     if not has_filter:
-        chroms = intervals["chrom"].astype(str).values
+        chroms = _chrom_names(intervals["chrom"]).to_numpy()
         starts = intervals["start"].to_numpy(dtype=_numpy.int64) + sshift
         ends = intervals["end"].to_numpy(dtype=_numpy.int64) + eshift
 
@@ -618,44 +613,56 @@ def _build_unmasked_segments(
             "base_start": v_starts,
         })
 
-    # --- Per-row path (with mask subtraction) ---
+    # --- With a mask: each interval minus the mask. The mask is canonic (sorted, disjoint,
+    # touching intervals unified), so the mask intervals an interval overlaps are consecutive
+    # and its unmasked parts are the gaps between them, in order ---
     assert filter_df is not None
-    mask_map: dict[str, list[tuple[int, int]]] = {}
-    _f_chroms = filter_df["chrom"].astype(str).values
-    _f_starts = filter_df["start"].values
-    _f_ends = filter_df["end"].values
-    for _fi in range(len(filter_df)):
-        _fc = _f_chroms[_fi]
-        if _fc not in mask_map:
-            mask_map[_fc] = []
-        mask_map[_fc].append((int(_f_starts[_fi]), int(_f_ends[_fi])))
-    for chrom in list(mask_map.keys()):
-        mask_map[chrom].sort()
-
-    seg_rows = []
-    for row_idx, row in enumerate(intervals.itertuples(index=False)):
-        chrom = str(row.chrom)
-        start = int(row.start) + sshift
-        end = int(row.end) + eshift
-        chrom_size = chrom_sizes.get(chrom)
-        if chrom_size is None:
-            continue
-        if start < 0:
-            start = 0
-        if end > chrom_size:
-            end = chrom_size
-        if end <= start:
-            continue
-        segments = _subtract_masks(start, end, mask_map.get(chrom))
-        for s, e in segments:
-            if e > s:
-                seg_rows.append((chrom, int(s), int(e), row_idx, int(e - s), int(start)))
-    if not seg_rows:
+    names = _pandas.Index(list(chrom_sizes))
+    sizes = _numpy.array(list(chrom_sizes.values()), dtype=_numpy.int64)
+    chroms = intervals["chrom"].astype(str).to_numpy()
+    cid = names.get_indexer(chroms)
+    starts = _numpy.maximum(intervals["start"].to_numpy(dtype=_numpy.int64) + sshift, 0)
+    ends = intervals["end"].to_numpy(dtype=_numpy.int64) + eshift
+    known = cid >= 0
+    ends = _numpy.where(known, _numpy.minimum(ends, sizes[cid]), ends)
+    keep = _numpy.flatnonzero(known & (ends > starts))
+    if keep.size == 0:
         return None
-    return _pandas.DataFrame(
-        seg_rows,
-        columns=["chrom", "start", "end", "orig_idx", "seg_len", "base_start"],
-    )
+    cid, starts, ends = cid[keep], starts[keep], ends[keep]
+
+    # positions keyed by chromosome, then coordinate
+    key = int(sizes.max()) + 1
+    m_cid = names.get_indexer(filter_df["chrom"].astype(str).to_numpy())
+    m_start = filter_df["start"].to_numpy(dtype=_numpy.int64)[m_cid >= 0]
+    m_end = filter_df["end"].to_numpy(dtype=_numpy.int64)[m_cid >= 0]
+    m_cid = m_cid[m_cid >= 0]
+    order = _numpy.lexsort((m_start, m_cid))
+    m_cid, m_start, m_end = m_cid[order], m_start[order], m_end[order]
+    # the first mask interval ending after the start, the first starting at or after the end
+    k0 = _numpy.searchsorted(m_cid * key + m_end, cid * key + starts, side="right")
+    k1 = _numpy.searchsorted(m_cid * key + m_start, cid * key + ends, side="left")
+    # part t of an interval runs from the end of mask interval k0 + t - 1 (or the interval's
+    # start) to the start of mask interval k0 + t (or the interval's end)
+    n_parts = k1 - k0 + 1
+    row = _numpy.repeat(_numpy.arange(len(keep)), n_parts)
+    t = _numpy.arange(int(n_parts.sum())) - _numpy.repeat(_numpy.cumsum(n_parts) - n_parts, n_parts)
+    k = k0[row] + t
+    m_start = _numpy.append(m_start, 0)
+    m_end = _numpy.append(m_end, 0)
+    p_start = _numpy.where(t == 0, starts[row], m_end[k - 1])
+    p_end = _numpy.where(k == k1[row], ends[row], m_start[k])
+    nonempty = p_end > p_start
+    row, p_start, p_end = row[nonempty], p_start[nonempty], p_end[nonempty]
+    if row.size == 0:
+        return None
+    return _pandas.DataFrame({
+        "chrom": chroms[keep][row],
+        "start": p_start,
+        "end": p_end,
+        "orig_idx": keep[row],
+        "seg_len": p_end - p_start,
+        "base_start": starts[row],
+    })
 
 
 def _compute_value_df_vtrack(
@@ -679,36 +686,44 @@ def _compute_value_df_vtrack(
             return _numpy.zeros(len(intervals), dtype=float)
         return out
 
-    src_by_chrom = {
-        chrom: grp.reset_index(drop=True)
-        for chrom, grp in src_df.groupby("chrom", sort=False)
-    }
+    src_groups = dict(list(src_df.groupby("chrom", sort=False)))
+    src_by_chrom: dict[str, _ValueSource] = {}
 
-    for orig_idx, seg_group in seg_df.groupby("orig_idx", sort=False):
-        oi = int(orig_idx)
-        chrom = str(seg_group.iloc[0]["chrom"])
-        sgrp = src_by_chrom.get(chrom)
-        if sgrp is None or len(sgrp) == 0:
+    def chrom_src(chrom: str) -> _ValueSource | None:
+        if chrom not in src_by_chrom and chrom in src_groups and len(src_groups[chrom]):
+            src_by_chrom[chrom] = _ValueSource(src_groups[chrom])
+        return src_by_chrom.get(chrom)
+
+    seg_oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
+    seg_chrom = seg_df["chrom"].astype(str).to_numpy()
+    seg_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
+    seg_end = seg_df["end"].to_numpy(dtype=_numpy.int64)
+    seg_base = seg_df["base_start"].to_numpy(dtype=_numpy.int64)
+    seg_len = seg_df["seg_len"].to_numpy(dtype=_numpy.int64)
+    bounds = _numpy.flatnonzero(_numpy.r_[True, seg_oi[1:] != seg_oi[:-1], True]).tolist()  # by interval
+
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        oi = int(seg_oi[a])
+        sgrp = chrom_src(str(seg_chrom[a]))
+        if sgrp is None:
             if func == "exists":
                 out[oi] = 0.0
             continue
 
-        segments = [
-            (int(r.start), int(r.end), int(r.base_start), int(r.seg_len))
-            for r in seg_group.itertuples(index=False)
-        ]
-        base_start = segments[0][2]
-        unmasked_len = int(seg_group["seg_len"].sum())
+        segments = list(zip(seg_start[a:b].tolist(), seg_end[a:b].tolist(), strict=True))
+        base_start = int(seg_base[a])
+        unmasked_len = int(seg_len[a:b].sum())
 
         if has_filter and func == "nearest":
             # nearest under filter uses only the first unmasked segment.
             segments = [segments[0]]
 
-        # Vectorized overlap matching: compute overlaps between all source
-        # intervals and all query segments using numpy broadcasting.
-        src_starts = sgrp["start"].to_numpy(dtype=_numpy.int64)
-        src_ends = sgrp["end"].to_numpy(dtype=_numpy.int64)
-        src_vals = sgrp["value"].to_numpy(dtype=float)
+        # the source intervals that can overlap the segments, in source order (the others
+        # overlap none), matched to the segments with numpy broadcasting
+        cand = sgrp.overlapping(segments[0][0], segments[-1][1])
+        src_starts = sgrp.start[cand]
+        src_ends = sgrp.end[cand]
+        src_vals = sgrp.value[cand]
         n_src = len(src_starts)
 
         total_ov = _numpy.zeros(n_src, dtype=_numpy.int64)
@@ -717,7 +732,7 @@ def _compute_value_df_vtrack(
         first_part = _numpy.full(n_src, -1, dtype=_numpy.int64)
         last_part = _numpy.full(n_src, -1, dtype=_numpy.int64)
         overlaps_for_cov = []
-        for ss, se, _bs, _sl in segments:
+        for ss, se in segments:
             ov_s = _numpy.maximum(src_starts, ss)
             ov_e = _numpy.minimum(src_ends, se)
             ov_len = _numpy.maximum(ov_e - ov_s, 0)
@@ -819,39 +834,78 @@ def _compute_value_df_vtrack(
             pos = float(m_first_pos[order[-1]])
             out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
 
-    # nearest fallback for non-overlap cases — vectorized distance computation
+    # nearest fallback for non-overlap cases: the mean of the source values (in source order)
+    # at the least distance from the first segment, max(0, ss - src_e) + max(0, src_s - se)
     if func == "nearest":
-        for orig_idx, seg_group in seg_df.groupby("orig_idx", sort=False):
-            oi = int(orig_idx)
+        for a in bounds[:-1]:
+            oi = int(seg_oi[a])
             if not _numpy.isnan(out[oi]):
                 continue
-            chrom = str(seg_group.iloc[0]["chrom"])
-            sgrp = src_by_chrom.get(chrom)
-            if sgrp is None or len(sgrp) == 0:
+            sgrp = chrom_src(str(seg_chrom[a]))
+            if sgrp is None:
                 continue
-            ss = int(seg_group.iloc[0]["start"])
-            se = int(seg_group.iloc[0]["end"])
-
-            src_s = sgrp["start"].to_numpy(dtype=_numpy.int64)
-            src_e = sgrp["end"].to_numpy(dtype=_numpy.int64)
-            src_v = sgrp["value"].to_numpy(dtype=float)
-            valid = ~_numpy.isnan(src_v)
-            if not valid.any():
-                continue
-
-            # Vectorized distance: max(0, ss - src_e) for left, max(0, src_s - se) for right
-            d_left = _numpy.maximum(ss - src_e, 0)
-            d_right = _numpy.maximum(src_s - se, 0)
-            dists = d_left + d_right  # one of them is 0 when overlapping
-
-            dists_valid = dists[valid]
-            vals_valid = src_v[valid]
-            dmin = dists_valid.min()
-            cand = vals_valid[dists_valid == dmin]
-            if cand.size > 0:
-                out[oi] = float(cand.mean())
+            nearest = sgrp.nearest(int(seg_start[a]), int(seg_end[a]))
+            if nearest.size > 0:
+                out[oi] = float(sgrp.value[sgrp.valid][nearest].mean())
 
     return out
+
+
+class _ValueSource:
+    """A value-based vtrack's source intervals on one chromosome (_compute_value_df_vtrack),
+    in source order, indexed to find those overlapping or nearest to a range."""
+
+    def __init__(self, grp: pd.DataFrame):
+        self.start = grp["start"].to_numpy(dtype=_numpy.int64)
+        self.end = grp["end"].to_numpy(dtype=_numpy.int64)
+        self.value = grp["value"].to_numpy(dtype=float)
+        self.by_start, self.sorted_start, self.end_cummax = self._index(self.start, self.end)
+        self.valid = _numpy.flatnonzero(~_numpy.isnan(self.value))
+        self.v_by_start, self.v_sorted_start, self.v_end_cummax = self._index(
+            self.start[self.valid], self.end[self.valid])
+
+    @staticmethod
+    def _index(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The intervals by start, their starts, and the running maximum of their ends."""
+        by_start = _numpy.argsort(start, kind="stable")
+        ends = end[by_start]
+        return by_start, start[by_start], (_numpy.maximum.accumulate(ends) if len(ends) else ends)
+
+    def overlapping(self, start: int, end: int) -> np.ndarray:
+        """The intervals that start before end and end after start, in source order."""
+        lo = int(_numpy.searchsorted(self.end_cummax, start, side="right"))
+        hi = int(_numpy.searchsorted(self.sorted_start, end, side="left"))
+        cand = self.by_start[lo:max(lo, hi)]
+        return _numpy.sort(cand[self.end[cand] > start])
+
+    def nearest(self, start: int, end: int) -> np.ndarray:
+        """The intervals with a value at the least distance from [start, end), max(0, start -
+        their end) + max(0, their start - end), as positions among those with a value, in
+        source order."""
+        v_start, v_end = self.start[self.valid], self.end[self.valid]
+        n = len(v_start)
+        if n == 0:
+            return _numpy.empty(0, dtype=_numpy.int64)
+        hi = int(_numpy.searchsorted(self.v_sorted_start, end, side="right"))  # starting at or before end
+        lo = int(_numpy.searchsorted(self.v_end_cummax, start, side="left"))
+        at_zero = self.v_by_start[lo:max(lo, hi)]
+        at_zero = at_zero[v_end[at_zero] >= start]  # distance 0: touching or overlapping
+        if at_zero.size:
+            return _numpy.sort(at_zero)
+        # the others starting at or before end all end before start
+        d_left = start - int(self.v_end_cummax[hi - 1]) if hi > 0 else None
+        d_right = int(self.v_sorted_start[hi]) - end if hi < n else None
+        dmin = min(d for d in (d_left, d_right) if d is not None)
+        parts = []
+        if d_left == dmin:
+            max_end = int(self.v_end_cummax[hi - 1])
+            first = int(_numpy.searchsorted(self.v_end_cummax[:hi], max_end, side="left"))
+            left = self.v_by_start[first:hi]
+            parts.append(left[v_end[left] == max_end])
+        if d_right == dmin:
+            last = int(_numpy.searchsorted(self.v_sorted_start, self.v_sorted_start[hi], side="right"))
+            parts.append(self.v_by_start[hi:last])
+        return _numpy.sort(_numpy.concatenate(parts))
 
 
 def _compute_filtered_nearest(
@@ -883,93 +937,193 @@ def _compute_filtered_nearest(
     return out
 
 
+class _Unmasked(NamedTuple):
+    """What a filtered track vtrack reads for a run of intervals (_read_unmasked_items).
+
+    vals and pos are the items read (bins or track intervals, non-NaN values only) in
+    genome order, pos being each item's start. The other arrays have one entry per
+    unmasked part of the run's intervals, in the order of _build_unmasked_segments (by
+    interval, then position): the interval it belongs to (oi), its start, its interval's
+    shifted start (base) and the range [lo, hi) of the items it reads.
+    """
+
+    vals: np.ndarray
+    pos: np.ndarray
+    oi: np.ndarray
+    start: np.ndarray
+    base: np.ndarray
+    lo: np.ndarray
+    hi: np.ndarray
+
+
+# The bins a filtered dense track vtrack reads at a time, about (_read_unmasked_items)
+_UNMASKED_READ_ROWS = 2_000_000
+
+
 def _unmasked_items(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
-) -> tuple[dict[int, tuple[np.ndarray, np.ndarray]], dict[int, int], np.ndarray]:
+) -> tuple[Iterator[_Unmasked], np.ndarray]:
     """The values a filtered track vtrack reads, each bin or track interval once.
 
     As R misha 5.15 (parts_reading_items_once): a bin (dense) or interval (sparse,
-    array) that the filter splits is read once, however many unmasked parts it
-    overlaps. Each item's position is its start clipped to the first unmasked part
-    it overlaps (the *.pos functions clip to the part they read).
+    array) that the filter splits is read once, with the first unmasked part it
+    overlaps, at its start clipped to that part (the *.pos functions clip to the part
+    they read).
 
-    Returns ({orig_idx: (values, positions)} for the intervals with unmasked parts,
-    non-NaN values only, in genome order), {orig_idx: shifted interval start}, and
-    a NaN-filled output array.
+    Returns the items and parts read, a run of intervals at a time (_read_unmasked_items),
+    and a NaN-filled output array.
     """
-    from .extract import gextract
-
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     src = payload_eval.get("src")
     if seg_df is None or len(seg_df) == 0 or src is None:
-        return {}, {}, out
+        return iter(()), out
+    return _read_unmasked_items(seg_df, src), out
+
+
+def _read_unmasked_items(seg_df: pd.DataFrame, src: str) -> Iterator[_Unmasked]:
+    """The items each unmasked part of seg_df (_build_unmasked_segments) reads from track src.
+
+    The track is read with its own iterator (a row per bin or track interval) over the union
+    of the intervals' spans (first part's start to last part's end), in runs of intervals:
+    those on a chromosome for a sparse or array track, whose reader loads the chromosome's
+    intervals anyway; for a dense track, intervals whose union holds about
+    _UNMASKED_READ_ROWS bins (or max_data_size, if lower). Its items do not overlap, so the
+    items a part reads are consecutive: those that start before its end and not before the
+    previous part's end, and end after its start.
+    """
+    from .intervals import gintervals_all
 
     oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
     p_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
     p_end = seg_df["end"].to_numpy(dtype=_numpy.int64)
-    uniq, first, counts = _numpy.unique(oi, return_index=True, return_counts=True)
-    base_starts = dict(zip(uniq.tolist(), seg_df["base_start"].to_numpy()[first].tolist(), strict=True))
-    groups: dict[int, tuple[np.ndarray, np.ndarray]] = {
-        int(o): (_numpy.empty(0), _numpy.empty(0, dtype=_numpy.int64)) for o in uniq}
+    base = seg_df["base_start"].to_numpy(dtype=_numpy.int64)
+    is_first = _numpy.r_[True, oi[1:] != oi[:-1]]
+    first = _numpy.flatnonzero(is_first)
+    last = _numpy.r_[first[1:], len(oi)] - 1
+    prev_end = _numpy.r_[0, p_end[:-1]]
+    # positions keyed by chromosome (in genome order, as the track's rows come), then coordinate
+    names = _pandas.Index(gintervals_all()["chrom"].astype(str).to_numpy())
+    key = int(p_end.max()) + 1
+    p_key = names.get_indexer(seg_df["chrom"].astype(str).to_numpy()).astype(_numpy.int64) * key
 
-    # each interval's span over its parts, read with the source's own iterator (a row per bin
-    # or track interval); overlapping spans go to separate calls, so rows map to one interval
-    spans = _pandas.DataFrame({
-        "chrom": seg_df["chrom"].to_numpy()[first],
-        "start": _numpy.minimum.reduceat(p_start, first),
-        "end": _numpy.maximum.reduceat(p_end, first),
-        "oi": uniq,
-    }).sort_values(["chrom", "start"], kind="stable")
-    layers: list[list[int]] = []
-    layer_end: list[tuple[str, int]] = []
-    for row in spans.itertuples(index=False):
-        for k, (c, e) in enumerate(layer_end):
-            if c != row.chrom or e <= row.start:
-                layers[k].append(int(row.oi))
-                layer_end[k] = (row.chrom, int(row.end))
-                break
-        else:
-            layers.append([int(row.oi)])
-            layer_end.append((row.chrom, int(row.end)))
+    # the intervals in genome order of their spans, cut into runs
+    span_s = p_key[first] + p_start[first]
+    span_e = p_key[first] + p_end[last]
+    order = _numpy.argsort(span_s, kind="stable")
+    span_s, span_e = span_s[order], span_e[order]
+    try:
+        bin_size = _pymisha.pm_track_info(src).get("bin_size")
+    except _pymisha.error:
+        bin_size = None
+    if bin_size:
+        # the bases each span adds to the union of those before it
+        run_end = _numpy.maximum.accumulate(span_e)
+        added = _numpy.maximum(span_e - _numpy.maximum(span_s, _numpy.r_[span_s[:1], run_end[:-1]]), 0)
+        budget = min(_shared._config_limit("max_data_size"), _UNMASKED_READ_ROWS) * int(bin_size)
+        run = (_numpy.cumsum(added) - added) // budget
+    else:
+        run = span_s // key
+    _, span_run = _numpy.unique(run, return_inverse=True)
+    part_run: _numpy.ndarray = _numpy.empty(len(first), dtype=_numpy.int64)
+    part_run[order] = span_run
+    part_run = _numpy.repeat(part_run, _numpy.diff(_numpy.r_[first, len(oi)]))
+    by_run = _numpy.argsort(part_run, kind="stable")
+    n_runs = int(span_run[-1]) + 1
+    part_bounds = _numpy.searchsorted(part_run[by_run], _numpy.arange(n_runs + 1))
+    span_bounds = _numpy.searchsorted(span_run, _numpy.arange(n_runs + 1))
 
-    pos_in_group = dict(zip(uniq.tolist(), range(len(uniq)), strict=True))
-    for layer in layers:
-        lay = spans.set_index("oi").loc[layer]
-        extracted = gextract(src, _pandas.DataFrame({"chrom": lay["chrom"].to_numpy(),
-                                                     "start": lay["start"].to_numpy(),
-                                                     "end": lay["end"].to_numpy()}))
-        if extracted is None or len(extracted) == 0:
-            continue
-        col = [c for c in extracted.columns if c not in {"chrom", "start", "end", "intervalID"}][0]
-        ids = extracted["intervalID"].to_numpy(dtype=_numpy.int64) - 1
-        r_start = extracted["start"].to_numpy(dtype=_numpy.int64)
-        r_end = extracted["end"].to_numpy(dtype=_numpy.int64)
-        vals = extracted[col].to_numpy(dtype=float)
-        for k, o in enumerate(layer):
-            sel = (ids == k) & ~_numpy.isnan(vals)
-            if not sel.any():
-                continue
-            g = pos_in_group[o]
-            ps, pe = p_start[first[g]:first[g] + counts[g]], p_end[first[g]:first[g] + counts[g]]
-            rs, re_, rv = r_start[sel], r_end[sel], vals[sel]
-            j = _numpy.searchsorted(pe, rs, side="right")  # the first part ending after the item's start
-            hit = j < len(ps)
-            hit[hit] = ps[j[hit]] < re_[hit]
-            groups[o] = (rv[hit], _numpy.maximum(rs[hit], ps[_numpy.minimum(j, len(ps) - 1)][hit]))
-    return groups, base_starts, out
+    for r in range(n_runs):
+        sel = by_run[part_bounds[r]:part_bounds[r + 1]]
+        s, e = span_s[span_bounds[r]:span_bounds[r + 1]], span_e[span_bounds[r]:span_bounds[r + 1]]
+        # the run's spans, merged where they overlap or touch
+        e_max = _numpy.maximum.accumulate(e)
+        new = _numpy.flatnonzero(_numpy.r_[True, s[1:] > e_max[:-1]])
+        m_s = s[new]
+        m_e = e_max[_numpy.r_[new[1:], len(s)] - 1]
+        m_key = m_s // key * key
+        # gextract(src, spans) without building its data frame: columns chrom, start, end,
+        # value, intervalID (None if no rows)
+        res = _pymisha.pm_extract([src], _df2pymisha(_pandas.DataFrame({
+            "chrom": names[m_s // key].to_numpy(), "start": m_s - m_key, "end": m_e - m_key})), None, CONFIG)
+        if res is None:
+            res = [None, None] + [_numpy.empty(0, dtype=_numpy.int64)] * 4
+        vals = _numpy.asarray(res[4], dtype=float)
+        ok = ~_numpy.isnan(vals)
+        vals = vals[ok]
+        r_key = m_key[_numpy.asarray(res[5], dtype=_numpy.int64)[ok] - 1]
+        pos = _numpy.asarray(res[2], dtype=_numpy.int64)[ok]
+        r_s = r_key + pos
+        r_e = r_key + _numpy.asarray(res[3], dtype=_numpy.int64)[ok]
+        del res
+        if (_numpy.diff(r_s) < 0).any():
+            o = _numpy.argsort(r_s, kind="stable")
+            vals, pos, r_s, r_e = vals[o], pos[o], r_s[o], r_e[o]
+        if (_numpy.diff(r_e) < 0).any():
+            raise RuntimeError(f"Track {src} holds overlapping intervals")
+
+        k = p_key[sel]
+        hi = _numpy.searchsorted(r_s, k + p_end[sel], side="left")
+        lo = _numpy.searchsorted(r_e, k + p_start[sel], side="right")
+        lo = _numpy.where(is_first[sel], lo,
+                          _numpy.maximum(lo, _numpy.searchsorted(r_s, k + prev_end[sel], side="left")))
+        yield _Unmasked(vals, pos, oi[sel], p_start[sel], base[sel], _numpy.minimum(lo, hi), hi)
+
+
+def _unmasked_groups(u: _Unmasked, positions: bool = False) -> list[tuple[int, np.ndarray, np.ndarray | None]]:
+    """(interval, values, positions) for each interval of u that reads at least one item: its
+    values in genome order and, if asked, their positions (each item's start clipped to its
+    part)."""
+    read = _numpy.flatnonzero(u.hi > u.lo)
+    oi = u.oi[read]
+    bounds = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1], True]).tolist() if len(read) else []
+    lo, hi, start = u.lo.tolist(), u.hi.tolist(), u.start.tolist()
+    groups: list[tuple[int, np.ndarray, np.ndarray | None]] = []
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        parts = read[a:b].tolist()
+        vals = [u.vals[lo[j]:hi[j]] for j in parts]
+        pos = [_numpy.maximum(u.pos[lo[j]:hi[j]], start[j]) for j in parts] if positions else None
+        groups.append((int(oi[a]), vals[0] if len(parts) == 1 else _numpy.concatenate(vals),
+                       None if pos is None else pos[0] if len(parts) == 1 else _numpy.concatenate(pos)))
+    return groups
 
 
 def _extract_raw_unmasked_values(
     intervals: pd.DataFrame,
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
-) -> tuple[dict[int, list[float]], np.ndarray]:
-    """The unmasked values per interval, each bin or track interval once (_unmasked_items)."""
-    groups, _, out = _unmasked_items(intervals, payload_eval, filter_df)
-    return {o: v.tolist() for o, (v, _p) in groups.items() if len(v)}, out
+) -> tuple[Iterator[tuple[int, np.ndarray]], np.ndarray]:
+    """The unmasked values of each interval that has any, each bin or track interval once
+    (_unmasked_items)."""
+    runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+    return ((o, v) for u in runs for o, v, _p in _unmasked_groups(u)), out
+
+
+def _seq_range_sums(vals: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """The values in each range [lo, hi) of vals added one after the other, as np.cumsum
+    adds them (-0.0 for an empty range); np.add.reduceat adds pairwise, which rounds
+    differently.
+
+    The ranges are summed together, a value of each per step, except the longest ones,
+    summed on their own where that takes fewer steps.
+    """
+    n = hi - lo
+    out = _numpy.full(len(n), -0.0)
+    by_len = _numpy.argsort(-n, kind="stable")
+    lens = n[by_len]
+    # summing the m longest on their own leaves lens[m] steps
+    m = int(_numpy.argmin(_numpy.r_[lens, 0] + _numpy.arange(len(lens) + 1)))
+    for k in by_len[:m]:
+        out[k] = _numpy.cumsum(vals[lo[k]:hi[k]])[-1]
+    rest, starts, neg_lens = by_len[m:], lo[by_len[m:]], -lens[m:]
+    acc = _numpy.full(len(rest), -0.0)  # -0.0 + v is v for every v
+    for step in range(-int(neg_lens[0]) if len(rest) else 0):
+        active = int(_numpy.searchsorted(neg_lens, -step, side="left"))  # the ranges longer than step
+        acc[:active] += vals[starts[:active] + step]
+    out[rest] = acc
+    return out
 
 
 def _compute_filtered_extremum_pos(
@@ -1001,28 +1155,14 @@ def _compute_filtered_extremum_pos(
 
     # For track sources (string), use raw bin extraction with positions
     if isinstance(src, str):
-        items, base_starts, out = _unmasked_items(intervals, payload_eval, filter_df)
-        for orig_idx, (ivals, ipos) in items.items():
-            val_pos_pairs = list(zip(ivals.tolist(), ipos.tolist(), strict=True))
-            if not val_pos_pairs:
-                continue
-            if mode == "max":
-                best_val, best_pos = val_pos_pairs[0]
-                for v, s in val_pos_pairs[1:]:
-                    if v > best_val:
-                        best_val = v
-                        best_pos = s
-            else:  # min
-                best_val, best_pos = val_pos_pairs[0]
-                for v, s in val_pos_pairs[1:]:
-                    if v < best_val:
-                        best_val = v
-                        best_pos = s
-            if relative:
-                bs = base_starts.get(orig_idx, 0)
-                out[orig_idx] = float(best_pos - bs)
-            else:
-                out[orig_idx] = float(best_pos)
+        runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+        for u in runs:
+            base = dict(zip(u.oi.tolist(), u.base.tolist(), strict=True))
+            for orig_idx, ivals, ipos in _unmasked_groups(u, positions=True):
+                assert ipos is not None
+                # the first item holding the extremum
+                best_pos = int(ipos[int(_numpy.argmax(ivals) if mode == "max" else _numpy.argmin(ivals))])
+                out[orig_idx] = float(best_pos - base[orig_idx]) if relative else float(best_pos)
         return out
 
     # For value-based (DataFrame) sources, filter in Python.
@@ -1113,8 +1253,9 @@ def _compute_filtered_edit_distance(
     oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
     offset = (seg_df["start"].to_numpy(dtype=_numpy.int64)
               - seg_df["base_start"].to_numpy(dtype=_numpy.int64)).astype(float)
-    for o in _numpy.unique(oi):
-        idx = _numpy.flatnonzero(oi == o)
+    bounds = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1], True])  # the parts by interval
+    for a, b in zip(bounds[:-1].tolist(), bounds[1:].tolist(), strict=True):
+        o, idx = oi[a], range(a, b)
         best = _numpy.nan
         if func.endswith(".pos"):
             best_edits = _numpy.nan
@@ -1149,7 +1290,7 @@ def _compute_filtered_stddev(
 ) -> np.ndarray:
     """Stddev under filter: extract raw bin values and compute exact stddev."""
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
-    for orig_idx, raw_vals in groups.items():
+    for orig_idx, raw_vals in groups:
         if len(raw_vals) >= 2:
             out[orig_idx] = float(_numpy.std(raw_vals, ddof=1))
     return out
@@ -1163,7 +1304,7 @@ def _compute_filtered_quantile(
     """Quantile under filter: extract raw bin values and compute exact quantile."""
     percentile = _quantile_param(payload_eval)
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
-    for orig_idx, raw_vals in groups.items():
+    for orig_idx, raw_vals in groups:
         out[orig_idx] = float(_numpy.quantile(raw_vals, percentile))
     return out
 
@@ -1188,7 +1329,7 @@ def _compute_filtered_lse(
     if not isinstance(payload_eval.get("src"), str):
         raise NotImplementedError("lse under filter currently requires a track source")
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
-    for orig_idx, raw_vals in groups.items():
+    for orig_idx, raw_vals in groups:
         out[orig_idx] = _logsumexp(raw_vals)
     return out
 
@@ -1324,9 +1465,10 @@ def _compute_filtered_max_pos_by_score(
 
 def _global_percentile_reference_values(src: str, bin_size: int) -> np.ndarray:
     key = (str(_shared._GROOT), str(src), int(bin_size))
+    stamp = _source_stamp(src)
     cached = _GLOBAL_PERCENTILE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
 
     from .extract import gextract
     from .intervals import gintervals_all
@@ -1342,7 +1484,7 @@ def _global_percentile_reference_values(src: str, bin_size: int) -> np.ndarray:
             ref = extracted[data_cols[0]].to_numpy(dtype=float, copy=False)
             ref = ref[~_numpy.isnan(ref)]
             ref.sort()
-    _GLOBAL_PERCENTILE_CACHE[key] = ref
+    _GLOBAL_PERCENTILE_CACHE[key] = (stamp, ref)
     return ref
 
 
@@ -1368,8 +1510,10 @@ def _load_pv_table(src: str) -> tuple[np.ndarray, np.ndarray] | None:
     import os
 
     key = (str(_shared._GROOT), str(src))
-    if key in _PV_TABLE_CACHE:
-        return _PV_TABLE_CACHE[key]
+    stamp = _source_stamp(src)
+    cached = _PV_TABLE_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
 
     result: tuple[np.ndarray, np.ndarray] | None = None
     try:
@@ -1390,9 +1534,14 @@ def _load_pv_table(src: str) -> tuple[np.ndarray, np.ndarray] | None:
             if breaks is not None:
                 bins = _numpy.asarray(obj, dtype=float).ravel()
                 br = _numpy.asarray(breaks, dtype=float).ravel()
-                if bins.size == br.size and bins.size >= 2:
+                if br.size and _numpy.isnan(br).all():
+                    # the table of a track with no values (c(1, 1), breaks c(NaN, NaN)):
+                    # nothing to look up, every percentile is NaN
+                    result = (_numpy.empty(0), _numpy.empty(0))
+                elif bins.size == br.size and bins.size >= 2:
+                    _check_breaks_na(br)
                     result = (bins, br)
-    _PV_TABLE_CACHE[key] = result
+    _PV_TABLE_CACHE[key] = (stamp, result)
     return result
 
 
@@ -1403,13 +1552,14 @@ def _percentile_from_pv_table(
 
     Mirrors R ``TrackVarProcessor`` + ``BinFinder::val2bin`` (right-closed
     bins): ``bin = val2bin(val)``; ``bins[bin]`` in range; for out-of-range,
-    ``bins[0]`` when ``val <= breaks[0]`` else ``1.0``. NaN stays NaN.
+    ``bins[0]`` when ``val <= breaks[0]`` else ``1.0``. NaN stays NaN, and an
+    empty table (a track with no values) gives NaN.
     """
     from .summary import _bin_values
 
     out = _numpy.full(values.shape, _numpy.nan, dtype=float)
     valid = ~_numpy.isnan(values)
-    if not valid.any():
+    if not valid.any() or not bins.size:
         return out
     vals = values[valid]
     bin_idx = _bin_values(vals, breaks, include_lowest=False)
@@ -1450,9 +1600,8 @@ def _compute_filtered_global_percentile(
         stat_fn = _numpy.max
 
     stats = _numpy.full(len(intervals), _numpy.nan, dtype=float)
-    for orig_idx, raw_vals in groups.items():
-        if raw_vals:
-            stats[orig_idx] = float(stat_fn(raw_vals))
+    for orig_idx, raw_vals in groups:
+        stats[orig_idx] = float(stat_fn(raw_vals))
 
     table = _load_pv_table(src)
     if table is not None:
@@ -1609,6 +1758,12 @@ def _compute_vtrack_values(
 
     payload = dict(vtrack_config)
     src = payload.get('src')
+    if isinstance(src, str) and "chrom1" not in intervals.columns:
+        from .tracks import gtrack_exists, gtrack_info
+
+        if gtrack_exists(src) and int(gtrack_info(src).get("dimensions", 1) or 1) == 2:
+            # R's TrackExpressionVars::init message
+            raise ValueError(f"Virtual track {vtrack_name}: 1D iterator is applied to a 2D track {src}")
     if isinstance(src, _pandas.DataFrame):
         payload['src_df'] = src.copy()
         payload['src'] = _df2pymisha(src)
@@ -1712,14 +1867,30 @@ def _compute_vtrack_values(
         return _compute_filtered_edit_distance(intervals, payload_eval, filter_df, func)
 
     # sum, size and avg of a track: each bin or track interval once, however many unmasked
-    # parts it overlaps, and avg the plain mean of those values (R misha 5.15)
+    # parts it overlaps (R misha 5.15)
     if isinstance(payload_eval.get("src"), str) and func in ("sum", "size", "avg", "mean"):
-        items, _, out = _unmasked_items(intervals, payload_eval, filter_df)
-        for o, (ivals, _p) in items.items():
+        runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+        for u in runs:
+            n = u.hi - u.lo
             if func == "size":
-                out[o] = float(len(ivals))
-            elif len(ivals):
-                out[o] = float(ivals.sum()) if func == "sum" else float(ivals.mean())
+                first = _numpy.flatnonzero(_numpy.r_[True, u.oi[1:] != u.oi[:-1]])
+                out[u.oi[first]] = _numpy.add.reduceat(n, first).astype(float)
+                continue
+            read = n > 0
+            if not read.any():
+                continue
+            # as R: each part's sum or mean, which the track holds as a float, then the parts'
+            # sums, or their means weighted by their value counts, added in order
+            counts = n[read].astype(float)
+            part_sums = _seq_range_sums(u.vals, u.lo[read], u.hi[read])
+            if func == "sum":
+                terms = part_sums.astype(_numpy.float32).astype(float)
+            else:
+                terms = (part_sums / counts).astype(_numpy.float32).astype(float) * counts
+            oi = u.oi[read]
+            first = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1]])
+            totals = _seq_range_sums(terms, first, _numpy.r_[first[1:], len(oi)])
+            out[oi[first]] = totals if func == "sum" else totals / _numpy.add.reduceat(counts, first)
         return out
 
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
@@ -2095,6 +2266,8 @@ def gvtrack_create(
 
         _check_max_edits(kwargs.get("max_edits"))
         _check_edit_distance_args(kwargs, func_lc)
+    sshift = _shift_arg(vtrack_name, "sshift", sshift)
+    eshift = _shift_arg(vtrack_name, "eshift", eshift)
     if (sshift or eshift) and _vtrack_src_is_2d({"src": src}):
         raise ValueError(f"Virtual track {vtrack_name}: 1D iterator modifier cannot be used with source "
                          "that supports only 2D iterators")
@@ -2105,6 +2278,11 @@ def gvtrack_create(
         req = {"chrom", "start", "end"}
         if not req.issubset(src.columns):
             raise ValueError("DataFrame source must include columns: chrom, start, end")
+        try:
+            _check_intervals_strand(src)
+        except _pymisha.error as e:
+            raise _pymisha.error(f"Source of virtual track {vtrack_name} was not recognized neither as a track "
+                                 f'nor as intervals. ("{e}")') from None
 
         is_interval_func = func_lc in _DF_INTERVAL_FUNCS
         value_cols = [
@@ -2122,7 +2300,7 @@ def gvtrack_create(
             src_df = src[["chrom", "start", "end", value_col]].copy()
             src_df.columns = ["chrom", "start", "end", "value"]
 
-        src_df["chrom"] = _normalize_chroms(src_df["chrom"].astype(str).tolist())
+        src_df["chrom"] = _normalize_chroms(_chrom_names(src_df["chrom"]).tolist())
         src_df["start"] = _pandas.to_numeric(src_df["start"], errors="coerce").astype("Int64")
         src_df["end"] = _pandas.to_numeric(src_df["end"], errors="coerce").astype("Int64")
         if not is_interval_func:
@@ -2441,6 +2619,14 @@ def gvtrack_info(vtrack_name: str) -> dict[str, Any]:
     return dict(_shared._VTRACKS[vtrack_name])
 
 
+def _shift_arg(vtrack_name: str, name: str, value: Any) -> int:
+    """An iterator shift as R takes it: a finite number, a fraction truncated."""
+    if (value is None or value is _pandas.NA or isinstance(value, (bool, _numpy.bool_))
+            or not isinstance(value, numbers.Real) or not _math.isfinite(value)):
+        raise ValueError(f"Virtual track {vtrack_name}: {name} must be an integer")
+    return int(float(value))
+
+
 def gvtrack_iterator(vtrack_name: str, dim: int | None = None, sshift: int = 0, eshift: int = 0) -> None:
     """
     Define modification rules for the 1D iterator of a virtual track.
@@ -2516,6 +2702,8 @@ def gvtrack_iterator(vtrack_name: str, dim: int | None = None, sshift: int = 0, 
     if _vtrack_src_is_2d(cfg):
         raise ValueError(f"Virtual track {vtrack_name}: 1D iterator modifier cannot be used with source "
                          "that supports only 2D iterators")
+    sshift = _shift_arg(vtrack_name, "sshift", sshift)
+    eshift = _shift_arg(vtrack_name, "eshift", eshift)
     if dim is not None:
         cfg['dim'] = dim
     cfg['sshift'] = sshift
@@ -2594,11 +2782,10 @@ def gvtrack_iterator_2d(
     if not _vtrack_src_is_2d(cfg):
         raise ValueError(f"Virtual track {vtrack_name}: 2D iterator modifier cannot be used with source "
                          "that supports only 1D iterators")
+    shifts = {k: _shift_arg(vtrack_name, k, v) for k, v in
+              (("sshift1", sshift1), ("eshift1", eshift1), ("sshift2", sshift2), ("eshift2", eshift2))}
     cfg['itr_type'] = '2d'
-    cfg['sshift1'] = sshift1
-    cfg['eshift1'] = eshift1
-    cfg['sshift2'] = sshift2
-    cfg['eshift2'] = eshift2
+    cfg.update(shifts)
     _shared._VTRACKS[vtrack_name] = cfg
 
 
@@ -2802,7 +2989,7 @@ def gvtrack_clear() -> None:
 
 def gvtrack_array_slice(
     vtrack: str,
-    slice: list[str] | list[int] | None = None,
+    slice: str | int | list[str] | list[int] | None = None,
     func: str = "avg",
     params=None,
 ) -> None:
@@ -2820,14 +3007,13 @@ def gvtrack_array_slice(
         Name of an existing virtual track. The vtrack must have been created
         with an array track as its source. Raises ``ValueError`` if the vtrack
         does not exist or its source is not an array track.
-    slice : list of str or int, optional
+    slice : str, int, or list of str or int, optional
         Column subset to use. Strings are matched against track colnames;
         integers are 0-based column indices. ``None`` uses all columns.
     func : str, default ``'avg'``
         Aggregation function applied across all non-NaN values in the
         selected columns for each iterator interval.  Supported values:
-        ``'avg'``, ``'min'``, ``'max'``, ``'sum'``, ``'stddev'``
-        (R's ``stdev`` is also accepted).
+        ``'avg'``, ``'min'``, ``'max'``, ``'sum'``, ``'stddev'``.
     params : None
         Reserved for future use. Must be ``None``; raises
         ``NotImplementedError`` if provided.
@@ -2888,10 +3074,7 @@ def gvtrack_array_slice(
     _ALLOWED_SLICE_FUNCS = ARRAY_REDUCE_FUNCS | {"quantile"}
     func_lc = func.lower()
     if func_lc not in _ALLOWED_SLICE_FUNCS:
-        raise ValueError(
-            f"gvtrack_array_slice: func must be one of "
-            f"{sorted(_ALLOWED_SLICE_FUNCS)!r}, got {func!r}"
-        )
+        raise ValueError(f"Virtual track {vtrack}: invalid function {func_lc} used with a track")
 
     # quantile requires a percentile in params; other reducers take no params.
     if func_lc == "quantile":
@@ -2919,7 +3102,7 @@ def gvtrack_array_slice(
 
         track_path = Path(_pymisha.pm_track_path(src))
         colnames = read_colnames(track_path)
-        slice_list: list[Any] = list(slice)
+        slice_list: list[Any] = [slice] if isinstance(slice, (str, int, np.integer)) else list(slice)
         if all(isinstance(s, str) for s in slice_list):
             str_list: list[str] = [str(s) for s in slice_list]
             cn_idx = {name: i for i, name in enumerate(colnames)}

@@ -38,6 +38,7 @@ extern PyObject *s_pm_err;
 extern void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end);
 extern void verify_interval_coords(const GenomeChromKey &chromkey, int chromid,
                                    int64_t start, int64_t end);
+extern std::string py_chrom_name(PyObject *val, Py_ssize_t i);
 
 namespace {
 
@@ -323,32 +324,7 @@ void convert_py_intervals_basic(PyObject *py_intervals, std::vector<GInterval> &
             TGLError("Failed to get interval values at index %ld", (long)i);
         }
 
-        int chromid = -1;
-        if (PyUnicode_Check(chrom_val)) {
-            const char *chrom_name = PyUnicode_AsUTF8(chrom_val);
-            chromid = chromkey.chrom2id(chrom_name);
-            if (chromid < 0) {
-                TGLError("Unknown chromosome: %s", chrom_name);
-            }
-        } else if (PyNumber_Check(chrom_val)) {
-            PMPY py_long(PyNumber_Long(chrom_val), true);
-            if (!py_long) {
-                PyErr_Clear();
-                TGLError("Failed to convert chromosome to integer at index %ld", (long)i);
-            }
-            long chrom_num = PyLong_AsLong(py_long);
-            std::string chrom_str = std::to_string(chrom_num);
-            chromid = chromkey.chrom2id(chrom_str.c_str());
-            if (chromid < 0) {
-                chrom_str = "chr" + std::to_string(chrom_num);
-                chromid = chromkey.chrom2id(chrom_str.c_str());
-            }
-            if (chromid < 0) {
-                TGLError("Unknown chromosome: %ld", chrom_num);
-            }
-        } else {
-            TGLError("Invalid chromosome type at index %ld", (long)i);
-        }
+        int chromid = chromkey.chrom2id(py_chrom_name(chrom_val, i));
 
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
@@ -450,24 +426,7 @@ void convert_py_intervals_with_values(PyObject *py_intervals,
             TGLError("Failed to get interval values at index %ld", (long)i);
         }
 
-        int chromid = -1;
-        if (PyUnicode_Check(chrom_val)) {
-            const char *chrom_name = PyUnicode_AsUTF8(chrom_val);
-            chromid = chromkey.chrom2id(chrom_name);
-            if (chromid < 0) TGLError("Unknown chromosome: %s", chrom_name);
-        } else if (PyNumber_Check(chrom_val)) {
-            PMPY py_long(PyNumber_Long(chrom_val), true);
-            long chrom_num = PyLong_AsLong(py_long);
-            std::string chrom_str = std::to_string(chrom_num);
-            chromid = chromkey.chrom2id(chrom_str.c_str());
-            if (chromid < 0) {
-                chrom_str = "chr" + std::to_string(chrom_num);
-                chromid = chromkey.chrom2id(chrom_str.c_str());
-            }
-            if (chromid < 0) TGLError("Unknown chromosome: %ld", chrom_num);
-        } else {
-            TGLError("Invalid chromosome type at index %ld", (long)i);
-        }
+        int chromid = chromkey.chrom2id(py_chrom_name(chrom_val, i));
 
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);

@@ -318,8 +318,8 @@ def test_r_cartesian_grid_band(_init_db):
     assert len(band_filtered) <= len(grid)
 
     # R: expect_error(giterator.intervals(..., band=c(1,1)))
-    # In pymisha: _validate_band raises ValueError when d1 == d2.
-    with pytest.raises(ValueError, match="d1.*must be less than d2|d2.*must be greater"):
+    # In pymisha: _validate_band raises R's error when d1 == d2.
+    with pytest.raises(ValueError, match="Invalid band argument: distance1 exceeds distance2"):
         from pymisha.extract import _validate_band
         _validate_band((1, 1))
 

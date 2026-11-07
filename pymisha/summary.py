@@ -13,8 +13,12 @@ from ._log import get_logger
 from ._safe_eval import UnsafeExpressionError, compile_safe_expression
 from ._shared import (
     CONFIG,
+    _check_breaks,
+    _check_breaks_na,
+    _check_flag,
     _checkroot,
     _chunk_slices,
+    _config_limit,
     _config_no_mt,
     _df2pymisha,
     _numpy,
@@ -23,6 +27,7 @@ from ._shared import (
     _progress_context,
     _pymisha,
     _pymisha2df,
+    _refuse_unsupported_2d_iterator,
     _track_names_set,
 )
 from ._types import Iterator
@@ -74,7 +79,7 @@ def gdist(
     iterator: Iterator | str = None,
     band: tuple[int, int] | None = None,
     dataframe: bool = False,
-    names: list[str] | None = None,
+    names: str | list[str] | None = None,
     vars: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> np.ndarray | pd.DataFrame:
@@ -103,7 +108,7 @@ def gdist(
         Track expression band (not yet supported).
     dataframe : bool, default False
         If True, return a DataFrame instead of an N-dimensional array.
-    names : list of str, optional
+    names : str or list of str, optional
         Column names for the expressions in the returned DataFrame
         (only relevant when dataframe=True).
     vars : dict, optional
@@ -147,15 +152,18 @@ def gdist(
         raise ValueError("gdist requires pairs of (expression, breaks) arguments")
 
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
+    if isinstance(names, str):
+        names = [names]
 
     # Capture caller namespace for user variable resolution
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
+        from .intervals import _whole_genome_2d
         _str_exprs = [a for a in args if isinstance(a, str)]
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(_str_exprs, iterator) else gintervals_all()
+        intervals = _whole_genome_2d() if _expr_is_2d(_str_exprs, iterator) else gintervals_all()
 
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gdist")
@@ -173,12 +181,7 @@ def gdist(
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
             raise ValueError(f"Breaks at position {i + 1} must be 1D array")
-        if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
-
-        # Validate breaks are strictly increasing
-        if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
+        _check_breaks(breaks)
 
         exprs.append(expr)
         breaks_list.append(breaks.tolist())
@@ -286,26 +289,23 @@ def _gdist_band_path(
     """Compute distribution from 2D extraction with band filter."""
     counts = _numpy.zeros(n_bins, dtype=_numpy.int64)
 
-    for i, expr in enumerate(exprs):
-        result = gextract(expr, intervals, iterator=iterator, band=band, progress=progress,
-                          progress_desc=progress_desc)
-        if result is None or len(result) == 0:
-            continue
+    # All the expressions are extracted together, so each iterator interval
+    # gives one value per expression.
+    value_cols = [f"v{i}" for i in range(len(exprs))]
+    result = gextract(list(exprs), intervals, iterator=iterator, band=band, colnames=value_cols,
+                      progress=progress, progress_desc=progress_desc)
+    if result is None or len(result) == 0:
+        return counts
 
-        data_cols = [c for c in result.columns if c not in _INTERVAL_META_COLS]
-        if not data_cols:
-            continue
-        values = result[data_cols[0]].to_numpy(dtype=float, copy=False)
-        bin_idx = _bin_values(values, _numpy.asarray(breaks_list[i], dtype=float), include_lowest)
-
-        # Single-dim: accumulate directly
-        if len(exprs) == 1:
-            valid_idx = bin_idx[bin_idx >= 0]
-            if valid_idx.size:
-                counts += _numpy.bincount(valid_idx, minlength=counts.shape[0])
-        else:
-            # Multi-dim would require co-extraction which 2D doesn't support yet
-            raise NotImplementedError("Multi-expression gdist with band is not yet supported")
+    bin_idx = [
+        _bin_values(result[col].to_numpy(dtype=float, copy=False),
+                    _numpy.asarray(breaks, dtype=float), include_lowest)
+        for col, breaks in zip(value_cols, breaks_list, strict=True)
+    ]
+    valid = _numpy.logical_and.reduce([idx >= 0 for idx in bin_idx])
+    if valid.any():
+        flat = _numpy.ravel_multi_index(tuple(idx[valid] for idx in bin_idx), counts.shape)
+        counts += _numpy.bincount(flat, minlength=counts.size).reshape(counts.shape)
 
     return counts
 
@@ -652,7 +652,8 @@ def _gsummary_vtrack_streaming(
                 # Parallel Welford merge: combine chunk stats with global stats.
                 chunk_count = int(valid.size)
                 chunk_mean = float(_numpy.mean(valid))
-                chunk_m2 = float(_numpy.sum((valid - chunk_mean) ** 2))
+                with _numpy.errstate(invalid="ignore"):  # an infinite value: inf - inf, a NaN sd as R
+                    chunk_m2 = float(_numpy.sum((valid - chunk_mean) ** 2))
                 if valid_count == 0:
                     valid_count = chunk_count
                     running_mean = chunk_mean
@@ -781,9 +782,8 @@ def _gquantiles_vtrack_streaming(
 
     n_rows = len(iter_df)
     chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
-    sample_cap = int(CONFIG.get("max_data_size", 10000000) or 10000000)  # type: ignore[call-overload]
-    if sample_cap <= 0:
-        sample_cap = 1
+    # each row gives one value: a reservoir as large as the rows keeps them all
+    sample_cap = min(_config_limit("max_data_size"), n_rows)
 
     allowed_names = {
         "np",
@@ -1023,8 +1023,8 @@ def gsummary(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1085,6 +1085,17 @@ def gsummary(
         progress_desc=progress_desc,
         user_vars=user_vars,
     )
+
+
+def _percentiles_arg(percentiles: Any) -> np.ndarray:
+    """The percentiles as a float array, each in [0, 1] as R checks: a NaN, None
+    or pd.NA is not."""
+    vals = _numpy.ravel(_numpy.asarray(percentiles, dtype=object))
+    pct = _numpy.array([_numpy.nan if v is None or v is _pandas.NA else v for v in vals], dtype=float)
+    bad = ~((pct >= 0) & (pct <= 1))
+    if bad.any():
+        raise ValueError(f"Percentile ({pct[bad][0]:g}) is not in [0, 1] range")
+    return pct
 
 
 def gquantiles(
@@ -1150,8 +1161,8 @@ def gquantiles(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     intervals = _maybe_load_2d_intervals_set(intervals, [expr], iterator, band)
@@ -1173,11 +1184,7 @@ def gquantiles(
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gquantiles")
 
-    pct = _numpy.asarray(percentiles, dtype=float)
-    if pct.ndim == 0:
-        pct = pct.reshape(1)
-    if _numpy.any((pct < 0) | (pct > 1)):
-        raise ValueError("percentiles must be within [0, 1]")
+    pct = _percentiles_arg(percentiles)
 
     # Band or 2D intervals require extract-then-quantile path
     if band is not None or _is_2d_intervals(intervals):
@@ -1351,17 +1358,25 @@ def gintervals_summary(
                     # squared deviations from each interval's mean: R misha 5.15's accurate
                     # Std dev (the one-pass sum(x^2) - N*mean^2 cancels for large values)
                     sub["_sq"] = (sub[col] - sub.groupby("intervalID")[col].transform("mean")) ** 2
+                    sub["_inf"] = _numpy.isinf(sub[col].to_numpy(dtype=float))
                     grouped = sub.groupby("intervalID")
                     total_counts = grouped.size()
                     stats = grouped[col].agg(["min", "max", "sum", "mean", "count"])
                     sumsq = grouped["_sq"].sum()
                     idx = total_counts.index.to_numpy(dtype=int) - 1
                     cnt = stats["count"].to_numpy(dtype=float)
-                    ssum = stats["sum"].to_numpy(dtype=float)
-                    ssq = sumsq.to_numpy(dtype=float)
+                    ssum = stats["sum"].to_numpy(dtype=float, copy=True)
+                    ssq = sumsq.to_numpy(dtype=float, copy=True)
+                    # an infinite value makes the standard deviation NaN, as R's sd() (the
+                    # grouped sum above skips the NaN that inf - inf gives)
+                    ssq[grouped["_inf"].any().to_numpy(dtype=bool)] = _numpy.nan
                     # unbiased: sqrt(sum((x-mean)^2) / (N-1)); a single value gives 0/0 = NaN, as R
                     with _numpy.errstate(invalid="ignore", divide="ignore"):
                         std = _numpy.sqrt(ssq / (cnt - 1.0))
+                    # an interval with no value has a NaN sum and standard deviation, as R
+                    # (the grouped sums above give 0 for it)
+                    ssum[cnt == 0] = _numpy.nan
+                    std[cnt == 0] = _numpy.nan
                     out.iloc[idx, out.columns.get_loc("Total intervals")] = total_counts.to_numpy(dtype=float)
                     out.iloc[idx, out.columns.get_loc("NaN intervals")] = total_counts.to_numpy(dtype=float) - cnt
                     out.iloc[idx, out.columns.get_loc("Min")] = stats["min"].to_numpy(dtype=float)
@@ -1429,6 +1444,7 @@ def gintervals_quantiles(
     _checkroot()
 
     intervals = _maybe_load_intervals_set(intervals)
+    _refuse_unsupported_2d_iterator(expr, intervals, iterator)
     orig_intervals = intervals
     orig_iterator = iterator
 
@@ -1439,11 +1455,7 @@ def gintervals_quantiles(
     progress = kwargs.get("progress")
     progress_desc = kwargs.get("progress_desc", "gintervals_quantiles")
 
-    pct = _numpy.asarray(percentiles, dtype=float)
-    if pct.ndim == 0:
-        pct = pct.reshape(1)
-    if _numpy.any((pct < 0) | (pct > 1)):
-        raise ValueError("percentiles must be within [0, 1]")
+    pct = _percentiles_arg(percentiles)
 
     pct_names = _percentile_colnames(pct)
 
@@ -1592,20 +1604,22 @@ def gpartition(
     from .intervals import gintervals_all
 
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
 
     if breaks is None:
         raise ValueError("gpartition requires breaks argument")
 
-    # tolist() gives Python numbers; list() of an int array gives np.int64,
-    # which the C++ side rejects.
-    breaks_list = breaks.tolist() if isinstance(breaks, np.ndarray) else list(breaks)
-    if len(breaks_list) < 2:
+    breaks_arr = _numpy.asarray(breaks, dtype=float)
+    if breaks_arr.size < 2:
         raise ValueError("gpartition requires at least 2 break values (for 1 bin)")
+    _check_breaks_na(breaks_arr)
+    # tolist() gives Python floats; the C++ side rejects numpy scalars
+    breaks_list = breaks_arr.tolist()
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
     band = kwargs.get("band")
@@ -1741,8 +1755,8 @@ def gsample(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr, iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d(expr, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -1781,7 +1795,7 @@ def gcor(
     band: tuple[int, int] | None = None,
     method: str = "pearson",
     details: bool = False,
-    names: list[str] | None = None,
+    names: str | list[str] | None = None,
 ) -> np.ndarray | pd.DataFrame | None:
     """
     Compute correlation between pairs of track expressions.
@@ -1813,7 +1827,7 @@ def gcor(
         If ``True``, return a DataFrame with full statistics (cor, cov,
         mean1, mean2, sd1, sd2, n, n.na) for Pearson, or (n, n.na, cor) for
         Spearman methods, instead of just correlation values.
-    names : list of str, optional
+    names : str or list of str, optional
         Names for each correlation pair.  If ``None``, names are generated
         as ``"expr1~expr2"``.
 
@@ -1856,6 +1870,8 @@ def gcor(
     gsummary, gextract
     """
     _checkroot()
+    if isinstance(names, str):
+        names = [names]
 
     expr_list = list(exprs)
     if len(expr_list) < 2:
@@ -1872,8 +1888,8 @@ def gcor(
 
     if intervals is None:
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d(expr_list, iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d(expr_list, iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -1885,6 +1901,8 @@ def gcor(
         # pm_cor has no virtual tracks; the gextract-based computation does
         result = _gcor_2d(expr_list, intervals, iterator, None, method)
     else:
+        # A track or interval-set name as the iterator, as R accepts it
+        intervals, iterator, _ = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
         result = _pymisha.pm_cor(
             expr_list,
             _df2pymisha(intervals),
@@ -1966,9 +1984,9 @@ def _gcor_2d(
             i = j
         return ranks
 
-    def _var(sx: float, sx2: float, n: float) -> float:
-        var = (sx2 - sx * sx / n) / (n - 1)
-        return 0.0 if -1e-12 < var < 0 else var
+    def _sq_dev(d: np.ndarray, e: np.ndarray, n: float) -> float:
+        # sum((d - mean(d)) * (e - mean(e)))
+        return float((d * e).sum() - d.sum() * e.sum() / n)
 
     out: list[dict[str, float]] = []
     for i in range(0, len(cols), 2):
@@ -1981,24 +1999,28 @@ def _gcor_2d(
         if method != "pearson":
             d["cor"] = _numpy.nan
             if nn >= 2:
+                # two passes (means first), as R's pearson_from_values
                 rx, ry = _ranks(x), _ranks(y)
-                vx = _var(rx.sum(), (rx * rx).sum(), nn)
-                vy = _var(ry.sum(), (ry * ry).sum(), nn)
-                if vx > 0 and vy > 0:
-                    cov = ((rx * ry).sum() - rx.sum() * ry.sum() / nn) / (nn - 1)
-                    d["cor"] = cov / (_numpy.sqrt(vx) * _numpy.sqrt(vy))
+                rx, ry = rx - rx.mean(), ry - ry.mean()
+                sxx, syy = float((rx * rx).sum()), float((ry * ry).sum())
+                if sxx > 0 and syy > 0:
+                    d["cor"] = float((rx * ry).sum()) / (_numpy.sqrt(sxx) * _numpy.sqrt(syy))
             out.append(d)
             continue
         d.update({"mean1": _numpy.nan, "mean2": _numpy.nan, "sd1": _numpy.nan, "sd2": _numpy.nan,
                   "cov": _numpy.nan, "cor": _numpy.nan})
         if nn > 0:
-            sx, sy = x.sum(), y.sum()
-            d["mean1"], d["mean2"] = sx / nn, sy / nn
+            d["mean1"], d["mean2"] = x.sum() / nn, y.sum() / nn
             if nn >= 2:
-                v1, v2 = _var(sx, (x * x).sum(), nn), _var(sy, (y * y).sum(), nn)
-                sd1 = _numpy.sqrt(v1) if v1 >= 0 else _numpy.nan
-                sd2 = _numpy.sqrt(v2) if v2 >= 0 else _numpy.nan
-                cov = ((x * y).sum() - sx * sy / nn) / (nn - 1)
+                # shifted by the first pair, as R's CorSummary: unshifted sums of squares
+                # cancel when the variance is small relative to mean^2
+                with _numpy.errstate(invalid="ignore"):
+                    dx, dy = x - x[0], y - y[0]
+                    sxx, syy, sxy = _sq_dev(dx, dx, nn), _sq_dev(dy, dy, nn), _sq_dev(dx, dy, nn)
+                # rounding can leave a tiny negative sum of squared deviations; NaN (Inf values) is kept
+                sd1 = _numpy.sqrt((0.0 if sxx < 0 else sxx) / (nn - 1))
+                sd2 = _numpy.sqrt((0.0 if syy < 0 else syy) / (nn - 1))
+                cov = sxy / (nn - 1)
                 d["sd1"], d["sd2"], d["cov"] = sd1, sd2, cov
                 if sd1 > 0 and sd2 > 0:
                     d["cor"] = cov / (sd1 * sd2)
@@ -2028,10 +2050,7 @@ def _parse_bin_args(args: tuple[str | np.ndarray | list[float], ...]) -> tuple[l
         brk = _numpy.asarray(args[i + 1], dtype=float)
         if brk.ndim != 1:
             raise ValueError(f"Breaks at position {i + 1} must be 1D")
-        if len(brk) < 2:
-            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
-        if not _numpy.all(_numpy.diff(brk) > 0):
-            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
+        _check_breaks(brk)
         bin_exprs.append(expr)
         breaks_list.append(brk)
     return bin_exprs, breaks_list
@@ -2119,6 +2138,7 @@ def gbins_summary(
     gsummary, gintervals_summary, gdist
     """
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
 
     bin_exprs, breaks_list = _parse_bin_args(args)
 
@@ -2128,8 +2148,8 @@ def gbins_summary(
     if intervals is None:
         # R's .misha$ALLGENOME: the 2D genome when the iterator is 2D
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -2240,7 +2260,9 @@ def gbins_summary(
         has_multiple = valid_count > 1
         if _numpy.any(has_multiple):
             # Compute sum of (x - mean)^2 per bin
-            deviations = vals_valid - mean_per_bin[flat_valid]
+            # an infinite value gives inf - inf = NaN, so a NaN standard deviation as R's sd()
+            with _numpy.errstate(invalid="ignore"):
+                deviations = vals_valid - mean_per_bin[flat_valid]
             sq_dev_per_bin = _numpy.bincount(flat_valid, weights=deviations**2, minlength=total_flat_bins)
             std_per_bin[has_multiple] = _numpy.sqrt(sq_dev_per_bin[has_multiple] / (valid_count[has_multiple] - 1))
         result_flat[:, 6] = std_per_bin
@@ -2296,23 +2318,20 @@ def gbins_quantiles(
     gquantiles, gintervals_quantiles, gdist
     """
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
 
     bin_exprs, breaks_list = _parse_bin_args(args)
 
     if expr is None:
         expr = bin_exprs[0]
 
-    pct = _numpy.asarray(percentiles, dtype=float)
-    if pct.ndim == 0:
-        pct = pct.reshape(1)
-    if _numpy.any((pct < 0) | (pct > 1)):
-        raise ValueError("percentiles must be within [0, 1]")
+    pct = _percentiles_arg(percentiles)
 
     if intervals is None:
         # R's .misha$ALLGENOME: the 2D genome when the iterator is 2D
         from .expr import _expr_is_2d
-        from .intervals import _gintervals_2d_all
-        intervals = _gintervals_2d_all("full") if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
+        from .intervals import _whole_genome_2d
+        intervals = _whole_genome_2d() if _expr_is_2d([*bin_exprs, expr], iterator) else gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
 

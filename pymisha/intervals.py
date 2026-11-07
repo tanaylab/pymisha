@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import math
+import numbers
 import os
 import re
 import shutil
@@ -31,7 +33,12 @@ from ._log import get_logger
 from ._name_validation import validate_dotted_name
 from ._shared import (
     CONFIG,
+    _check_flag,
+    _check_intervals_strand,
+    _check_strand_column,
     _checkroot,
+    _chrom_names,
+    _config_limit,
     _config_no_mt,
     _df2pymisha,
     _numpy,
@@ -41,8 +48,11 @@ from ._shared import (
     _pymisha,
     _pymisha2df,
     _refuse_dataset_order,
+    _refuse_unsupported_2d_iterator,
     _remap_interval_ids,
     _sort_by_chrom,
+    _str2strand_values,
+    _verify_iterator_dim,
 )
 
 _logger = get_logger(__name__)
@@ -631,7 +641,9 @@ def gintervals_2d_all(mode: str | None = None) -> pd.DataFrame:
 
     On a genome with more than ``CONFIG["multicontig_2d_threshold"]``
     chromosomes (100 by default, R's ``gmulticontig.2d.threshold``) R
-    returns only the intra-chromosomal pairs, and so does the default here.
+    returns the pairs of ``CONFIG["multicontig_2d_mode"]`` (R's
+    ``gmulticontig.2d.mode``), and, when it is not set, only the
+    intra-chromosomal pairs, with a warning; so does the default here.
 
     Parameters
     ----------
@@ -675,14 +687,58 @@ def gintervals_2d_all(mode: str | None = None) -> pd.DataFrame:
     n = len(intervals)
     threshold = int(cast("int", CONFIG.get("multicontig_2d_threshold", 100)))
     if mode is None:
-        mode = "full" if n <= threshold else "diagonal"
-    elif mode == "full" and n > threshold:
+        if n <= threshold:
+            mode = "full"
+        else:
+            mode = _multicontig_2d_mode() or "diagonal"
+            if CONFIG.get("multicontig_2d_mode") is None:
+                warnings.warn(
+                    f"The database has more than CONFIG['multicontig_2d_threshold'] ({threshold}) contigs: "
+                    "gintervals_2d_all() returns the cis chromosome pairs only. Set "
+                    "CONFIG['multicontig_2d_mode'] = \"full\" for all chromosome pairs.",
+                    stacklevel=2,
+                )
+    if mode == "full" and n > threshold:
         warnings.warn(
             f"Generating full 2D genome with {n} contigs ({n * n} pairs). "
             "This may take time and use significant memory.",
             stacklevel=2,
         )
     return _gintervals_2d_all(mode, intervals)
+
+
+# The error of a 2D computation over the whole-genome 2D scope, which is not built by default
+# above CONFIG["multicontig_2d_threshold"] contigs (R's DEFERRED_2D_SCOPE_MSG)
+_DEFERRED_2D_SCOPE_MSG = (
+    "The whole-genome 2D scope of a database with more than CONFIG['multicontig_2d_threshold'] contigs is not "
+    "built by default, and a 2D computation over it would miss the trans chromosome pairs. Set "
+    "CONFIG['multicontig_2d_mode'] = \"full\" for all chromosome pairs, CONFIG['multicontig_2d_mode'] = "
+    "\"diagonal\" for the cis pairs only, or give the 2D intervals explicitly."
+)
+
+
+def _multicontig_2d_mode() -> str | None:
+    """CONFIG["multicontig_2d_mode"], checked: "full", "diagonal" or None (unset)."""
+    mode = CONFIG.get("multicontig_2d_mode")
+    if mode is not None and mode not in ("diagonal", "full"):
+        raise ValueError(f"Unknown 2D generation mode: {mode}. Must be 'diagonal' or 'full'")
+    return cast("str | None", mode)
+
+
+def _whole_genome_2d(cis: bool = False) -> pd.DataFrame:
+    """The whole-genome 2D scope of a 2D computation given no intervals (R's
+    ``.misha$ALLGENOME``): every chromosome pair. Above CONFIG["multicontig_2d_threshold"]
+    contigs it is built in CONFIG["multicontig_2d_mode"], and without that it is an error
+    (R's ``.gintervals.2d.whole_genome``): its cis pairs alone would miss the trans ones.
+    With cis, only its cis pairs, for a caller that uses no others."""
+    intervals = gintervals_all()
+    mode = "full"
+    if len(intervals) > int(cast("int", CONFIG.get("multicontig_2d_threshold", 100))):
+        mode_set = _multicontig_2d_mode()
+        if mode_set is None:
+            raise ValueError(_DEFERRED_2D_SCOPE_MSG)
+        mode = mode_set
+    return _gintervals_2d_all("diagonal" if cis else mode, intervals)
 
 
 def _gintervals_2d_all(mode: str, intervals: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -764,11 +820,11 @@ def gintervals_2d_band_intersect(
 
     if band is None:
         raise ValueError("band cannot be None")
-    if len(band) != 2:
-        raise ValueError("band must be a pair (d1, d2)")
-    d1, d2 = int(band[0]), int(band[1])
-    if d1 >= d2:
-        raise ValueError(f"band d1 ({d1}) must be less than d2 ({d2})")
+    from .extract import _validate_band
+
+    band_t = _validate_band(band)
+    assert band_t is not None
+    d1, d2 = band_t
 
     if len(intervals) == 0:
         result = intervals.copy()
@@ -930,12 +986,16 @@ def _verify_2d_intervals(intervals: pd.DataFrame) -> None:
     ``gintervals_2d_intersect``/``_union``/``_band_intersect`` operate on
     rectangle frames without requiring a genome-registered chrom name.
     """
-    if intervals is None or len(intervals) == 0:
+    if intervals is None:
+        return
+    if not all(c in intervals.columns for c in ("chrom1", "start1", "end1", "chrom2", "start2", "end2")):
+        raise ValueError("Invalid format of intervals: column names do not match neither 1d nor 2d intervals")
+    if len(intervals) == 0:
         return
 
     np = _numpy
-    chrom1 = intervals['chrom1'].astype(str).to_numpy()
-    chrom2 = intervals['chrom2'].astype(str).to_numpy()
+    chrom1 = _chrom_names(intervals['chrom1'], 'chrom1').to_numpy()
+    chrom2 = _chrom_names(intervals['chrom2'], 'chrom2').to_numpy()
     start1 = pd.to_numeric(intervals['start1'], errors='coerce').to_numpy(dtype='float64')
     end1 = pd.to_numeric(intervals['end1'], errors='coerce').to_numpy(dtype='float64')
     start2 = pd.to_numeric(intervals['start2'], errors='coerce').to_numpy(dtype='float64')
@@ -1475,7 +1535,7 @@ def _sort_intervals_df(df: pd.DataFrame) -> pd.DataFrame:
         return df.reset_index(drop=True)
     allchroms = gintervals_all()["chrom"].astype(str).tolist()
     chrom_order = {c: i for i, c in enumerate(allchroms)}
-    chromid = df["chrom"].astype(str).map(
+    chromid = _chrom_names(df["chrom"]).astype(str).map(
         lambda c: chrom_order.get(c, len(chrom_order))
     )
     df = df.assign(_chromid=chromid)
@@ -1873,7 +1933,7 @@ def gintervals_force_range(
         to an empty interval after clamping. Mirrors R's vectorized
         ``pmax``/``pmin`` fast path instead of looping per row.
         """
-        chrom_vals = chrom_series.astype(str).tolist()
+        chrom_vals = _chrom_names(chrom_series, str(chrom_series.name)).tolist()
         # each name on its own, so an unknown one (left as given; the map below drops
         # it) does not keep an alias such as "1" from naming chr1, as in R misha 5.15
         uniq = list(dict.fromkeys(chrom_vals))
@@ -2051,6 +2111,8 @@ def gintervals_union(
     assert isinstance(intervals2, pd.DataFrame)
     if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
         raise ValueError("Expecting 1D intervals while receiving 2D intervals")  # as R
+    _check_intervals_strand(intervals1)
+    _check_intervals_strand(intervals2)
 
     if len(intervals1) == 0 and len(intervals2) == 0:
         return None
@@ -2126,6 +2188,8 @@ def gintervals_intersect(
         raise ValueError("Cannot intersect 1D intervals with 2D intervals")  # as R
     if is2d1:
         return gintervals_2d_intersect(intervals1, intervals2)
+    _check_intervals_strand(intervals1)
+    _check_intervals_strand(intervals2)
 
     if len(intervals1) == 0 or len(intervals2) == 0:
         return None
@@ -2191,6 +2255,8 @@ def gintervals_diff(
     assert isinstance(intervals2, pd.DataFrame)
     if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
         raise ValueError("Expecting 1D intervals while receiving 2D intervals")  # as R
+    _check_intervals_strand(intervals1)
+    _check_intervals_strand(intervals2)
 
     if len(intervals1) == 0:
         return None
@@ -2277,6 +2343,13 @@ def gintervals_canonic(
 
     _checkroot()
 
+    if _is_2d_intervals_df(intervals):
+        return _gintervals_canonic_2d(intervals)
+
+    # the strand is not used, but as in R a boolean column, a missing strand or a bad label
+    # is an error
+    _check_intervals_strand(intervals)
+
     # Use C++ for the heavy lifting (sort + merge + mapping)
     cpp_result = _pymisha.pm_intervals_canonic(
         _intervals_to_cpp(intervals),
@@ -2294,6 +2367,33 @@ def gintervals_canonic(
     result = _pandas.DataFrame(result_dict)
     # 1-based, as R's "mapping" attribute
     result.attrs['mapping'] = _numpy.asarray(mapping, dtype=_numpy.int64) + 1
+    return result
+
+
+def _gintervals_canonic_2d(intervals: pd.DataFrame) -> pd.DataFrame:
+    """R's gintervals.canonic of 2D intervals: nothing is merged, the intervals are
+    sorted by chromosome pair as R sorts them and must not overlap. Only the six
+    coordinate columns are kept, and ``mapping`` gives each input row its 1-based
+    row in the result."""
+    np = _numpy
+    _verify_2d_intervals(intervals)
+    n = len(intervals)
+    cols: dict[str, Any] = {}
+    cids = []
+    for k in ("1", "2"):
+        chroms = _normalize_chroms(_chrom_names(intervals[f"chrom{k}"], f"chrom{k}").tolist())
+        codes, uniques = _pandas.factorize(np.asarray(chroms, dtype=object))
+        cids.append(np.asarray(_pymisha.pm_chrom_ids(list(uniques)), dtype=np.int64)[codes])
+        cols[f"chrom{k}"] = np.asarray(chroms, dtype=object)
+        cols[f"start{k}"] = intervals[f"start{k}"].to_numpy(dtype=np.int64)
+        cols[f"end{k}"] = intervals[f"end{k}"].to_numpy(dtype=np.int64)
+    order = np.asarray(_pymisha.pm_r_2d_sort_order(cids[0], cids[1]), dtype=np.int64)
+    result = _pandas.DataFrame({c: cols[c][order] for c in ("chrom1", "start1", "end1", "chrom2", "start2", "end2")})
+    _pymisha.pm_verify_no_overlaps_2d(cids[0][order], result["start1"].to_numpy(), result["end1"].to_numpy(),
+                                      cids[1][order], result["start2"].to_numpy(), result["end2"].to_numpy())
+    mapping = np.empty(n, dtype=np.int64)
+    mapping[order] = np.arange(1, n + 1)
+    result.attrs['mapping'] = mapping
     return result
 
 
@@ -2334,6 +2434,7 @@ def gintervals_covered_bp(intervals: pd.DataFrame | str, src: pd.DataFrame | str
     gintervals : Create a set of 1D intervals.
     """
     intervals = _resolve_intervals(intervals)
+    _check_intervals_strand(intervals)
     if src is not None:
         src = _resolve_intervals(src)
         intervals = gintervals_intersect(intervals, src)
@@ -2393,6 +2494,8 @@ def gintervals_coverage_fraction(
     intervals1 = _resolve_intervals(intervals1)
     if intervals2 is not None:
         intervals2 = _resolve_intervals(intervals2)
+    _check_intervals_strand(intervals1)
+    _check_intervals_strand(intervals2)
     if intervals1 is None:
         raise ValueError("intervals1 cannot be None")
     if len(intervals1) == 0:
@@ -2590,8 +2693,8 @@ def _neighbors_2d(
             return ta1 - qa2
         return 0
 
-    c1q = i1["chrom1"].astype(str).to_numpy()
-    c2q = i1["chrom2"].astype(str).to_numpy()
+    c1q = _chrom_names(i1["chrom1"], "chrom1").to_numpy()
+    c2q = _chrom_names(i1["chrom2"], "chrom2").to_numpy()
     qx1 = i1["start1"].to_numpy(np.int64)
     qx2 = i1["end1"].to_numpy(np.int64)
     qy1 = i1["start2"].to_numpy(np.int64)
@@ -2822,11 +2925,15 @@ def gintervals_neighbors(
     if intervals2 is None:
         raise ValueError("intervals2 cannot be None")
 
+    maxneighbors = _maxneighbors_arg(maxneighbors)
+    _check_flag(na_if_notfound, "na_if_notfound")
+    _check_flag(use_intervals1_strand, "use_intervals1_strand")
+
     if _is_2d_intervals_df(intervals1) or _is_2d_intervals_df(intervals2):
         if not (_is_2d_intervals_df(intervals1) and _is_2d_intervals_df(intervals2)):
             raise ValueError("Cannot intermix 1D and 2D intervals")
-        if maxneighbors < 1:
-            raise ValueError("maxneighbors must be >= 1")
+        mindist1, maxdist1 = _dist_arg(mindist1, "mindist1"), _dist_arg(maxdist1, "maxdist1")
+        mindist2, maxdist2 = _dist_arg(mindist2, "mindist2"), _dist_arg(maxdist2, "maxdist2")
         if mindist1 > maxdist1 or mindist2 > maxdist2:
             raise ValueError("mindist exceeds maxdist")
         # R returns NULL when an upper bound is negative.
@@ -2848,9 +2955,7 @@ def gintervals_neighbors(
         # that rather than erroring so R-script ports work.
         pass
 
-    if maxneighbors < 1:
-        raise ValueError("maxneighbors must be >= 1")
-
+    mindist, maxdist = _dist_arg(mindist, "mindist"), _dist_arg(maxdist, "maxdist")
     if mindist > maxdist:
         raise ValueError("mindist must be <= maxdist")
 
@@ -2868,14 +2973,33 @@ def gintervals_neighbors(
             stacklevel=2,
         )
 
-    strand_col = None  # (position, original values) of a strand column given as labels
-    if use_intervals1_strand and isinstance(intervals1, _pandas.DataFrame) and "strand" in intervals1.columns:
+    # as R reads both sets: a boolean strand column, a missing strand or a label other than
+    # "+", "-", ".", "*" or "" is an error whether or not the strand is used
+    labels = []
+    for df in (intervals1, intervals2):
+        lab = None
+        if isinstance(df, _pandas.DataFrame) and "strand" in df.columns:
+            _check_strand_column(df["strand"])
+            lab = _str2strand_values(df["strand"])
+        labels.append(lab)
+
+    # The C++ reads numeric strands: labels are passed as numbers and each output row gets
+    # its own label back through __pm_row (intervals1) or __pm_row2 (intervals2).
+    strand_col = None  # (position, row column position, original values) of intervals1's labels
+    if isinstance(intervals1, _pandas.DataFrame) and "strand" in intervals1.columns:
         orig = intervals1["strand"]
-        mapped = _r_strand_values(orig)
+        if use_intervals1_strand:
+            mapped = _r_strand_values(orig)
+        else:
+            mapped = orig if labels[0] is None else _pandas.Series(labels[0], index=orig.index)
         if mapped is not orig:
-            # the C++ reads +-1; each output row gets its query's own label back through __pm_row
             strand_col = (list(intervals1.columns).index("strand"), len(intervals1.columns), orig)
             intervals1 = intervals1.assign(strand=mapped, __pm_row=_numpy.arange(len(intervals1)))
+    strand_col2 = None  # the same for intervals2, whose strand signs the distance
+    if labels[1] is not None:
+        orig2 = intervals2["strand"]
+        strand_col2 = (list(intervals2.columns).index("strand"), len(intervals2.columns), orig2)
+        intervals2 = intervals2.assign(strand=labels[1], __pm_row2=_numpy.arange(len(intervals2)))
 
     if len(intervals1) == 0:
         if intervals_set_out is not None:
@@ -2887,9 +3011,9 @@ def gintervals_neighbors(
         return None
 
     # the database's chrom names in the output (chr1, not an alias such as "1"), as in R
-    intervals1 = intervals1.assign(chrom=_normalize_chroms(intervals1["chrom"].astype(str).tolist()))
+    intervals1 = intervals1.assign(chrom=_normalize_chroms(_chrom_names(intervals1["chrom"]).tolist()))
     if len(intervals2):
-        intervals2 = intervals2.assign(chrom=_normalize_chroms(intervals2["chrom"].astype(str).tolist()))
+        intervals2 = intervals2.assign(chrom=_normalize_chroms(_chrom_names(intervals2["chrom"]).tolist()))
 
     result = _pymisha.pm_find_neighbors(
         _df2pymisha(intervals1),
@@ -2902,6 +3026,15 @@ def gintervals_neighbors(
     )
 
     df = _pymisha2df(result)
+    if strand_col2 is not None and df is not None:
+        n1 = len(intervals1.columns)
+        pos, row_pos, orig = n1 + strand_col2[0], n1 + strand_col2[1], strand_col2[2]
+        rows = df.iloc[:, row_pos].to_numpy(dtype=float)  # -1 (or NaN) where a query has no neighbor
+        found = rows >= 0
+        vals = _numpy.full(len(df), _numpy.nan, dtype=object)
+        vals[found] = orig.to_numpy(dtype=object)[rows[found].astype(_numpy.int64)]
+        df.isetitem(pos, _pandas.Series(vals, index=df.index, dtype=orig.dtype))
+        df = df.iloc[:, [i for i in range(df.shape[1]) if i != row_pos]]
     if strand_col is not None and df is not None:
         pos, row_pos, orig = strand_col
         rows = df.iloc[:, row_pos].to_numpy(dtype=_numpy.int64)
@@ -2938,11 +3071,10 @@ def gintervals_neighbors(
 
 def _r_strand_values(col: _pandas.Series) -> _pandas.Series:
     """A strand column as R's gintervals.neighbors reads it (get_strand_value):
-    labels (strings or a Categorical, read by its labels) "+"/"1" are 1,
-    "-"/"-1" are -1 and anything else, NA too, is 1; booleans are 1 / -1; numbers
-    must be -1 or 1. Returns *col* itself when it is already numeric."""
-    if col.dtype == bool:
-        return _pandas.Series(_numpy.where(col.to_numpy(), 1, -1), index=col.index)
+    labels (strings or a Categorical, read by its labels, already checked by
+    _str2strand_values) "-" is -1 and any other is 1, a number among them read as
+    its label ("-1" is -1); numbers must be -1 or 1. Returns *col* itself when it
+    is already numeric."""
     if isinstance(col.dtype, _pandas.CategoricalDtype) or col.dtype == object or _pandas.api.types.is_string_dtype(col):
         def label(v: Any) -> Any:  # a number's label is R's as.character of it ("-1", not "-1.0")
             return f"{v:g}" if isinstance(v, (int, float, _numpy.number)) and not isinstance(v, bool) else v
@@ -2954,6 +3086,35 @@ def _r_strand_values(col: _pandas.Series) -> _pandas.Series:
         v = vals[bad[0]]
         raise ValueError(f"Invalid strand value {v:g} at row {bad[0] + 1}. Strand must be -1 or 1.")
     return col
+
+
+def _maxneighbors_arg(maxneighbors: Any) -> int:
+    """gintervals_neighbors' maxneighbors: a number >= 1, truncated as R does; NA,
+    NaN or an infinite one is an error."""
+    if maxneighbors is None or maxneighbors is _pandas.NA:
+        raise ValueError("maxneighbors must be >= 1")
+    if isinstance(maxneighbors, (bool, _numpy.bool_)) or not isinstance(maxneighbors, numbers.Real):
+        raise ValueError("maxneighbors argument is not numeric")
+    if not math.isfinite(maxneighbors) or maxneighbors < 1:
+        raise ValueError("maxneighbors must be >= 1")
+    return int(float(maxneighbors))
+
+
+def _dist_arg(value: Any, name: str) -> float:
+    """A distance limit of gintervals_neighbors (mindist, maxdist, ...) as R reads it:
+    a single number, not NA. -inf, inf and anything beyond +-1e18 are no limit."""
+    if isinstance(value, (list, tuple, _numpy.ndarray, _pandas.Series)):
+        flat = _numpy.ravel(_numpy.asarray(value, dtype=object))
+        if flat.size != 1:
+            raise ValueError(f"{name} argument is not numeric")
+        value = flat[0]
+    if value is None or value is _pandas.NA:
+        raise ValueError(f"{name} argument is NA")
+    if isinstance(value, (bool, _numpy.bool_)) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} argument is not numeric")
+    if math.isnan(value):
+        raise ValueError(f"{name} argument is NA")
+    return max(-1e18, min(1e18, float(value)))
 
 
 def _is_2d_intervals_df(intervals: Any) -> bool:
@@ -3482,6 +3643,7 @@ def gintervals_chrom_sizes(intervals: pd.DataFrame | str) -> pd.DataFrame:
         if isinstance(resolved, str):
             raise ValueError(f"Interval set or track '{intervals}' does not exist")
         intervals = resolved
+    _check_intervals_strand(intervals)
 
     if intervals is None or len(intervals) == 0:
         return _pandas.DataFrame(columns=["chrom"])
@@ -3489,7 +3651,7 @@ def gintervals_chrom_sizes(intervals: pd.DataFrame | str) -> pd.DataFrame:
     # Count intervals per chromosome (1D) or chromosome pair (2D), as R does.
     if "chrom" in intervals.columns:
         return (
-            intervals.assign(chrom=intervals["chrom"].astype(str))
+            intervals.assign(chrom=_chrom_names(intervals["chrom"]).astype(str))
             .groupby("chrom", observed=True)
             .size()
             .reset_index(name="size")
@@ -3499,8 +3661,8 @@ def gintervals_chrom_sizes(intervals: pd.DataFrame | str) -> pd.DataFrame:
     if "chrom1" in intervals.columns:
         return (
             intervals.assign(
-                chrom1=intervals["chrom1"].astype(str),
-                chrom2=intervals["chrom2"].astype(str),
+                chrom1=_chrom_names(intervals["chrom1"], "chrom1").astype(str),
+                chrom2=_chrom_names(intervals["chrom2"], "chrom2").astype(str),
             )
             .groupby(["chrom1", "chrom2"], observed=True)
             .size()
@@ -3667,7 +3829,7 @@ def _intervset_loadable(
 
 def _normalize_chrom_column(df: pd.DataFrame, col: str) -> None:
     if col in df.columns:
-        df[col] = _normalize_chroms(df[col].astype(str).tolist())
+        df[col] = _normalize_chroms(_chrom_names(df[col], col).tolist())
         df[col] = _pandas.Series(df[col])
 
 
@@ -3861,7 +4023,7 @@ def gintervals_load(
             stats["chrom1"] = _normalize_chroms(stats["chrom1"].astype(str).tolist())
         if "chrom2" in stats.columns:
             stats["chrom2"] = _normalize_chroms(stats["chrom2"].astype(str).tolist())
-        max_size = cast("int | None", CONFIG.get("max_data_size"))
+        max_size = _config_limit("max_data_size")
         if "chrom" in stats.columns:
             if chrom1 is not None or chrom2 is not None:
                 raise ValueError(f"{intervals_set} is a 1D big intervals set. chrom1/chrom2 are for 2D only.")
@@ -4090,6 +4252,7 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     # Check if already exists
     if gintervals_exists(intervals_set):
         raise ValueError(f"Intervals set '{intervals_set}' already exists")
+    _check_intervals_strand(intervals)
 
     # written under the working directory (gdir_cd), as R misha does
     path_part = intervals_set.replace(".", "/")
@@ -4116,8 +4279,8 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
 
     if is_2d:
         # Normalize chromosome names
-        df["chrom1"] = _normalize_chroms(df["chrom1"].astype(str).tolist())
-        df["chrom2"] = _normalize_chroms(df["chrom2"].astype(str).tolist())
+        df["chrom1"] = _normalize_chroms(_chrom_names(df["chrom1"], "chrom1").tolist())
+        df["chrom2"] = _normalize_chroms(_chrom_names(df["chrom2"], "chrom2").tolist())
         # a point (start == end) is saved as 1 bp, as R's .gintervals.save_file does
         for a, b in (("start1", "end1"), ("start2", "end2")):
             df[b] = df[b].where(df[a] != df[b], df[b] + 1)
@@ -4137,7 +4300,7 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
             df[col] = df[col].astype(float)
     else:
         # Normalize chromosome names
-        df["chrom"] = _normalize_chroms(df["chrom"].astype(str).tolist())
+        df["chrom"] = _normalize_chroms(_chrom_names(df["chrom"]).tolist())
         # Sort by chrom, as R does (by chrom id)
         df = _sort_by_chrom(df, ["chrom"])
         # Convert chrom to categorical (R factor style)
@@ -4190,14 +4353,17 @@ def _replace_intervals_set(intervals: pd.DataFrame, intervals_set: str) -> None:
     rename it over the original. ``os.replace`` is atomic, so a crash at any
     point leaves either the old set or the new one, never nothing.
 
-    The old set's ``.iattr`` companion survives the rename, which is what R
-    does too - attributes describe the set, not its rows. A directory-backed
-    set still loses it with the rest of the directory, as it did before.
+    The set's attributes are kept, as R does - they describe the set, not its
+    rows: a small set's ``.iattr`` companion survives the rename, and those of
+    a directory-backed set (inside the directory) are written beside the small
+    set that replaces it.
     """
     from . import _shared
+    from .intervals_attr import _iattr_path, _iattr_read, _iattr_write
     assert _shared._GROOT is not None
 
     dest = Path(_shared._names_dir()) / f"{intervals_set.replace('.', '/')}.interv"
+    attrs = _iattr_read(_iattr_path(intervals_set)) if dest.is_dir() else {}
 
     # An underscore suffix (not a dotted one) keeps the temporary set a sibling
     # *file* of dest rather than a new dotted namespace, so the rename below
@@ -4229,6 +4395,9 @@ def _replace_intervals_set(intervals: pd.DataFrame, intervals_set: str) -> None:
                 _logger.warning("could not remove the temporary interval set %r", tmp_name,
                                 exc_info=True)
         raise
+
+    if attrs:
+        _iattr_write(dest.with_suffix(".iattr"), attrs)
 
     # tmp_name's registration now points at a path that no longer exists, and
     # dest may have been unregistered by the gintervals_rm above.
@@ -4277,8 +4446,9 @@ def gintervals_update(
     Raises
     ------
     ValueError
-        If intervals set does not exist, or no chrom/chrom1/chrom2 specified,
-        or wrong dimensionality (e.g. ``chrom`` on a 2D set).
+        If intervals set does not exist or belongs to a loaded dataset (not the
+        working database), or no chrom/chrom1/chrom2 specified, or wrong
+        dimensionality (e.g. ``chrom`` on a 2D set).
 
     See Also
     --------
@@ -4307,6 +4477,9 @@ def gintervals_update(
 
     if not gintervals_exists(intervals_set):
         raise ValueError(f"Intervals set '{intervals_set}' does not exist")
+    # written into the working database, so only a set of it (as gintervals_attr_set)
+    from .intervals_attr import _check_writable
+    _check_writable(intervals_set)
 
     # Load existing intervals to discover dimensionality.
     existing = gintervals_load(intervals_set)
@@ -4326,9 +4499,9 @@ def gintervals_update(
         if intervals is not None:
             new_df = intervals.copy()
             if "chrom1" in new_df.columns:
-                new_df["chrom1"] = _normalize_chroms(new_df["chrom1"].astype(str).tolist())
+                new_df["chrom1"] = _normalize_chroms(_chrom_names(new_df["chrom1"], "chrom1").tolist())
             if "chrom2" in new_df.columns:
-                new_df["chrom2"] = _normalize_chroms(new_df["chrom2"].astype(str).tolist())
+                new_df["chrom2"] = _normalize_chroms(_chrom_names(new_df["chrom2"], "chrom2").tolist())
             if len(kept) > 0 and len(new_df) > 0:
                 kept = _pandas.concat([kept, new_df], ignore_index=True)
             elif len(new_df) > 0:
@@ -4344,7 +4517,7 @@ def gintervals_update(
         if intervals is not None:
             new_df = intervals.copy()
             if "chrom" in new_df.columns:
-                new_df["chrom"] = _normalize_chroms(new_df["chrom"].astype(str).tolist())
+                new_df["chrom"] = _normalize_chroms(_chrom_names(new_df["chrom"]).tolist())
             if len(kept) > 0 and len(new_df) > 0:
                 kept = _pandas.concat([kept, new_df], ignore_index=True)
             elif len(new_df) > 0:
@@ -4376,26 +4549,31 @@ def gintervals_mapply(
     Parameters
     ----------
     func : callable
-        Function to apply. Receives one numpy array per track expression.
+        Function to apply. Receives one numpy array per track expression:
+        the values of the iterator bins in the interval (in reverse order
+        for an interval on strand -1). It must return a single number, stored
+        as a float; an interval with no iterator bin gets NaN without a call.
         If *enable_gapply_intervals* is True, also receives a keyword
-        argument ``gapply_intervals`` containing the current iterator
-        interval (as a dict with chrom/start/end keys, plus the 2D
-        analogues when applicable).
+        argument ``gapply_intervals``: a DataFrame (chrom, start, end, or
+        the 2D coordinates) of the iterator bins in the interval, the bins
+        whose values are passed, in genomic order (also on strand -1), as R's
+        ``GAPPLY.INTERVALS``.
     *exprs : str
         Track expressions to evaluate.
     intervals : DataFrame
         Intervals to process.
     iterator : optional
-        Track expression iterator.
+        Track expression iterator: its bins in each interval give the values
+        passed to *func*.
     intervals_set_out : str, optional
         If given, save result as an intervals set and return None.
     colnames : str, default "value"
         Name of the result column.
     enable_gapply_intervals : bool, default False
-        R parity. When True, ``func`` is called with an additional
-        ``gapply_intervals`` keyword argument carrying the current
-        iterator interval. ``func`` must accept ``**kwargs`` or an
-        explicit ``gapply_intervals=None`` parameter.
+        When True, ``func`` is called with an additional
+        ``gapply_intervals`` keyword argument holding the iterator bins of
+        the current interval (see *func*). ``func`` must accept
+        ``**kwargs`` or an explicit ``gapply_intervals`` parameter.
     band : (int, int), optional
         2D-band filter for 2D track expressions. Forwarded to
         :func:`gextract`.
@@ -4403,8 +4581,8 @@ def gintervals_mapply(
     Returns
     -------
     DataFrame or None
-        Intervals with an additional column containing func results,
-        or None if intervals_set_out is specified.
+        The intervals, one row each, with an additional column containing
+        func results, or None if intervals_set_out is specified.
 
     See Also
     --------
@@ -4428,95 +4606,68 @@ def gintervals_mapply(
         raise ValueError("intervals parameter is required")
 
     intervals = _maybe_load_intervals_set(intervals)
+    assert isinstance(intervals, pd.DataFrame)
+    strands = None  # the strand of each interval as R reads it: labels are "+"/"-"/...
+    if "strand" in intervals.columns:
+        _check_strand_column(intervals["strand"])
+        strands = _str2strand_values(intervals["strand"])
+        if strands is None:
+            strands = intervals["strand"].to_numpy()
 
     expr_list = list(exprs)
     if not expr_list:
         raise ValueError("At least one track expression is required")
+    _refuse_unsupported_2d_iterator(expr_list, intervals, iterator)
+    coord_cols = (["chrom1", "start1", "end1", "chrom2", "start2", "end2"] if "chrom1" in intervals.columns
+                  else ["chrom", "start", "end"])
 
     np = _numpy
 
-    # Determine the intervals to iterate over
-    if iterator is not None:
-        # With explicit iterator, use giterator_intervals to split
-        iter_intervals = giterator_intervals(
-            expr=expr_list[0], intervals=intervals, iterator=iterator
-        )
-        if iter_intervals is None or len(iter_intervals) == 0:
-            return None
-        work_intervals = iter_intervals
-    else:
-        # Without iterator, iterate over original intervals directly
-        work_intervals = intervals
-
-    # --- Batch extraction: one gextract call per expression for ALL intervals ---
-    # This avoids N separate C++ extraction calls (one per interval).
-    query_intervals = work_intervals[["chrom", "start", "end"]].copy()
-    query_intervals = query_intervals.reset_index(drop=True)
-
-    # Check strand reversal per interval
-    has_strand = "strand" in work_intervals.columns
-    reverse_flags = work_intervals["strand"].to_numpy() == -1 if has_strand else None
-
-    # Extract each expression once for all intervals
-    extracted = []
-    for expr in expr_list:
-        ext = gextract(expr, intervals=query_intervals, band=band)
-        extracted.append(ext)
-
+    # As R: one row per interval, FUN given the values of the iterator bins in it,
+    # all the expressions evaluated on the same bins
+    query_intervals = intervals[coord_cols].reset_index(drop=True)
     n_intervals = len(query_intervals)
+    cols = [f"_v{i}" for i in range(len(expr_list))]
+    ext = gextract(expr_list, intervals=query_intervals, iterator=iterator, band=band, colnames=cols) \
+        if n_intervals else None
 
-    # Pre-group extracted data by intervalID for O(1) lookup per interval.
-    # gextract returns 1-based intervalIDs.
-    grouped_data: list[tuple[dict[Any, Any] | None, Any]] = []
-    for ext in extracted:
-        if ext is not None and len(ext) > 0:
-            iid = ext["intervalID"].to_numpy()
-            val_cols = [c for c in ext.columns if c not in ("chrom", "start", "end", "intervalID")]
-            val_col = val_cols[0] if val_cols else None
-            vals = ext[val_col].to_numpy(dtype=float) if val_col else None
-            # Build dict: intervalID -> (start_idx, end_idx) for contiguous groups
-            grp_dict = {}
-            if len(iid) > 0:
-                breaks = np.flatnonzero(np.diff(iid) != 0)
-                starts = np.concatenate([[0], breaks + 1])
-                ends = np.concatenate([breaks + 1, [len(iid)]])
-                for s, e in zip(starts, ends, strict=False):
-                    grp_dict[iid[s]] = (s, e)
-            grouped_data.append((grp_dict, vals))
-        else:
-            grouped_data.append((None, None))
-
-    # Apply func per interval
-    results = []
-    iv_rows = (
-        query_intervals.to_dict("records")
-        if enable_gapply_intervals
-        else None
-    )
-    for i in range(n_intervals):
-        reverse = reverse_flags[i] if reverse_flags is not None else False
-        interval_id = i + 1  # gextract uses 1-based intervalIDs
-
-        arrays = []
-        for g_dict, g_vals in grouped_data:
-            if g_dict is not None and g_vals is not None and interval_id in g_dict:
-                s, e = g_dict[interval_id]
-                arr = g_vals[s:e]
-            else:
-                arr = np.array([])
-            if reverse:
-                arr = arr[::-1].copy()
-            arrays.append(arr)
-
+    # the rows of each interval: gextract's intervalID is the 1-based input row
+    bins = None  # the iterator bins, grouped by interval, for gapply_intervals
+    if ext is None or len(ext) == 0:
+        counts: np.ndarray = np.zeros(n_intervals, dtype=np.int64)
+        vals = [np.empty(0) for _ in cols]
+    else:
+        iid = ext["intervalID"].to_numpy(dtype=np.int64) - 1
+        order = np.argsort(iid, kind="stable")
+        counts = np.bincount(iid, minlength=n_intervals)
+        vals = [ext[c].to_numpy(dtype=float)[order] for c in cols]
         if enable_gapply_intervals:
-            assert iv_rows is not None
-            val = func(*arrays, gapply_intervals=iv_rows[i])
+            bins = ext[coord_cols].iloc[order].reset_index(drop=True)
+    offsets = np.cumsum(counts) - counts
+
+    reverse_flags = strands == -1 if strands is not None else None
+    results = np.full(n_intervals, np.nan)
+    for i in range(n_intervals):
+        # an interval with no iterator bin is NaN, FUN is not called
+        if not counts[i]:
+            continue
+        arrays = [v[offsets[i]:offsets[i] + counts[i]] for v in vals]
+        if reverse_flags is not None and reverse_flags[i]:
+            arrays = [a[::-1].copy() for a in arrays]
+        if enable_gapply_intervals:
+            assert bins is not None
+            # as R's GAPPLY.INTERVALS: the interval's bins, in genomic order whatever its strand
+            val = func(*arrays, gapply_intervals=bins.iloc[offsets[i]:offsets[i] + counts[i]].reset_index(drop=True))
         else:
             val = func(*arrays)
-        results.append(val)
+        # stored as a double, as R does; anything but a single number is an error
+        arr = np.asarray(val)
+        if arr.size != 1 or arr.dtype.kind not in "iuf":
+            raise ValueError("Evaluation of function does not produce a single numeric value")
+        results[i] = float(arr.ravel()[0])
 
-    # Build result DataFrame
-    result_df = query_intervals.copy()
+    # Build result DataFrame: the intervals' columns and the values
+    result_df = intervals.reset_index(drop=True).copy()
     result_df[colnames] = results
 
     if intervals_set_out is not None:
@@ -4558,6 +4709,31 @@ def _write_index_header_2d(fp: IO[bytes], num_entries: int, checksum: int) -> No
     flags = 0x01
     reserved = 0
     fp.write(struct.pack("<8sIIQQQ", magic, version, num_entries, flags, checksum, reserved))
+
+
+def _check_reconvert(set_name: str, interv_path: Path, is_2d: bool) -> None:
+    """A forced re-conversion of an indexed interval set rebuilds its index from its
+    per-chromosome files only: the intervals of a chromosome (pair) that are only in the
+    existing index would be dropped. Stops, before anything is changed, when a chromosome
+    (pair) the set's .meta lists has no file of its own (named by it or by an alias, as the
+    conversion lists them). R's .gintervals.check_reconvert."""
+    stats, _ = _decode_intervals_meta(interv_path / ".meta")
+    files = _pymisha.pm_chrom_files(str(interv_path), is_2d, True)
+    if is_2d:
+        have = set(zip(files["chrom1"], files["chrom2"], strict=True))
+        listed = zip(stats["chrom1"].astype(str), stats["chrom2"].astype(str), strict=True)
+        missing = [f"{c1}-{c2}" for c1, c2 in listed if (c1, c2) not in have]
+    else:
+        have_1d = set(files["chrom"])
+        missing = [c for c in stats["chrom"].astype(str) if c not in have_1d]
+    missing = list(dict.fromkeys(missing))
+    if missing:
+        more = f" (and {len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise ValueError(
+            f"Cannot re-convert interval set {set_name} with force = TRUE: the intervals of "
+            f"{', '.join(missing[:5])}{more} are only in its index, and the conversion rebuilds "
+            "the index from per-chromosome files. Nothing was changed."
+        )
 
 
 def gintervals_convert_to_indexed(
@@ -4621,6 +4797,8 @@ def gintervals_convert_to_indexed(
     if idx_path.exists() and not force:
         return
     _refuse_subdir_order(set_name, interv_path)
+    if idx_path.exists():
+        _check_reconvert(set_name, interv_path, is_2d=False)
 
     dat_tmp = interv_path / "intervals.dat.tmp"
     idx_tmp = interv_path / "intervals.idx.tmp"
@@ -4742,6 +4920,8 @@ def gintervals_2d_convert_to_indexed(
     if idx_path.exists() and not force:
         return
     _refuse_subdir_order(set_name, interv_path)
+    if idx_path.exists():
+        _check_reconvert(set_name, interv_path, is_2d=True)
 
     dat_tmp = interv_path / "intervals2d.dat.tmp"
     idx_tmp = interv_path / "intervals2d.idx.tmp"
@@ -4937,7 +5117,7 @@ def giterator_cartesian_grid(
         if not {"chrom", "start", "end"}.issubset(df.columns):
             raise ValueError(f"{name} must contain chrom, start, end columns")
         out = df[["chrom", "start", "end"]].copy()
-        out["chrom"] = _normalize_chroms(out["chrom"].astype(str).tolist())
+        out["chrom"] = _normalize_chroms(_chrom_names(out["chrom"]).tolist())
         out["start"] = _pandas.to_numeric(out["start"], errors="coerce").astype("Int64")
         out["end"] = _pandas.to_numeric(out["end"], errors="coerce").astype("Int64")
         out = out.dropna(subset=["start", "end"]).copy()
@@ -5049,7 +5229,7 @@ def _resolve_2d_scope(intervals: pd.DataFrame | str | None) -> pd.DataFrame:
     from .tracks import gtrack_exists, gtrack_info
 
     if intervals is None:
-        return _gintervals_2d_all("full")
+        return _whole_genome_2d()
 
     if isinstance(intervals, str):
         if gtrack_exists(intervals):
@@ -5074,6 +5254,7 @@ def _resolve_2d_scope(intervals: pd.DataFrame | str | None) -> pd.DataFrame:
     if isinstance(intervals, _pandas.DataFrame) and "chrom1" in intervals.columns:
         return intervals
 
+    _verify_iterator_dim(intervals, True)
     raise ValueError(
         "A cartesian-grid iterator requires a 2D scope (2D DataFrame, 2D track "
         "name, or None for the whole 2D genome)"
@@ -5109,7 +5290,7 @@ def _enumerate_cartesian_grid_cells(
 
     def _to_1d_dict(df: pd.DataFrame) -> dict[str, Any]:
         d = df.copy()
-        d["chrom"] = _normalize_chroms(d["chrom"].astype(str).tolist())
+        d["chrom"] = _normalize_chroms(_chrom_names(d["chrom"]).tolist())
         return {
             "chrom": _chromids(d["chrom"]),
             "start": d["start"].to_numpy(_numpy.int64),
@@ -5124,8 +5305,8 @@ def _enumerate_cartesian_grid_cells(
         return result
 
     s = scope_df.copy()
-    s["chrom1"] = _normalize_chroms(s["chrom1"].astype(str).tolist())
-    s["chrom2"] = _normalize_chroms(s["chrom2"].astype(str).tolist())
+    s["chrom1"] = _normalize_chroms(_chrom_names(s["chrom1"], "chrom1").tolist())
+    s["chrom2"] = _normalize_chroms(_chrom_names(s["chrom2"], "chrom2").tolist())
     scope_dict = {
         "chrom1": _chromids(s["chrom1"]),
         "start1": s["start1"].to_numpy(_numpy.int64),
@@ -5202,8 +5383,8 @@ def _run_2d_iterator_coords(
         return _pandas.DataFrame(columns=empty_cols)
 
     s = scope_df.copy()
-    s["chrom1"] = _normalize_chroms(s["chrom1"].astype(str).tolist())
-    s["chrom2"] = _normalize_chroms(s["chrom2"].astype(str).tolist())
+    s["chrom1"] = _normalize_chroms(_chrom_names(s["chrom1"], "chrom1").tolist())
+    s["chrom2"] = _normalize_chroms(_chrom_names(s["chrom2"], "chrom2").tolist())
     scope_dict = {
         "chrom1": _chromids(s["chrom1"]),
         "start1": s["start1"].to_numpy(_numpy.int64),
@@ -5450,7 +5631,7 @@ def giterator_intervals(
                     # all chrom pairs (full mode), so a bare 2D-track iterator
                     # visits every rectangle of the track - not just the
                     # intra-chromosomal (diagonal) ones.
-                    intervals = _gintervals_2d_all("full")
+                    intervals = _whole_genome_2d()
                 elif isinstance(intervals, str):
                     # The scope may be an interval-set name *or* a 2D track name
                     # (its rectangles); _maybe_load_intervals_set handles both,
@@ -5462,7 +5643,7 @@ def giterator_intervals(
                 if intervals is None or len(intervals) == 0:
                     return None
                 if not isinstance(intervals, _pandas.DataFrame) or "chrom1" not in intervals.columns:
-                    raise ValueError("2D track iterator requires 2D intervals")
+                    raise ValueError("2D iterator is used along with 1D intervals")
 
                 res = gextract(itr, intervals=intervals, iterator=itr, band=band)
                 if res is None or len(res) == 0:
@@ -5730,8 +5911,8 @@ def gintervals_mark_overlaps(
 def gintervals_annotate(
     intervals: pd.DataFrame | str,
     annotation_intervals: pd.DataFrame | str,
-    annotation_columns: list[str] | None = None,
-    column_names: list[str] | None = None,
+    annotation_columns: str | list[str] | None = None,
+    column_names: str | list[str] | None = None,
     dist_column: str | None = "dist",
     max_dist: float = float("inf"),
     na_value: Any = _numpy.nan,
@@ -5754,10 +5935,10 @@ def gintervals_annotate(
         1D query intervals.
     annotation_intervals : DataFrame
         Source intervals containing annotation data.
-    annotation_columns : list of str, optional
+    annotation_columns : str or list of str, optional
         Columns to copy from *annotation_intervals*.  ``None`` means all
         non-coordinate columns.
-    column_names : list of str, optional
+    column_names : str or list of str, optional
         Output names for the annotation columns (must match length of
         *annotation_columns*).
     dist_column : str or None, default ``"dist"``
@@ -5780,6 +5961,9 @@ def gintervals_annotate(
           coordinate.
         - ``"min.end"`` -- prefer the neighbor with the smaller end
           coordinate.
+
+        With 2D annotation intervals and ``maxneighbors > 1`` only
+        ``"first"`` is supported.
     overwrite : bool, default False
         If ``True``, allow annotation columns to overwrite existing columns
         in *intervals*.
@@ -5838,6 +6022,9 @@ def gintervals_annotate(
         raise ValueError(
             f"tie_method must be one of {_valid_tie_methods}, got '{tie_method}'"
         )
+    # ties are broken by start or end, which 2D intervals do not have
+    if tie_method != "first" and maxneighbors > 1 and _is_2d_intervals_df(annotation_intervals):
+        raise ValueError('tie_method other than "first" is supported for 1D intervals only')
 
     _checkroot()
 
@@ -5854,6 +6041,8 @@ def gintervals_annotate(
         annotation_columns = [
             c for c in annotation_intervals.columns if c not in basic_cols
         ]
+    elif isinstance(annotation_columns, str):
+        annotation_columns = [annotation_columns]
 
     # Validate annotation columns exist
     missing = [c for c in annotation_columns if c not in annotation_intervals.columns]
@@ -5864,6 +6053,8 @@ def gintervals_annotate(
         )
 
     # Set up output column names
+    if isinstance(column_names, str):
+        column_names = [column_names]
     if column_names is None:
         column_names = list(annotation_columns)
     elif len(column_names) != len(annotation_columns):
@@ -5995,6 +6186,7 @@ def gintervals_normalize(
     # Validate 2D intervals
     if "chrom1" in intervals.columns:
         raise ValueError("gintervals_normalize does not support 2D intervals")
+    _check_intervals_strand(intervals)
 
     # Normalize size to numpy array
     size = _numpy.asarray(size, dtype=_numpy.int64).ravel()
@@ -6032,7 +6224,7 @@ def gintervals_normalize(
     starts = intervals["start"].values.astype(_numpy.int64)
     ends = intervals["end"].values.astype(_numpy.int64)
     # an alias such as "1" is the database's chr1, as in misha
-    chroms = _numpy.asarray(_normalize_chroms(intervals["chrom"].astype(str).tolist()), dtype=object)
+    chroms = _numpy.asarray(_normalize_chroms(_chrom_names(intervals["chrom"]).tolist()), dtype=object)
 
     # As R's gintervals_normalize (GenomeIntervalUtils.cpp): integer center, an
     # odd size's extra bp on the right, and the result clipped (not shifted) at
@@ -6184,7 +6376,7 @@ def gintervals_random(
     size: int,
     n: int,
     dist_from_edge: float = 3_000_000,
-    chromosomes: list[str] | None = None,
+    chromosomes: str | list[str] | None = None,
     mask: pd.DataFrame | None = None,
     seed: int | None = None,
     **kwargs: Any,
@@ -6216,7 +6408,7 @@ def gintervals_random(
         Number of intervals to generate (must be positive).
     dist_from_edge : float, default 3_000_000
         Minimum distance from chromosome boundaries.
-    chromosomes : list of str, optional
+    chromosomes : str or list of str, optional
         Restrict sampling to these chromosomes.
     mask : DataFrame, optional
         Intervals to exclude from sampling (columns ``chrom``, ``start``,
@@ -6271,6 +6463,8 @@ def gintervals_random(
 
     all_genome = gintervals_all()
 
+    if isinstance(chromosomes, str):
+        chromosomes = [chromosomes]
     if chromosomes is not None:
         if not isinstance(chromosomes, (list, tuple)):
             raise ValueError("chromosomes must be a list of strings")
@@ -6288,7 +6482,7 @@ def gintervals_random(
             raise ValueError("mask must have columns: chrom, start, end")
         if len(mask) > 0:
             mask = mask.copy()
-            mask["chrom"] = _normalize_chroms(mask["chrom"].astype(str).tolist())
+            mask["chrom"] = _normalize_chroms(_chrom_names(mask["chrom"]).tolist())
             if chromosomes is not None:
                 mask = mask[mask["chrom"].isin(chromosomes)]
             mask = gintervals_canonic(mask)
@@ -6721,7 +6915,7 @@ def _unify_intervals(
 def gintervals_import_genes(
     genes_file: str,
     annots_file: str | None = None,
-    annots_names: list[str] | None = None,
+    annots_names: str | list[str] | None = None,
 ) -> dict[str, pd.DataFrame | None]:
     """Import gene annotations from a UCSC knownGene-format file.
 
@@ -6748,7 +6942,7 @@ def gintervals_import_genes(
     annots_file : str, optional
         Path or URL to an annotation file. The first column is the gene ID
         (matching ``genes_file``), followed by annotation columns.
-    annots_names : list of str, optional
+    annots_names : str or list of str, optional
         Names for the annotation columns. Required when ``annots_file`` is
         given. The length must match the number of columns in the annotation
         file.
@@ -6793,6 +6987,8 @@ def gintervals_import_genes(
             "annots_names argument cannot be None if annots_file is specified"
         )
 
+    if isinstance(annots_names, str):
+        annots_names = [annots_names]
     if annots_names is not None and not isinstance(annots_names, (list, tuple)):
         raise ValueError("annots_names argument must be a list of strings")
 

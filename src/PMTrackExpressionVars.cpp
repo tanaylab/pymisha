@@ -294,6 +294,10 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
     GenomeTrack::Type track_type = GenomeTrack::get_type(var.track_path.c_str(), g_pmdb->chromkey(), false);
     var.track_type = track_type;
 
+    // These variables are read by a 1D iterator (R's TrackExpressionVars::init message)
+    if (GenomeTrack::is_2d(track_type))
+        TGLError("1D iterator is applied to a 2D track %s", track_name.c_str());
+
     if (!m_common_track_type_valid) {
         m_common_track_type = track_type;
         m_common_track_type_valid = true;

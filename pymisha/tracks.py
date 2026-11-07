@@ -25,18 +25,20 @@ import warnings
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, overload
 from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 
 from . import _shared
-from ._db_trash import _gdb_trash, _gdb_trash_sweep_old
+from ._db_trash import _gdb_staging_name, _gdb_trash, _gdb_trash_sweep_old
 from ._log import PymishaWarning, get_logger, user_stacklevel
 from ._name_validation import validate_dotted_name
 from ._safe_pickle import restricted_load, restricted_loads
 from ._shared import (
+    _check_flag,
+    _check_intervals_strand,
     _checkroot,
     _config_no_mt,
     _df2pymisha,
@@ -803,15 +805,13 @@ def _atomic_track_create(track: str):
     that the track does not already exist before doing any work.
     Mirrors R misha .gtrack.create_atomic (R 5.6.30 a7f6bb95, 81635130).
     """
-    if _track_exists(track):
-        raise ValueError(f"Track '{track}' already exists")
+    _ensure_track_absent(track)
 
     track_dir = _track_dir_for_create(track)
     parent = track_dir.parent
     with _shared._with_umask():
         parent.mkdir(parents=True, exist_ok=True)
-    rand = secrets.token_hex(4)
-    tmp_dir = parent / f".{track_dir.name}.tmp.{os.getpid()}.{rand}"
+    tmp_dir = parent / _gdb_staging_name(track_dir.name)
 
     _pymisha.pm_set_create_dir_override(str(tmp_dir))
     try:
@@ -840,7 +840,16 @@ def _atomic_track_create(track: str):
         _pymisha.pm_clear_create_dir_override()
 
 
-def _normalize_intervals_df(intervals: Any) -> pd.DataFrame:
+def _normalize_intervals_df(intervals: Any, strict: bool = True) -> pd.DataFrame:
+    """The chrom, start and end of *intervals* for a track creator.
+
+    A row with a missing coordinate, a negative start or start >= end is an
+    error, worded as misha's track creators word it. misha checks the rows in
+    turn, the chromosome of a row before its coordinates. With *strict* (the
+    creators called directly), the chromosome checks of
+    _canonicalize_known_chroms run first on the rows before the bad one and on
+    its chromosome, so that the error is the one misha gives.
+    """
     if intervals is None:
         raise ValueError("intervals cannot be None")
     if not isinstance(intervals, pd.DataFrame):
@@ -849,24 +858,43 @@ def _normalize_intervals_df(intervals: Any) -> pd.DataFrame:
     if not required.issubset(intervals.columns):
         raise ValueError("intervals must contain columns: chrom, start, end")
 
-    out = intervals.copy()
-    out = out.loc[:, ["chrom", "start", "end"]]
-    out["chrom"] = out["chrom"].astype(str)
-    out["start"] = pd.to_numeric(out["start"], errors="coerce")
-    out["end"] = pd.to_numeric(out["end"], errors="coerce")
-    out = out.dropna(subset=["chrom", "start", "end"])
-    if len(out) == 0:
-        raise ValueError("intervals is empty after dropping invalid rows")
-
-    out["start"] = out["start"].astype(np.int64)
-    out["end"] = out["end"].astype(np.int64)
-    out = out[(out["start"] >= 0) & (out["end"] > out["start"])].copy()
-    if len(out) == 0:
-        raise ValueError("intervals must contain at least one valid row with 0 <= start < end")
+    out = intervals.loc[:, ["chrom", "start", "end"]].copy()
+    out["chrom"] = _shared._chrom_names(out["chrom"]).astype(str)
+    start = pd.to_numeric(out["start"], errors="coerce").to_numpy(dtype=np.float64)
+    end = pd.to_numeric(out["end"], errors="coerce").to_numpy(dtype=np.float64)
+    missing = ~(np.isfinite(start) & np.isfinite(end))
+    # misha casts the coordinates to integers before it checks them
+    start = np.trunc(np.where(missing, 0, start)).astype(np.int64)
+    end = np.trunc(np.where(missing, 0, end)).astype(np.int64)
+    bad = np.flatnonzero(missing | (start < 0) | (start >= end))
+    if bad.size:
+        i = int(bad[0])
+        if strict:
+            _canonicalize_known_chroms(out.iloc[:i].assign(start=start[:i], end=end[:i]), strict=True)
+            if not missing[i]:
+                _canonicalize_known_chroms(out.iloc[i:i + 1].assign(start=0, end=0), strict=True)
+        if missing[i]:
+            raise ValueError(f"Invalid format of interval at index {i + 1}")
+        chrom = out["chrom"].iat[i]
+        try:
+            chrom = _pymisha.pm_normalize_chroms([chrom])[0]
+        except (_pymisha.error, IndexError):
+            _logger.debug("chromosome %r of a bad interval does not normalize", chrom, exc_info=True)
+        if start[i] < 0:
+            raise ValueError(f"Interval ({chrom}, {start[i]}, {end[i]}): start coordinate must be greater "
+                             "or equal than zero")
+        raise ValueError(f"Interval ({chrom}, {start[i]}, {end[i]}): start coordinate must be lesser than "
+                         "end coordinate. misha uses 0-based, half-open [start, end) coordinates; if your "
+                         "input is 1-based (GFF/GTF/VCF), subtract 1 from start.")
+    out["start"] = start
+    out["end"] = end
     return out.reset_index(drop=True)
 
 
-_MAX_REPORTED_CHROMS = 20
+# R misha's UnknownChroms: how many names a report shows, and how many distinct names are counted
+# before the count becomes a lower bound ("100+")
+_MAX_REPORTED_CHROMS = 5
+_MAX_TRACKED_CHROMS = 100
 
 
 def _is_primary_chrom_name(name: str) -> bool:
@@ -884,8 +912,107 @@ def _is_primary_chrom_name(name: str) -> bool:
     return len(core) == 1 and core.upper() in "XYZW"
 
 
+def _unknown_chroms(names: Any) -> dict[str, Any]:
+    """misha's UnknownChroms of the chromosome names of a file that the database does not
+    have, given in order of appearance: "unknown", up to 5 of them, of "num_unknown" in all
+    ("truncated": the count is a lower bound, as names past the first 100 are not counted
+    unless they look like a primary chromosome), and "unknown_primary" / "num_primary" for
+    those that look like a primary chromosome. The pm_* importers return the same keys."""
+    seen: set[str] = set()
+    primary_seen: set[str] = set()
+    shown: list[str] = []
+    primary: list[str] = []
+    untracked_primary = 0
+    truncated = False
+    for name in names:
+        is_primary = _is_primary_chrom_name(name)
+        new_primary = is_primary and name not in primary_seen
+        if new_primary:
+            primary_seen.add(name)
+            if len(primary) < _MAX_REPORTED_CHROMS:
+                primary.append(name)
+        if len(seen) >= _MAX_TRACKED_CHROMS:
+            if name not in seen:
+                if is_primary:
+                    untracked_primary += new_primary
+                else:
+                    truncated = True
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        if len(shown) < _MAX_REPORTED_CHROMS:
+            shown.append(name)
+    return {"unknown": shown, "num_unknown": len(seen) + untracked_primary, "truncated": truncated,
+            "unknown_primary": primary, "num_primary": len(primary_seen)}
+
+
+def _resolve_import_chroms(chroms: Any) -> tuple[np.ndarray, dict[str, Any], int]:
+    """The database name of each of *chroms* (aliases resolved), None where the database
+    does not have it; the _unknown_chroms of the latter; and the number of database
+    chromosomes named."""
+    from .intervals import gintervals_all
+
+    known = set(gintervals_all()["chrom"].astype(str))
+    raw = pd.Series(chroms, dtype=object).astype(str)
+    canon: dict[str, str | None] = {}
+    for name in pd.unique(raw):
+        try:
+            c = _pymisha.pm_normalize_chroms([name])[0]
+        except (_pymisha.error, IndexError):
+            c = None
+        canon[name] = c if c in known else None
+    names = raw.map(canon).to_numpy(dtype=object, na_value=None)
+    unknown = _unknown_chroms(n for n, c in canon.items() if c is None)
+    return names, unknown, len({c for c in canon.values() if c is not None})
+
+
+def _format_chrom_names(names: list[str], total: int, truncated: bool) -> str:
+    """misha's format_chrom_names: "a, b, c (and N more)", "N+" when the count itself was capped."""
+    res = ", ".join(names)
+    if total > len(names):
+        res += f"{' ' if names else ''}(and {total - len(names)}{'+' if truncated else ''} more)"
+    return res
+
+
+def _alias_hint() -> str:
+    from . import _shared
+
+    return (f"Chromosome aliases are resolved automatically (chr1 <-> 1, M <-> MT, plus "
+            f"{_shared._GROOT}/chrom_aliases.tsv if present). If the file's names should map to "
+            f"database chromosomes, add them to that file (tab separated: canonical<TAB>alias<TAB>source) "
+            f"and reload the database with gdb_reload(), or rename the chromosomes in the file.")
+
+
+def _verify_chroms_matched(unknown: dict[str, Any], n_matched: int, file_path: str) -> None:
+    """A file that named chromosomes and matched none of them would contribute nothing to
+    the track: an error, as misha's verify_chroms_matched. *unknown* is an _unknown_chroms of
+    the file, *n_matched* the number of its chromosomes the database has. A file with no
+    chromosome records at all is not an error."""
+    if not unknown["num_unknown"] or n_matched:
+        return
+    from .intervals import gintervals_all
+
+    db_chroms = [str(c) for c in gintervals_all()["chrom"]]
+    raise ValueError(
+        f"None of the chromosome names in {file_path} exist in the genome database: no data from the file "
+        f"would reach the track.\n"
+        f"File chromosomes: {_format_chrom_names(unknown['unknown'], unknown['num_unknown'], unknown['truncated'])}.\n"
+        f"Database chromosomes: {_format_chrom_names(db_chroms[:_MAX_REPORTED_CHROMS], len(db_chroms), False)}.\n"
+        f"{_alias_hint()}"
+    )
+
+
 def _report_skipped_chroms(parsed: pd.DataFrame, file_path: str) -> None:
-    """Report the chromosome names an import dropped (misha 5.11.18).
+    """Report the chromosome names of *parsed* that the database does not have (see
+    _report_unknown_chroms)."""
+    _, unknown, n_matched = _resolve_import_chroms(parsed["chrom"])
+    _report_unknown_chroms(unknown, n_matched, file_path)
+
+
+def _report_unknown_chroms(unknown: dict[str, Any], n_matched: int, file_path: str) -> None:
+    """Report the chromosome names an import that did produce data dropped: *unknown*, an
+    _unknown_chroms; *n_matched*, the number of chromosomes imported (misha 5.11.18).
 
     Which channel depends on what was dropped. A scaffold or unplaced contig is
     what every whole-genome bigWig looks like against a primary-only database:
@@ -896,60 +1023,36 @@ def _report_skipped_chroms(parsed: pd.DataFrame, file_path: str) -> None:
     chromosomes the file happens not to cover. A chr1-only bedGraph dropped
     nothing.
     """
-    from .intervals import gintervals_all
-
-    known = set(gintervals_all()["chrom"].astype(str))
-    unknown: list[str] = []
-    n_matched = 0
-    for raw in pd.unique(parsed["chrom"].astype(str)):
-        try:
-            canon = _pymisha.pm_normalize_chroms([raw])[0]
-        except (_pymisha.error, IndexError):
-            canon = None
-        if canon is not None and canon in known:
-            n_matched += 1
-        else:
-            unknown.append(raw)
-
-    _report_unknown_chroms(unknown, len(unknown), [c for c in unknown if _is_primary_chrom_name(c)],
-                           n_matched, file_path)
-
-
-def _report_unknown_chroms(unknown: list[str], num_unknown: int, primary: list[str], n_matched: int,
-                           file_path: str) -> None:
-    """The report of _report_skipped_chroms, given the names: *unknown* (or the first of them, of
-    *num_unknown* in all), those of them that look like a primary chromosome, and the number of
-    chromosomes that matched."""
-    # Nothing dropped, or nothing matched at all - the latter is the caller's
-    # "No intervals map to known chromosomes" error, not a partial import.
-    if not num_unknown or not n_matched:
+    num = unknown["num_unknown"]
+    if not num:
         return
-
-    def fmt(names: list[str], total: int) -> str:
-        # R's format_chrom_names: the first few, then "(and N more)"
-        shown = names[:_MAX_REPORTED_CHROMS]
-        rest = total - len(shown)
-        return ", ".join(shown) + (f"{' ' if shown else ''}(and {rest} more)" if rest > 0 else "")
-
-    if primary:
-        from . import _shared
+    count = f"{num}{'+' if unknown['truncated'] else ''}"
+    if unknown["unknown_primary"]:
         warnings.warn(
-            f"{num_unknown} chromosome name(s) in {file_path} do not exist "
-            f"in the genome database and were skipped, among them primary "
-            f"chromosome(s): {fmt(primary, len(primary))}. Data for "
-            f"the remaining {n_matched} chromosome(s) was imported. Chromosome aliases are "
-            f"resolved automatically (chr1 <-> 1, M <-> MT, plus {_shared._GROOT}/chrom_aliases.tsv "
-            f"if present). If the file's names should map to database chromosomes, add them to "
-            f"that file (tab separated: canonical<TAB>alias<TAB>source) and reload the database "
-            f"with gdb_reload(), or rename the chromosomes in the file.",
+            f"{count} chromosome name(s) in {file_path} do not exist in the genome database and were "
+            f"skipped, among them primary chromosome(s): "
+            f"{_format_chrom_names(unknown['unknown_primary'], unknown['num_primary'], False)}. Data for "
+            f"the remaining {n_matched} chromosome(s) was imported. {_alias_hint()}",
             stacklevel=user_stacklevel(),
         )
     else:
         _logger.info(
-            "%d chromosome name(s) in %s do not exist in the genome database "
-            "and were skipped: %s. Data for the remaining %d chromosome(s) was "
-            "imported.", num_unknown, file_path, fmt(unknown, num_unknown), n_matched,
+            "%s chromosome name(s) in %s do not exist in the genome database and were skipped: %s. "
+            "Data for the remaining %d chromosome(s) was imported.", count, file_path,
+            _format_chrom_names(unknown["unknown"], num, unknown["truncated"]), n_matched,
         )
+
+
+def _known_chroms_records(parsed: pd.DataFrame, file_path: str) -> tuple[pd.DataFrame, dict[str, Any], int]:
+    """The records of an imported file on the database's chromosomes, named as the database
+    names them, with the _unknown_chroms of the other names and the number of database
+    chromosomes the file names. A file that names chromosomes and matches none is an error."""
+    canon, unknown, n_matched = _resolve_import_chroms(parsed["chrom"])
+    _verify_chroms_matched(unknown, n_matched, file_path)
+    keep = np.array([c is not None for c in canon], dtype=bool)
+    out = parsed.loc[keep].copy()
+    out["chrom"] = canon[keep]
+    return out.reset_index(drop=True), unknown, n_matched
 
 
 def _canonicalize_known_chroms(df: pd.DataFrame, *, strict: bool = False) -> pd.DataFrame:
@@ -961,22 +1064,26 @@ def _canonicalize_known_chroms(df: pd.DataFrame, *, strict: bool = False) -> pd.
     chrom_sizes = gintervals_all()
     known = set(chrom_sizes["chrom"].astype(str).tolist())
     if strict:
+        # misha checks the rows in turn: the first row with either is the error
+        raw = _shared._chrom_names(df["chrom"]).astype(str)
         canon = {}
-        for raw in df["chrom"].astype(str).unique():
+        for name in raw.unique():
             try:
-                c = _pymisha.pm_normalize_chroms([raw])[0]
+                c = _pymisha.pm_normalize_chroms([name])[0]
             except (_pymisha.error, IndexError):
                 c = None
-            if c not in known:
-                raise ValueError(f'Chromosome "{raw}" does not exist')
-            canon[raw] = c
+            canon[name] = c if c in known else None
         out = df.copy()
-        out["chrom"] = df["chrom"].astype(str).map(canon).to_numpy()
+        out["chrom"] = raw.map(canon).to_numpy()
         size_of = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=True))
-        sizes = out["chrom"].map(size_of).to_numpy()
-        past = np.flatnonzero(out["end"].to_numpy() > sizes)
-        if past.size:
-            r = out.iloc[past[0]]
+        unknown = out["chrom"].isna().to_numpy()
+        sizes = out["chrom"].map(size_of).to_numpy(dtype=np.float64)
+        bad = np.flatnonzero(unknown | (out["end"].to_numpy() > sizes))
+        if bad.size:
+            i = bad[0]
+            if unknown[i]:
+                raise ValueError(f'Chromosome "{raw.iat[i]}" does not exist')
+            r = out.iloc[i]
             raise ValueError(f"Interval ({r['chrom']}, {r['start']}, {r['end']}): "
                              "end coordinate exceeds chromosome boundaries")
         return out.reset_index(drop=True)
@@ -1188,6 +1295,34 @@ def _parse_bed_generic(kept: list[str]) -> pd.DataFrame:
     return pd.DataFrame({"chrom": chrom, "start": start, "end": end, "value": value})
 
 
+def _bed_fit_chroms(parsed: pd.DataFrame, path: str) -> tuple[pd.DataFrame, str | None]:
+    """misha's .gtrack_bed_fit_chroms. BED files from other tools often have records that run
+    past the end of the chromosome, or that are empty: clips the first to the chromosome end and
+    drops the records left empty (zero length, or starting at or past the end), which the track
+    creators would reject, and returns the warning that gives the counts, if any. An inverted
+    record is left for the creator to reject. A file with no record left is an error. The
+    chromosomes of *parsed* must be the database's."""
+    from .intervals import gintervals_all
+
+    sizes_of = gintervals_all().set_index("chrom")["end"]
+    sizes = parsed["chrom"].map(sizes_of).to_numpy(dtype=np.int64)
+    start = parsed["start"].to_numpy(dtype=np.int64)
+    end = parsed["end"].to_numpy(dtype=np.int64)
+    past = (end > sizes) & (start <= end)
+    fitted = np.where(past, sizes, end)
+    empty = (end == start) | (past & (fitted <= start))
+    num_clipped = int((past & ~empty).sum())
+    if len(empty) and empty.all():
+        raise ValueError(f"BED file {path}: all of its {len(empty)} record(s) are empty (zero length, or "
+                         "starting at or past the end of their chromosome): nothing to import")
+    if not num_clipped and not empty.any():
+        return parsed, None
+    out = parsed.assign(end=fitted).loc[~empty].reset_index(drop=True)
+    return out, (f"BED file {path}: {num_clipped} record(s) running past the end of their chromosome were "
+                 f"clipped to it, and {int(empty.sum())} empty record(s) (zero length, or starting at or past "
+                 "the chromosome end) were dropped")
+
+
 def _unzip_import_file(path: str, tmpdir: str) -> str:
     """misha's gtrack.import unzips a .gz / .zip file into a temporary file named like it
     without that suffix, and imports that. Returns the unzipped file."""
@@ -1214,21 +1349,35 @@ def _parse_wig_or_bedgraph(path: str) -> pd.DataFrame:
     return pd.DataFrame({c: cols[c] for c in ("chrom", "start", "end", "value", "step")})
 
 
-def _check_wig_records(parsed: pd.DataFrame, path: str) -> pd.DataFrame:
+def _check_wig_records(parsed: pd.DataFrame, path: str) -> tuple[pd.DataFrame, dict[str, Any], int]:
     """misha's rules for WIG / bedGraph records, which a bigWig's records follow too.
 
-    A fixedStep / variableStep record that crosses the chromosome end is clipped
-    to it; one that starts past it is an error, as is a bedGraph record that is
-    empty or does not fit the chromosome. A chromosome's records must be together,
-    sorted and not overlapping. Returns the records of the database chromosomes.
+    A chromosome's records must be together: a block of a chromosome that
+    resumes after another one, known to the database or not, is an error. A
+    file that names chromosomes and matches none is an error. A fixedStep /
+    variableStep record that crosses the chromosome end is clipped to it; one
+    that starts past it is an error, as is a bedGraph record that is empty or
+    does not fit the chromosome. A chromosome's records must be sorted and not
+    overlapping. Returns the records of the database chromosomes, the
+    _unknown_chroms of the other names and the number of database chromosomes
+    the file names.
     """
     from .intervals import gintervals_all
 
     if len(parsed) == 0:   # no records at all: an empty track, as in misha
-        return parsed.drop(columns="step")
-    df = _canonicalize_known_chroms(parsed)
-    if len(df) == 0:
-        raise ValueError("No intervals map to known chromosomes")
+        return parsed.drop(columns="step"), _unknown_chroms([]), 0
+    canon, unknown, n_matched = _resolve_import_chroms(parsed["chrom"])
+    # the chromosome of each block, -1 for one the database does not have
+    codes = pd.factorize(pd.Series(canon, dtype=object))[0]
+    runs = codes[np.r_[True, codes[1:] != codes[:-1]]]
+    runs = runs[runs >= 0]
+    if len(np.unique(runs)) < len(runs):
+        raise ValueError(f"Invalid format of WIG file {path}: file is not sorted by chromosomes")
+    _verify_chroms_matched(unknown, n_matched, path)
+
+    keep = codes >= 0
+    df = parsed.loc[keep].reset_index(drop=True)
+    df["chrom"] = canon[keep]
     sizes = gintervals_all().set_index("chrom")["end"]
     chrom = df["chrom"].to_numpy()
     size = df["chrom"].map(sizes).to_numpy(dtype=np.int64)
@@ -1242,16 +1391,13 @@ def _check_wig_records(parsed: pd.DataFrame, path: str) -> pd.DataFrame:
         raise ValueError(f"WIG file {path}: invalid record {chrom[i]}:{start[i]}-{end[i]} "
                          f"(chromosome size {size[i]})")
     same = chrom[1:] == chrom[:-1]
-    runs = chrom[np.r_[True, ~same]]
-    if len(set(runs)) < len(runs):
-        raise ValueError(f"WIG file {path} is not sorted by chromosomes")
     end = np.where(step, np.minimum(end, size), end)
     bad = np.flatnonzero(same & (start[1:] < end[:-1]))
     if bad.size:
         i = bad[0] + 1
         raise ValueError(f"WIG file {path}: records of {chrom[i]} are overlapping or unsorted at {start[i]}")
     df["end"] = end
-    return df
+    return df, unknown, n_matched
 
 
 def _parse_tabular_track(path: str) -> pd.DataFrame:
@@ -1341,26 +1487,33 @@ def _parse_tabular_generic(kept: list[str], path: str) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def _parse_bigwig(path: str, name: str) -> pd.DataFrame:
+def _parse_bigwig(path: str, name: str) -> tuple[pd.DataFrame, dict[str, Any], int]:
     """Read a bigWig's full-resolution records with misha's reader; zoom levels are not used.
 
     Records come back sorted, non-overlapping and within their chromosome, as
     _check_wig_records makes the text ones. A truncated or corrupt file is an
-    error, as is one whose chromosomes are all unknown to the database. Reports
-    the chromosomes it skipped, as _report_skipped_chroms does; messages name
-    *name*, the file the user gave (path may be its unzipped copy).
+    error, as is one whose chromosomes are all unknown to the database. Returns
+    the records, the _unknown_chroms of the file and the number of database
+    chromosomes it has data for; messages name *name*, the file the user gave
+    (path may be its unzipped copy).
     """
     res = _pymisha.pm_parse_bigwig(path)
-    if res["num_unknown"] and not res["num_matched"]:
-        raise ValueError(f"BigWig file '{name}' contains no intervals for known chromosomes")
-    _report_unknown_chroms(res["unknown"], res["num_unknown"], res["unknown_primary"],
-                           res["num_matched"], name)
-    return pd.DataFrame({c: res[c] for c in ("chrom", "start", "end", "value")})
+    _verify_chroms_matched(res, res["num_matched"], name)
+    return pd.DataFrame({c: res[c] for c in ("chrom", "start", "end", "value")}), res, res["num_matched"]
 
 
 def _ensure_track_absent(track: str) -> None:
+    """R misha's .gconfirmtrackcreate: a new track takes a name no track of the database it is
+    written in has, and no interval set (a track and an interval set of one name make the
+    database unloadable). A loaded dataset's track of that name is allowed: the new one is
+    written into the working database, which then wins."""
     if _track_exists(track):
-        raise ValueError(f"Track '{track}' already exists")
+        existing = gtrack_dataset(track)
+        in_dataset = any(_shared._same_path(existing, d) for d in _shared._GDATASETS)
+        if not in_dataset or _shared._same_path(existing, _target_root()):
+            raise ValueError(f"Track '{track}' already exists")
+    if track in _pymisha.pm_interv_names():
+        raise ValueError(f"Interval {track} already exists")
 
 
 def gtrack_create_sparse(
@@ -1371,9 +1524,9 @@ def gtrack_create_sparse(
 
     Creates a new Sparse track where each interval carries an associated
     numeric value. Intervals must be non-overlapping within each
-    chromosome. Chromosome names are normalized and filtered to those
-    present in the current genome database. The description is stored
-    as a track attribute.
+    chromosome. Chromosome names are matched through the alias chain
+    (``chr1`` <-> ``1``, ``M`` <-> ``MT``); a chromosome the database does
+    not have is an error. The description is stored as a track attribute.
 
     *values* is matched to *intervals* row by row, in the order the intervals
     are passed; *intervals* need not be sorted. Note however that
@@ -1406,8 +1559,9 @@ def gtrack_create_sparse(
     ------
     ValueError
         If the track already exists, intervals overlap, values length
-        does not match intervals, or no intervals map to known
-        chromosomes.
+        does not match intervals, or an interval has a missing
+        coordinate, a negative start, start >= end, an unknown
+        chromosome or an end past the chromosome end.
 
     See Also
     --------
@@ -1425,6 +1579,7 @@ def gtrack_create_sparse(
     >>> pm.gtrack_create_sparse("test_sp", "Test", intervs, [1.0])  # doctest: +SKIP
     >>> pm.gtrack_rm("test_sp", force=True)  # doctest: +SKIP
     """
+    _check_intervals_strand(intervals)
     _create_sparse(track, description, intervals, values)
 
 
@@ -1435,7 +1590,7 @@ def _empty_records() -> pd.DataFrame:
 
 def _create_sparse(track: str, description: str, intervals: Intervals, values: Any = None,
                    r_import: bool = False) -> None:
-    """gtrack_create_sparse. With *r_import* (gtrack_import), no intervals at all make an empty track."""
+    """gtrack_create_sparse (*r_import*: called by gtrack_import). No intervals make an empty track."""
     _checkroot()
     _validate_track_name(track)
 
@@ -1444,20 +1599,15 @@ def _create_sparse(track: str, description: str, intervals: Intervals, values: A
             raise ValueError('values is missing and intervals has no "value" column')
         values = intervals["value"].to_numpy()
 
-    if r_import and len(intervals) == 0:
+    data = _normalize_intervals_df(intervals, strict=not r_import)
+    vals = np.asarray(values, dtype=np.float64)
+    if len(vals) != len(data):
+        raise ValueError(f"Number of intervals ({len(data)}) does not match the number of values ({len(vals)})")
+    if len(data) == 0:
         data = _empty_records()
     else:
-        data = _normalize_intervals_df(intervals)
-        vals = np.asarray(values, dtype=np.float64)
-        if len(vals) != len(data):
-            raise ValueError("Length of values must match number of intervals")
-        data = data.copy()
         data["value"] = vals
         data = _canonicalize_known_chroms(data, strict=not r_import)
-
-        if len(data) == 0:
-            raise ValueError("No intervals map to known chromosomes")
-
         data = data.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
         prev = data.groupby("chrom")["end"].shift(1)
         overlap = data["start"] < prev
@@ -1511,7 +1661,7 @@ def _apply_create_parallel_writers_from_config() -> None:
     override = config.get("track_create_parallel_writers")
     if override is not None:
         n = int(override)  # type: ignore[call-overload]
-    elif not bool(config.get("multitasking", True)):
+    elif not _shared._config_multitasking():
         n = 1
     else:
         n = _DEFAULT_TRACK_CREATE_PARALLEL_WRITERS
@@ -1598,8 +1748,9 @@ def gtrack_create_dense(
     ValueError
         If the track already exists, binsize is not positive, values
         length does not match intervals, ``func`` is not one of the
-        seven supported reductions, or no intervals map to known
-        chromosomes.
+        seven supported reductions, or an interval has a missing
+        coordinate, a negative start, start >= end, an unknown
+        chromosome or an end past the chromosome end.
 
     See Also
     --------
@@ -1623,10 +1774,10 @@ def gtrack_create_dense(
 
 def _create_dense(track: str, description: str, intervals: Intervals, values: Any, binsize: int,
                   defval: float = np.nan, func: str = "weighted.mean", r_import: bool = False) -> None:
-    """gtrack_create_dense. With *r_import* (gtrack_import), no intervals at all make an empty
-    track, and the weighted mean multiplies each value by its overlap in float32, as misha's
-    import does (gtrack.create_dense multiplies in double). The other funcs have no counterpart
-    in misha's import and keep gtrack_create_dense's arithmetic."""
+    """gtrack_create_dense. No intervals make a track of defval. With *r_import* (gtrack_import),
+    the weighted mean multiplies each value by its overlap in float32, as misha's import does
+    (gtrack.create_dense multiplies in double). The other funcs have no counterpart in misha's
+    import and keep gtrack_create_dense's arithmetic."""
     _checkroot()
     _validate_track_name(track)
 
@@ -1641,18 +1792,16 @@ def _create_dense(track: str, description: str, intervals: Intervals, values: An
         raise ValueError("binsize must be a positive integer")
     defval = float(defval)
 
-    if r_import and len(intervals) == 0:
+    data = _normalize_intervals_df(intervals, strict=not r_import)
+    vals = np.asarray(values, dtype=np.float64)
+    if len(vals) != len(data):
+        raise ValueError("Length of values must match the number of intervals")
+    if len(data) == 0:
         data = _empty_records()
     else:
-        data = _normalize_intervals_df(intervals)
-        vals = np.asarray(values, dtype=np.float64)
-        if len(vals) != len(data):
-            raise ValueError("Length of values must match number of intervals")
         # _normalize_intervals_df already returns a copy; no need to copy again
         data["value"] = vals
         data = _canonicalize_known_chroms(data, strict=not r_import)
-        if len(data) == 0:
-            raise ValueError("No intervals map to known chromosomes")
 
     with _atomic_track_create(track):
         _pymisha.pm_track_create_dense(
@@ -1691,6 +1840,25 @@ def _create_dense(track: str, description: str, intervals: Intervals, values: An
             stacklevel=user_stacklevel(),
         )
         raise
+
+
+def _bin_overlap_sums(starts: np.ndarray, ends: np.ndarray, weights: np.ndarray,
+                      binsize: int, num_bins: int) -> np.ndarray:
+    """Per bin, the sum of weight * (bases of the interval in the bin) over the intervals."""
+    out = np.zeros(num_bins, dtype=np.float64)
+    if len(starts) == 0:
+        return out
+    fb = starts // binsize
+    lb = (ends - 1) // binsize
+    single = fb == lb
+    np.add.at(out, fb[single], weights[single] * (ends[single] - starts[single]))
+    multi = ~single
+    m_fb, m_lb, m_w = fb[multi], lb[multi], weights[multi]
+    np.add.at(out, m_fb, m_w * ((m_fb + 1) * binsize - starts[multi]))
+    np.add.at(out, m_lb, m_w * (ends[multi] - m_lb * binsize))
+    for j in np.flatnonzero(m_lb > m_fb + 1):
+        out[m_fb[j] + 1 : m_lb[j]] += m_w[j] * binsize
+    return out
 
 
 @_shared._with_umask()   # database writes carry misha's permissions
@@ -1752,12 +1920,10 @@ def gtrack_create_dense_direct(
     data = _normalize_intervals_df(intervals)
     vals = np.asarray(values, dtype=np.float64)
     if len(vals) != len(data):
-        raise ValueError("Length of values must match number of intervals")
+        raise ValueError("Length of values must match the number of intervals")
 
     data["value"] = vals
     data = _canonicalize_known_chroms(data, strict=True)
-    if len(data) == 0:
-        raise ValueError("No intervals map to known chromosomes")
 
     # Get chromosome sizes
     from .intervals import gintervals_all
@@ -1778,61 +1944,37 @@ def gtrack_create_dense_direct(
 
         for chrom, chrom_size in chrom_sizes.items():
             num_bins = math.ceil(chrom_size / binsize)
-            dense = np.full(num_bins, defval, dtype=np.float32)
+            dense: np.ndarray = np.full(num_bins, defval, dtype=np.float32)
 
             if chrom in grouped.groups:
                 grp = grouped.get_group(chrom)
-                starts = grp["start"].values.astype(np.int64)
-                ends = grp["end"].values.astype(np.int64)
-                grp_vals = grp["value"].values.astype(np.float64)
+                # As gtrack_create_dense: the weighted mean of the float values by their overlap
+                # with the bin, defval weighing the bases no interval with a value covers
+                ok = ~np.isnan(grp["value"].values)
+                starts = grp["start"].values.astype(np.int64)[ok]
+                ends = np.minimum(grp["end"].values.astype(np.int64)[ok], chrom_size)
+                grp_vals = grp["value"].values.astype(np.float32).astype(np.float64)[ok]
+                keep = ends > starts
+                starts, ends, grp_vals = starts[keep], ends[keep], grp_vals[keep]
 
-                # Use an accumulator in float64 to collect weighted contributions.
-                # Initialize to 0.0 - we merge with defval after all intervals.
-                accum = np.zeros(num_bins, dtype=np.float64)
-                touched = np.zeros(num_bins, dtype=np.bool_)
-
-                # Vectorized bin assignment for all intervals at once
-                fb = np.maximum(starts // binsize, 0).astype(np.intp)
-                tb = np.minimum(
-                    np.ceil(ends / binsize).astype(np.intp) - 1,
-                    num_bins - 1,
-                )
-
-                # Single-bin intervals (fb == tb): one fractional contribution
-                single = fb >= tb
-                if np.any(single):
-                    s_fb = fb[single]
-                    fracs = (ends[single] - starts[single]) / binsize
-                    np.add.at(accum, s_fb, grp_vals[single] * fracs)
-                    touched[s_fb] = True
-
-                # Multi-bin intervals: first-bin, last-bin, and full bins
-                multi = ~single
-                if np.any(multi):
-                    m_fb = fb[multi]
-                    m_tb = tb[multi]
-                    m_s = starts[multi]
-                    m_e = ends[multi]
-                    m_v = grp_vals[multi]
-
-                    # First-bin fraction
-                    f_frac = ((m_fb + 1) * binsize - m_s) / binsize
-                    np.add.at(accum, m_fb, m_v * f_frac)
-                    touched[m_fb] = True
-
-                    # Last-bin fraction
-                    l_frac = (m_e - m_tb * binsize) / binsize
-                    np.add.at(accum, m_tb, m_v * l_frac)
-                    touched[m_tb] = True
-
-                    # Full bins in between (value * 1.0 for each)
-                    for j in range(len(m_fb)):
-                        if m_tb[j] > m_fb[j] + 1:
-                            accum[m_fb[j] + 1 : m_tb[j]] += m_v[j]
-                            touched[m_fb[j] + 1 : m_tb[j]] = True
-
-                # Merge: touched bins get accumulated value, rest keep defval
-                dense[touched] = accum[touched].astype(np.float32)
+                wsum = _bin_overlap_sums(starts, ends, grp_vals, binsize, num_bins)
+                weight = _bin_overlap_sums(starts, ends, np.ones(len(starts)), binsize, num_bins)
+                # bases under at least one interval: the overlaps of the intervals' union
+                order = np.argsort(starts, kind="stable")
+                s_sorted, e_sorted = starts[order], np.maximum.accumulate(ends[order])
+                new_run = np.ones(len(s_sorted), dtype=bool)
+                new_run[1:] = s_sorted[1:] > e_sorted[:-1]
+                run_ends = np.append(e_sorted[np.flatnonzero(new_run)[1:] - 1], e_sorted[-1:])
+                covered = _bin_overlap_sums(s_sorted[new_run], run_ends, np.ones(int(new_run.sum())),
+                                            binsize, num_bins)
+                if not np.isnan(defval):
+                    widths = np.minimum(binsize, chrom_size - np.arange(num_bins, dtype=np.int64) * binsize)
+                    uncovered = widths - covered
+                    part = uncovered > 0
+                    wsum[part] += defval * uncovered[part]
+                    weight[part] += uncovered[part]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    dense = np.where(weight > 0, wsum / weight, np.nan).astype(np.float32)
 
             # Write binary: [uint32 binsize][float32 x num_bins]
             out_path = track_dir / chrom
@@ -1868,7 +2010,7 @@ def gtrack_create_dense_direct(
         try:
             _pm_dbreload(_target_root())
             if _db_is_indexed(_shared._GROOT):
-                _index_created_track(track, remove_old=False)
+                _index_created_track(track, remove_old=True)
                 _pm_dbreload(_target_root())
         except Exception as exc:
             warnings.warn(
@@ -1941,6 +2083,7 @@ def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> 
 
     from .extract import _maybe_load_intervals_set
     intervals = _maybe_load_intervals_set(intervals)
+    _check_intervals_strand(intervals)
 
     vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_modify")
 
@@ -1959,7 +2102,7 @@ def gtrack_modify(track: str, expr: str, intervals: Intervals | None = None) -> 
         raise ValueError(f"Track {track} is in no loaded database; modify it in a session of the database it is in.")
     parent = track_dir.parent
     _gdb_trash_sweep_old(parent)
-    stage_dir = parent / f".{track_dir.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    stage_dir = parent / _gdb_staging_name(track_dir.name)
     with _shared._with_umask():
         stage_dir.mkdir(parents=True)
     try:
@@ -2054,6 +2197,7 @@ def gtrack_smooth(
     from .intervals import gintervals_all
 
     _checkroot()
+    _check_flag(smooth_nans, "smooth_nans")
     if expr is None:
         raise ValueError("expr cannot be None")
     if winsize is None or winsize <= 0:
@@ -2097,7 +2241,7 @@ def gtrack_smooth(
             if "bin_size" in new_info:
                 gtrack_attr_set(track, "binsize", str(int(new_info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
-            _index_created_track(track, remove_old=False)
+            _index_created_track(track, remove_old=True)
         _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
@@ -2113,50 +2257,38 @@ def _gtrack_create_2d_from_expr(
     description: str,
     expr: str,
     iterator: Any = None,
+    band: tuple[int, int] | None = None,
 ) -> None:
-    """Create a 2D RECTS/POINTS track from a 2D track expression.
+    """Create a RECTS track from a track expression over a 2D iterator.
 
-    Evaluates *expr* over the 2D scope (the source track's native rectangles
-    when *iterator* is ``None``, or an explicit 2D-intervals iterator) and
-    writes one rectangle per iterated cell with the expression's value -
-    R's ``gtrack.create(track, desc, "<2d expr>"[, iterator])``.
+    As R's ``gtrack.create`` with a 2D iterator: *expr* is evaluated over the
+    whole 2D genome with *iterator* and *band* (the rectangles of the
+    expression's 2D track when *iterator* is ``None``, or those of a 2D track,
+    2D intervals or a rectangle size) and each iterator rectangle is written
+    with its value, NaN included. An iterator that gives no rectangle makes an
+    empty sparse track, as in R.
     """
     from .extract import gextract
-    from .intervals import _gintervals_2d_all
+    from .intervals import _whole_genome_2d
 
-    if iterator is None:
-        scope: Any = _gintervals_2d_all("full")
-        res = gextract(expr, scope, colnames=["value"])
-    elif isinstance(iterator, pd.DataFrame) and "chrom1" in iterator.columns:
-        # Explicit 2D iterator set: its rectangles are the cells to evaluate.
-        res = gextract(expr, iterator, iterator=iterator, colnames=["value"])
-    else:
-        raise ValueError(
-            "A 2D track expression requires either no iterator (use the source "
-            "track's rectangles) or a 2D-intervals iterator"
-        )
+    res = gextract(expr, _whole_genome_2d(), iterator=iterator, band=band, colnames=["value"])
+    if res is None or len(res) == 0:
+        _create_sparse(track, description, _empty_records())
+        return
 
     coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
-    if res is None or len(res) == 0:
-        raise ValueError(
-            f"2D track expression {expr!r} produced no intervals to create a track"
-        )
-
-    intervals_2d = res[coord_cols].copy()
-    values = res["value"].to_numpy()
-
     # gtrack_2d_create handles its own (atomic) track-dir creation, attribute
     # writing, dbreload and indexed-format conversion - it must NOT run inside
     # _atomic_track_create (which is for the C++ pm_track_create_* writers that
     # honour the dir override).
-    gtrack_2d_create(track, description, intervals_2d, values)
+    gtrack_2d_create(track, description, res[coord_cols], res["value"].to_numpy())
 
 
 def gtrack_create(
     track: str,
     description: str,
     expr: str,
-    iterator: int | None = None,
+    iterator: Any = None,
     band: tuple[int, int] | None = None,
 ) -> None:
     """
@@ -2176,9 +2308,13 @@ def gtrack_create(
         Human-readable description stored as a track attribute.
     expr : str
         Numeric track expression to evaluate.
-    iterator : int or None, optional
-        Fixed-bin iterator bin size. If None, the iterator is determined
-        implicitly from the track expression.
+    iterator : int, str, DataFrame, tuple or None, optional
+        Track expression iterator: a bin size, a track or intervals set
+        name, intervals, or for a 2D track a ``(width, height)`` rectangle
+        size. If None, the iterator is determined implicitly from the track
+        expression. With a 2D iterator (a 2D track or 2D intervals) the new
+        track is a Rectangles track holding each iterator rectangle and its
+        value.
     band : tuple or None, optional
         Diagonal band ``(d1, d2)`` for 2D track creation.  When provided,
         only contacts where ``d1 <= (x - y) < d2`` are stored.
@@ -2190,8 +2326,8 @@ def gtrack_create(
     Raises
     ------
     ValueError
-        If the track already exists, *expr* is None, or *band* is not
-        None.
+        If the track already exists, *expr* is None, or the dimension of
+        the iterator does not match the tracks of *expr*.
 
     See Also
     --------
@@ -2216,13 +2352,18 @@ def gtrack_create(
     if expr is None:
         raise ValueError("expr cannot be None")
     _validate_track_name(track)
+    created_by = (f'gtrack.create("{track}", description, {str(expr)!r}, '
+                  f'iterator={_r_deparse_iterator(iterator)})')
 
-    # 2D track expression (e.g. "test.rects+10"): the 1D scanner cannot iterate
-    # a rectangles track, so evaluate the expression over the 2D scope and write
-    # a 2D RECTS/POINTS track (R's gtrack.create on a 2D expression).
+    # A 2D iterator - given, or the rectangles of the expression's 2D track:
+    # evaluate the expression over the 2D genome and write a RECTS track (R's
+    # gtrack.create with a 2D iterator).
     from .expr import _expr_is_2d
-    if _expr_is_2d(expr):
-        _gtrack_create_2d_from_expr(track, description, str(expr), iterator)
+    if _expr_is_2d(expr, iterator):
+        _gtrack_create_2d_from_expr(track, description, str(expr), iterator, band)
+        attrs = _load_track_attributes(track)
+        attrs["created.by"] = created_by
+        _save_track_attributes(track, attrs)
         return
 
     if band is not None:
@@ -2277,18 +2418,14 @@ def gtrack_create(
 
     try:
         _pm_dbreload(_target_root())
-        _set_created_attrs(
-            track,
-            description,
-            f'gtrack.create("{track}", description, {str(expr)!r}, iterator={iterator!r})',
-        )
+        _set_created_attrs(track, description, created_by)
         info = gtrack_info(track)
         if info.get("type") == "dense":
             gtrack_attr_set(track, "type", "dense")
             if "bin_size" in info:
                 gtrack_attr_set(track, "binsize", str(int(info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
-            _index_created_track(track, remove_old=False)
+            _index_created_track(track, remove_old=True)
         _pm_dbreload(_target_root())
     except Exception as exc:
         warnings.warn(
@@ -2475,7 +2612,7 @@ def gtrack_create_pwm_energy(
         # Overwrite the created.by attribute to match R's format
         created_by = (
             f'gtrack.create_pwm_energy("{track}", description, '
-            f'"{pssmset}", {int(pssmid)}, {float(prior)}, {iterator})'
+            f'"{pssmset}", {int(pssmid)}, {float(prior):g}, iterator={_r_num(iterator)})'
         )
         # Bypass readonly check for internal overwrite
         attrs = _load_track_attributes(track)
@@ -2518,15 +2655,24 @@ def gtrack_import(
     with columns ``chrom``, ``start``, ``end``, and exactly one value column.
     A WIG / bedGraph / tab-delimited file with no records at all makes an
     empty track; one whose records are all on chromosomes the database
-    lacks is an error.
+    lacks is an error. Records on a chromosome the database lacks are
+    skipped and reported: a log message for a scaffold or patch, a warning
+    when the name looks like a primary chromosome.
+
+    BED records that run past the end of their chromosome are clipped to
+    it, and records left empty (zero length, or starting at or past the
+    chromosome end) are dropped, with one warning giving the counts; a BED
+    file with no record left is an error.
 
     BigWig files are read directly at full resolution and full float
     precision (zoom levels are not used). A truncated or corrupt bigWig is
     an error. A bigWig imports bin for bin like the WIG / bedGraph text it
     was made from, and both follow the same rules: the records of a
-    chromosome must be together, sorted and must not overlap, a bedGraph
-    record must fit its chromosome, and a fixedStep / variableStep record
-    that crosses the chromosome end is clipped to it. An empty bedGraph
+    chromosome must be together (a block that resumes after another
+    chromosome, known to the database or not, is an error), sorted and
+    must not overlap, a bedGraph record must fit its chromosome, and a
+    fixedStep / variableStep record that crosses the chromosome end is
+    clipped to it. An empty bedGraph
     record is an error in text and skipped in a bigWig. Two bigWig
     chromosomes that name the same database chromosome (``chr1`` and ``1``)
     are an error. A WIG file may mix fixedStep / variableStep sections and
@@ -2614,23 +2760,22 @@ def gtrack_import(
             f"func={func!r} requires a positive binsize; the sparse import path has no per-bin reduction"
         )
 
+    bed_warning = None
     with tempfile.TemporaryDirectory() as tmpdir:
         # As in misha, a .gz / .zip file is unzipped first and its format found on the
-        # plain copy, so a compressed bigWig reads like any other.
+        # plain copy, so a compressed bigWig reads like any other. The records on chromosomes
+        # the database does not have are dropped, and reported once the track is created.
         lower = file_path.lower()
         src = _unzip_import_file(file_path, tmpdir) if lower.endswith((".gz", ".zip")) else file_path
         if lower.endswith((".bed", ".bed.gz", ".bed.zip")):
-            parsed = _parse_bed(src)
-            _report_skipped_chroms(parsed, file_path)
+            parsed, unknown, n_matched = _known_chroms_records(_parse_bed(src), file_path)
+            parsed, bed_warning = _bed_fit_chroms(parsed, file_path)
         elif _pymisha.pm_is_bigwig(src):
-            parsed = _parse_bigwig(src, file_path)   # reports its skipped chromosomes itself
+            parsed, unknown, n_matched = _parse_bigwig(src, file_path)
         elif src.lower().endswith((".wig", ".bedgraph")):
-            parsed = _parse_wig_or_bedgraph(src)
-            _report_skipped_chroms(parsed, file_path)
-            parsed = _check_wig_records(parsed, file_path)
+            parsed, unknown, n_matched = _check_wig_records(_parse_wig_or_bedgraph(src), file_path)
         else:
-            parsed = _parse_tabular_track(src)
-            _report_skipped_chroms(parsed, file_path)
+            parsed, unknown, n_matched = _known_chroms_records(_parse_tabular_track(src), file_path)
 
     # r_import: misha's import arithmetic, and a file without records makes an empty track
     if binsize > 0:
@@ -2639,6 +2784,9 @@ def gtrack_import(
                       func=func, r_import=True)
     else:
         _create_sparse(track, description, parsed[["chrom", "start", "end"]], parsed["value"], r_import=True)
+    _report_unknown_chroms(unknown, n_matched, file_path)
+    if bed_warning is not None:
+        warnings.warn(bed_warning, stacklevel=user_stacklevel())
 
     func_suffix = "" if func == "weighted.mean" else f', func="{func}"'
     created_by = (
@@ -2910,7 +3058,7 @@ def _import_parquet_tracks(
     """
     root = _target_root()
     finals = [_track_dir_for_create(t) for t in tracks]
-    staging = [f.parent / f".{f.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}" for f in finals]
+    staging = [f.parent / _gdb_staging_name(f.name) for f in finals]
     created: list[tuple[str, Path]] = []
     try:
         for parent in dict.fromkeys(f.parent for f in finals):
@@ -2924,6 +3072,8 @@ def _import_parquet_tracks(
         chrom_names, unknown_files = _pymisha.pm_parquet_import(
             [str(d) for d in staging], files, names, columns, float(binsize), float(defval)
         )
+        _, unknown, n_matched = _resolve_import_chroms(chrom_names)
+        _verify_chroms_matched(unknown, n_matched, unknown_files)
 
         for track, stage_dir, final, cb in zip(tracks, staging, finals, created_by, strict=True):
             _fsync_tree(stage_dir)
@@ -2958,7 +3108,7 @@ def _import_parquet_tracks(
         raise
 
     # Only now, when the import can no longer fail
-    _report_skipped_chroms(pd.DataFrame({"chrom": chrom_names}), unknown_files)
+    _report_unknown_chroms(unknown, n_matched, unknown_files)
 
 
 def gtrack_import_parquet(
@@ -3204,6 +3354,9 @@ def gtrack_mv(src: str, dest: str) -> None:
         raise ValueError(f"Track '{src}' does not exist")
     if _track_exists(dest):
         raise ValueError(f"Track '{dest}' already exists")
+    # (as track creation: a track and an interval set of one name make the database unloadable)
+    if dest in _pymisha.pm_interv_names():
+        raise ValueError(f"Interval {dest} already exists")
 
     src_dir = Path(_pymisha.pm_track_path(src))
     src_db = gtrack_dataset(src)
@@ -3287,20 +3440,30 @@ def _dest_db_loaded(dest_db: Path) -> bool:
 
 
 def _copy_track_dir(src_dir: Path, dest_dir: Path) -> None:
-    """Copy the full source track directory into dest_dir.
+    """Copy the full source track directory into dest_dir (which may exist, empty).
 
-    Tolerates a pre-existing empty dest_dir (used so cross-db conversion
-    helpers can register the destination before writing into it).
+    A copy can come out short without an error (one the close of a full disk does not
+    report), so every file of it is checked to have the size of its source; a short copy is
+    removed and is an error.
     """
-    if dest_dir.exists():
-        for entry in src_dir.iterdir():
-            target = dest_dir / entry.name
-            if entry.is_dir():
-                shutil.copytree(entry, target)
-            else:
-                shutil.copy2(entry, target)
-    else:
-        shutil.copytree(src_dir, dest_dir)
+    with _shared._with_umask():
+        dest_dir.mkdir(exist_ok=True)
+    for entry in src_dir.iterdir():
+        target = dest_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target, copy_function=shutil.copy2)
+        else:
+            shutil.copy2(entry, target)
+    for root, _, names in os.walk(src_dir):
+        for name in names:
+            rel = os.path.relpath(os.path.join(root, name), src_dir)
+            dest = dest_dir / rel
+            if not dest.exists() or dest.stat().st_size != os.path.getsize(os.path.join(root, name)):
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                _shared._invalidate_dir_cache(dest_dir)
+                raise ValueError(f"Failed to copy {src_dir} into {dest_dir}: the copy of {rel} is incomplete")
+    # the layout just copied in, not one cached for an earlier track at this path
+    _shared._invalidate_dir_cache(dest_dir)
 
 
 def _match_chrom_alias(filename: str, dest_chroms: list[str]) -> str | None:
@@ -3381,10 +3544,8 @@ def _gtrack_copy_pipeline(
     if track_type in ("rectangles", "points"):
         # _gtrack_copy_one already stopped for differing chrom orders and for the format
         # changes not supported (indexed into per-chromosome, or into a database that is
-        # not the active one)
+        # not the active one); it converts one to indexed by its name, once in place
         _copy_track_dir(src_dir, dest_dir)
-        if dest_indexed and not src_indexed:
-            gtrack_2d_convert_to_indexed(destname, remove_old=True)
         return
 
     # 1D pipeline.
@@ -3445,6 +3606,8 @@ def _gtrack_copy_pipeline(
 def _gtrack_copy_one(
     srcname: str, destname: str, dest_info: dict[str, Any], overwrite: bool
 ) -> str:
+    from .intervals import _intervals_dir
+
     dest_db: Path = dest_info["db"]
     if not _track_exists(srcname):
         raise ValueError(f"Track '{srcname}' does not exist")
@@ -3462,6 +3625,11 @@ def _gtrack_copy_one(
         raise ValueError(
             f"Source and destination are the same track: {srcname}"
         )
+
+    # a track and an interval set of one name make the database unloadable (as gtrack_mv)
+    if ((_dest_db_loaded(dest_db) and destname in _pymisha.pm_interv_names())
+            or _intervals_dir(destname, str(dest_db)).exists()):
+        raise ValueError(f"Interval {destname} already exists")
 
     if dest_dir.exists() and not overwrite:
         raise ValueError(
@@ -3550,29 +3718,28 @@ def _gtrack_copy_one(
             )
 
     dest_db_loaded = _dest_db_loaded(dest_db)
+    parent = dest_dir.parent
     with _shared._with_umask():
-        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        parent.mkdir(parents=True, exist_ok=True)
+    # leftovers of writers that died before they could clean up, as the creators do
+    _gdb_trash_sweep_old(parent)
 
-    # The existing track is set aside (hidden, as a staging directory, swept as one if
-    # left) until the copy has succeeded, and comes back if any step of it fails
+    # The copy is made in a hidden staging directory and moved under the real name only once
+    # it is complete, so that a copy killed at any point (SIGKILL, OOM: no handler runs)
+    # leaves at the real name either the track that was there or the complete copy. A
+    # staging directory left by a killed copy is removed by the next sweep of the directory.
+    stage_dir = parent / _gdb_staging_name(dest_dir.name)
+    # a 2D track converted to indexed is converted by its name, so once in place
+    convert_2d = is_2d and dest_indexed and not src_indexed
     aside: Path | None = None
-    if dest_dir.exists():
-        aside = dest_dir.parent / f".{dest_dir.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-        try:
-            os.rename(dest_dir, aside)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Failed to set the existing destination {dest_dir} aside; copy aborted."
-            ) from exc
-        # dated now: a sweep of staging directories goes by their age
-        with contextlib.suppress(OSError):
-            os.utime(aside)
-        _shared._invalidate_dir_cache(dest_dir)
-
+    # whether this call's copy is at the real name: only then is what is there this call's
+    # to move away
+    placed = False
+    success = False
     try:
         _gtrack_copy_pipeline(
             src_dir,
-            dest_dir,
+            stage_dir,
             src_chroms,
             dest_chroms,
             src_indexed,
@@ -3581,35 +3748,92 @@ def _gtrack_copy_one(
             destname,
             dest_db,
         )
-    except BaseException:
-        # the failed copy is moved away first, then the existing track comes back
+        _fsync_tree(stage_dir)
+
         if dest_dir.exists():
-            _gdb_trash(dest_dir, async_unlink=True)
-        if aside is not None:
+            # The existing track is set aside until the copy is in place and has succeeded,
+            # and comes back if any step fails. Its name is a hidden one no sweep removes (not
+            # a staging or trash name): if the copy is killed between the two renames, it is
+            # the only copy of the track, kept there.
+            aside_path = parent / f".{secrets.token_hex(6)}"
             try:
-                os.rename(aside, dest_dir)
-            except OSError:
+                if aside_path.exists():
+                    raise FileExistsError(aside_path)
+                os.rename(dest_dir, aside_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to set the existing destination {dest_dir} aside; copy aborted."
+                ) from exc
+            aside = aside_path
+            _shared._invalidate_dir_cache(dest_dir)
+
+        # (a name taken meanwhile by another writer is not replaced: a directory with files
+        # in it cannot be renamed over)
+        try:
+            os.rename(stage_dir, dest_dir)
+        except OSError as exc:
+            raise RuntimeError(f"Failed to rename {stage_dir} -> {dest_dir}") from exc
+        placed = True
+        _fsync_dir(parent)
+        _shared._invalidate_dir_cache(dest_dir)
+        try:
+            if dest_db_loaded:
+                # dest_db can be the primary GROOT or a loaded secondary dataset
+                _pm_dbreload(str(dest_db))
+            if convert_2d:
+                gtrack_2d_convert_to_indexed(destname, remove_old=True)
+        except BaseException:
+            # a copy that was not there before goes (a track set aside comes back below)
+            if aside is None:
+                _gdb_trash(dest_dir, async_unlink=True)
+            raise
+        success = True
+    finally:
+        if stage_dir.exists():
+            _gdb_trash(stage_dir, async_unlink=True)
+        if not success and aside is not None and aside.exists():
+            # the failed copy is moved away first, then the existing track comes back. Only
+            # this call's copy: what another session put at the name meanwhile stays, and the
+            # track set aside is then kept where it is.
+            failed: Path | None = None
+            if placed and dest_dir.exists():
+                failed = parent / _gdb_staging_name(dest_dir.name)
+                try:
+                    os.rename(dest_dir, failed)
+                except OSError:
+                    failed = None
+            restored = False
+            if not dest_dir.exists():
+                try:
+                    os.rename(aside, dest_dir)
+                    restored = True
+                except OSError:
+                    restored = False
+            _shared._invalidate_dir_cache(dest_dir)
+            if not restored:
                 warnings.warn(
                     f"The copy over {dest_dir} failed; the track that was there is kept at {aside}",
                     stacklevel=user_stacklevel(),
                 )
-        _shared._invalidate_dir_cache(dest_dir)
-        if dest_db_loaded:
-            _pm_dbreload(str(dest_db))
-        raise
+            if failed is not None and failed.exists():
+                _gdb_trash(failed, async_unlink=True)
+        if not success:
+            if dest_db_loaded:
+                _pm_dbreload(str(dest_db))
+            else:
+                _shared._touch_db_cache_dirty(str(dest_db))
 
     if aside is not None:
-        _gdb_trash(aside, async_unlink=True)
+        # no longer needed: given a staging name first, so that a sweep removes it if the
+        # trash fails
+        old = parent / _gdb_staging_name(dest_dir.name)
+        try:
+            os.rename(aside, old)
+        except OSError:
+            old = aside
+        _gdb_trash(old, async_unlink=True)
 
-    # The destination path now holds a different track than anything cached for
-    # it (the copy pipeline rewrites track.idx in place at :_gtrack_copy_pipeline).
-    _shared._invalidate_dir_cache(dest_dir)
-
-    if dest_db_loaded:
-        # dest_db can be the primary GROOT or a loaded secondary dataset;
-        # pass it explicitly so the right one's caches get refreshed.
-        _pm_dbreload(str(dest_db))
-    else:
+    if not dest_db_loaded:
         # dest_db isn't loaded at all in this session, so _pm_dbreload()
         # (which rescans/clears caches for the *current* session) would be
         # both pointless and wrong here - just mark the sentinel directly.
@@ -3832,6 +4056,23 @@ def _r_num(x: float) -> str:
         mant = mant.rstrip("0").rstrip(".")
     sci = f"{mant}e{int(exp):+03d}"
     return sci if len(sci) < len(fixed) else fixed
+
+
+def _r_deparse_iterator(iterator: Any) -> str:
+    """The iterator argument as R's deparse() writes it in a created.by: a name quoted, a
+    number as R prints it, a rectangle size as c(width, height), None as NULL. For anything
+    else R writes the caller's expression, which is not known here: "intervals", as
+    created.by names an intervals argument."""
+    if iterator is None:
+        return "NULL"
+    if isinstance(iterator, str):
+        return '"' + iterator.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(iterator, numbers.Real) and not isinstance(iterator, bool):
+        return _r_num(float(iterator))
+    if (isinstance(iterator, (tuple, list)) and len(iterator) == 2
+            and all(isinstance(x, numbers.Real) and not isinstance(x, bool) for x in iterator)):
+        return f"c({_r_num(float(iterator[0]))}, {_r_num(float(iterator[1]))})"
+    return "intervals"
 
 
 def gtrack_import_mappedseq(
@@ -4410,7 +4651,7 @@ def gtrack_2d_convert_to_indexed(track: str, remove_old: bool = True, force: boo
     clear_indexed_2d_cache()
 
     track_type_int = 1 if track_type == "points" else 0
-    _pymisha.pm_track2d_convert_to_indexed(track_path, track_type_int, bool(remove_old), bool(force))
+    _pymisha.pm_track2d_convert_to_indexed(track_path, track_type_int, bool(remove_old), bool(force), track)
 
 
 def gtrack_attr_set(track: str, attr: str, value: str) -> None:
@@ -4580,21 +4821,24 @@ def gtrack_attr_import(table: pd.DataFrame, remove_others: bool = False) -> None
         _save_track_attributes(track, new_attrs)
 
 
-def gtrack_attr_export(tracks: list[str] | None = None, attrs: list[str] | None = None) -> pd.DataFrame:
+def gtrack_attr_export(tracks: str | list[str] | None = None,
+                       attrs: str | list[str] | None = None) -> pd.DataFrame:
     """
     Export track attributes as a DataFrame.
 
     Parameters
     ----------
-    tracks : list of str, optional
-        List of track names. If None, all tracks.
-    attrs : list of str, optional
-        List of attribute names to include. If None, all attributes.
+    tracks : str or list of str, optional
+        Track name(s). If None, all tracks.
+    attrs : str or list of str, optional
+        Attribute name(s) to include, in this order. If None, all attributes,
+        the most common first.
 
     Returns
     -------
     DataFrame
-        DataFrame with tracks as rows and attributes as columns.
+        DataFrame with tracks as rows and attributes as columns. A name given
+        twice appears once.
 
     Raises
     ------
@@ -4619,16 +4863,22 @@ def gtrack_attr_export(tracks: list[str] | None = None, attrs: list[str] | None 
 
     _checkroot()
 
+    if isinstance(tracks, str):
+        tracks = [tracks]
+    if isinstance(attrs, str):
+        attrs = [attrs]
+
     # Get list of tracks
     if tracks is None:
         tracks = gtrack_ls()
         if tracks is None:
             tracks = []
     else:
+        tracks = list(dict.fromkeys(tracks))
         # Validate tracks exist
         for track in tracks:
             if not _track_exists(track):
-                raise ValueError(f"Track '{track}' does not exist")
+                raise ValueError(f"Track {track} does not exist")
 
     # Collect all attributes
     all_attrs: dict[str, dict[str, str]] = {}  # track -> {attr: value}
@@ -4639,17 +4889,17 @@ def gtrack_attr_export(tracks: list[str] | None = None, attrs: list[str] | None 
         all_attrs[track] = track_attrs
         all_attr_names.update(track_attrs.keys())
 
-    # Filter attributes if specified
     if attrs is not None:
-        all_attr_names = set(attrs)
+        # the attributes asked for, in the order asked
+        sorted_attrs = list(dict.fromkeys(attrs))
+    else:
+        # Sort attribute names by popularity (number of tracks having this attr)
+        attr_counts = {}
+        for attr_name in all_attr_names:
+            count = sum(1 for t in tracks if attr_name in all_attrs.get(t, {}))
+            attr_counts[attr_name] = count
 
-    # Sort attribute names by popularity (number of tracks having this attr)
-    attr_counts = {}
-    for attr_name in all_attr_names:
-        count = sum(1 for t in tracks if attr_name in all_attrs.get(t, {}))
-        attr_counts[attr_name] = count
-
-    sorted_attrs = sorted(all_attr_names, key=lambda a: (-attr_counts[a], a))
+        sorted_attrs = sorted(all_attr_names, key=lambda a: (-attr_counts[a], a))
 
     # Build DataFrame
     data = {}
@@ -4940,8 +5190,8 @@ def _normalize_2d_intervals(intervals: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
 
     out = intervals[["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].copy()
     out["_row"] = np.arange(len(out))
-    out["chrom1"] = out["chrom1"].astype(str)
-    out["chrom2"] = out["chrom2"].astype(str)
+    out["chrom1"] = _shared._chrom_names(out["chrom1"], "chrom1").astype(str)
+    out["chrom2"] = _shared._chrom_names(out["chrom2"], "chrom2").astype(str)
     for col in ("start1", "end1", "start2", "end2"):
         out[col] = pd.to_numeric(out[col], errors="coerce").astype(np.int64)
 
@@ -5096,11 +5346,16 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
         raise
 
 
+def _import_src_name(files: list[Any]) -> str:
+    """What the messages about unknown chromosomes call the input files: the file, or the first one and a count."""
+    if len(files) == 1:
+        return str(files[0])
+    return f"{files[0]} and {len(files) - 1} other file(s)"
+
+
 def _import_2d_limits() -> tuple[int, int]:
     """CONFIG['max_data_size'] and CONFIG['max_mem_usage'] (KB) as the 2D imports read them."""
-    max_data_size = int(cast("int", _shared.CONFIG.get("max_data_size", 10000000)))
-    max_mem_usage = _shared.CONFIG.get("max_mem_usage")
-    return max_data_size, -1 if max_mem_usage is None else int(cast("int", max_mem_usage))
+    return _shared._config_limit("max_data_size"), _shared._config_limit("max_mem_usage")
 
 
 @_shared._with_umask()   # database writes carry misha's permissions
@@ -5127,8 +5382,8 @@ def gtrack_2d_import(track: str, description: str, file: str | list[str]) -> Non
     ------
     ValueError
         If the track already exists, any file is not found, the file list
-        is empty, or a file is malformed (the message names the file and
-        line).
+        is empty, a file is malformed (the message names the file and
+        line), or no interval is left to import.
 
     See Also
     --------
@@ -5141,7 +5396,9 @@ def gtrack_2d_import(track: str, description: str, file: str | list[str]) -> Non
     The first 6 columns must be named chrom1, start1, end1, chrom2, start2
     and end2; the value is the 7th column. A POINTS track if every interval
     is 1 x 1, a RECTS track otherwise, as in R misha. Intervals on a
-    chromosome the database does not have are skipped. Each chromosome pair
+    chromosome the database does not have are skipped and the names
+    reported, as :func:`gtrack_import` reports them; a file that names
+    chromosomes and matches none is an error. Each chromosome pair
     is written as R writes it - its records in input order, a pair of at
     least 4 x ``CONFIG['max_data_size']`` records in parts (R's
     gmax.data.size) - so the files are the bytes R writes.
@@ -5182,13 +5439,23 @@ def gtrack_2d_import(track: str, description: str, file: str | list[str]) -> Non
         if not os.path.exists(f):
             raise ValueError(f"File not found: {f}")
 
+    srcname = _import_src_name(files)
     max_data_size, max_mem_usage = _import_2d_limits()
     with _atomic_track_create(track) as track_dir:
         track_dir.mkdir(parents=True, exist_ok=True)
         try:
-            _pymisha.pm_track_2d_import_files(str(track_dir), [str(f) for f in files], max_data_size, max_mem_usage)
+            res = _pymisha.pm_track_2d_import_files(str(track_dir), [str(f) for f in files], max_data_size,
+                                                    max_mem_usage)
         except _pymisha.error as exc:
             raise ValueError(str(exc)) from exc
+        _verify_chroms_matched(res, res["num_matched"], srcname)
+        if not res["num_pairs"]:
+            if res["num_matched"]:
+                raise ValueError(f"No interval of {srcname} has both of its chromosomes in the genome database, "
+                                 "so nothing is left to import: a 2D track needs at least one interval")
+            raise ValueError(f"No intervals were read from {srcname}: a 2D track needs at least one")
+    # the chromosomes that got data, not all the names that matched
+    _report_unknown_chroms(res, res["num_data_chroms"], srcname)
 
     try:
         _pm_dbreload(_target_root())
@@ -5245,7 +5512,11 @@ def gtrack_2d_import_contacts(
       a chrA-chrB file and a chrB-chrA file (with swapped coordinates) are
       created so that queries work regardless of chromosome pair order.
     * Contacts on a chromosome the database does not have, or on a fend the
-      fends file does not define, are skipped.
+      fends file does not define, are skipped; the unknown chromosome names
+      are reported, as :func:`gtrack_import` reports them. A file that names
+      chromosomes and matches none is an error, as is an import that leaves
+      no contact.
+    * Fend ids must be in 0 - 2147483647 and listed once.
     * Each chromosome pair is written as R misha writes it - the contacts
       summed and inserted in R's order, a pair of at least
       4 x ``CONFIG['max_data_size']`` records in parts (R's gmax.data.size;
@@ -5271,7 +5542,8 @@ def gtrack_2d_import_contacts(
     ------
     ValueError
         If the track already exists, no contact files are provided, a file is
-        malformed, or duplicates are found when *allow_duplicates* is False.
+        malformed, no contact is left to import, or duplicates are found when
+        *allow_duplicates* is False.
 
     See Also
     --------
@@ -5305,16 +5577,31 @@ def gtrack_2d_import_contacts(
         if not os.path.exists(cfile):
             raise ValueError(f"Contacts file not found: {cfile}")
 
+    # the chromosome names of the fends file, if there is one, else those of the contacts
+    srcname = _import_src_name(contacts) if fends is None else str(fends)
     max_data_size, max_mem_usage = _import_2d_limits()
     with _atomic_track_create(track) as track_dir:
         track_dir.mkdir(parents=True, exist_ok=True)
         try:
-            _pymisha.pm_track_2d_import_contacts_files(
+            res = _pymisha.pm_track_2d_import_contacts_files(
                 str(track_dir), [str(f) for f in contacts], None if fends is None else str(fends),
                 bool(allow_duplicates), max_data_size, max_mem_usage,
             )
         except _pymisha.error as exc:
             raise ValueError(str(exc)) from exc
+        _verify_chroms_matched(res, res["num_matched"], srcname)
+        if not res["num_pairs"]:
+            if fends is not None:
+                raise ValueError(
+                    f"No contact of {_import_src_name(contacts)} could be placed: none was read, or their fragment "
+                    f"ends are missing from {srcname} or lie on chromosomes that the genome database does not "
+                    "have. A 2D track needs at least one contact.")
+            if res["num_matched"]:
+                raise ValueError(f"No contact of {srcname} has both of its chromosomes in the genome database, so "
+                                 "nothing is left to import: a 2D track needs at least one contact")
+            raise ValueError(f"No contacts were read from {srcname}: a 2D track needs at least one")
+    # the chromosomes that got data, not all the names that matched
+    _report_unknown_chroms(res, res["num_data_chroms"], srcname)
 
     try:
         _pm_dbreload(_target_root())
@@ -5421,7 +5708,7 @@ def gtrack_array_create(
     description: str,
     intervals: pd.DataFrame,
     values: Any,
-    colnames: list[str],
+    colnames: str | list[str],
 ) -> None:
     """Create an ``array`` track from intervals + a per-position matrix.
 
@@ -5441,7 +5728,7 @@ def gtrack_array_create(
     values : array_like of shape (n_intervals, n_cols)
         Float values. ``NaN`` is treated as "missing" and stored sparsely
         (matching the R format - NaN cells are not written).
-    colnames : list of str
+    colnames : str or list of str
         Column names; ``len(colnames) == values.shape[1]``.
 
     Examples
@@ -5465,6 +5752,8 @@ def gtrack_array_create(
         if col not in intervals.columns:
             raise ValueError(f"intervals must have a '{col}' column")
 
+    if isinstance(colnames, str):
+        colnames = [colnames]
     values_arr = np.asarray(values, dtype=np.float64)
     if values_arr.ndim != 2:
         raise ValueError("values must be a 2-D array (n_intervals x n_cols)")
@@ -5481,10 +5770,10 @@ def gtrack_array_create(
     if len(set(colnames)) != len(colnames):
         raise ValueError("colnames must be unique")
 
+    if len(intervals) == 0:
+        raise ValueError("intervals is empty")
     ivs = _normalize_intervals_df(intervals).copy().reset_index(drop=True)
     ivs = _canonicalize_known_chroms(ivs, strict=True)
-    if len(ivs) == 0:
-        raise ValueError("No intervals map to known chromosomes")
     if len(ivs) != len(intervals):
         raise ValueError(
             "intervals contains rows mapping to unknown chromosomes"
@@ -5545,6 +5834,11 @@ def gtrack_array_import(
     as a single output column (consistency-checked, error on mismatch).
     Partial overlaps across sources raise an error.
 
+    Rows of a file on a chromosome the database does not have are skipped
+    and the names reported, as :func:`gtrack_import` reports them; a file
+    that names chromosomes and matches none is an error. On an indexed
+    database the track is written in the indexed format.
+
     Parameters
     ----------
     track : str
@@ -5577,13 +5871,15 @@ def gtrack_array_import(
     )
     from .intervals import gintervals_all
 
-    # Resolve each src to a CSV or track source. R: not-a-track -> CSV.
+    # Resolve each src to a CSV or track source. R: not-a-track -> CSV. A file that names
+    # chromosomes and matches none is an error.
     sources: list = []
     for src in srcs:
         if _track_exists(src):
             sources.append(_TrackSource(src))
         else:
             sources.append(_CSVSource(src))
+            _verify_chroms_matched(sources[-1].unknown, sources[-1].num_matched, src)
 
     chrom_order = [str(c) for c in gintervals_all()["chrom"].tolist()]
 
@@ -5596,6 +5892,10 @@ def gtrack_array_import(
         (track_dir / "vars").mkdir(exist_ok=True)
         colnames = _import_sources(track_dir, sources, chrom_order)
         write_colnames(track_dir, colnames)
+
+    for src, source in zip(srcs, sources, strict=True):
+        if isinstance(source, _CSVSource):
+            _report_unknown_chroms(source.unknown, source.num_matched, src)
 
     _pymisha.pm_dbreload()
     created_by = (
@@ -5610,6 +5910,8 @@ def gtrack_array_import(
     # here. It writes through _atomic_track_create(), i.e. _target_root()
     # (_UROOT if set, else _GROOT) - not necessarily _GROOT.
     _shared._touch_db_cache_dirty(_target_root())
+    if _db_is_indexed(_shared._GROOT):
+        _index_created_track(track, remove_old=True)
 
 
 def gtrack_array_get_colnames(track: str) -> list[str]:
@@ -5632,7 +5934,7 @@ def gtrack_array_get_colnames(track: str) -> list[str]:
     return read_colnames(track_path)
 
 
-def gtrack_array_set_colnames(track: str, colnames: list[str]) -> None:
+def gtrack_array_set_colnames(track: str, colnames: str | list[str]) -> None:
     """Set the column names of an ``array`` track.
 
     R parity for ``gtrack.array.set_colnames``. Writes
@@ -5647,14 +5949,21 @@ def gtrack_array_set_colnames(track: str, colnames: list[str]) -> None:
             f"gtrack_array_set_colnames: '{track}' is not an array track "
             f"(type={info.get('type')!r})"
         )
-    from ._array_track import write_colnames
+    from ._array_track import read_colnames, write_colnames
     track_path = Path(_pymisha.pm_track_path(track))
-    write_colnames(track_path, list(colnames))
+    names = [colnames] if isinstance(colnames, str) else list(colnames)
+    num_cols = len(read_colnames(track_path))
+    if num_cols != len(names):
+        raise ValueError(
+            f"The number of columns in the track ({num_cols}) does not match the number of column names "
+            f"({len(names)})"
+        )
+    write_colnames(track_path, names)
 
 
 def gtrack_array_extract(
     track: str,
-    slice: list[str] | list[int] | None = None,
+    slice: str | int | list[str] | list[int] | None = None,
     intervals: pd.DataFrame | str | None = None,
     file: str | None = None,
 ) -> pd.DataFrame | None:
@@ -5669,7 +5978,7 @@ def gtrack_array_extract(
     ----------
     track : str
         Array track name.
-    slice : list of str or int, optional
+    slice : str, int, or list of str or int, optional
         Column subset to return. Strings are matched against the track
         colnames; integers are 0-based column indices. ``None`` returns
         all columns.
@@ -5707,11 +6016,12 @@ def gtrack_array_extract(
     intervals = _maybe_load_intervals_set(intervals)
     if not isinstance(intervals, pd.DataFrame):
         raise ValueError("intervals must be a DataFrame or interval-set name")
+    _check_intervals_strand(intervals)
 
     if slice is None:
         slice_idx: list[int] | None = None
     else:
-        slice_list = list(slice)
+        slice_list = [slice] if isinstance(slice, (str, int, np.integer)) else list(slice)
         if all(isinstance(s, str) for s in slice_list):
             cn_idx = {name: i for i, name in enumerate(colnames)}
             try:

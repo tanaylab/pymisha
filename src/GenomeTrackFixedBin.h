@@ -132,6 +132,7 @@ protected:
 	int64_t m_cur_bin{0};  // current bin index for mmap path
 
 	void init_read(const char *filename, const char *mode, int chromid);
+	void init_read_once(const char *filename, const char *mode, int chromid);
 
 	// Helper to parse header at current file position
 	void read_header_at_current_pos_(BufferedFile &bf);

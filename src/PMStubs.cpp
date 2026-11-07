@@ -42,37 +42,163 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-// Resolve a Python chrom value (str or int) to a chromid. Helper used by
-// the vectorized parser below; not inlined into the hot loop so the loop
-// stays compact.
-static int resolve_chrom_id(PyObject *chrom_val, const GenomeChromKey &chromkey)
+// Whether a Python value is missing: None, NaN or pandas.NA.
+bool py_is_missing(PyObject *val)
+{
+    if (val == Py_None)
+        return true;
+    if (PyFloat_Check(val))
+        return std::isnan(PyFloat_AS_DOUBLE(val));
+    if (PyArray_IsScalar(val, Floating)) {
+        double v = PyFloat_AsDouble(val);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            return false;
+        }
+        return std::isnan(v);
+    }
+    const char *type_name = Py_TYPE(val)->tp_name;
+    const char *dot = strrchr(type_name, '.');
+    return !strcmp(dot ? dot + 1 : type_name, "NAType");
+}
+
+// The chromosome name of a chrom value, as R misha's IntervalConverter reads it: a string is
+// the name, and a number is printed as as.character() prints a whole number (1 and 1.0 are "1",
+// -0 is "0"), for the chromosome aliases to resolve as gintervals(1, ...) does. A missing value or
+// a fraction is an error at row i (reported 1-based, as R does); a bool or another type is too.
+std::string py_chrom_name(PyObject *val, Py_ssize_t i)
+{
+    if (PyUnicode_Check(val)) {
+        const char *name = PyUnicode_AsUTF8(val);
+        if (name)
+            return name;
+        PyErr_Clear();
+        TGLError("Invalid format of interval at index %ld", (long)i + 1);
+    }
+    if (!PyBool_Check(val) && !PyArray_IsScalar(val, Bool)) {
+        if (PyIndex_Check(val)) {
+            PMPY num(PyNumber_Index(val), true);
+            int overflow = 0;
+            long long n = num ? PyLong_AsLongLongAndOverflow(num, &overflow) : -1;
+            if (!num || overflow || (n == -1 && PyErr_Occurred())) {
+                PyErr_Clear();
+                TGLError("Invalid format of interval at index %ld", (long)i + 1);
+            }
+            return std::to_string(n);
+        }
+        if (PyFloat_Check(val) || PyArray_IsScalar(val, Floating)) {
+            double v = PyFloat_AsDouble(val);
+            if (PyErr_Occurred())
+                PyErr_Clear();
+            if (!std::isfinite(v) || v != std::floor(v) || std::fabs(v) > 1e15)
+                TGLError("Invalid format of interval at index %ld", (long)i + 1);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.0f", v == 0 ? 0.0 : v);  // -0 is "0"
+            return buf;
+        }
+        if (py_is_missing(val))
+            TGLError("Invalid format of interval at index %ld", (long)i + 1);
+    }
+    TGLError("Invalid format of intervals argument: column chrom must be character, factor or numeric");
+    return "";
+}
+
+// A strand label R's GInterval::str2strand reads: "+", "-", ".", "*" or "".
+static bool is_strand_label(const char *s)
+{
+    return s && (!s[0] || (!s[1] && (s[0] == '+' || s[0] == '-' || s[0] == '.' || s[0] == '*')));
+}
+
+static void bad_strand_label(PyObject *label)
+{
+    const char *s = PyUnicode_AsUTF8(label);
+    TGLError("Bad strand value \"%s\" (expected \"+\", \"-\", \".\", \"*\" or \"\")", s ? s : "");
+}
+
+// R misha's check of a strand column: a boolean column (or a categorical of booleans) is not a
+// strand column ("Invalid format of intervals argument", as R says of a logical one), and the first
+// row with a missing strand (None, NaN or pandas.NA; not strand 0) or a label other than "+", "-",
+// ".", "*" or "" is an error. A categorical column arrives from _df2pymisha as
+// [categories, codes], NA as code -1.
+void check_strand_column(PyObject *py_strand)
+{
+    if (!py_strand)
+        return;
+    PMPY values;
+    if (PyList_Check(py_strand) && PyList_Size(py_strand) == 2 && PyArray_Check(PyList_GET_ITEM(py_strand, 1))) {
+        PyObject *cats = PyList_GET_ITEM(py_strand, 0);
+        if (PyArray_Check(cats) && PyArray_TYPE((PyArrayObject *)cats) == NPY_BOOL)
+            TGLError("Invalid format of intervals argument");
+        PMPY codes(PyArray_FROM_OTF(PyList_GET_ITEM(py_strand, 1), NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+        if (!codes) {
+            PyErr_Clear();
+            return;
+        }
+        PMPY cat_objs;
+        if (PyArray_Check(cats) && PyArray_TYPE((PyArrayObject *)cats) == NPY_OBJECT)
+            cat_objs.assign(PyArray_FROM_OTF(cats, NPY_OBJECT, NPY_ARRAY_IN_ARRAY), true);
+        const int64_t *c = (const int64_t *)PyArray_DATA((PyArrayObject *)*codes);
+        for (npy_intp k = 0; k < PyArray_SIZE((PyArrayObject *)*codes); ++k) {
+            if (c[k] < 0)
+                TGLError("Invalid strand value (NA) at index %ld", (long)k + 1);
+            if (cat_objs && c[k] < PyArray_SIZE((PyArrayObject *)*cat_objs)) {
+                PyObject *label = *(PyObject **)PyArray_GETPTR1((PyArrayObject *)*cat_objs, c[k]);
+                if (label && PyUnicode_Check(label) && !is_strand_label(PyUnicode_AsUTF8(label)))
+                    bad_strand_label(label);
+            }
+        }
+        PyErr_Clear();
+        return;
+    }
+    values.assign(PyArray_FROM_O(py_strand), true);
+    if (!values || PyArray_NDIM((PyArrayObject *)*values) != 1) {
+        PyErr_Clear();
+        return;
+    }
+    PyArrayObject *arr = (PyArrayObject *)*values;
+    npy_intp n = PyArray_SIZE(arr);
+    if (PyArray_TYPE(arr) == NPY_BOOL)
+        TGLError("Invalid format of intervals argument");
+    if (PyTypeNum_ISFLOAT(PyArray_TYPE(arr))) {
+        PMPY as_double(PyArray_FROM_OTF((PyObject *)arr, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY), true);
+        if (!as_double) {
+            PyErr_Clear();
+            return;
+        }
+        const double *d = (const double *)PyArray_DATA((PyArrayObject *)*as_double);
+        for (npy_intp k = 0; k < n; ++k) {
+            if (std::isnan(d[k]))
+                TGLError("Invalid strand value (NA) at index %ld", (long)k + 1);
+        }
+    } else if (PyArray_TYPE(arr) == NPY_OBJECT) {
+        // booleans with missing values (an object or a pandas "boolean" column) are logical too
+        for (npy_intp k = 0; k < n; ++k) {
+            PyObject *v = *(PyObject **)PyArray_GETPTR1(arr, k);
+            if (v && (PyBool_Check(v) || PyArray_IsScalar(v, Bool)))
+                TGLError("Invalid format of intervals argument");
+        }
+        for (npy_intp k = 0; k < n; ++k) {
+            PyObject *v = *(PyObject **)PyArray_GETPTR1(arr, k);
+            if (!v || py_is_missing(v))
+                TGLError("Invalid strand value (NA) at index %ld", (long)k + 1);
+            if (PyUnicode_Check(v) && !is_strand_label(PyUnicode_AsUTF8(v)))
+                bad_strand_label(v);
+        }
+        PyErr_Clear();
+    }
+}
+
+// Resolve a Python chrom value to a chromid. Helper used by the vectorized parser below; not
+// inlined into the hot loop so the loop stays compact.
+static int resolve_chrom_id(PyObject *chrom_val, const GenomeChromKey &chromkey, Py_ssize_t i)
 {
     if (PyUnicode_Check(chrom_val)) {
         const char *name = PyUnicode_AsUTF8(chrom_val);
-        int id = chromkey.chrom2id(name);
-        if (id < 0)
-            TGLError("Unknown chromosome: %s", name);
-        return id;
+        if (name)
+            return chromkey.chrom2id(name);
+        PyErr_Clear();
     }
-    if (PyNumber_Check(chrom_val)) {
-        PMPY py_long(PyNumber_Long(chrom_val), true);
-        if (!py_long) {
-            PyErr_Clear();
-            TGLError("Failed to convert chromosome to integer");
-        }
-        long n = PyLong_AsLong((PyObject *)py_long);
-        std::string s = std::to_string(n);
-        int id = chromkey.chrom2id(s.c_str());
-        if (id < 0) {
-            s = "chr" + std::to_string(n);
-            id = chromkey.chrom2id(s.c_str());
-        }
-        if (id < 0)
-            TGLError("Unknown chromosome: %ld", n);
-        return id;
-    }
-    TGLError("Invalid chromosome type");
-    return -1;
+    return chromkey.chrom2id(py_chrom_name(chrom_val, i));
 }
 
 // Bring the raw chrom / start / end columns into the shape the converters
@@ -81,10 +207,20 @@ void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end)
 {
     // A categorical chrom column arrives from _df2pymisha as the 2-element
     // list [categories, codes]. Materialize it with numpy fancy indexing.
+    // A missing value is code -1, which would index the last category.
     if (PyList_Check((PyObject *)py_chrom) && PyList_Size((PyObject *)py_chrom) == 2) {
         PyObject *cats = PyList_GetItem((PyObject *)py_chrom, 0);
         PyObject *codes = PyList_GetItem((PyObject *)py_chrom, 1);
         if (cats && codes && PyArray_Check(cats) && PyArray_Check(codes)) {
+            PMPY codes64(PyArray_FROM_OTF(codes, NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+            if (codes64) {
+                const int64_t *c = (const int64_t *)PyArray_DATA((PyArrayObject *)*codes64);
+                for (npy_intp k = 0; k < PyArray_SIZE((PyArrayObject *)*codes64); ++k) {
+                    if (c[k] < 0)
+                        TGLError("Invalid format of interval at index %ld", (long)k + 1);
+                }
+            } else
+                PyErr_Clear();
             PyObject *expanded = PyObject_GetItem(cats, codes);
             if (expanded)
                 py_chrom.assign(expanded, true);
@@ -179,6 +315,7 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
     PMPY py_chrom;
     PMPY py_start;
     PMPY py_end;
+    PMPY py_strand;
 
     // Check if it's the internal list format from _df2pymisha
     if (PyList_Check(py_intervals) && PyList_Size(py_intervals) >= 2) {
@@ -187,7 +324,7 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
         if (colnames && PyArray_Check(colnames)) {
             // Find column indices
             Py_ssize_t num_cols = PyArray_SIZE((PyArrayObject *)colnames);
-            int chrom_idx = -1, start_idx = -1, end_idx = -1;
+            int chrom_idx = -1, start_idx = -1, end_idx = -1, strand_idx = -1;
 
             for (Py_ssize_t i = 0; i < num_cols; ++i) {
                 PyObject *name = PyArray_GETITEM((PyArrayObject *)colnames,
@@ -197,6 +334,7 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
                     if (strcmp(name_str, "chrom") == 0) chrom_idx = i;
                     else if (strcmp(name_str, "start") == 0) start_idx = i;
                     else if (strcmp(name_str, "end") == 0) end_idx = i;
+                    else if (strcmp(name_str, "strand") == 0) strand_idx = i;
                 }
                 Py_XDECREF(name);
             }
@@ -206,6 +344,8 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
                 py_chrom.assign(PyList_GetItem(py_intervals, chrom_idx + 1), false);
                 py_start.assign(PyList_GetItem(py_intervals, start_idx + 1), false);
                 py_end.assign(PyList_GetItem(py_intervals, end_idx + 1), false);
+                if (strand_idx >= 0)
+                    py_strand.assign(PyList_GetItem(py_intervals, strand_idx + 1), false);
             }
         }
     }
@@ -216,6 +356,10 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
         py_chrom.assign(PyObject_GetAttrString(py_intervals, "chrom"), true);
         py_start.assign(PyObject_GetAttrString(py_intervals, "start"), true);
         py_end.assign(PyObject_GetAttrString(py_intervals, "end"), true);
+        if (py_chrom && py_start && py_end) {
+            py_strand.assign(PyObject_GetAttrString(py_intervals, "strand"), true);
+            PyErr_Clear();  // strand may not exist
+        }
     }
 
     // Fallback: try dict-like access
@@ -232,8 +376,10 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
 
     if (!py_chrom || !py_start || !py_end) {
         PyErr_Clear();
-        TGLError("intervals must have 'chrom', 'start', and 'end' columns");
+        TGLError("Invalid format of intervals argument: intervals must have 'chrom', 'start', and 'end' columns");
     }
+
+    check_strand_column(py_strand);
 
     normalize_interval_columns(py_chrom, py_start, py_end);
 
@@ -289,7 +435,7 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
             if (obj == last_obj) {
                 id = last_id;
             } else {
-                id = resolve_chrom_id(obj, chromkey);
+                id = resolve_chrom_id(obj, chromkey, i);
                 last_obj = obj;
                 last_id = id;
             }
@@ -317,7 +463,7 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
 
         // No pointer cache here: chrom_val is a new reference freed at the end
         // of each row, so the next row's object can reuse its address.
-        int chromid = resolve_chrom_id((PyObject *)chrom_val, chromkey);
+        int chromid = resolve_chrom_id((PyObject *)chrom_val, chromkey, i);
 
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
@@ -852,26 +998,7 @@ PyObject *pm_normalize_chroms(PyObject *self, PyObject *args)
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
 
         for (Py_ssize_t i = 0; i < n; ++i) {
-            PyObject *item = items[i];
-            int chromid = -1;
-
-            if (PyUnicode_Check(item)) {
-                chromid = chromkey.chrom2id(PyUnicode_AsUTF8(item));
-            } else if (PyLong_Check(item)) {
-                long chrom_num = PyLong_AsLong(item);
-                std::string chrom_str = std::to_string(chrom_num);
-                chromid = chromkey.chrom2id(chrom_str.c_str());
-                if (chromid < 0) {
-                    chrom_str = "chr" + chrom_str;
-                    chromid = chromkey.chrom2id(chrom_str.c_str());
-                }
-            } else {
-                verror("Invalid chromosome type at index %ld", (long)i);
-            }
-
-            if (chromid < 0) {
-                verror("Unknown chromosome at index %ld", (long)i);
-            }
+            int chromid = chromkey.chrom2id(py_chrom_name(items[i], i));
 
             PyList_SetItem((PyObject *)out, i,
                            PyUnicode_FromString(chromkey.id2chrom(chromid).c_str()));
@@ -2037,8 +2164,8 @@ struct SummaryStats {
     double num_bins{0};
     double num_non_nan{0};
     double total{0};
-    double minval{std::numeric_limits<double>::max()};
-    double maxval{-std::numeric_limits<double>::max()};
+    double minval{std::numeric_limits<double>::infinity()};
+    double maxval{-std::numeric_limits<double>::infinity()};
     // For the standard deviation (R misha 5.15): sums of (x - shift) and (x - shift)^2,
     // shifted by the first value. Unshifted, sum(x^2) - N*mean^2 cancels catastrophically
     // when the variance is small relative to mean^2.
@@ -2063,10 +2190,11 @@ struct SummaryStats {
 
     double mean() const { return total / num_non_nan; }
 
-    // sum((x - mean)^2)
+    // sum((x - mean)^2). Rounding can leave it slightly negative; NaN (an infinite value) is
+    // kept, so the standard deviation is NaN as in R's sd().
     double sq_dev_sum() const {
         double s = shifted_sq_sum - shifted_sum * shifted_sum / num_non_nan;
-        return s > 0 ? s : 0;
+        return s < 0 ? 0 : s;
     }
 
     // unbiased standard deviation: sqrt(sum((x-mean)^2) / (N-1))
@@ -2732,7 +2860,10 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             }
 
             std::vector<double> merged_samples;
-            merged_samples.reserve(g_pymisha->max_data_size());
+            uint64_t num_kid_samples = 0;
+            for (uint64_t kid_sample_size : kid_sample_sizes)
+                num_kid_samples += kid_sample_size;
+            merged_samples.reserve(std::min(g_pymisha->max_data_size(), num_kid_samples));
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 const auto &samples = kid_samples[kid];
@@ -3587,10 +3718,11 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
 
     if (!py_chrom || !py_start || !py_end) {
         PyErr_Clear();
-        TGLError("intervals must have 'chrom', 'start', and 'end' columns");
+        TGLError("Invalid format of intervals argument: intervals must have 'chrom', 'start', and 'end' columns");
     }
 
     normalize_interval_columns(py_chrom, py_start, py_end);
+    check_strand_column(py_strand);
 
     Py_ssize_t len = PyObject_Length(py_chrom);
     if (len < 0) {
@@ -3613,33 +3745,7 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
             TGLError("Failed to get interval values at index %ld", (long)i);
         }
 
-        // Get chromosome id
-        int chromid = -1;
-        if (PyUnicode_Check(chrom_val)) {
-            const char *chrom_name = PyUnicode_AsUTF8(chrom_val);
-            chromid = chromkey.chrom2id(chrom_name);
-            if (chromid < 0) {
-                TGLError("Unknown chromosome: %s", chrom_name);
-            }
-        } else if (PyNumber_Check(chrom_val)) {
-            PMPY py_long(PyNumber_Long(chrom_val), true);
-            if (!py_long) {
-                PyErr_Clear();
-                TGLError("Failed to convert chromosome to integer at index %ld", (long)i);
-            }
-            long chrom_num = PyLong_AsLong(py_long);
-            std::string chrom_str = std::to_string(chrom_num);
-            chromid = chromkey.chrom2id(chrom_str.c_str());
-            if (chromid < 0) {
-                chrom_str = "chr" + std::to_string(chrom_num);
-                chromid = chromkey.chrom2id(chrom_str.c_str());
-            }
-            if (chromid < 0) {
-                TGLError("Unknown chromosome: %ld", chrom_num);
-            }
-        } else {
-            TGLError("Invalid chromosome type at index %ld", (long)i);
-        }
+        int chromid = resolve_chrom_id(chrom_val, chromkey, i);
 
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
@@ -3661,9 +3767,13 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
                         if (s == -1 || s == 1) strand = (char)s;
                     }
                 } else if (PyUnicode_Check(strand_val)) {
-                    const char *s = PyUnicode_AsUTF8(strand_val);
-                    if (s && s[0] == '+') strand = 1;
-                    else if (s && s[0] == '-') strand = -1;
+                    // R's GInterval::str2strand: "+", "-", ".", "*" or "", anything else is an error
+                    const char *cs = PyUnicode_AsUTF8(strand_val);
+                    const std::string s = cs ? cs : "";
+                    if (s == "+") strand = 1;
+                    else if (s == "-") strand = -1;
+                    else if (!s.empty() && s != "." && s != "*")
+                        TGLError("Bad strand value \"%s\" (expected \"+\", \"-\", \".\", \"*\" or \"\")", s.c_str());
                 }
             }
             PyErr_Clear();
@@ -5466,38 +5576,59 @@ struct CorSummary {
     double n_na{0};
     double sum1{0};
     double sum2{0};
-    double sumsq1{0};
-    double sumsq2{0};
-    double cross{0};
+    // Sums of (v1 - shift1), (v2 - shift2), their squares and cross product, shifted by
+    // the first pair. Unshifted, sum(v^2) - sum(v)^2/n cancels catastrophically when the
+    // variance is small relative to mean^2.
+    double shift1{0};
+    double shift2{0};
+    double shifted_sum1{0};
+    double shifted_sum2{0};
+    double shifted_sumsq1{0};
+    double shifted_sumsq2{0};
+    double shifted_cross{0};
 
     void update(double v1, double v2) {
-        ++n;
         if (std::isnan(v1) || std::isnan(v2)) {
             ++n_na;
         } else {
+            if (!n_valid()) {
+                shift1 = v1;
+                shift2 = v2;
+            }
             sum1 += v1;
             sum2 += v2;
-            sumsq1 += v1 * v1;
-            sumsq2 += v2 * v2;
-            cross += v1 * v2;
+            double d1 = v1 - shift1;
+            double d2 = v2 - shift2;
+            shifted_sum1 += d1;
+            shifted_sum2 += d2;
+            shifted_sumsq1 += d1 * d1;
+            shifted_sumsq2 += d2 * d2;
+            shifted_cross += d1 * d2;
         }
+        ++n;
     }
 
     double n_valid() const { return n - n_na; }
 
+    // sum((v1 - mean1)^2), sum((v2 - mean2)^2), sum((v1 - mean1)(v2 - mean2))
+    double sq_dev1() const { return shifted_sumsq1 - shifted_sum1 * shifted_sum1 / n_valid(); }
+    double sq_dev2() const { return shifted_sumsq2 - shifted_sum2 * shifted_sum2 / n_valid(); }
+    double co_dev() const { return shifted_cross - shifted_sum1 * shifted_sum2 / n_valid(); }
+
     double mean1() const { return n_valid() > 0 ? sum1 / n_valid() : std::numeric_limits<double>::quiet_NaN(); }
     double mean2() const { return n_valid() > 0 ? sum2 / n_valid() : std::numeric_limits<double>::quiet_NaN(); }
 
+    // Rounding can leave a tiny negative sum of squared deviations; NaN (from Inf values) is kept
     double var1() const {
         if (n_valid() < 2) return std::numeric_limits<double>::quiet_NaN();
-        double m = mean1();
-        return (sumsq1 - n_valid() * m * m) / (n_valid() - 1);
+        double sq_dev = sq_dev1();
+        return (sq_dev < 0 ? 0 : sq_dev) / (n_valid() - 1);
     }
 
     double var2() const {
         if (n_valid() < 2) return std::numeric_limits<double>::quiet_NaN();
-        double m = mean2();
-        return (sumsq2 - n_valid() * m * m) / (n_valid() - 1);
+        double sq_dev = sq_dev2();
+        return (sq_dev < 0 ? 0 : sq_dev) / (n_valid() - 1);
     }
 
     double sd1() const { return std::sqrt(var1()); }
@@ -5505,32 +5636,51 @@ struct CorSummary {
 
     double cov() const {
         if (n_valid() < 2) return std::numeric_limits<double>::quiet_NaN();
-        return (cross - n_valid() * mean1() * mean2()) / (n_valid() - 1);
+        return co_dev() / (n_valid() - 1);
     }
 
     double cor() const {
         double s1 = sd1();
         double s2 = sd2();
-        if (std::isnan(s1) || std::isnan(s2) || s1 == 0 || s2 == 0)
-            return std::numeric_limits<double>::quiet_NaN();
-        return cov() / (s1 * s2);
+        if (s1 > 0 && s2 > 0)
+            return cov() / (s1 * s2);
+        return std::numeric_limits<double>::quiet_NaN();
     }
 
+    // Summaries of disjoint parts of the scope (multitasking)
     void merge(const CorSummary &other) {
-        // Parallel Welford-style merge for two-pass-free streaming correlation
-        // This is a simplified merge that is exact when both summaries
-        // are computed over non-overlapping partitions.
-        double nv1 = n_valid();
-        double nv2 = other.n_valid();
+        double nv1 = n_valid(), nv2 = other.n_valid();
+        if (nv2 > 0) {
+            if (!nv1) {
+                shift1 = other.shift1;
+                shift2 = other.shift2;
+                shifted_sum1 = other.shifted_sum1;
+                shifted_sum2 = other.shifted_sum2;
+                shifted_sumsq1 = other.shifted_sumsq1;
+                shifted_sumsq2 = other.shifted_sumsq2;
+                shifted_cross = other.shifted_cross;
+            } else {
+                // Combine the (co)moments pairwise (Chan et al.), then store the result
+                // relative to this summary's shifts
+                double nv = nv1 + nv2;
+                // mean2 - mean1, without forming the means themselves (they may be large)
+                double delta1 = (other.shift1 - shift1) + (other.shifted_sum1 / nv2 - shifted_sum1 / nv1);
+                double delta2 = (other.shift2 - shift2) + (other.shifted_sum2 / nv2 - shifted_sum2 / nv1);
+                double w = nv1 * nv2 / nv;
+                double m11 = sq_dev1() + other.sq_dev1() + delta1 * delta1 * w;
+                double m22 = sq_dev2() + other.sq_dev2() + delta2 * delta2 * w;
+                double m12 = co_dev() + other.co_dev() + delta1 * delta2 * w;
+                shifted_sum1 = shifted_sum1 + other.shifted_sum1 + nv2 * (other.shift1 - shift1);
+                shifted_sum2 = shifted_sum2 + other.shifted_sum2 + nv2 * (other.shift2 - shift2);
+                shifted_sumsq1 = m11 + shifted_sum1 * shifted_sum1 / nv;
+                shifted_sumsq2 = m22 + shifted_sum2 * shifted_sum2 / nv;
+                shifted_cross = m12 + shifted_sum1 * shifted_sum2 / nv;
+            }
+        }
         n += other.n;
         n_na += other.n_na;
         sum1 += other.sum1;
         sum2 += other.sum2;
-        sumsq1 += other.sumsq1;
-        sumsq2 += other.sumsq2;
-        cross += other.cross;
-        (void)nv1;
-        (void)nv2;
     }
 };
 
@@ -5578,22 +5728,28 @@ static double pearson_from_values(const std::vector<double> &x, const std::vecto
     if (n < 2)
         return std::numeric_limits<double>::quiet_NaN();
 
-    double sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0, sum_xy = 0;
+    // Two passes (means first), so the sums of squares do not cancel
+    double mean_x = 0, mean_y = 0;
     for (uint64_t i = 0; i < n; ++i) {
-        sum_x += x[i];
-        sum_y += y[i];
-        sum_x2 += x[i] * x[i];
-        sum_y2 += y[i] * y[i];
-        sum_xy += x[i] * y[i];
+        mean_x += x[i];
+        mean_y += y[i];
+    }
+    mean_x /= n;
+    mean_y /= n;
+
+    double sq_dev_x = 0, sq_dev_y = 0, co_dev = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        double dx = x[i] - mean_x;
+        double dy = y[i] - mean_y;
+        sq_dev_x += dx * dx;
+        sq_dev_y += dy * dy;
+        co_dev += dx * dy;
     }
 
-    double var_x = (sum_x2 - (sum_x * sum_x) / n) / (n - 1);
-    double var_y = (sum_y2 - (sum_y * sum_y) / n) / (n - 1);
-    if (var_x <= 0 || var_y <= 0)
+    if (!(sq_dev_x > 0) || !(sq_dev_y > 0))
         return std::numeric_limits<double>::quiet_NaN();
 
-    double cov = (sum_xy - (sum_x * sum_y) / n) / (n - 1);
-    return cov / (std::sqrt(var_x) * std::sqrt(var_y));
+    return co_dev / (std::sqrt(sq_dev_x) * std::sqrt(sq_dev_y));
 }
 
 static double estimate_rank(double value, const std::vector<double> &sorted_sample, uint64_t total_count)
@@ -5864,9 +6020,11 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
     if (sample_size == 0)
         sample_size = 1;
 
-    StreamSampler<ValuePair> pair_sampler(sample_size, true);
-    StreamSampler<double> x_sampler(sample_size, true);
-    StreamSampler<double> y_sampler(sample_size, true);
+    // with no limit, the samplers grow with the values instead
+    const bool reserve = sample_size < PyMisha::MAX_DATA_SIZE_NO_LIMIT;
+    StreamSampler<ValuePair> pair_sampler(sample_size, reserve);
+    StreamSampler<double> x_sampler(sample_size, reserve);
+    StreamSampler<double> y_sampler(sample_size, reserve);
 
     uint64_t non_nan = 0;
 
@@ -8442,4 +8600,51 @@ PyObject *pm_r_2d_sort_order(PyObject *self, PyObject *args) {
     for (npy_intp i = 0; i < n; ++i)
         o[i] = (int64_t)order[i];
     return out;
+}
+
+// R's GIntervals2D::verify_no_overlaps: 2D intervals given in R's sorted order (rows of a
+// chromosome pair together) must not overlap; the first overlap is an error naming both
+// intervals. Takes the chromosome ids and coordinates of the two sides.
+PyObject *pm_verify_no_overlaps_2d(PyObject *self, PyObject *args) {
+    try {
+        PyMisha pymisha(true);
+
+        PyObject *objs[6];
+        if (!PyArg_ParseTuple(args, "OOOOOO", &objs[0], &objs[1], &objs[2], &objs[3], &objs[4], &objs[5]))
+            return NULL;
+        PMPY arrs[6];
+        const int64_t *cols[6];
+        npy_intp n = 0;
+        for (int k = 0; k < 6; ++k) {
+            arrs[k].assign(PyArray_FROM_OTF(objs[k], NPY_INT64, NPY_ARRAY_IN_ARRAY), true);
+            if (!*arrs[k])
+                return NULL;
+            if (k == 0)
+                n = PyArray_SIZE((PyArrayObject *)*arrs[k]);
+            else if (PyArray_SIZE((PyArrayObject *)*arrs[k]) != n)
+                verror("2D interval columns differ in length");
+            cols[k] = (const int64_t *)PyArray_DATA((PyArrayObject *)*arrs[k]);
+        }
+        std::vector<GInterval2D> intervs;
+        intervs.reserve(n);
+        for (npy_intp i = 0; i < n; ++i)
+            intervs.push_back(GInterval2D((int)cols[0][i], cols[1][i], cols[2][i], (int)cols[3][i], cols[4][i], cols[5][i]));
+
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        RectsQuadTree qtree;
+        size_t first = 0;
+        for (size_t i = 1; i <= intervs.size(); ++i) {
+            if (i == intervs.size() || !intervs[i].is_same_chrom_pair(intervs[first])) {
+                build_scope_qtree(qtree, intervs, first, i, chromkey);
+                first = i;
+            }
+        }
+        Py_RETURN_NONE;
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
 }

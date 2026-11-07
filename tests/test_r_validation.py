@@ -112,8 +112,10 @@ def _chain(tmp_path, header, size=100, name="c.chain"):
 
 def test_liftover_with_no_source_chromosome_in_the_chain(tmp_path):
     chain = pm.gintervals_load_chain(_chain(tmp_path, "100 chrS 100000 + 0 100 chr2 300000 + 500 600 1"))
-    with pytest.raises(ValueError, match="Source chromosome does not exist in the chain source genome"):
-        pm.gintervals_liftover(pd.DataFrame({"chrom": ["chrZZ"], "start": [0], "end": [10]}), chain)
+    with pytest.warns(UserWarning, match=r"None of the intervals' chromosomes is a source chromosome of the "
+                                         r"chain \(for example chrS\); the result is empty"):
+        got = pm.gintervals_liftover(pd.DataFrame({"chrom": ["chrZZ"], "start": [0], "end": [10]}), chain)
+    assert got.empty
 
 
 def test_load_chain_src_groot(tmp_path):

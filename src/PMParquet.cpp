@@ -530,12 +530,23 @@ PyObject *pm_parquet_columns(PyObject *self, PyObject *args)
 	return NULL;
 }
 
+// The (chrom_names, unknown_files) that pm_parquet_import returns, a new reference
+static PyObject *import_result(const ParquetImport &import)
+{
+	const vector<string> &chrom_names = import.chrom_names();
+	PMPY py_chroms(PyList_New(chrom_names.size()), true);
+	for (size_t i = 0; i < chrom_names.size(); ++i)
+		PyList_SET_ITEM(*py_chroms, i, PyUnicode_FromString(chrom_names[i].c_str()));
+	return Py_BuildValue("(Os)", *py_chroms, import.has_unknown() ? import.unknown_chroms_files().c_str() : "");
+}
+
 // pm_parquet_import(dirs, files, names, columns, binsize, defval) -> (chrom_names, unknown_files)
 //
 // dirs[i] is an existing empty directory that receives the per-chromosome files of columns[i],
 // for every chromosome of the database. names[i] is what messages call files[i]: gtrack_import
 // reads a compressed file from a temporary copy. Returns every chromosome name of the files, in
 // the order of first appearance, and the files that hold names the database does not have.
+// When none of the names is in the database nothing is written, and the caller reports it.
 PyObject *pm_parquet_import(PyObject *self, PyObject *args)
 {
 	try {
@@ -568,9 +579,8 @@ PyObject *pm_parquet_import(PyObject *self, PyObject *args)
 		import.open();
 		import.index();
 
-		uint64_t num_matched = import.num_matched_chroms();
-		if (!num_matched)
-			verror("No intervals map to known chromosomes");
+		if (!import.num_matched_chroms())
+			return import_result(import);
 
 		// Units: each chromosome times batches of columns of nearly equal size, ordered by batch and
 		// then by where the chromosome's rows start in the files. Kid i takes the i-th of num_kids
@@ -635,11 +645,7 @@ PyObject *pm_parquet_import(PyObject *self, PyObject *args)
 			}
 		});
 
-		const vector<string> &chrom_names = import.chrom_names();
-		PMPY py_chroms(PyList_New(chrom_names.size()), true);
-		for (size_t i = 0; i < chrom_names.size(); ++i)
-			PyList_SET_ITEM(*py_chroms, i, PyUnicode_FromString(chrom_names[i].c_str()));
-		PMPY res(Py_BuildValue("(Os)", *py_chroms, import.has_unknown() ? import.unknown_chroms_files().c_str() : ""), true);
+		PMPY res(import_result(import), true);
 		return_py(res);
 	} catch (TGLException &e) {
 		PyMisha::handle_error(e.msg());

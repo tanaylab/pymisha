@@ -612,7 +612,8 @@ class TestGseqKmerDistRParity:
         iv = self._one(0, 1000)
         total = pm.gseq_kmer_dist(iv, k=3)["count"].sum()
         masked = pm.gseq_kmer_dist(iv, k=3, mask=self._one(500, 600))["count"].sum()
-        assert total - masked == 100
+        # the k-mers with any base in the mask: starts 498-599, 102 positions
+        assert total - masked == 102
 
     def test_handles_multiple_intervals(self):
         iv = self._iv(["chr1", "chr1"], [0, 2000], [1000, 3000])
@@ -662,7 +663,8 @@ class TestGseqKmerDistRParity:
         none = pm.gseq_kmer_dist(iv, k=2)["count"].sum()
         assert none == 99
         assert none - start == 20
-        assert none - end == 19
+        # dinucleotides starting at 179-198 reach into [180, 200)
+        assert none - end == 20
 
     def test_handles_overlapping_intervals_correctly(self):
         iv = self._iv(["chr1", "chr1"], [0, 500], [1000, 1500])
@@ -672,7 +674,8 @@ class TestGseqKmerDistRParity:
         iv = self._one(0, 1000)
         mask = self._iv(["chr1"] * 3, [100, 300, 700], [150, 400, 800])
         diff = pm.gseq_kmer_dist(iv, k=3)["count"].sum() - pm.gseq_kmer_dist(iv, k=3, mask=mask)["count"].sum()
-        assert diff == 250
+        # each mask also removes the 2 k-mers that start before it and reach into it
+        assert diff == 52 + 102 + 102
 
     def test_with_k_10_works(self):
         r = pm.gseq_kmer_dist(self._one(0, 1000), k=10)
@@ -743,7 +746,8 @@ class TestGseqKmerDistRParity:
         iv = self._one(0, 100)
         masked = pm.gseq_kmer_dist(iv, k=2, mask=self._one(50, 150))["count"].sum()
         diff = pm.gseq_kmer_dist(iv, k=2)["count"].sum() - masked
-        assert diff == 49
+        # k-mers starting at 49-98 reach into the mask
+        assert diff == 50
 
     def test_with_all_possible_k_values(self):
         iv = self._one(0, 100)

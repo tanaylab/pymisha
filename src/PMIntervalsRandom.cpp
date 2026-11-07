@@ -28,6 +28,9 @@
 
 using namespace std;
 
+// Defined in PMStubs.cpp
+extern std::string py_chrom_name(PyObject *val, Py_ssize_t i);
+
 namespace {
 
 struct ValidSegment {
@@ -130,13 +133,7 @@ static void parse_intervals_df(PyObject *py_df,
                 return true;
             }
             if (PyNumber_Check(name)) {
-                PMPY py_long(PyNumber_Long(name), true);
-                if (!py_long) {
-                    PyErr_Clear();
-                    TGLError("%s: bad chrom value at row %lld", what, (long long)i);
-                }
-                long v = PyLong_AsLong(py_long);
-                out = std::to_string(v);
+                out = py_chrom_name(name, i);
                 return true;
             }
         }

@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.18.0 (2026-11-06)
+
+Follows R misha 5.16.0. Several results change; recompute anything that depends on them.
+
+### Breaking
+
+* `gtrack_create_dense` (and `gtrack_import` of a BED file with `binsize > 0`) counts the bases under overlapping intervals once, so `defval` weighs the rest of the bin; overlapping intervals used to crowd it out.
+* `gtrack_create_dense_direct` gives what `gtrack_create_dense` gives (the overlap-weighted mean, `defval` for the uncovered bases). It gave the sum of value × covered fraction and ignored `defval` in covered bins, which also shrank the last partial bin of each chromosome in `gsynth_score` tracks.
+* `pwm` and `pwm.max` vtracks are NaN at a chromosome end where no motif fits (were -inf).
+* `gseq_kmer_dist(mask=)` leaves out every k-mer with a base in the mask, not only those starting in it.
+* `gintervals_mapply` returns one row per input interval, with the intervals' columns, also with `iterator=`; the function gets the values of the iterator bins in the interval. The result column is float; a result that is not a single number is an error, and an interval with no bin is NaN without calling the function. With `enable_gapply_intervals=True`, `gapply_intervals` is a DataFrame of those bins (chrom, start, end), as R's `GAPPLY.INTERVALS`; it was a dict of the interval.
+* `gintervals_liftover` returns an empty result with a warning when no interval is on a source chromosome of the chain (it raised an error).
+* On a database with more than `CONFIG["multicontig_2d_threshold"]` contigs, a 2D computation over the whole genome without explicit intervals is an error unless the new `CONFIG["multicontig_2d_mode"]` is `"full"` or `"diagonal"`; `gintervals_2d_all()` warns that it returns only the cis pairs.
+* `gtrack_smooth` with a window that covers no bin besides the center is an error.
+* Band distances must be finite numbers within ±1e18; a fractional distance is rounded (10.6 is 11, not 10). A first distance not below the second gives R's error, "Invalid band argument: distance1 exceeds distance2".
+* Errors with R's messages, instead of silently guessing: NaN, None or pd.NA percentiles; NaN breaks; NaN `mindist`/`maxdist`; non-finite vtrack iterator shifts; NaN or pd.NA for a logical flag; a missing strand; a chain with character or missing strands; a chrom of `1.5`, `True` or NA; an invalid `CONFIG["max_data_size"]` or `CONFIG["max_mem_usage"]` (NaN, negative); a `CONFIG["multitasking"]` other than True, False, 1, 0 or None.
+* Every function that takes intervals checks their strand column as R does, also where the strand is not used (`gintervals_intersect`, `gtrack_create_sparse`, a DataFrame iterator, ...): a boolean column, a missing strand or a label other than "+", "-", ".", "*" or "" is an error. It was ignored, read as forward, or (booleans) read as 1 / 0.
+* `gseq_extract` reads a categorical strand by its labels (it was ignored).
+* Bad breaks (fewer than 2, NA, unsorted, repeated) give R's errors in `gdist`, `glookup`, `gtrack_lookup`, `gbins_summary`, `gbins_quantiles` and `gcis_decay`; `gcis_decay` accepted unsorted or repeated breaks.
+* An iterator whose dimension does not match the intervals or the tracks gives R's errors ("2D iterator is used along with 1D intervals", "1D iterator is applied to a 2D track ...", ...); other messages, or a crash, were given before.
+* `gintervals_quantiles` and `gintervals_mapply` refuse a 2D track, 2D intervals or a cartesian grid as the iterator, with R's error; a `(width, height)` iterator is taken.
+* `glookup` returns `value` before `intervalID` for 2D intervals and virtual tracks, as R.
+* `gtrack_create_sparse` and `gtrack_create_dense` raise R's per-row errors for an interval with a missing coordinate, a negative start or start >= end, instead of dropping the row.
+* An import (Parquet too) whose file matches none of the database's chromosomes fails with "None of the chromosome names in ... exist in the genome database". Reports of skipped chromosomes list at most 5 names.
+* `gtrack_import_mappedseq` matches chromosome names through the aliases (`1`, `MT`), so reads on alias names are now mapped.
+* `gvtrack_array_slice` no longer accepts `func="stdev"`; use `"stddev"`.
+* `gintervals_update` refuses an interval set of a loaded dataset; `gtrack_mv`, `gtrack_copy` and the track-creating functions refuse the name of an interval set; `gdataset_load` refuses a dataset by which a name would be both a track and an interval set.
+* A forced re-conversion of an indexed interval set refuses, changing nothing, when some of its data is only in its index; so does a forced re-conversion of a 2D track when only some pairs have a per-pair file.
+
+### New features
+
+* `CONFIG["multicontig_2d_mode"]` (R's `gmulticontig.2d.mode`).
+* `CONFIG["max_data_size"] = None` or `float("inf")` means no limit, also with multitasking; `CONFIG["max_mem_usage"]` likewise.
+* `gcor` accepts a track name, an interval set or intervals as the iterator.
+* `gtrack_2d_import`, `gtrack_2d_import_contacts` and `gtrack_array_import` report the chromosomes they skipped.
+* `gtrack_array_import` writes the indexed format on an indexed database.
+* `gtrack_create` of a 2D expression takes a 2D track (rectangles or points), 2D intervals, an interval set or a `(width, height)` size as the iterator, as R; the track holds each iterator rectangle with its value.
+* `gintervals_mapply` takes 2D intervals with a `(width, height)` iterator.
+* A track can be created over the name of a loaded dataset's track; the new one, in the working database, wins.
+
+### Bug fixes
+
+* A track or interval set that another session (pymisha or R) re-created is read with its current index; it gave wrong values or errors, even after `gdb_reload()`. `global.percentile` vtracks and 2D readers follow it too.
+* `gcor` is accurate when values are large relative to their spread (an offset of 1e8 gave NaN), with and without multitasking.
+* `gsummary` and `gintervals_summary` give a NaN standard deviation when a value is infinite (gave 0 or Inf), and Min/Max of -Inf/Inf when every value is infinite (gave ±1.797693e+308).
+* Array tracks: `lse` is NaN where no value overlaps (it repeated the previous interval's value), and `sample` and `sample.pos.*` work.
+* `gseq_pwm_edits` with `max_indels` reports tied edits in motif order.
+* A numeric chrom column (`chrom=[1.0, 2.0]`) is read as chromosome names everywhere; several functions raised 'Chromosome "1.0" does not exist'. `-0` is chromosome 0. A chain with a numeric source or target chromosome lifts over.
+* `CONFIG["max_data_size"] = 2**64` no longer breaks every later call with `SystemError`; a float or `np.int64` value is used by all functions, and values below 1 count as 1.
+* `gintervals_annotate` gives R's error for `tie_method` other than "first" on 2D intervals (it raised KeyError) and takes a single column name as a string.
+* A `global.percentile` vtrack on a track whose percentile table has some NaN breaks is an error; on a track with no values it is NaN.
+* `gtrack_2d_import_contacts` checks fend ids: a negative, too large, empty or repeated id is an error naming the line (they crashed the import, were accepted, or left a broken track). Fends on a chromosome the database lacks are skipped.
+* `gtrack_2d_import` and `gtrack_2d_import_contacts` fail and leave no track when nothing is imported.
+* BED import clips records past the chromosome end and drops empty ones, with one warning; one zero-length record used to fail the whole import.
+* A WIG / bedGraph block of a chromosome that resumes after an unknown chromosome is an error; both blocks were imported.
+* `gtrack_export_bedgraph` merges overlapping intervals first, so no base is written twice.
+* `gtrack_array_import` of a header-only file makes an empty array track (it was called sparse).
+* `gtrack_copy` builds the copy in a staging directory and puts it in place only when complete: a copy killed or cut short never leaves a partial track, and a failed `overwrite=True` keeps the old track.
+* `gintervals_update` keeps a set's attributes when it moves from big to small, and `gdataset_save` copies the attributes of small interval sets.
+* `gdb_convert_to_indexed` converts a 1D interval set over contigs whose names have a dash.
+* `gextract` of a 2D track with no intervals runs over the 2D genome (it raised an error).
+* A sequence or value based vtrack, or one on a 1D track, under a 2D iterator without `dim` gives R's error message.
+* 2D intervals missing a column give a clear error instead of `KeyError`.
+* The mean of a dense track over several bins is summed in double and rounded to float once, as in R. `gextract`, `gscreen`, `gsummary` and other track expressions could differ from R in the last bits, and `gscreen` could drop a window at an exact threshold.
+* Filtered `avg` and `sum` virtual tracks give R's values (they could differ in the last bits).
+* `gintervals_summary` of a virtual track gives a NaN Sum and Std dev for an interval without values (it gave 0 and -0).
+* `gintervals_canonic` and `gintervals_mark_overlaps` work on 2D intervals: sorted by chromosome pair, not merged, and overlapping intervals are an error, as in R (they raised KeyError).
+* `gintervals_neighbors` reads a strand column of labels ("+"/"-", strings or a Categorical) in both sets and keeps the labels in the result; it raised an error. `gintervals_mapply` reverses the values on a `"-"` strand label too.
+* `gtrack_create_sparse` with no intervals creates an empty track, and `gtrack_create_dense` a track of `defval`; so does `gtrack_create` over an iterator of no intervals. They raised "intervals is empty".
+* A single name is one name, not a list of characters: `gextract(colnames=)`, `gtrack_array_extract(slice=)`, `gvtrack_array_slice(slice=)`, `gintervals_to_mat(value_cols=)`, `gintervals_random(chromosomes=)`, `gintervals_import_genes(annots_names=)`, `gdist(names=)`, `gcor(names=)`, `gtrack_attr_export`, `gtrack_array_create(colnames=)` and `gtrack_array_set_colnames`, which also refuses a number of names that is not the track's number of columns.
+* On an indexed database, `gtrack_create`, `gtrack_smooth` and `gtrack_create_dense_direct` no longer leave per-chromosome files next to track.dat/track.idx (they went stale once the track was modified).
+* `gtrack_create` of a 2D expression applies `band` (it was ignored).
+* `gdist` with several expressions over 2D intervals or with a band works (it raised NotImplementedError).
+* `created.by` records the iterator as R does (`iterator="sp0"`, `iterator=NULL`), not `iterator=-1`.
+* Track creators, `gtrack_modify` and the Parquet import name their staging directory by host and pid, so `gdb_init` removes what a killed process left at once instead of after 24 hours.
+
+### Performance
+
+* `gtrack_smooth` keeps running sums over the window: a 200 kb window over 10 bp bins takes 0.01 s instead of 2.5 s, with the same values.
+* `gtrack_create_dense` no longer slows down when a long interval spans many short ones.
+* Filtered virtual tracks (`gvtrack_filter`) read their source once for all the intervals, with the same values: a filtered `avg` over 40,000 intervals with ±20 kb windows on hg38 takes 0.8 s instead of 131 s, and 1.5 s under a 5,000-interval mask, where it failed with a `max_data_size` error.
+* Filtered edit-distance virtual tracks and data-frame virtual tracks no longer slow down quadratically with the number of intervals.
+
 ## v0.17.1 (2026-11-06)
 
 The same code as 0.17.0, which was not published: its macOS build asked for a runner GitHub has retired.

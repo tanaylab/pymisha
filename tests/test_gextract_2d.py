@@ -323,7 +323,7 @@ class TestGextract2dBand:
     def test_band_validation(self):
         """Invalid band should raise ValueError."""
         intervals = pm.gintervals_2d("1", 0, 500000, "1", 0, 500000)
-        with pytest.raises(ValueError, match="d1.*must be less than d2"):
+        with pytest.raises(ValueError, match="Invalid band argument: distance1 exceeds distance2"):
             pm.gextract("rects_track", intervals, band=(100, 50))
 
     def test_band_with_1d_raises(self):

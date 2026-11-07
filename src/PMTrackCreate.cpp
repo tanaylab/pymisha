@@ -78,6 +78,15 @@ static bool db_is_indexed()
     return file_exists(base + "genome.idx") && file_exists(base + "genome.seq");
 }
 
+// A track of that name is an error, unless the track is built in a staging directory
+// (_atomic_track_create), whose caller checked the name as R's .gconfirmtrackcreate does: a
+// loaded dataset's track of the name is allowed, and the new one then wins.
+static void check_new_track_name(const string &track_name)
+{
+    if (pymisha_track_create::g_create_dir_override.empty() && g_pmdb->track_exists(track_name))
+        verror("Track '%s' already exists", track_name.c_str());
+}
+
 static string track_name_to_dir(const string &track_name)
 {
     if (!pymisha_track_create::g_create_dir_override.empty())
@@ -341,8 +350,7 @@ PyObject *pm_track_create_sparse(PyObject *self, PyObject *args)
             verror("Invalid arguments to pm_track_create_sparse");
 
         string track_name(track);
-        if (g_pmdb->track_exists(track_name))
-            verror("Track '%s' already exists", track);
+        check_new_track_name(track_name);
 
         string track_dir = track_name_to_dir(track_name);
         if (file_exists(track_dir))
@@ -569,8 +577,7 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         const bool is_wmean = (func == DenseAggFunc::WMEAN);
 
         string track_name(track);
-        if (g_pmdb->track_exists(track_name))
-            verror("Track '%s' already exists", track);
+        check_new_track_name(track_name);
 
         string track_dir = track_name_to_dir(track_name);
         if (file_exists(track_dir))
@@ -601,6 +608,7 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         vector<Contribution> contribs;
         if (!is_wmean)
             contribs.reserve(64);
+        vector<size_t> active;
 
         for (int chromid = 0; chromid < (int)num_chroms; ++chromid) {
             uint64_t chrom_size = chromkey.get_chrom_size(chromid);
@@ -621,7 +629,11 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
                 ++data_idx;
             size_t chrom_end = data_idx;
 
-            size_t cur_idx = chrom_begin;
+            // The first interval that has not reached a bin yet, and the intervals that overlap the
+            // current bin, in sorted order. An interval stays in active for every bin it overlaps, so
+            // a long interval does not make the bins after it rescan the short intervals it spans.
+            size_t next_idx = chrom_begin;
+            active.clear();
             vector<float> batch;
             batch.reserve(10000);
 
@@ -637,49 +649,65 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
 
             for (uint64_t start = 0; start < chrom_size; start += binsize) {
                 uint64_t end = std::min(start + (uint64_t)binsize, chrom_size);
-                while (cur_idx < chrom_end && (uint64_t)recs[cur_idx].end <= start)
-                    ++cur_idx;
+
+                // Drop the intervals that ended before this bin, and add those that start in it
+                size_t num_active = 0;
+                for (size_t idx : active) {
+                    if ((uint64_t)recs[idx].end > start)
+                        active[num_active++] = idx;
+                }
+                active.resize(num_active);
+                while (next_idx < chrom_end && (uint64_t)recs[next_idx].start < end)
+                    active.push_back(next_idx++);
 
                 uint64_t width = end - start;
+                // Bases of the bin under at least one interval with a value. Intervals may overlap,
+                // so this is the length of their union, not the sum of their overlaps; defval
+                // weighs the rest of the bin.
+                uint64_t covered = 0;
+                uint64_t covered_end = start;
+                auto add_covered = [&](uint64_t ov_start, uint64_t ov_end) {
+                    // ov_start does not decrease along the sorted intervals
+                    if (ov_end > covered_end) {
+                        covered += ov_end - std::max(ov_start, covered_end);
+                        covered_end = ov_end;
+                    }
+                };
                 float out;
 
                 if (is_wmean) {
                     // Historical streaming-sum fast path. Byte-identical
                     // to pre-5.6.32 output.
                     double sum = 0;
-                    uint64_t covered = 0;
-                    size_t j = cur_idx;
-                    while (j < chrom_end && (uint64_t)recs[j].start < end) {
+                    uint64_t weight = 0;
+                    for (size_t j : active) {
                         uint64_t ov_start = std::max(start, (uint64_t)recs[j].start);
                         uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
                         if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
                             uint64_t ov = ov_end - ov_start;
                             sum += float_products ? (double)(recs[j].value * (float)ov)
                                                   : (double)recs[j].value * (double)ov;
-                            covered += ov;
+                            weight += ov;
+                            add_covered(ov_start, ov_end);
                         }
-                        ++j;
                     }
                     if (covered < width && !std::isnan(defval)) {
                         uint64_t unc = width - covered;
                         sum += defval * (double)unc;
-                        covered += unc;
+                        weight += unc;
                     }
-                    out = covered ? (float)(sum / (double)covered)
-                                  : std::numeric_limits<float>::quiet_NaN();
+                    out = weight ? (float)(sum / (double)weight)
+                                 : std::numeric_limits<float>::quiet_NaN();
                 } else {
                     contribs.clear();
-                    uint64_t covered = 0;
-                    size_t j = cur_idx;
-                    while (j < chrom_end && (uint64_t)recs[j].start < end) {
+                    for (size_t j : active) {
                         uint64_t ov_start = std::max(start, (uint64_t)recs[j].start);
                         uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
                         if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
                             uint64_t ov = ov_end - ov_start;
                             contribs.push_back({(double)recs[j].value, (double)ov});
-                            covered += ov;
+                            add_covered(ov_start, ov_end);
                         }
-                        ++j;
                     }
                     // Synthetic uncovered contribution at defval, except for COUNT
                     // (which reports only real interval count).
@@ -737,14 +765,15 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
             py_vtracks = nullptr;
 
         string track_name(track);
-        if (g_pmdb->track_exists(track_name))
-            verror("Track '%s' already exists", track);
+        check_new_track_name(track_name);
 
         long iterator_policy = parse_iterator_policy_local(py_iterator, 0, "pm_track_create_expr");
 
         vector<GInterval> intervals;
         parse_intervals_from_df(py_intervals, intervals);
-        if (intervals.empty())
+        // An intervals iterator (-1: the scope already cut to its intervals) of no intervals
+        // makes an empty sparse track, as in misha
+        if (intervals.empty() && iterator_policy != -1)
             verror("intervals are empty");
 
         string track_dir = track_name_to_dir(track_name);
@@ -810,7 +839,9 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
                 gtrack.write_next_interval(interv, v);
             }
 
-            if (!indexed_db) {
+            // With no interval at all, an indexed database too gets a file per chromosome:
+            // what tells the indexed conversion that the track is sparse
+            if (!indexed_db || none_of(created.begin(), created.end(), [](bool c) { return c; })) {
                 for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
                     if (created[chromid])
                         continue;
@@ -1099,6 +1130,201 @@ PyObject *pm_modify(PyObject *self, PyObject *args)
     }
 }
 
+namespace {
+
+// Running-sum window smoothers, as R misha's GenomeTrackSmooth.cpp: each sample updates the
+// window sums instead of rescanning the whole window. A sample is written once the samples to
+// its right are read; finish() writes the last ones of the chromosome.
+class Smoother {
+public:
+    Smoother(GenomeTrackFixedBin &gtrack, unsigned num_samples_aside, bool smooth_nans) :
+        m_gtrack(gtrack), m_smooth_nans(smooth_nans), m_counter(0), m_num_read_samples(0),
+        m_num_samples(2 * num_samples_aside + 1), m_num_samples_aside(num_samples_aside),
+        m_left_idx(0), m_peak_idx(num_samples_aside)
+    {
+        m_vals.resize(m_num_samples, numeric_limits<double>::quiet_NaN());
+    }
+    virtual ~Smoother() {}
+
+    virtual void set_next_sample(double sample) = 0;
+
+    void finish()
+    {
+        for (unsigned i = 0; i <= m_num_samples_aside; ++i)
+            set_next_sample(numeric_limits<double>::quiet_NaN());
+    }
+
+protected:
+    GenomeTrackFixedBin &m_gtrack;
+    bool           m_smooth_nans;
+    int            m_counter;
+    unsigned       m_num_read_samples;
+    unsigned       m_num_samples;
+    unsigned       m_num_samples_aside;
+    vector<double> m_vals;
+    unsigned       m_left_idx;
+    unsigned       m_peak_idx;
+};
+
+class LinearRampSmoother : public Smoother {
+public:
+    LinearRampSmoother(GenomeTrackFixedBin &gtrack, unsigned num_samples_aside, double weight_thr, bool smooth_nans) :
+        Smoother(gtrack, num_samples_aside, smooth_nans),
+        m_weight_thr(weight_thr * (num_samples_aside + 1)),
+        m_left_nans(num_samples_aside), m_right_nans(num_samples_aside + 1),
+        m_left_weights_sum(0), m_right_weights_sum(0), m_left_vals_sum(0), m_right_vals_sum(0),
+        m_left_weighted_vals_sum(0), m_right_weighted_vals_sum(0) {}
+
+    void set_next_sample(double sample) override
+    {
+        if (m_num_read_samples > m_num_samples_aside) {
+            float mean;
+            double weight = m_left_weights_sum + m_right_weights_sum;
+
+            if ((!m_smooth_nans && std::isnan(m_vals[m_peak_idx])) || !weight || weight < m_weight_thr)
+                mean = numeric_limits<float>::quiet_NaN();
+            else
+                mean = (m_left_weighted_vals_sum + m_right_weighted_vals_sum) / weight;
+            m_gtrack.write_next_bin(mean);
+            m_counter++;
+        } else
+            m_num_read_samples++;
+
+        // shift all elements left to the peak one position left
+        m_left_weights_sum -= m_num_samples_aside - m_left_nans;
+        m_left_weighted_vals_sum -= m_left_vals_sum;
+
+        // release the leftmost element
+        if (std::isnan(m_vals[m_left_idx]))
+            m_left_nans--;
+        else
+            m_left_vals_sum -= m_vals[m_left_idx];
+
+        // shift the peak element left
+        if (std::isnan(m_vals[m_peak_idx])) {
+            m_left_nans++;
+            m_right_nans--;
+        } else {
+            m_left_weights_sum += m_num_samples_aside;
+            m_left_vals_sum += m_vals[m_peak_idx];
+            m_left_weighted_vals_sum += m_vals[m_peak_idx] * m_num_samples_aside;
+
+            m_right_weights_sum -= m_num_samples_aside + 1;
+            m_right_vals_sum -= m_vals[m_peak_idx];
+            m_right_weighted_vals_sum -= m_vals[m_peak_idx] * (m_num_samples_aside + 1);
+        }
+
+        // shift all elements right to the peak one position left
+        m_right_weights_sum += m_num_samples_aside - m_right_nans;
+        m_right_weighted_vals_sum += m_right_vals_sum;
+
+        // add the new element at the rightmost position
+        if (std::isnan(sample))
+            m_right_nans++;
+        else {
+            m_right_weights_sum++;
+            m_right_vals_sum += sample;
+            m_right_weighted_vals_sum += sample;
+        }
+        m_vals[m_left_idx] = sample;
+
+        if (++m_left_idx >= m_num_samples) m_left_idx = 0;
+        if (++m_peak_idx >= m_num_samples) m_peak_idx = 0;
+
+        // The running sums lose precision over time: recalculate them every half window of
+        // written samples (the weights sums hold integers and stay exact). Not while the window
+        // fills, when m_counter stays 0.
+        if (m_num_read_samples > m_num_samples_aside && m_counter % m_num_samples_aside == 0) {
+            double val;
+
+            m_left_vals_sum = m_right_vals_sum = 0;
+            m_left_weighted_vals_sum = m_right_weighted_vals_sum = 0;
+
+            for (unsigned i = 1; i <= m_num_samples_aside; ++i) {
+                // left of the peak
+                val = m_vals[(m_peak_idx + m_num_samples - i) % m_num_samples];
+                if (!std::isnan(val))
+                    m_left_vals_sum += val;
+                m_left_weighted_vals_sum += m_left_vals_sum;
+
+                // right of the peak
+                val = m_vals[(m_peak_idx + i) % m_num_samples];
+                if (!std::isnan(val))
+                    m_right_vals_sum += val;
+                m_right_weighted_vals_sum += m_right_vals_sum;
+            }
+
+            // the peak itself (it is counted at the right)
+            val = m_vals[m_peak_idx];
+            if (!std::isnan(val)) {
+                m_right_weighted_vals_sum += val * (m_num_samples_aside + 1);
+                m_right_vals_sum += val;
+            }
+        }
+    }
+
+private:
+    double   m_weight_thr;
+    // left = the samples left to the peak, right = the peak sample and the samples right to it
+    unsigned m_left_nans;
+    unsigned m_right_nans;
+    double   m_left_weights_sum;
+    double   m_right_weights_sum;
+    double   m_left_vals_sum;
+    double   m_right_vals_sum;
+    double   m_left_weighted_vals_sum;
+    double   m_right_weighted_vals_sum;
+};
+
+class MeanSmoother : public Smoother {
+public:
+    MeanSmoother(GenomeTrackFixedBin &gtrack, unsigned num_samples_aside, double weight_thr, bool smooth_nans) :
+        Smoother(gtrack, num_samples_aside, smooth_nans), m_weight_thr(weight_thr), m_weights_sum(0), m_vals_sum(0) {}
+
+    void set_next_sample(double sample) override
+    {
+        if (m_num_read_samples > m_num_samples_aside) {
+            float mean = (!m_smooth_nans && std::isnan(m_vals[m_peak_idx])) || !m_weights_sum || m_weights_sum < m_weight_thr ?
+                numeric_limits<float>::quiet_NaN() : m_vals_sum / m_weights_sum;
+            m_gtrack.write_next_bin(mean);
+            m_counter++;
+        } else
+            m_num_read_samples++;
+
+        if (!std::isnan(m_vals[m_left_idx])) {
+            m_weights_sum--;
+            m_vals_sum -= m_vals[m_left_idx];
+        }
+
+        if (!std::isnan(sample)) {
+            m_weights_sum++;
+            m_vals_sum += sample;
+        }
+
+        m_vals[m_left_idx] = sample;
+
+        if (++m_left_idx >= m_num_samples) m_left_idx = 0;
+        if (++m_peak_idx >= m_num_samples) m_peak_idx = 0;
+
+        // The running sum loses precision over time: recalculate it every half window of
+        // written samples. Not while the window fills, when m_counter stays 0.
+        if (m_num_read_samples > m_num_samples_aside && m_counter % m_num_samples_aside == 0) {
+            m_vals_sum = 0;
+            for (vector<double>::iterator i = m_vals.begin(); i != m_vals.end(); ++i) {
+                if (!std::isnan(*i))
+                    m_vals_sum += *i;
+            }
+        }
+    }
+
+private:
+    double m_weight_thr;
+    double m_weights_sum;
+    double m_vals_sum;
+};
+
+}  // namespace
+
 PyObject *pm_smooth(PyObject *self, PyObject *args)
 {
     try {
@@ -1120,8 +1346,7 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
             py_vtracks = nullptr;
 
         string track_name(track);
-        if (g_pmdb->track_exists(track_name))
-            verror("Track '%s' already exists", track);
+        check_new_track_name(track_name);
 
         string alg_str(alg);
         bool use_linear_ramp = false;
@@ -1153,16 +1378,11 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
         if (binsize <= 0)
             verror("Failed to infer dense iterator binsize");
 
-        int num_samples_aside = (int)(0.5 * winsize / binsize + 0.5);
-        if (num_samples_aside < 0)
-            num_samples_aside = 0;
-        int window_size = 2 * num_samples_aside + 1;
-
-        double adjusted_weight_thr;
-        if (use_linear_ramp)
-            adjusted_weight_thr = weight_thr * (num_samples_aside + 1);
-        else
-            adjusted_weight_thr = weight_thr;
+        // the window size is taken as a whole number, as R does
+        unsigned num_samples_aside = (unsigned)(0.5 * std::floor(winsize) / binsize + 0.5);
+        if (!num_samples_aside)
+            verror("Smoothing window is narrow and does not cover any other values around the center");
+        g_pymisha->verify_max_data_size(2 * (uint64_t)num_samples_aside + 1, "Smoothing window");
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
         const bool indexed_db = db_is_indexed();
@@ -1170,81 +1390,32 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
 
         GenomeTrackFixedBin out_track;
         int cur_chromid = -1;
-
-        vector<float> buf(window_size, numeric_limits<float>::quiet_NaN());
-        int buf_pos = 0;
-        int64_t samples_fed = 0;
-
-        auto compute_smoothed = [&]() -> float {
-            int center_idx = (buf_pos + window_size - 1 - num_samples_aside) % window_size;
-            float center_val = buf[center_idx];
-
-            if (!smooth_nans && std::isnan(center_val))
-                return numeric_limits<float>::quiet_NaN();
-
-            double total_val = 0;
-            double total_weight = 0;
-
-            for (int offset = -num_samples_aside; offset <= num_samples_aside; offset++) {
-                int idx = (center_idx + offset + window_size) % window_size;
-                float v = buf[idx];
-                if (!std::isnan(v)) {
-                    double w;
-                    if (use_linear_ramp)
-                        w = (double)(num_samples_aside + 1 - abs(offset));
-                    else
-                        w = 1.0;
-                    total_val += v * w;
-                    total_weight += w;
-                }
-            }
-
-            if (total_weight >= adjusted_weight_thr && total_weight > 0)
-                return (float)(total_val / total_weight);
-            else
-                return numeric_limits<float>::quiet_NaN();
-        };
-
-        auto flush_remaining = [&](int count) {
-            for (int i = 0; i < count; i++) {
-                buf[buf_pos] = numeric_limits<float>::quiet_NaN();
-                buf_pos = (buf_pos + 1) % window_size;
-                samples_fed++;
-                if (samples_fed > num_samples_aside)
-                    out_track.write_next_bin(compute_smoothed());
-            }
-        };
+        std::unique_ptr<Smoother> smoother;
 
         for (; !scanner.isend(); scanner.next()) {
             const GInterval &interv = scanner.last_interval();
 
             if (interv.chromid != cur_chromid) {
-                if (cur_chromid >= 0 && num_samples_aside > 0)
-                    flush_remaining(num_samples_aside);
+                // the previous chromosome's last bins, before init_write() moves to the next one
+                if (smoother)
+                    smoother->finish();
 
                 cur_chromid = interv.chromid;
                 string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
                 out_track.init_write(path.c_str(), (unsigned)binsize, cur_chromid);
                 created[cur_chromid] = true;
 
-                fill(buf.begin(), buf.end(), numeric_limits<float>::quiet_NaN());
-                buf_pos = 0;
-                samples_fed = 0;
+                if (use_linear_ramp)
+                    smoother.reset(new LinearRampSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
+                else
+                    smoother.reset(new MeanSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
             }
 
-            float v = (float)scanner.vdouble();
-            buf[buf_pos] = v;
-            buf_pos = (buf_pos + 1) % window_size;
-            samples_fed++;
-
-            if (samples_fed <= num_samples_aside)
-                continue;
-
-            out_track.write_next_bin(compute_smoothed());
+            smoother->set_next_sample(scanner.vdouble());
         }
 
-        if (cur_chromid >= 0 && num_samples_aside > 0)
-            flush_remaining(num_samples_aside);
+        if (smoother)
+            smoother->finish();
 
         if (!indexed_db) {
             for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {

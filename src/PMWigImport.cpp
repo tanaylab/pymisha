@@ -384,7 +384,9 @@ static PyObject *string_list(const std::vector<std::string> &strs)
  *   - "chrom", "start", "end", "value": the records, chrom holding database chromosome names
  *   - "unknown": up to 5 names of bigWig chromosomes with data that the database lacks
  *   - "num_unknown": the number of such names
+ *   - "truncated": whether num_unknown is a lower bound (see UnknownChroms)
  *   - "unknown_primary": up to 5 of them that look like a primary chromosome
+ *   - "num_primary": the number of those
  *   - "num_matched": the number of database chromosomes the file has data for
  */
 PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
@@ -451,9 +453,11 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
         PMPY py_unknown(string_list(unknown.names()), true);
         PMPY py_primary(string_list(unknown.primary_names()), true);
         PMPY py_num_unknown(PyLong_FromUnsignedLongLong(unknown.num()), true);
+        PMPY py_truncated(PyBool_FromLong(unknown.truncated()), true);
+        PMPY py_num_primary(PyLong_FromUnsignedLongLong(unknown.num_primary()), true);
         PMPY py_num_matched(PyLong_FromUnsignedLongLong(bigwig.get_num_matched_chroms()), true);
         PMPY result(PyDict_New(), true);
-        if (!py_unknown || !py_primary || !py_num_unknown || !py_num_matched || !result)
+        if (!py_unknown || !py_primary || !py_num_unknown || !py_truncated || !py_num_primary || !py_num_matched || !result)
             return_err();
 
         PyDict_SetItemString(result, "chrom", py_chrom);
@@ -462,7 +466,9 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
         PyDict_SetItemString(result, "value", py_value);
         PyDict_SetItemString(result, "unknown", py_unknown);
         PyDict_SetItemString(result, "num_unknown", py_num_unknown);
+        PyDict_SetItemString(result, "truncated", py_truncated);
         PyDict_SetItemString(result, "unknown_primary", py_primary);
+        PyDict_SetItemString(result, "num_primary", py_num_primary);
         PyDict_SetItemString(result, "num_matched", py_num_matched);
         return_py(result);
     } catch (TGLException &e) {

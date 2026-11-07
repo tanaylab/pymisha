@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fstream>
+#include <string>
 #include <stdlib.h>   // drand48, used for s_rnd_func below; see pmutils.h
 #include <unistd.h>
 #include <sys/stat.h>
@@ -30,6 +32,25 @@ double (*GenomeTrack::s_rnd_func)() = drand48;
 // Static members for track index cache
 std::map<std::string, std::shared_ptr<TrackIndex>> GenomeTrack::s_index_cache;
 std::mutex GenomeTrack::s_cache_mutex;
+std::map<std::string, std::string> GenomeTrack::s_index_stamp;
+
+// The stamp of an index file: its size and its header, which holds the checksum of its entries (the
+// offsets and lengths read through it); "" if it cannot be read. One that another session wrote
+// since it was cached with another layout differs. (Not the file's inode and mtime: a file deleted
+// and written again within the same second can get the same ones.)
+static std::string index_file_stamp(const std::string &path)
+{
+	char header[64];
+	struct stat st;
+	int fd = open(path.c_str(), O_RDONLY);
+	if (fd < 0)
+		return std::string();
+	ssize_t n = fstat(fd, &st) ? -1 : read(fd, header, sizeof(header));
+	close(fd);
+	if (n < 0)
+		return std::string();
+	return std::to_string((long long)st.st_size) + ":" + std::string(header, n);
+}
 
 std::shared_ptr<TrackIndex> GenomeTrack::get_track_index(const std::string &track_dir) {
     std::lock_guard<std::mutex> lock(s_cache_mutex);
@@ -44,6 +65,8 @@ std::shared_ptr<TrackIndex> GenomeTrack::get_track_index(const std::string &trac
     auto idx = std::make_shared<TrackIndex>();
     std::string idx_path = track_dir + "/track.idx";
 
+    // stamped before the load: a file replaced in between is seen as replaced
+    std::string stamp = index_file_stamp(idx_path);
     if (!idx->load(idx_path)) {
         // Index file doesn't exist - return nullptr
         return nullptr;
@@ -51,17 +74,44 @@ std::shared_ptr<TrackIndex> GenomeTrack::get_track_index(const std::string &trac
 
     // Cache and return
     s_index_cache[track_dir] = idx;
+    if (!stamp.empty())
+        s_index_stamp[track_dir] = stamp;
     return idx;
 }
 
 void GenomeTrack::invalidate_index_cache(const std::string &track_dir) {
     std::lock_guard<std::mutex> lock(s_cache_mutex);
     s_index_cache.erase(track_dir);
+    s_index_stamp.erase(track_dir);
 }
 
 void GenomeTrack::clear_index_cache() {
     std::lock_guard<std::mutex> lock(s_cache_mutex);
     s_index_cache.clear();
+    s_index_stamp.clear();
+}
+
+bool GenomeTrack::drop_stale_index(const std::string &track_dir) {
+	std::string cached;
+	{
+		std::lock_guard<std::mutex> lock(s_cache_mutex);
+		if (s_index_cache.find(track_dir) == s_index_cache.end())
+			return false;
+		auto it = s_index_stamp.find(track_dir);
+		if (it != s_index_stamp.end())
+			cached = it->second;
+	}
+	// the file is read without holding the lock
+	if (!cached.empty() && index_file_stamp(track_dir + "/track.idx") == cached)
+		return false;
+	std::lock_guard<std::mutex> lock(s_cache_mutex);
+	auto it = s_index_stamp.find(track_dir);
+	// dropped unless another thread reloaded it meanwhile (then it is current already)
+	if (s_index_cache.find(track_dir) != s_index_cache.end() && (it == s_index_stamp.end() ? cached.empty() : it->second == cached)) {
+		s_index_cache.erase(track_dir);
+		s_index_stamp.erase(track_dir);
+	}
+	return true;
 }
 
 std::string GenomeTrack::get_track_dir(const std::string &filename) {
@@ -79,8 +129,8 @@ GenomeTrack::ChromFiles::ChromFiles(const GenomeChromKey &chromkey, const string
 {
 	struct stat st;
 
-	// an indexed track keeps all the chromosomes in track.dat
-	if (!stat((dir + "/track.idx").c_str(), &st))
+	// an indexed track keeps all the chromosomes in track.dat (unless it is being converted again)
+	if (!converting && !stat((dir + "/track.idx").c_str(), &st))
 		return;
 
 	DIR *d = opendir(dir.c_str());
@@ -355,6 +405,11 @@ GenomeTrack::Type GenomeTrack::get_type(const ChromFiles &files, bool return_obs
 	std::string idx_path = std::string(track_dir) + "/track.idx";
 	struct stat st;
 	if (stat(idx_path.c_str(), &st) == 0) {
+		// a cached index of a track.idx that another session replaced since is dropped here, where every
+		// computation reads its tracks' types, once per track (drop_stale_index)
+		drop_stale_index(track_dir);
+		TrackIndex2D::drop_stale_index(track_dir);
+
 		// Try 1D index first
 		try {
 			auto idx = get_track_index(track_dir);

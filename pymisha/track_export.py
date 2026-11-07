@@ -13,7 +13,13 @@ import pandas as pd
 from ._log import get_logger
 from ._shared import _checkroot, _pymisha
 from .extract import gextract
-from .intervals import gintervals_all
+from .intervals import (
+    gintervals_all,
+    gintervals_canonic,
+    gintervals_chrom_sizes,
+    gintervals_is_bigset,
+    gintervals_load,
+)
 
 _logger = get_logger(__name__)
 
@@ -21,7 +27,7 @@ _logger = get_logger(__name__)
 def gtrack_export_bedgraph(
     track: str,
     file: str,
-    intervals: pd.DataFrame | None = None,
+    intervals: pd.DataFrame | str | None = None,
     iterator: int | None = None,
     name: str | None = None,
     header: bool = True,
@@ -41,9 +47,10 @@ def gtrack_export_bedgraph(
         ``"dense_track * 2"``).
     file : str
         Output file path. If it ends in ``.gz``, output is gzip-compressed.
-    intervals : DataFrame or None, optional
-        Genomic intervals to export. If ``None`` (default), the entire
-        genome is used.
+    intervals : DataFrame, str or None, optional
+        Genomic intervals to export, or the name of an interval set. If
+        ``None`` (default), the entire genome is used. Overlapping intervals
+        are merged first, so each base is written once.
     iterator : int or None, optional
         Iterator bin size. If ``None`` (default), the iterator is
         determined automatically from the track expression.
@@ -106,15 +113,26 @@ def gtrack_export_bedgraph(
     if name is None:
         name = track
 
-    # Set up intervals
-    if intervals is None:
-        intervals = gintervals_all()
-
-    # Extract data
+    # Extract the data. Overlapping intervals would extract the same bins twice, and bedGraph (and
+    # bedGraphToBigWig) does not allow overlapping records, so they are merged first.
     kwargs: dict = {}
     if iterator is not None:
         kwargs["iterator"] = iterator
-    data = gextract(track, intervals=intervals, **kwargs)
+
+    def extract_canonic(intervals):
+        canonic = gintervals_canonic(intervals, unify_touching_intervals=False)
+        return None if canonic is None else gextract(track, intervals=canonic, **kwargs)
+
+    if intervals is None:
+        data = gextract(track, intervals=gintervals_all(), **kwargs)
+    elif isinstance(intervals, str) and gintervals_is_bigset(intervals):
+        # a big intervals set is read one chromosome at a time
+        parts = [extract_canonic(gintervals_load(intervals, chrom=str(chrom)))
+                 for chrom in gintervals_chrom_sizes(intervals)["chrom"]]
+        parts = [p for p in parts if p is not None and len(p)]
+        data = pd.concat(parts, ignore_index=True) if parts else None
+    else:
+        data = extract_canonic(intervals)
 
     if data is None or len(data) == 0:
         import warnings

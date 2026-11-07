@@ -729,11 +729,8 @@
    "tgt_overlap_policy": "auto_first"
   },
   "lift": {},
-  "r": {
-   "error": [
-    "Source chromosome does not exist in the chain source genome"
-   ]
-  }
+  "r": {},
+  "warning": "None of the intervals' chromosomes is a source chromosome of the chain (for example sourceA); the result is empty"
  },
  "contained_keep_B": {
   "name": "contained_keep_B",

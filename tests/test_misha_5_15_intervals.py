@@ -136,7 +136,7 @@ FEAT = DF(dict(chrom=["chr1"] * 2, start=[800, 4800], end=[810, 4810]))
 
 @pytest.mark.parametrize("strand", [
     pd.Categorical(["+", "-"]), pd.Categorical(["+", "-"], categories=["-", "+"]), ["+", "-"],
-    pd.Categorical([1, -1]), [1, -1], [True, False], ["1", "-1"]])
+    pd.Categorical([1, -1]), [1, -1]])
 def test_neighbors_read_strand_labels(strand):  # R :5
     r = pm.gintervals_neighbors(TSS.assign(strand=strand), FEAT, use_intervals1_strand=True)
     assert r["dist"].tolist() == [-190, 190]

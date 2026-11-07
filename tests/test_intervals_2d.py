@@ -152,7 +152,8 @@ class TestGintervals2dAll:
         intra-chromosomal pairs, as R's gintervals.2d.all() above
         gmulticontig.2d.threshold."""
         monkeypatch.setitem(pymisha.CONFIG, "multicontig_2d_threshold", 2)
-        assert _pairs(pymisha.gintervals_2d_all()) == [("chr1", "chr1"), ("chr2", "chr2"), ("chrX", "chrX")]
+        with pytest.warns(UserWarning, match="returns the cis chromosome pairs only"):
+            assert _pairs(pymisha.gintervals_2d_all()) == [("chr1", "chr1"), ("chr2", "chr2"), ("chrX", "chrX")]
         monkeypatch.setitem(pymisha.CONFIG, "multicontig_2d_threshold", 3)
         assert len(pymisha.gintervals_2d_all()) == 9
 
@@ -234,17 +235,18 @@ class TestGintervals2dAllScratchDb:
         assert _pairs(pymisha.gintervals_2d_all()) == [(a, b) for a in order for b in order]
         assert _pairs(pymisha.gintervals_2d_all(mode="diagonal")) == [(c, c) for c in order]
 
-    def test_many_contig_db_like_r(self, tmp_path):
+    def test_many_contig_db_like_r(self, tmp_path, monkeypatch):
         """101 chromosomes, above R's default gmulticontig.2d.threshold of 100: R's
-        gintervals.2d.all() returns the 101 intra-chromosomal pairs, and warns before
-        building all 10201. Whole-genome 2D scopes used inside pymisha keep every pair
-        and stay quiet."""
+        gintervals.2d.all() returns the 101 intra-chromosomal pairs, with a warning that
+        says so, and warns before building all 10201. A 2D computation over the
+        whole-genome scope stops unless CONFIG["multicontig_2d_mode"] is set, and is
+        quiet in a mode that was set."""
         db = _scratch_db(tmp_path, [f"chrB{i}" for i in range(101)])
         pymisha.gdb_init(str(db))
         chroms = list(pymisha.gintervals_all()["chrom"])
         assert pymisha.CONFIG.get("multicontig_2d_threshold", 100) == 100
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        assert pymisha.CONFIG.get("multicontig_2d_mode") is None
+        with pytest.warns(UserWarning, match="returns the cis chromosome pairs only"):
             result = pymisha.gintervals_2d_all()
         assert _pairs(result) == [(c, c) for c in chroms]
         with pytest.warns(UserWarning, match=r"101 contigs \(10201 pairs\)"):
@@ -253,6 +255,9 @@ class TestGintervals2dAllScratchDb:
 
         rects = pymisha.gintervals_2d(["chrB0", "chrB0"], 0, 4, ["chrB0", "chrB1"], 0, 4)
         pymisha.gtrack_2d_create("t2d", "x", rects, [1.0, 100.0])
+        with pytest.raises(ValueError, match="multicontig_2d_mode"):
+            pymisha.gsummary("t2d")
+        monkeypatch.setitem(pymisha.CONFIG, "multicontig_2d_mode", "full")
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             summary = pymisha.gsummary("t2d")

@@ -15,7 +15,10 @@
 //
 // pymisha differences: the track directory is made by the caller; a pair file is written as
 // PMTrack2DCreate.cpp writes it (signature, then the serializer); R's progress report and the
-// memory throttle of the stage 1 and 2 kids are not ported.
+// memory throttle of the stage 1 and 2 kids are not ported. The entry points return the chromosome
+// names of the input that the database does not have and leave the checks and the report of them
+// (R's verify_chroms_matched and report_skipped_chroms) to the caller, which also says why nothing was
+// imported when no chromosome pair got data.
 
 #include "pymisha.h"
 
@@ -30,9 +33,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,6 +52,7 @@
 #include "StatQuadTreeCached.h"
 #include "StatQuadTreeCachedSerializer.h"
 #include "TGLException.h"
+#include "UnknownChroms.h"
 
 using namespace std;
 
@@ -245,6 +252,139 @@ vector<PairFiles> list_pair_files(const string &dirname)
         pairs.push_back(pair_files);
     }
     return pairs;
+}
+
+// The chromosome names a kid of stage 1 read: the ids that matched, and the names that the database does not have
+struct KidChroms {
+    vector<char>   matched;  // by chromosome id
+    set<string>    seen;
+    vector<string> names;
+
+    // Notes a chromosome name of the input and what it resolved to (a negative id if nothing)
+    void note(int chromid, const string &chrom) {
+        if (chromid < 0)
+            record(chrom);
+        else {
+            if ((size_t)chromid >= matched.size())
+                matched.resize(chromid + 1);
+            matched[chromid] = 1;
+        }
+    }
+
+    void record(const string &chrom) {
+        if (seen.count(chrom) || (names.size() > (size_t)UnknownChroms::MAX_TRACKED && !UnknownChroms::is_primary_chrom_name(chrom)))
+            return;
+        seen.insert(chrom);
+        names.push_back(chrom);
+    }
+
+    // The file holds a line of the matched chromosome ids, then a line per unresolved name
+    void save(const string &dirname, int kid) const;
+};
+
+string unknown_chroms_file_name(const string &dirname, int kid)
+{
+    return dirname + "/.unknown_chroms." + to_string(kid);
+}
+
+void KidChroms::save(const string &dirname, int kid) const
+{
+    string filename = unknown_chroms_file_name(dirname, kid);
+    FILE *fp = fopen(filename.c_str(), "w");
+
+    if (!fp)
+        verror("Writing an intermediate file %s: %s\n", filename.c_str(), strerror(errno));
+    for (size_t chromid = 0; chromid < matched.size(); ++chromid) {
+        if (matched[chromid])
+            fprintf(fp, "%zu ", chromid);
+    }
+    fprintf(fp, "\n");
+    for (const string &name : names)
+        fprintf(fp, "%s\n", name.c_str());
+    bool failed = ferror(fp);
+
+    if (fclose(fp) || failed)
+        verror("Writing an intermediate file %s: %s\n", filename.c_str(), strerror(errno));
+}
+
+// Merges what the kids of stage 1 saved into matched (chromosome ids) and unknown, and removes their files
+void load_kid_chroms(const string &dirname, int num_kids, set<int> &matched, UnknownChroms &unknown)
+{
+    for (int kid = 0; kid < num_kids; ++kid) {
+        string filename = unknown_chroms_file_name(dirname, kid);
+        ifstream file(filename);
+        string name;
+
+        if (!file || !getline(file, name))
+            verror("Reading an intermediate file %s: %s\n", filename.c_str(), strerror(errno));
+        istringstream ids(name);
+        for (int chromid; ids >> chromid; )
+            matched.insert(chromid);
+        while (getline(file, name))
+            unknown.record(name);
+        if (file.bad())
+            verror("Reading an intermediate file %s: %s\n", filename.c_str(), strerror(errno));
+        file.close();
+        unlink(filename.c_str());
+    }
+}
+
+// Number of distinct chromosomes in the chromosome pairs: those that got data
+uint64_t pairs_num_chroms(const vector<PairFiles> &pairs)
+{
+    set<int> chromids;
+
+    for (const PairFiles &pair_files : pairs) {
+        chromids.insert(pair_files.chromid1);
+        chromids.insert(pair_files.chromid2);
+    }
+    return chromids.size();
+}
+
+// What an import returns to the caller for its checks and its report: the names of the input that the database
+// does not have (UnknownChroms), the number of chromosomes of the input that it has, the number of chromosomes that
+// got data and the number of chromosome pairs written
+PyObject *import_chroms_result(const UnknownChroms &unknown, uint64_t num_matched, const vector<PairFiles> &pairs)
+{
+    auto string_list = [](const vector<string> &strs) -> PyObject * {
+        PyObject *list = PyList_New(strs.size());
+        if (!list)
+            return nullptr;
+        for (size_t i = 0; i < strs.size(); ++i) {
+            PyObject *s = PyUnicode_FromStringAndSize(strs[i].data(), strs[i].size());
+            if (!s) {
+                Py_DECREF(list);
+                return nullptr;
+            }
+            PyList_SET_ITEM(list, i, s);
+        }
+        return list;
+    };
+
+    PMPY result(PyDict_New(), true);
+    PMPY py_unknown(string_list(unknown.names()), true);
+    PMPY py_primary(string_list(unknown.primary_names()), true);
+    PMPY py_num_unknown(PyLong_FromUnsignedLongLong(unknown.num()), true);
+    PMPY py_num_primary(PyLong_FromUnsignedLongLong(unknown.num_primary()), true);
+    PMPY py_truncated(PyBool_FromLong(unknown.truncated()), true);
+    PMPY py_num_matched(PyLong_FromUnsignedLongLong(num_matched), true);
+    PMPY py_num_data_chroms(PyLong_FromUnsignedLongLong(pairs_num_chroms(pairs)), true);
+    PMPY py_num_pairs(PyLong_FromUnsignedLongLong(pairs.size()), true);
+
+    if (!result || !py_unknown || !py_primary || !py_num_unknown || !py_num_primary || !py_truncated ||
+        !py_num_matched || !py_num_data_chroms || !py_num_pairs)
+        verror("Out of memory");
+
+    PyDict_SetItemString(result, "unknown", py_unknown);
+    PyDict_SetItemString(result, "num_unknown", py_num_unknown);
+    PyDict_SetItemString(result, "truncated", py_truncated);
+    PyDict_SetItemString(result, "unknown_primary", py_primary);
+    PyDict_SetItemString(result, "num_primary", py_num_primary);
+    PyDict_SetItemString(result, "num_matched", py_num_matched);
+    PyDict_SetItemString(result, "num_data_chroms", py_num_data_chroms);
+    PyDict_SetItemString(result, "num_pairs", py_num_pairs);
+    result.to_be_stolen();
+    return result;
 }
 
 // Anonymous shared memory, zeroed, that forked kids inherit. Unmapped by the parent when it goes out of scope
@@ -465,9 +605,9 @@ bool open_intervals_file(BufferedFile &infile, const string &fname, vector<strin
     return true;
 }
 
-// Reads the next interval of an input file. Returns 0 at EOF, -1 for a line on a chromosome the database does
-// not have (skipped, as R skips it), 1 otherwise.
-int read_interval_line(const ImportArgs &args, BufferedFile &infile, vector<string> &fields, long &lineno,
+// Reads the next interval of an input file and notes its chromosome names in chroms. Returns 0 at EOF, -1 for a
+// line on a chromosome the database does not have (skipped, as R skips it), 1 otherwise.
+int read_interval_line(const ImportArgs &args, BufferedFile &infile, vector<string> &fields, long &lineno, KidChroms &chroms,
                        int &chromid1, int &chromid2, int64_t &start1, int64_t &end1, int64_t &start2, int64_t &end2, float &val)
 {
     char *endptr;
@@ -481,13 +621,13 @@ int read_interval_line(const ImportArgs &args, BufferedFile &infile, vector<stri
     if (fields.size() < NUM_2D_COLS + 1)
         verror("File %s, line %ld: invalid format", infile.file_name().c_str(), lineno);
 
-    try {
-        chromid1 = args.chromkey->chrom2id(fields[CHROM1]);
-        chromid2 = args.chromkey->chrom2id(fields[CHROM2]);
-    } catch (TGLException &) {
-        // there might be unrecognized chromosomes, ignore them
+    // there might be unrecognized chromosomes: skip them, and report them once the track is written
+    chromid1 = args.chromkey->find_chromid(fields[CHROM1]);
+    chromid2 = args.chromkey->find_chromid(fields[CHROM2]);
+    chroms.note(chromid1, fields[CHROM1]);
+    chroms.note(chromid2, fields[CHROM2]);
+    if (chromid1 < 0 || chromid2 < 0)
         return -1;
-    }
 
     start1 = strtoll(fields[START1].c_str(), &endptr, 10);
     if (*endptr || start1 < 0)
@@ -621,6 +761,7 @@ void for_each_interval(const vector<string> &files, F f)
 bool read_input_files(const ImportArgs &args, int fbegin, int fend, int kid)
 {
     PairOutFiles out_files;
+    KidChroms chroms;
     bool are_all_points = true;
     int64_t start1, start2, end1, end2;
     float val;
@@ -634,7 +775,7 @@ bool read_input_files(const ImportArgs &args, int fbegin, int fend, int kid)
         if (!open_intervals_file(infile, args.files[ifile], fields, lineno))
             continue;
 
-        while ((res = read_interval_line(args, infile, fields, lineno, chromid1, chromid2, start1, end1, start2, end2, val))) {
+        while ((res = read_interval_line(args, infile, fields, lineno, chroms, chromid1, chromid2, start1, end1, start2, end2, val))) {
             if (res < 0)
                 continue;
 
@@ -644,6 +785,7 @@ bool read_input_files(const ImportArgs &args, int fbegin, int fend, int kid)
     }
 
     out_files.close();
+    chroms.save(args.dirname, kid);
     return are_all_points;
 }
 
@@ -831,14 +973,17 @@ void for_each_contact(const vector<string> &files, F f)
     }
 }
 
-// STAGE 1, intervals-value format: each kid reads a contiguous block of the files
-void process_contacts_as_intervals(const ImportArgs &args)
+// STAGE 1, intervals-value format: each kid reads a contiguous block of the files. unknown receives the chromosome
+// names of the files that the database does not have. Returns the number of chromosome names of the files that the
+// database has.
+uint64_t process_contacts_as_intervals(const ImportArgs &args, UnknownChroms &unknown)
 {
     vector<int64_t> sizes = get_files_sizes(args.files);
     vector<int> bounds = split_files(sizes, import_num_kids(sizes.size()));
 
     run_kids(bounds.size() - 1, [&](int kid) {
         PairOutFiles out_files;
+        KidChroms chroms;
         int64_t start1, start2, end1, end2;
         float val;
 
@@ -851,7 +996,7 @@ void process_contacts_as_intervals(const ImportArgs &args)
             if (!open_intervals_file(infile, args.files[ifile], fields, lineno))
                 continue;
 
-            while ((res = read_interval_line(args, infile, fields, lineno, chromid1, chromid2, start1, end1, start2, end2, val))) {
+            while ((res = read_interval_line(args, infile, fields, lineno, chroms, chromid1, chromid2, start1, end1, start2, end2, val))) {
                 if (res < 0)
                     continue;
 
@@ -867,13 +1012,22 @@ void process_contacts_as_intervals(const ImportArgs &args)
             }
         }
         out_files.close();
+        chroms.save(args.dirname, kid);
         return (char)0;
     });
+
+    set<int> matched;
+    load_kid_chroms(args.dirname, bounds.size() - 1, matched, unknown);
+    return matched.size();
 }
 
+// Fend ids index arrays (see process_contacts_as_fends), so they are bounded
+const int64_t MAX_FEND_ID = INT32_MAX;
+
 // STAGE 1, fends-value format: the fends file is read here, then each kid reads a contiguous block of the
-// contacts files
-void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
+// contacts files. unknown receives the chromosome names of the fends file that the database does not have; the
+// contacts of their fends are skipped. Returns the number of chromosomes of the fends file that the database has.
+uint64_t process_contacts_as_fends(const ImportArgs &args, const char *fends_fname, UnknownChroms &unknown)
 {
     enum { COL_FEND, COL_CHR, COL_COORD, NUM_FENDS_COLS };
     const char *FENDS_COLS[] = { "fend", "chr", "coord" };
@@ -889,9 +1043,12 @@ void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
     BufferedFile fends_file;
     fends_cols_total = read_header(fends_file, fends_fname, "fragment ends", FENDS_COLS, NUM_FENDS_COLS, fends_col_idx);
 
+    // Indexed by fend id, so their size follows the largest id (12 bytes an id): real fends files number their
+    // fends 1..N. chromids: FEND_NOT_LISTED, FEND_UNKNOWN_CHROM, or the chromosome of the fend.
+    enum { FEND_NOT_LISTED = -2, FEND_UNKNOWN_CHROM = -1 };
     vector<int> chromids;
     vector<int64_t> coords;
-    vector<bool> defined;
+    set<int> matched_chromids;
     int64_t lineno;
     char *endptr;
     int64_t fendid;
@@ -911,30 +1068,40 @@ void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
         const char *chr_str = fields[fends_col_idx[COL_CHR]].c_str();
         const char *coord_str = fields[fends_col_idx[COL_COORD]].c_str();
 
+        errno = 0;
         fendid = strtoll(fendid_str, &endptr, 10);
-        if (*endptr)
+        if (*endptr || endptr == fendid_str)
             verror("Error reading fragment ends file %s, line %ld: invalid %s", fends_fname, (long)lineno, FENDS_COLS[COL_FEND]);
 
-        if (fendid < 0)
-            verror("Error reading fragment ends file %s, line %ld: %s is out of range", fends_fname, (long)lineno, FENDS_COLS[COL_FEND]);
+        if (fendid < 0 || errno == ERANGE || fendid > MAX_FEND_ID)
+            verror("Error reading fragment ends file %s, line %ld: %s %s is out of range (0 - %lld)", fends_fname, (long)lineno,
+                   FENDS_COLS[COL_FEND], fendid_str, (long long)MAX_FEND_ID);
 
-        // Grow only: ids need not be sorted, and shrinking drops earlier ones.
+        // grow only: the ids need not be sorted, and shrinking would drop the fends read so far
         if ((uint64_t)fendid >= chromids.size()) {
-            chromids.resize(fendid + 1);
+            chromids.resize(fendid + 1, FEND_NOT_LISTED);
             coords.resize(fendid + 1);
-            defined.resize(fendid + 1);
         }
-        defined[fendid] = true;
+
+        if (chromids[fendid] != FEND_NOT_LISTED)
+            verror("Error reading fragment ends file %s, line %ld: %s %lld appears more than once", fends_fname, (long)lineno,
+                   FENDS_COLS[COL_FEND], (long long)fendid);
 
         // Use chromosome name as-is (no forced chr prefix)
-        chromids[fendid] = args.chromkey->chrom2id(chr_str);
+        chromids[fendid] = args.chromkey->find_chromid(chr_str);
+        if (chromids[fendid] < 0)
+            chromids[fendid] = FEND_UNKNOWN_CHROM;
 
         coord = strtoll(coord_str, &endptr, 10);
         if (*endptr)
             verror("Error reading fragment ends file %s, line %ld: invalid %s", fends_fname, (long)lineno, FENDS_COLS[COL_COORD]);
 
-        if (coord < 0 || coord >= (int64_t)args.chromkey->get_chrom_size(chromids[fendid]))
+        if (chromids[fendid] == FEND_UNKNOWN_CHROM)
+            unknown.record(chr_str);
+        else if (coord < 0 || coord >= (int64_t)args.chromkey->get_chrom_size(chromids[fendid]))
             verror("Error reading fragment ends file %s, line %ld: %s is out of range", fends_fname, (long)lineno, FENDS_COLS[COL_COORD]);
+        else
+            matched_chromids.insert(chromids[fendid]);
 
         coords[fendid] = coord;
         check_interrupt();
@@ -976,13 +1143,13 @@ void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
                 fend1 = strtoll(fend1_str, &endptr, 10);
                 if (*endptr)
                     verror("Error reading contacts file %s, line %ld: invalid %s", contacts_fname, (long)lineno, CONTACTS_COLS[COL_FEND1]);
-                if (fend1 < 0 || fend1 >= (int64_t)defined.size() || !defined[fend1])
+                if (fend1 < 0 || fend1 >= (int64_t)chromids.size() || chromids[fend1] < 0)
                     continue;
 
                 fend2 = strtoll(fend2_str, &endptr, 10);
                 if (*endptr)
                     verror("Error reading contacts file %s, line %ld: invalid %s", contacts_fname, (long)lineno, CONTACTS_COLS[COL_FEND2]);
-                if (fend2 < 0 || fend2 >= (int64_t)defined.size() || !defined[fend2])
+                if (fend2 < 0 || fend2 >= (int64_t)chromids.size() || chromids[fend2] < 0)
                     continue;
 
                 value = strtod(value_str, &endptr);
@@ -999,6 +1166,7 @@ void process_contacts_as_fends(const ImportArgs &args, const char *fends_fname)
         out_files.close();
         return (char)0;
     });
+    return matched_chromids.size();
 }
 
 // The number of subtrees of a pair's quad trees: a cis pair holds every contact twice, mirrored around the diagonal
@@ -1230,10 +1398,12 @@ void read_import_args(ImportArgs &args, const char *dir_str, PyObject *files_obj
 
 } // namespace
 
-// pm_track_2d_import_files(track_dir, files, max_data_size, max_mem_usage_kb)
+// pm_track_2d_import_files(track_dir, files, max_data_size, max_mem_usage_kb) -> dict
 //
 // gtrack_2d_import: reads the files (header chrom1 .. end2, then the value) and writes the pair files of the
 // track into track_dir, which exists. A POINTS track if every interval is 1 x 1, a RECTS track otherwise.
+// Intervals on a chromosome the database does not have are skipped. Returns the import_chroms_result; nothing
+// is written when no chromosome pair got data.
 PyObject *pm_track_2d_import_files(PyObject *self, PyObject *args)
 {
     (void)self;
@@ -1243,6 +1413,8 @@ PyObject *pm_track_2d_import_files(PyObject *self, PyObject *args)
         long long max_data_size, max_mem_usage_kb;
         ImportArgs import_args;
         vector<PairFiles> pairs;
+        UnknownChroms unknown;
+        uint64_t num_matched;
         bool are_all_points = true;
 
         if (!PyArg_ParseTuple(args, "sOLL", &dir_str, &files_obj, &max_data_size, &max_mem_usage_kb))
@@ -1264,17 +1436,21 @@ PyObject *pm_track_2d_import_files(PyObject *self, PyObject *args)
             for (char kid_all_points : kids_all_points)
                 are_all_points &= (bool)kid_all_points;
 
+            set<int> matched;
+            load_kid_chroms(import_args.dirname, bounds.size() - 1, matched, unknown);
+            num_matched = matched.size();
             pairs = list_pair_files(import_args.dirname);
             check_interrupt();
         }
 
-        split_and_build(import_args, pairs, INTERVAL_RECORD_SIZE,
-            [&](const PairFiles &pair_files) { return pair_num_subtrees(import_args, pair_files.size / INTERVAL_RECORD_SIZE); },
-            [&](const PairFiles &pair_files) { return split_pair(import_args, pair_files); },
-            are_all_points ? POINT_MEM : RECT_MEM,
-            [&](const PairFiles &pair_files) { write_pair(import_args, pair_files, are_all_points); });
+        if (!pairs.empty())
+            split_and_build(import_args, pairs, INTERVAL_RECORD_SIZE,
+                [&](const PairFiles &pair_files) { return pair_num_subtrees(import_args, pair_files.size / INTERVAL_RECORD_SIZE); },
+                [&](const PairFiles &pair_files) { return split_pair(import_args, pair_files); },
+                are_all_points ? POINT_MEM : RECT_MEM,
+                [&](const PairFiles &pair_files) { write_pair(import_args, pair_files, are_all_points); });
 
-        Py_RETURN_NONE;
+        return import_chroms_result(unknown, num_matched, pairs);
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());
         return nullptr;
@@ -1284,10 +1460,12 @@ PyObject *pm_track_2d_import_files(PyObject *self, PyObject *args)
     }
 }
 
-// pm_track_2d_import_contacts_files(track_dir, contacts, fends, allow_duplicates, max_data_size, max_mem_usage_kb)
+// pm_track_2d_import_contacts_files(track_dir, contacts, fends, allow_duplicates, max_data_size, max_mem_usage_kb) -> dict
 //
 // gtrack_import_contacts: reads the contacts files ("intervals-value" format if fends is None, "fends-value"
-// otherwise) and writes the pair files of a POINTS track into track_dir, which exists.
+// otherwise) and writes the pair files of a POINTS track into track_dir, which exists. Contacts on a chromosome
+// the database does not have are skipped. Returns the import_chroms_result, the chromosome names those of the
+// fends file if there is one; nothing is written when no chromosome pair got data.
 PyObject *pm_track_2d_import_contacts_files(PyObject *self, PyObject *args)
 {
     (void)self;
@@ -1298,6 +1476,8 @@ PyObject *pm_track_2d_import_contacts_files(PyObject *self, PyObject *args)
         long long max_data_size, max_mem_usage_kb;
         ImportArgs import_args;
         vector<PairFiles> pairs;
+        UnknownChroms unknown;
+        uint64_t num_matched;
 
         if (!PyArg_ParseTuple(args, "sOOpLL", &dir_str, &files_obj, &fends_obj, &allow_duplicates, &max_data_size, &max_mem_usage_kb))
             return nullptr;
@@ -1317,21 +1497,22 @@ PyObject *pm_track_2d_import_contacts_files(PyObject *self, PyObject *args)
 
             read_import_args(import_args, dir_str, files_obj, max_data_size, max_mem_usage_kb);
             if (fends_obj == Py_None)
-                process_contacts_as_intervals(import_args);
+                num_matched = process_contacts_as_intervals(import_args, unknown);
             else
-                process_contacts_as_fends(import_args, fends.c_str());
+                num_matched = process_contacts_as_fends(import_args, fends.c_str(), unknown);
 
             pairs = list_pair_files(import_args.dirname);
             check_interrupt();
         }
 
-        split_and_build(import_args, pairs, CONTACT_RECORD_SIZE,
-            [&](const PairFiles &pair_files) { return contacts_num_subtrees(import_args, pair_files); },
-            [&](const PairFiles &pair_files) { return split_contacts_pair(import_args, pair_files); },
-            CONTACT_MEM,
-            [&](const PairFiles &pair_files) { write_contacts_pair(import_args, pair_files, allow_duplicates); });
+        if (!pairs.empty())
+            split_and_build(import_args, pairs, CONTACT_RECORD_SIZE,
+                [&](const PairFiles &pair_files) { return contacts_num_subtrees(import_args, pair_files); },
+                [&](const PairFiles &pair_files) { return split_contacts_pair(import_args, pair_files); },
+                CONTACT_MEM,
+                [&](const PairFiles &pair_files) { write_contacts_pair(import_args, pair_files, allow_duplicates); });
 
-        Py_RETURN_NONE;
+        return import_chroms_result(unknown, num_matched, pairs);
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());
         return nullptr;

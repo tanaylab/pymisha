@@ -231,7 +231,7 @@ class TestGtrackImportSkippedChroms:
     def test_no_matching_chromosome_errors(self, tmp_path):
         f = self._write(tmp_path, "none", [("chr99", 100, 200, 1.5)])
         self._clean("tmp_skip_none")
-        with pytest.raises(ValueError, match="No intervals map to known chromosomes"):
+        with pytest.raises(ValueError, match="None of the chromosome names in .* exist in the genome database"):
             pm.gtrack_import("tmp_skip_none", "t", f, binsize=10)
         self._clean("tmp_skip_none")
 

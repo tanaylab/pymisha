@@ -9,6 +9,8 @@ import pandas as pd
 
 from . import _shared
 from ._shared import (
+    _check_breaks,
+    _check_flag,
     _checkroot,
     _config_no_mt,
     _df2pymisha,
@@ -23,7 +25,7 @@ from ._shared import (
 from ._types import Iterator
 from .expr import _find_vtracks_in_expr, _parse_expr_vars
 from .extract import _is_2d_intervals, _maybe_load_intervals_set, gextract
-from .intervals import _gintervals_2d_all, gintervals_all
+from .intervals import _whole_genome_2d, gintervals_all
 
 
 def glookup(
@@ -110,6 +112,8 @@ def glookup(
         raise ValueError("glookup requires pairs of (expression, breaks) arguments")
 
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
+    _check_flag(force_binning, "force_binning")
 
     intervals = _maybe_load_intervals_set(intervals)
 
@@ -136,12 +140,7 @@ def glookup(
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
             raise ValueError(f"Breaks at position {i + 1} must be 1D array")
-        if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
-
-        # Validate breaks are strictly increasing
-        if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
+        _check_breaks(breaks)
 
         exprs.append(expr)
         breaks_list.append(breaks)
@@ -342,8 +341,10 @@ def _glookup_python(
             output_values[valid] = lookup_table.reshape(-1)[flat]
 
     assert extract_result is not None
-    result = extract_result[output_coord_cols].copy()
+    # as R: the coordinates, the value, then intervalID
+    result = extract_result[output_coord_cols[:-1]].copy()
     result["value"] = output_values
+    result["intervalID"] = extract_result["intervalID"].to_numpy()
 
     return result
 
@@ -452,6 +453,8 @@ def gtrack_lookup(
         raise ValueError("gtrack_lookup requires pairs of (expression, breaks) arguments")
 
     _checkroot()
+    _check_flag(include_lowest, "include_lowest")
+    _check_flag(force_binning, "force_binning")
 
     lookup_table = _numpy.asarray(lookup_table, dtype=float)
 
@@ -468,10 +471,7 @@ def gtrack_lookup(
         breaks = _numpy.asarray(breaks, dtype=float)
         if breaks.ndim != 1:
             raise ValueError(f"Breaks at position {i + 1} must be 1D array")
-        if len(breaks) < 2:
-            raise ValueError(f"Breaks at position {i + 1} must have at least 2 elements")
-        if not _numpy.all(_numpy.diff(breaks) > 0):
-            raise ValueError(f"Breaks at position {i + 1} must be strictly increasing")
+        _check_breaks(breaks)
 
         exprs.append(expr)
         breaks_list.append(breaks)
@@ -513,7 +513,7 @@ def gtrack_lookup(
     # mode would omit off-diagonal cells entirely and return None for an
     # off-diagonal query.
     scope_intervals = (
-        _gintervals_2d_all("full") if use_2d_scope else gintervals_all()
+        _whole_genome_2d() if use_2d_scope else gintervals_all()
     )
 
     # Compute lookup values using glookup over the whole genome

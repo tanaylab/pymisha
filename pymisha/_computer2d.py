@@ -172,7 +172,7 @@ class AreaComputer2D(Computer2D):
             return 0.0
         if band.do_contain(r):
             return 1.0
-        return intersected_area(r, band) / r.area
+        return intersected_area(band.shrink2intersected(r), band) / r.area
 
 
 class TestComputer2D(Computer2D):

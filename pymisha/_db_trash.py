@@ -11,6 +11,7 @@ sweeps stale trash entries on `gdb_init` to bound on-disk garbage.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -73,6 +74,30 @@ def _gdb_trash(path: str | os.PathLike[str], async_unlink: bool = True) -> bool:
     return True
 
 
+def _gdb_staging_name(base: str) -> str:
+    """R misha's ``.gdb.staging_name``: the hidden name a writer builds ``base`` in before
+    renaming it into place. It carries this host and pid, so that the leftover of a process
+    that is provably gone is removed at once (`_gdb_trash_sweep_old`)."""
+    from .extract import _host_tag
+
+    return f".{base}.tmp.{_host_tag()}-{os.getpid()}.{secrets.token_hex(6)}"
+
+
+def _staging_owner_gone(name: str) -> bool:
+    """R misha's ``.gdb.staging_owner_gone``: whether the process that named a staging
+    directory is provably gone: on this host, and no process has its pid. Anything else
+    (another host, a live pid, a name without a host tag) is left to the age rule."""
+    m = re.search(r"\.tmp\.([A-Za-z0-9_]+)-([0-9]+)\.[^.]+$", name)
+    if m is None:
+        return False
+    from .extract import _host_tag
+
+    if m.group(1) != _host_tag() or not os.path.isdir("/proc"):
+        return False
+    pid = int(m.group(2))
+    return pid != os.getpid() and not os.path.exists(f"/proc/{pid}")
+
+
 def _gdb_trash_sweep_old(
     parent: str | os.PathLike[str],
     max_age_hours: float = 24.0,
@@ -83,8 +108,12 @@ def _gdb_trash_sweep_old(
 
     * ``.trash.*`` - atomic-rename targets from `_gdb_trash` whose detached
       background `rm` was killed before completion.
-    * ``.<name>.tmp.<pid>.<rand>`` - tmp directories from interrupted atomic
-      `gtrack_create_*` calls that never reached the final rename.
+    * ``.<name>.tmp.<host>-<pid>.<rand>`` (`_gdb_staging_name`) - staging
+      directories of writers that never reached the final rename.
+
+    A tmp directory is removed at once when its owning process is provably
+    gone (`_staging_owner_gone`), otherwise once it is older than
+    ``max_age_hours``: a live writer on another host may still be filling it.
 
     Called by `gdb_init` to bound on-disk garbage from prior sessions.
     Entries whose mtime cannot be read (e.g. permission denied) are
@@ -107,20 +136,19 @@ def _gdb_trash_sweep_old(
     cutoff = time.time() - max_age_hours * 3600.0
     count = 0
     for name in names:
-        # `.trash.*` from _gdb_trash, plus `.<name>.tmp.<pid>.<rand>` from
-        # interrupted atomic creates. Sweep only fires under <groot>/tracks/
-        # and the 24h cutoff guards short-lived legitimate tmp files.
-        if not (
-            name.startswith(".trash.")
-            or (name.startswith(".") and ".tmp." in name)
-        ):
+        # `.trash.*` from _gdb_trash, plus the `.<name>.tmp.<host>-<pid>.<rand>`
+        # staging directories of interrupted writers. Sweep only fires in track
+        # directories, and the owner check and the 24h cutoff keep the staging
+        # directories of live writers.
+        trash = name.startswith(".trash.")
+        if not (trash or (name.startswith(".") and ".tmp." in name)):
             continue
         entry = parent_p / name
         try:
             mtime = entry.stat().st_mtime
         except OSError:
             continue
-        if mtime < cutoff:
+        if mtime < cutoff or (not trash and _staging_owner_gone(name)):
             _invalidate_dir_cache(entry)
             shutil.rmtree(entry, ignore_errors=True)
             count += 1

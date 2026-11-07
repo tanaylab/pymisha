@@ -1474,6 +1474,13 @@ def query_2d_track_objects(filepath: str, qx1: int, qy1: int, qx2: int, qy2: int
 _indexed_2d_cache: dict[str, IndexedTrack2DReader] = {}
 
 
+def _index_files_stamp(track_dir: str) -> tuple[Any, ...]:
+    """The stamp of an indexed 2D track's track.idx and track.dat (_shared._file_stamp)."""
+    from ._shared import _file_stamp
+
+    return _file_stamp(os.path.join(track_dir, "track.idx")), _file_stamp(os.path.join(track_dir, "track.dat"))
+
+
 class IndexedTrack2DReader:
     """Reader for indexed 2D tracks (track.idx + track.dat format).
 
@@ -1495,10 +1502,12 @@ class IndexedTrack2DReader:
     """
 
     __slots__ = ("_track_dir", "_dat_mmap", "_dat_file", "_pair_map",
-                 "_is_points", "_loaded")
+                 "_is_points", "_loaded", "stamp")
 
     def __init__(self, track_dir: str) -> None:
         self._track_dir = track_dir
+        # the files read, as _get_indexed_reader compares them with those at the path now
+        self.stamp = _index_files_stamp(track_dir)
         self._dat_mmap: mmap.mmap | None = None
         self._dat_file: Any = None
         self._pair_map: dict[tuple[int, int], tuple[int, int]] = {}  # (chrom1_id, chrom2_id) -> (offset, length)
@@ -1657,7 +1666,11 @@ def _get_indexed_reader(track_dir: str) -> IndexedTrack2DReader | None:
 
     reader = _indexed_2d_cache.get(track_dir)
     if reader is not None and reader.loaded:
-        return reader
+        # (another session may have replaced the track since: its mmap is of the old track.dat)
+        if reader.stamp == _index_files_stamp(track_dir):
+            return reader
+        reader.close()
+        del _indexed_2d_cache[track_dir]
 
     reader = IndexedTrack2DReader(track_dir)
     if reader.loaded:

@@ -150,6 +150,9 @@ public:
     int min_processes() const { return m_min_processes; }
     int max_processes() const { return m_max_processes; }
 
+    // max_data_size() of no limit (CONFIG['max_data_size'] of None or inf; pymisha._shared._NO_LIMIT)
+    static const uint64_t MAX_DATA_SIZE_NO_LIMIT = (uint64_t)1 << 53;
+
     // Returns the upper limit for data size
     uint64_t max_data_size() const { return m_max_data_size; }
 

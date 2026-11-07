@@ -104,20 +104,7 @@ def _flat(v):
 
 # Divergences this harness found that PREDATE it. Recorded rather than hidden:
 # strict, so whoever fixes one gets a failure telling them to delete the entry.
-KNOWN_DIVERGENCE = {
-    # pm_cor rejects a DataFrame iterator outright ("iterator must be an integer
-    # or float"); gcor never routes through _preprocess_intervals_iterator the
-    # way gsummary/gquantiles/gdist/gscreen do. R accepts it and returns a value.
-    **{(f"{sc}|df", "gcor"): "gcor does not accept a DataFrame iterator (R does)"
-       for sc in ("single", "overlapping", "nested", "touching", "unsorted",
-                  "disjoint", "multichrom", "dup")},
-    # A bin holding exactly 0.100 under "dense_track > 0.1": R promotes the
-    # stored float32 to double (0.10000000149... > 0.1, kept), pymisha compares
-    # in float32 (equal, dropped). Same result for a canonical single-interval
-    # scope, so it is a comparison-width difference, not a scope question.
-    ("touching|fixed", "gscreen"): "float32 vs double compare at an exact threshold",
-    ("touching|fixed", "gscreen_n"): "float32 vs double compare at an exact threshold",
-}
+KNOWN_DIVERGENCE: dict[tuple[str, str], str] = {}
 
 
 @pytest.mark.parametrize("case", sorted(BASELINE))

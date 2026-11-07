@@ -391,7 +391,7 @@ class TestGcisDecayEdgeCases:
         """Should raise ValueError with fewer than 2 breaks."""
         src = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [500000]})
         domain = pd.DataFrame({"chrom": ["1"], "start": [0], "end": [500000]})
-        with pytest.raises(ValueError, match="at least 2"):
+        with pytest.raises(ValueError, match="Invalid number of breaks 1"):
             pm.gcis_decay("rects_track", [100], src, domain)
 
     def test_non_2d_track_raises(self):

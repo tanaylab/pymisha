@@ -101,9 +101,10 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
         int track_type_int = 0;
         int remove_old = 1;
         int force = 0;
-        if (!PyArg_ParseTuple(args, "si|pp", &track_dir_cstr, &track_type_int, &remove_old, &force)) {
+        const char *track_cstr = nullptr;
+        if (!PyArg_ParseTuple(args, "si|pps", &track_dir_cstr, &track_type_int, &remove_old, &force, &track_cstr)) {
             verror("Invalid arguments to pm_track2d_convert_to_indexed. "
-                   "Expected (track_dir: str, track_type: int, remove_old: bool, force: bool)");
+                   "Expected (track_dir: str, track_type: int, remove_old: bool, force: bool, track: str)");
         }
 
         if (track_type_int != 0 && track_type_int != 1) {
@@ -140,15 +141,25 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args)
             try {
                 auto old_idx = TrackIndex2D::get_track_index_2d(track_dir);
                 if (old_idx && old_idx->is_loaded()) {
+                    // Which pairs have a file: the files the packing below finds, also those named by
+                    // aliases (e.g. "2-X" for chr2-chrX)
                     bool have_pair_files = false;
+                    string missing_pair_file;
+                    const GenomeTrack::ChromFiles pair_files(chromkey, track_dir, true);
                     for (const auto &entry : old_idx->entries()) {
-                        string pair_file = track_dir + "/" + GenomeTrack::get_2d_filename(chromkey, entry.chrom1_id, entry.chrom2_id);
-                        struct stat pst;
-                        if (stat(pair_file.c_str(), &pst) == 0) {
+                        if (pair_files.exists(entry.chrom1_id, entry.chrom2_id))
                             have_pair_files = true;
-                            break;
-                        }
+                        else if (missing_pair_file.empty())
+                            missing_pair_file = GenomeTrack::get_2d_filename(chromkey, entry.chrom1_id, entry.chrom2_id);
                     }
+
+                    // Only some of the pairs have a file: packing them would replace track.dat, and lose
+                    // the data of the other pairs. Refused before anything is changed.
+                    if (have_pair_files && !missing_pair_file.empty())
+                        extract_error = "Track " + string(track_cstr ? track_cstr : track_dir.c_str()) +
+                            " is indexed and has per-pair files for only some of its chromosome pairs (" +
+                            missing_pair_file + " is one that is missing): converting it would lose the data of the pairs without a file. "
+                            "Remove the per-pair files and run it again to extract all the pairs from track.dat.";
 
                     if (!have_pair_files) {
                         unique_ptr<FILE, int (*)(FILE *)> dat_fp(fopen(dat_path.c_str(), "rb"), fclose);

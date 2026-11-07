@@ -389,12 +389,13 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		uint64_t num_vs = 0;
 		double stddev_mean = 0;
 		double stddev_m2 = 0;
+		// summed in double and rounded to float once, as R misha
+		double sum_accum = 0;
 
 		// Reuse scratch buffers for sampling (avoids per-call allocation)
 		m_scratch_all_values.clear();
 		m_scratch_all_positions.clear();
 
-		m_last_sum = 0;
 		m_last_min = numeric_limits<float>::max();
 		m_last_max = -numeric_limits<float>::max();
 		if (has_function(MAX_POS))
@@ -422,7 +423,7 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 			m_cache_valid = true;
 
 			if (!std::isnan(v)) {
-				m_last_sum += v;
+				sum_accum += v;
 
 				// Min/max are always tracked (callers read them unconditionally)
 				// Only position bookkeeping is conditional
@@ -510,9 +511,10 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 			m_last_sample_pos = m_scratch_all_positions[idx];
 		}
 
-		if (num_vs > 0)
-			m_last_avg = m_last_nearest = m_last_sum / num_vs;
-		else {
+		if (num_vs > 0) {
+			m_last_sum = (float)sum_accum;
+			m_last_avg = m_last_nearest = (float)(sum_accum / num_vs);
+		} else {
 			m_last_avg = m_last_nearest = m_last_min = m_last_max = m_last_sum = numeric_limits<float>::quiet_NaN();
 			if (has_function(MIN_POS))
 				m_last_min_pos = numeric_limits<double>::quiet_NaN();
@@ -623,6 +625,28 @@ void GenomeTrackFixedBin::read_header_at_current_pos_(BufferedFile &bf)
 
 void GenomeTrackFixedBin::init_read(const char *filename, const char *mode, int chromid)
 {
+	// An indexed track whose track.idx another session replaced since this process cached it would
+	// be read at the old offsets. The cached index is checked against the file once per track and
+	// call, where the track's type is read (GenomeTrack::get_type); a size or signature error that is
+	// still met (a track read without that, or replaced in between) has the read done once more
+	// with the index as it is now and track.dat reopened (a handle kept open from before may be the
+	// replaced file). An error with the current index is raised as it is.
+	const std::string track_dir = GenomeTrack::get_track_dir(filename);
+	try {
+		init_read_once(filename, mode, chromid);
+	} catch (TGLException &) {
+		if (!drop_stale_index(track_dir) && !m_dat_open)
+			throw;
+		m_bfile.close();
+		m_dat_open = false;
+		m_mmap.close();
+		m_mmap_path.clear();
+		init_read_once(filename, mode, chromid);
+	}
+}
+
+void GenomeTrackFixedBin::init_read_once(const char *filename, const char *mode, int chromid)
+{
 	m_base_offset = 0; // Reset for per-chromosome
 	m_cur_coord = 0;
 	uint64_t header_start = 0;
@@ -680,6 +704,8 @@ void GenomeTrackFixedBin::init_read(const char *filename, const char *mode, int 
 			return;
 		}
 
+		if (entry->offset + entry->length > (uint64_t)m_bfile.file_size())
+			TGLError<GenomeTrackFixedBin>("Index entry of chromosome %d extends past the end of %s", chromid, dat_path.c_str());
 		if (m_bfile.seek(entry->offset, SEEK_SET))
 			TGLError<GenomeTrackFixedBin>("Failed to seek to offset %llu in %s",
 				(unsigned long long)entry->offset, dat_path.c_str());

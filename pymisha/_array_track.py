@@ -453,7 +453,7 @@ def extract_array(
 
 
 # Valid per-row reducer functions (matches R's SliceFunctions enum).
-ARRAY_REDUCE_FUNCS = {"avg", "min", "max", "sum", "stddev", "stdev"}
+ARRAY_REDUCE_FUNCS = {"avg", "min", "max", "sum", "stddev"}
 
 
 def reduce_array_extract(
@@ -506,7 +506,7 @@ def reduce_array_extract(
             out[idx] = float(_numpy.max(finite))
         elif func == "sum":
             out[idx] = float(_numpy.sum(finite))
-        elif func in ("stddev", "stdev"):
+        elif func == "stddev":
             out[idx] = float(_numpy.std(finite, ddof=1)) if finite.size > 1 else _numpy.nan
 
     return out
@@ -541,17 +541,15 @@ class _CSVSource:
             )
         self.colnames: list[str] = cols[3:]
         # Rows by chromosome, a chromosome given by any of its names (as R's chrom2id
-        # resolves them); a name the database does not know keeps its rows unread.
-        from . import _pymisha
+        # resolves them). The rows of a name the database does not have are skipped: the
+        # names (an _unknown_chroms) and the number of database chromosomes the file names
+        # are kept for the caller's check and report.
+        from .tracks import _resolve_import_chroms
 
-        df["chrom"] = df["chrom"].astype(str)
-        canonical: dict[str, str] = {}
-        for name in df["chrom"].unique():
-            try:
-                canonical[name] = _pymisha.pm_normalize_chroms([name])[0]
-            except _pymisha.error:
-                canonical[name] = name
-        df["chrom"] = df["chrom"].map(canonical)
+        canon, self.unknown, self.num_matched = _resolve_import_chroms(df["chrom"])
+        keep = _numpy.array([c is not None for c in canon], dtype=bool)
+        df = df.loc[keep].copy()
+        df["chrom"] = canon[keep]
         self._by_chrom: dict[str, _pd.DataFrame] = {
             str(c): g.reset_index(drop=True) for c, g in df.groupby("chrom", sort=False)
         }
@@ -722,10 +720,9 @@ def _import_sources(
     Path(track_dir).mkdir(parents=True, exist_ok=True)
     block_dtype = _numpy.dtype([("val", "<f4"), ("idx", "<u4")])
 
+    # A file for every chromosome, an empty one too, as R writes it
     for chrom in chrom_order:
         src_data = [src.read_chrom(chrom) for src in sources]
-        if all(len(d[0]) == 0 for d in src_data):
-            continue
 
         idx_ptr = [0] * len(sources)
         merged_starts: list[int] = []
@@ -834,13 +831,11 @@ def _import_sources(
                     if (s_i, e_i) == (pick_start, pick_end):
                         idx_ptr[i] += 1
 
-        if merged_starts:
-            filepath = Path(track_dir) / str(chrom)
-            write_chrom_file(
-                filepath,
-                _numpy.array(merged_starts, dtype=_numpy.int64),
-                _numpy.array(merged_ends, dtype=_numpy.int64),
-                merged_blocks,
-            )
+        write_chrom_file(
+            Path(track_dir) / str(chrom),
+            _numpy.array(merged_starts, dtype=_numpy.int64),
+            _numpy.array(merged_ends, dtype=_numpy.int64),
+            merged_blocks,
+        )
 
     return colnames_out

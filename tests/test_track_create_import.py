@@ -544,17 +544,17 @@ def test_gtrack_import_set_mixed_success(tmp_path):
 
 
 def test_gtrack_import_mappedseq_chrom_mismatch_rparity(tmp_path):
-    """SAM chrom names that don't exact-match DB chroms are silently
-    unmapped (R parity, no chrom normalization)."""
+    """Chromosome names are matched through the alias chain, as R misha 5.16 matches them:
+    '1' is chr1; a name the database does not know is unmapped."""
     root = _copy_db(tmp_path)
     try:
         pm.gdb_init(str(root))
         inp = tmp_path / "mapped.tsv"
-        # The DB names the chromosome chr1 (chrom_sizes.txt holds 1). '1' must NOT be
-        # remapped.
+        # The DB names the chromosome chr1 (chrom_sizes.txt holds 1).
         inp.write_text(
             "A\tchr1\t10\t+\n"
-            "A\t1\t20\t+\n",
+            "A\t1\t20\t+\n"
+            "A\tchr99\t30\t+\n",
             encoding="utf-8",
         )
         stats = pm.gtrack_import_mappedseq(
@@ -566,7 +566,7 @@ def test_gtrack_import_mappedseq_chrom_mismatch_rparity(tmp_path):
             cols_order=(1, 2, 3, 4),
             remove_dups=True,
         )
-        assert stats["total"]["total.mapped"] == 1.0
+        assert stats["total"]["total.mapped"] == 2.0
         assert stats["total"]["total.unmapped"] == 1.0
     finally:
         pm.gdb_init(str(TEST_DB))

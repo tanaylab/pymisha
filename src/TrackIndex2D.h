@@ -103,6 +103,10 @@ public:
     static void clear_cache();
     static void invalidate_cache(const std::string &track_dir);
 
+    // Drop the cached entry for `track_dir` if its track.idx was replaced since it was cached (by
+    // another session) or is gone. Returns true if it was dropped (GenomeTrack::drop_stale_index).
+    static bool drop_stale_index(const std::string &track_dir);
+
     // Write a 2D index file
     // entries must be populated with chrom1_id, chrom2_id, offset, length
     static void write_index(const string &index_path,
@@ -135,6 +139,7 @@ private:
 
     // Static index cache (thread-safe)
     static std::map<std::string, std::shared_ptr<TrackIndex2D>> s_index_cache;
+    static std::map<std::string, std::string> s_index_stamp; // track.idx stamp (index_file_stamp) when cached
     static std::mutex s_cache_mutex;
 };
 

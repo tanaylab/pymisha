@@ -69,6 +69,12 @@ CONFIG = {
     # this many chromosomes and only the intra-chromosomal pairs above it, as
     # R misha's gmulticontig.2d.threshold does.
     'multicontig_2d_threshold': 100,
+    # Above that many chromosomes, the whole-genome 2D scope a 2D computation
+    # runs over without explicit intervals: "full" (all chromosome pairs) or
+    # "diagonal" (the cis pairs only). Unset (None), such a computation is an
+    # error, and gintervals_2d_all() warns that it returns the cis pairs only.
+    # R misha's gmulticontig.2d.mode.
+    'multicontig_2d_mode': None,
     # Umask held around every write to the database. "0007" gives 660 files and
     # 770 directories - group rwx, no world access - which is what pymisha's own
     # C++ layer already sets (PyMisha's constructor) and what the shared lab
@@ -95,6 +101,50 @@ CONFIG = {
     # filesystems with many alt contigs.
     'track_create_parallel_writers': None,
 }
+
+# CONFIG['max_data_size'] or CONFIG['max_mem_usage'] of None, inf or any value of at least
+# this (R misha's MAX_DATA_SIZE_NO_LIMIT) is no limit
+_NO_LIMIT = 2**53
+# their values when the key is absent
+_LIMIT_DEFAULTS = {"max_data_size": 10_000_000, "max_mem_usage": _NO_LIMIT}
+
+
+def _config_limit(name: str, config: dict | None = None) -> int:
+    """CONFIG[name] for "max_data_size" (R's gmax.data.size) or "max_mem_usage" (gmax.mem.usage,
+    in KB), as R misha reads them: None, inf or any value of 2**53 or more is no limit (2**53),
+    NaN or a negative value is an error, and a max_data_size below 1 counts as 1. The C++ side
+    reads them through this too (PyMisha::load_options)."""
+    cfg = CONFIG if config is None else config
+    if name not in cfg:
+        return _LIMIT_DEFAULTS[name]
+    value = cfg[name]
+    if value is None:
+        return _NO_LIMIT
+    if value is _pandas.NA or (isinstance(value, (float, _numpy.floating)) and _numpy.isnan(value)):
+        raise ValueError(f"CONFIG['{name}'] must be a number, not NA")
+    if isinstance(value, (bool, _numpy.bool_)) or not isinstance(
+            value, (int, float, _numpy.integer, _numpy.floating)):
+        raise ValueError(f"CONFIG['{name}'] must be a number, not {value!r}")
+    if value < 0:
+        raise ValueError(f"CONFIG['{name}'] must not be negative (got {float(value):g})")
+    if value >= _NO_LIMIT:
+        return _NO_LIMIT
+    return max(int(value), 1) if name == "max_data_size" else int(value)
+
+
+def _config_multitasking(config: dict | None = None) -> bool:
+    """CONFIG['multitasking'] (R's gmultitasking): True or False (or 1 or 0), and None or an
+    absent key is False. Any other value, NaN included, is an error, so that the C++ side
+    (which reads it through this, in PyMisha::load_options) and the Python fork paths agree."""
+    value = (CONFIG if config is None else config).get("multitasking")
+    if value is None:
+        return False
+    if isinstance(value, (bool, _numpy.bool_)):
+        return bool(value)
+    if isinstance(value, (int, _numpy.integer)) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"CONFIG['multitasking'] must be True or False, not {value!r}")
+
 
 # Global state
 _GROOT: str | None = None    # Global database root
@@ -391,6 +441,24 @@ def _invalidate_dir_cache(*paths: object) -> None:
         _pymisha.pm_invalidate_dir_cache(args)
 
 
+def _file_stamp(path: Any) -> tuple[int, ...] | None:
+    """What tells a file or directory from another that another session put at its path
+    since: its inode, size, mtime and ctime (a rename or a write changes the ctime); None
+    if it is missing."""
+    try:
+        st = _os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _track_stamp(track_path: str) -> tuple[Any, ...]:
+    """The stamp of a track directory and its indexed files (_file_stamp). A value cached
+    from a track is stale once another session replaced the track (gtrack_rm then a
+    creation, gtrack_copy over it, a conversion), which nothing in this session clears."""
+    return tuple(_file_stamp(_os.path.join(track_path, f)) for f in ("", "track.idx", "track.dat"))
+
+
 def _pm_dbreload(groot: str | None = None) -> None:
     """Reload the C++ track scan + clear all Python-side caches.
 
@@ -493,17 +561,102 @@ def _itr2pymisha(itr):
 _CHROM_COLS = ("chrom", "chrom1", "chrom2")
 
 
+def _chrom_names(chroms: Any, col: str = "chrom", arg: str = "intervals") -> _pandas.Series:
+    """The chromosome names of a chrom column, read as R misha reads one: a string is the name,
+    and a number is printed as as.character() prints a whole number (1 and 1.0 are "1", -0 is
+    "0"), for the chromosome aliases to resolve as gintervals(1, ...) does. A missing value or a
+    fraction is R's "Invalid format of interval at index i" (1-based); a bool or another type is
+    an error too (col and arg name the column and the argument in it). A Series that holds only
+    strings - object, string or categorical - is returned as it is."""
+    s = chroms if isinstance(chroms, _pandas.Series) else _pandas.Series(chroms)
+    what = "columns chrom1 and chrom2" if col in ("chrom1", "chrom2") else f"column {col}"
+    bad_type = ValueError(f"Invalid format of {arg} argument: {what} must be character, factor or numeric")
+
+    def bad_value(i: int) -> ValueError:
+        return ValueError(f"Invalid format of interval at index {i + 1}")
+
+    def first(mask: Any) -> int:
+        return int(_numpy.argmax(mask))
+
+    dtype = s.dtype
+    if isinstance(dtype, _pandas.CategoricalDtype):
+        missing = s.cat.codes.to_numpy() < 0
+        if missing.any():
+            raise bad_value(first(missing))
+        if _pandas.api.types.infer_dtype(dtype.categories, skipna=False) == "string":
+            return s
+        return _chrom_names(s.astype(object), col, arg)
+    if _pandas.api.types.is_bool_dtype(dtype):
+        raise bad_type
+    if _pandas.api.types.is_integer_dtype(dtype):
+        missing = s.isna().to_numpy()
+        if missing.any():
+            raise bad_value(first(missing))
+        return s.astype(str)
+    if _pandas.api.types.is_float_dtype(dtype):
+        v = s.to_numpy(dtype=_numpy.float64, na_value=_numpy.nan)
+        bad = ~_numpy.isfinite(v) | (v != _numpy.floor(v)) | (_numpy.abs(v) > 1e15)
+        if bad.any():
+            raise bad_value(first(bad))
+        return _pandas.Series(v.astype(_numpy.int64).astype(str), index=s.index, dtype=object)
+    if _pandas.api.types.is_object_dtype(dtype):
+        if _pandas.api.types.infer_dtype(s, skipna=False) == "string":
+            return s
+        names = []
+        for i, v in enumerate(s.to_numpy()):
+            if isinstance(v, str):
+                names.append(v)
+            elif isinstance(v, (bool, _numpy.bool_)):
+                raise bad_type
+            elif isinstance(v, (int, _numpy.integer)):
+                names.append(str(int(v)))
+            elif isinstance(v, (float, _numpy.floating)):
+                f = float(v)
+                if not (_numpy.isfinite(f) and f == _numpy.floor(f) and abs(f) <= 1e15):
+                    raise bad_value(i)
+                names.append(str(int(f)))
+            elif v is None or v is _pandas.NA:
+                raise bad_value(i)
+            else:
+                raise bad_type
+        return _pandas.Series(names, index=s.index, dtype=object)
+    if _pandas.api.types.is_string_dtype(dtype):
+        missing = s.isna().to_numpy()
+        if missing.any():
+            raise bad_value(first(missing))
+        return s
+    raise bad_type
+
+
+def _with_chrom_names(df: _pandas.DataFrame) -> _pandas.DataFrame:
+    """df with its chrom, chrom1 and chrom2 columns as chromosome names (_chrom_names); df
+    itself when they hold names already."""
+    out = df
+    for col in _CHROM_COLS:
+        if col in df.columns:
+            values = df[col]
+            names = _chrom_names(values, col)
+            if names is not values:
+                if out is df:
+                    out = df.copy()
+                out[col] = names
+    return out
+
+
 def _with_canonical_chroms(df: _pandas.DataFrame) -> _pandas.DataFrame:
     """df with its chromosome columns holding the database's names for the
-    chromosomes (an alias, such as "1" for chr1, replaced). A name the database
-    does not know is kept, and all of them with no database."""
+    chromosomes (an alias, such as "1" for chr1, replaced; a number is a name,
+    as in _chrom_names). A name the database does not know is kept, and all of
+    them with no database."""
     out = df
     if _GROOT is None:
-        return out
+        return _with_chrom_names(df)
     for col in _CHROM_COLS:
         if col not in df.columns:
             continue
-        values = df[col].astype(str)
+        raw = df[col]
+        names = _chrom_names(raw, col)
+        values = names.astype(str)
         uniq = values.unique().tolist()
         try:
             canonical = dict(zip(uniq, _pymisha.pm_normalize_chroms(uniq), strict=True))
@@ -514,7 +667,7 @@ def _with_canonical_chroms(df: _pandas.DataFrame) -> _pandas.DataFrame:
                     canonical[name] = _pymisha.pm_normalize_chroms([name])[0]
                 except _pymisha.error:
                     canonical[name] = name
-        if all(k == v for k, v in canonical.items()):
+        if names is raw and all(k == v for k, v in canonical.items()):
             continue
         if out is df:
             out = df.copy()
@@ -904,6 +1057,34 @@ def _warn_overlapping_iterator(iterator, rows):
     )
 
 
+def _verify_iterator_dim(intervals, iterator_is_2d):
+    """Refuse an iterator whose dimension is not that of the intervals, with
+    R misha's messages (TrackExprScanner::verify_1d_iter / verify_2d_iter).
+    Empty intervals are not checked, as in R."""
+    if not isinstance(intervals, _pandas.DataFrame) or len(intervals) == 0:
+        return
+    intervals_are_2d = "chrom1" in intervals.columns
+    if iterator_is_2d and not intervals_are_2d:
+        raise ValueError("2D iterator is used along with 1D intervals")
+    if not iterator_is_2d and intervals_are_2d:
+        raise ValueError("1D iterator is used along with 2D intervals")
+
+
+def _refuse_unsupported_2d_iterator(exprs, intervals, iterator):
+    """gintervals_quantiles and gintervals_mapply take, of the 2D iterators,
+    only a rectangle size: R refuses a 2D track, 2D intervals or a cartesian
+    grid (GenomeTrackQuantiles.cpp, GenomeTrackApply.cpp), after checking
+    that the iterator and the intervals have the same dimension."""
+    from .expr import _expr_is_2d
+
+    if not isinstance(intervals, _pandas.DataFrame) or len(intervals) == 0:
+        return
+    iterator_is_2d = _expr_is_2d(exprs, iterator)
+    _verify_iterator_dim(intervals, iterator_is_2d)
+    if iterator_is_2d and not (isinstance(iterator, (tuple, list)) and len(iterator) == 2):
+        raise ValueError("The type of iterator is currently not supported by the function")
+
+
 def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
     """Handle DataFrame-as-iterator by intersecting with scope intervals.
 
@@ -935,6 +1116,7 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
             loaded = gintervals_load(iterator)
             if isinstance(loaded, _pandas.DataFrame) and "chrom1" in loaded.columns:
                 # 2D interval set — leave as string for 2D iterator path
+                _verify_iterator_dim(intervals, True)
                 return intervals, iterator, None
             iterator = loaded
         else:
@@ -946,17 +1128,10 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
 
             if gtrack_exists(iterator):
                 info = gtrack_info(iterator)
-                if int(info.get("dimensions", 1) or 1) == 2:
+                track_is_2d = int(info.get("dimensions", 1) or 1) == 2
+                _verify_iterator_dim(intervals, track_is_2d)
+                if track_is_2d:
                     return intervals, iterator, None  # 2D track iterator path
-                # A 1D track iterator is invalid for a 2D scope; leave it as a
-                # string so the 2D path raises the proper "1D track" error
-                # (R parity: this combination errors).
-                scope_is_2d = (
-                    isinstance(intervals, _pandas.DataFrame)
-                    and "chrom1" in intervals.columns
-                )
-                if scope_is_2d:
-                    return intervals, iterator, None
                 bin_size = info.get("bin_size") or info.get("bin.size")
                 if bin_size is not None:
                     # Dense track -> iterate over its fixed bins.
@@ -977,11 +1152,21 @@ def _preprocess_intervals_iterator(intervals, iterator, canonic_scope=False):
                 return intervals, iterator, None
 
     if not isinstance(iterator, _pandas.DataFrame):
+        from ._iterator_policy import CartesianGridSpec
+
+        if isinstance(iterator, CartesianGridSpec) or (
+            isinstance(iterator, (tuple, list)) and len(iterator) == 2
+        ):
+            _verify_iterator_dim(intervals, True)  # a rectangle size or a cartesian grid
+        elif isinstance(iterator, (int, float, _numpy.integer, _numpy.floating)) and not isinstance(iterator, bool):
+            _verify_iterator_dim(intervals, False)  # a bin size
         return intervals, iterator, None
 
     # 2D iterator DataFrame: leave for the 2D extraction path to handle.
+    _verify_iterator_dim(intervals, "chrom1" in iterator.columns)
     if "chrom1" in iterator.columns:
         return intervals, iterator, None
+    _check_intervals_strand(iterator)   # read as intervals, as R reads them
 
 
     if len(iterator) == 0 or len(intervals) == 0:
@@ -1093,12 +1278,16 @@ def _iterated_intervals(intervals, iterator, *, unlimited=False):
     chunks; max_data_size limits results, not their working set."""
     if unlimited:
         # the C++ side reads max_data_size from the global CONFIG
+        absent = "max_data_size" not in CONFIG
         prev = CONFIG.get("max_data_size")
-        CONFIG["max_data_size"] = 2**62
+        CONFIG["max_data_size"] = None
         try:
             return _iterated_intervals(intervals, iterator)
         finally:
-            CONFIG["max_data_size"] = prev
+            if absent:
+                CONFIG.pop("max_data_size", None)
+            else:
+                CONFIG["max_data_size"] = prev
     cfg = CONFIG
     if isinstance(iterator, _pandas.DataFrame):
         new_intervals, new_iterator, id_map = _preprocess_intervals_iterator(
@@ -1204,6 +1393,95 @@ def _names_dir(db: str | None = None) -> str:
 def _same_path(a: Any, b: Any) -> bool:
     """Whether two paths are the same directory, links resolved (None is no path)."""
     return a is not None and b is not None and _os.path.realpath(str(a)) == _os.path.realpath(str(b))
+
+
+def _check_flag(value: Any, name: str) -> Any:
+    """A TRUE/FALSE argument: a NaN or pd.NA is R's NA, an error as in R. Returned
+    unchanged otherwise (None included)."""
+    if value is _pandas.NA or (isinstance(value, (float, _numpy.floating)) and _numpy.isnan(value)):
+        raise ValueError(f"{name} argument is not logical")
+    return value
+
+
+_STR2STRAND = {"+": 1, "-": -1, ".": 0, "*": 0, "": 0}
+
+
+def _bad_strand_label(col: _pandas.Series) -> tuple[int, str] | None:
+    """The first row (0-based) of a strand column of labels (strings or a Categorical,
+    read by its labels) whose label R's GInterval::str2strand rejects, and the label."""
+    if not (isinstance(col.dtype, _pandas.CategoricalDtype) or col.dtype == object
+            or _pandas.api.types.is_string_dtype(col)):
+        return None
+    values = col.astype(object).to_numpy()
+    codes, uniques = _pandas.factorize(values)
+    bad = [i for i, v in enumerate(uniques) if isinstance(v, str) and v not in _STR2STRAND]
+    if not bad:
+        return None
+    row = int(_numpy.flatnonzero(_numpy.isin(codes, bad))[0])
+    return row, values[row]
+
+
+def _check_strand_column(col: _pandas.Series, prefix: str = "") -> None:
+    """R's checks of a strand column, as the C++ interval converters make them
+    (check_strand_column): a boolean column (a categorical of booleans too) is not a
+    strand column, and the first row with a missing strand (None, NaN, pandas.NA) or a
+    label other than "+", "-", ".", "*" or "" is an error. *prefix* starts the messages
+    R prefixes (gcis_decay's "Source intervals: ")."""
+    if _pandas.api.types.is_bool_dtype(col) or (
+            col.dtype == object and any(isinstance(v, (bool, _numpy.bool_)) for v in col.to_numpy())):
+        raise _pymisha.error(f"{prefix}Invalid format of intervals argument")
+    na = col.isna().to_numpy()
+    first_na = int(_numpy.argmax(na)) if na.any() else len(col)
+    bad = _bad_strand_label(col)
+    if bad is not None and bad[0] < first_na:
+        raise _pymisha.error(f'Bad strand value "{bad[1]}" (expected "+", "-", ".", "*" or "")')
+    if first_na < len(col):
+        raise _pymisha.error(f"{prefix}Invalid strand value (NA) at index {first_na + 1}")
+
+
+def _check_intervals_strand(intervals: Any, prefix: str = "") -> None:
+    """_check_strand_column on the strand column of 1D intervals, as R reads every
+    intervals argument; anything else is left alone."""
+    if (isinstance(intervals, _pandas.DataFrame) and "strand" in intervals.columns
+            and "chrom1" not in intervals.columns):
+        _check_strand_column(intervals["strand"], prefix)
+
+
+def _str2strand_values(col: _pandas.Series) -> Any:
+    """A strand column of labels (strings or a Categorical, read by its labels) as R
+    reads it (GInterval::str2strand): "+" is 1, "-" is -1, ".", "*" and "" are 0, any
+    other label is an error. A number among the labels is kept. Returns None for a
+    column of numbers."""
+    if not (isinstance(col.dtype, _pandas.CategoricalDtype) or col.dtype == object
+            or _pandas.api.types.is_string_dtype(col)):
+        return None
+    bad = _bad_strand_label(col)
+    if bad is not None:
+        raise _pymisha.error(f'Bad strand value "{bad[1]}" (expected "+", "-", ".", "*" or "")')
+    codes, uniques = _pandas.factorize(col.astype(object).to_numpy())
+    values = [_STR2STRAND[v] if isinstance(v, str) else int(v) for v in uniques]
+    return _numpy.asarray(values, dtype=_numpy.int64)[codes]
+
+
+def _check_breaks_na(breaks: _numpy.ndarray) -> None:
+    """Breaks with a NaN (an NA in R) are an error, as R's BinFinder makes them."""
+    nan = _numpy.flatnonzero(_numpy.isnan(breaks))
+    if nan.size:
+        raise ValueError(f"Breaks contain NA (break[{nan[0]}])")
+
+
+def _check_breaks(breaks: _numpy.ndarray) -> None:
+    """R's BinFinder checks of breaks, with its errors: at least 2 of them, none NA,
+    strictly increasing."""
+    if len(breaks) < 2:
+        raise ValueError(f"Invalid number of breaks {len(breaks)}")
+    _check_breaks_na(breaks)
+    bad = _numpy.flatnonzero(breaks[1:] <= breaks[:-1])
+    if bad.size:
+        i = int(bad[0]) + 1
+        if breaks[i] == breaks[i - 1]:
+            raise ValueError(f"Breaks are not unique (break[{i - 1}]=break[{i}]={breaks[i]:g})")
+        raise ValueError(f"Breaks are not sorted (break[{i - 1}]={breaks[i - 1]:g}, break[{i}]={breaks[i]:g})")
 
 
 def _check_spat_bounds(

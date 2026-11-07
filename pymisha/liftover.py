@@ -18,6 +18,7 @@ import heapq
 import math
 import os
 import struct
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,17 @@ from ._crc64 import (
 from ._crc64 import (
     crc64_init as _crc64_init,
 )
-from ._shared import _checkroot, _pm_dbreload, _pymisha, _sort_by_chrom, _with_canonical_chroms
+from ._log import user_stacklevel
+from ._shared import (
+    _check_intervals_strand,
+    _checkroot,
+    _chrom_names,
+    _pm_dbreload,
+    _pymisha,
+    _sort_by_chrom,
+    _with_canonical_chroms,
+    _with_chrom_names,
+)
 from .intervals import gintervals_all
 
 # ---------------------------------------------------------------------------
@@ -1193,11 +1204,29 @@ def _chain_from_r(chain: pd.DataFrame) -> pd.DataFrame:
     as '+' too, so a chain written with the old {0, 1} plus strand still works.
     As in R misha 5.15, liftover reads only the target strand, as the orientation
     of the target relative to the source: a block is reversed when exactly one of
-    strand and strandsrc is -1, so the source strand is folded into strand."""
+    strand and strandsrc is -1, so the source strand is folded into strand.
+    As R misha reads a chain, the strands must be numbers, a numeric chromsrc is
+    the chromosome of that name (_chrom_names), and a missing strand, startsrc or
+    chromsrc is an error."""
+    strand_cols = [c for c in ("strand", "strandsrc") if c in chain.columns]
+    for c in strand_cols:
+        if not pd.api.types.is_numeric_dtype(chain[c]) or pd.api.types.is_bool_dtype(chain[c]):
+            raise ValueError("Invalid format of chain argument: columns strand and strandsrc must be "
+                             "numeric (-1, 0 or 1)")
     out = chain.copy()
-    rev = (out["strand"].to_numpy() == -1) if "strand" in out.columns else None
-    if "strandsrc" in out.columns:
-        src_rev = out["strandsrc"].to_numpy() == -1
+    if "chromsrc" in out.columns:
+        out["chromsrc"] = _chrom_names(out["chromsrc"], "chromsrc", "chain")
+    strands = {c: out[c].to_numpy(dtype=float, na_value=np.nan) for c in strand_cols}
+    missing = np.zeros(len(out), dtype=bool)
+    for v in strands.values():
+        missing |= np.isnan(v)
+    if "startsrc" in out.columns and pd.api.types.is_numeric_dtype(out["startsrc"]):
+        missing |= np.isnan(out["startsrc"].to_numpy(dtype=float, na_value=np.nan))
+    if missing.any():
+        raise ValueError(f"Invalid format of interval at index {int(np.argmax(missing)) + 1}")
+    rev = (strands["strand"] == -1) if "strand" in strands else None
+    if "strandsrc" in strands:
+        src_rev = strands["strandsrc"] == -1
         rev = src_rev if rev is None else rev ^ src_rev
         out["strandsrc"] = np.zeros(len(out), dtype=np.int64)
     if rev is not None:
@@ -2011,6 +2040,8 @@ def gintervals_liftover(
 
     if intervals is None or chain is None:
         raise ValueError("intervals and chain are required")
+    _check_intervals_strand(intervals)
+    intervals = _with_chrom_names(intervals)   # a numeric chrom is the chromosome of that name
 
     nth = 0
     if value_col is not None:
@@ -2044,13 +2075,14 @@ def gintervals_liftover(
     if "chrom1" in intervals.columns:
         return _liftover_2d(intervals, chain_df)
 
-    # as R (IntervalsLiftover.cpp): intervals none of which is on a chromosome of
-    # the chain's source genome are an error, not an empty result
-    if len(intervals) and not chain_df.empty and not set(intervals["chrom"].astype(str)) & set(
-            chain_df["chromsrc"].astype(str)):
-        raise ValueError("Source chromosome does not exist in the chain source genome")
+    # intervals on chromosomes the chain does not have map nowhere; none at all
+    # on one is more likely a naming mismatch, which R warns about
+    no_src_chrom = bool(len(intervals)) and not set(intervals["chrom"].astype(str)) & set(
+        chain_df["chromsrc"].astype(str))
+    if no_src_chrom:
+        _warn_no_source_chrom(chain_df)
 
-    if chain_df.empty:
+    if chain_df.empty or no_src_chrom:
         cols = ["chrom", "start", "end", "intervalID", "chain_id"]
         if include_metadata:
             cols.append("score")
@@ -2127,7 +2159,7 @@ def _liftover_2d(intervals: pd.DataFrame, chain_df: pd.DataFrame) -> pd.DataFram
     c2 = intervals["chrom2"].astype(str).map(src_id).to_numpy(dtype=float)
     rows = np.flatnonzero(~np.isnan(c1) & ~np.isnan(c2))
     if len(intervals) and not len(rows):
-        raise ValueError("Source chromosome does not exist in the chain source genome")
+        _warn_no_source_chrom(chain_df)
     rows = rows[_pymisha.pm_r_2d_sort_order(c1[rows].astype(np.int64), c2[rows].astype(np.int64))]
     n = len(rows)
 
@@ -2156,6 +2188,16 @@ def _liftover_2d(intervals: pd.DataFrame, chain_df: pd.DataFrame) -> pd.DataFram
         "end2": m2["end"].to_numpy(np.int64)[b],
         "intervalID": rows[src] + 1,  # R's intervalID is the 1-based input row
     }, columns=[*cols, "intervalID"])
+
+
+def _warn_no_source_chrom(chain_df: pd.DataFrame) -> None:
+    """R's warning when none of the intervals is on a source chromosome of the chain."""
+    example = "the chain is empty" if chain_df.empty else f"for example {chain_df['chromsrc'].iloc[0]}"
+    warnings.warn(
+        f"None of the intervals' chromosomes is a source chromosome of the chain ({example}); "
+        "the result is empty",
+        stacklevel=user_stacklevel(),
+    )
 
 
 def _r_mapping_order(result: pd.DataFrame, intervals: pd.DataFrame) -> pd.DataFrame:
@@ -3130,9 +3172,9 @@ def gtrack_liftover(
 
     # C++ path: pre-validate, build chain dict + tgt_chrom_sizes, call C++.
     from .tracks import (
+        _ensure_track_absent,
         _load_track_attributes,
         _save_track_attributes,
-        _track_exists,
         _validate_track_name,
         gtrack_create_dense,
         gtrack_create_sparse,
@@ -3140,8 +3182,7 @@ def gtrack_liftover(
 
     _checkroot()
     _validate_track_name(track)
-    if _track_exists(track):
-        raise ValueError(f"Track '{track}' already exists")
+    _ensure_track_absent(track)
     nth_index = _nth_param(multi_target_agg, params)
 
     if isinstance(chain, str):
@@ -3335,9 +3376,9 @@ def _gtrack_liftover_python(
     """
     from .tracks import (
         _checkroot,
+        _ensure_track_absent,
         _load_track_attributes,
         _save_track_attributes,
-        _track_exists,
         _validate_track_name,
         gtrack_create_dense,
         gtrack_create_sparse,
@@ -3345,8 +3386,7 @@ def _gtrack_liftover_python(
 
     _checkroot()
     _validate_track_name(track)
-    if _track_exists(track):
-        raise ValueError(f"Track '{track}' already exists")
+    _ensure_track_absent(track)
 
     # Validate aggregation function
     nth_index = _nth_param(multi_target_agg, params)
@@ -3503,9 +3543,9 @@ def _gtrack_liftover_2d(
     from .tracks import (
         _atomic_track_create,
         _db_is_indexed,
+        _ensure_track_absent,
         _set_created_attrs,
         _target_root,
-        _track_exists,
         _validate_track_name,
         gtrack_2d_convert_to_indexed,
         gtrack_create_empty_indexed,
@@ -3513,8 +3553,7 @@ def _gtrack_liftover_2d(
 
     _checkroot()
     _validate_track_name(track)
-    if _track_exists(track):
-        raise ValueError(f"Track '{track}' already exists")
+    _ensure_track_absent(track)
     nth_index = _nth_param(multi_target_agg, params)
 
     if isinstance(chain, str):

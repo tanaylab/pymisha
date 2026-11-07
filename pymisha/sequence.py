@@ -10,6 +10,7 @@ import pandas as _pandas
 
 from ._shared import (
     CONFIG,
+    _check_intervals_strand,
     _check_spat_bounds,
     _checkroot,
     _coerce_score_thresh,
@@ -94,6 +95,13 @@ def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
     _checkroot()
 
     intervals = _maybe_load_intervals_set(intervals)
+    if (
+        isinstance(intervals, _pandas.DataFrame)
+        and "strand" in intervals.columns
+        and isinstance(intervals["strand"].dtype, _pandas.CategoricalDtype)
+    ):
+        # a categorical strand is read by its labels, as R reads a factor
+        intervals = intervals.assign(strand=intervals["strand"].astype(object))
 
     return list(_pymisha.pm_seq_extract(_df2pymisha(intervals), CONFIG))
 
@@ -354,7 +362,7 @@ def gseq_kmer_dist(
     k : int, default 6
         K-mer size (1-10).
     mask : DataFrame, optional
-        Intervals to exclude: a k-mer that starts in one is not counted.
+        Intervals to exclude: a k-mer with any base in one is not counted.
 
     Returns
     -------
@@ -388,10 +396,11 @@ def gseq_kmer_dist(
 
     # Extract sequences for the intervals
     seqs = gseq_extract(intervals)
+    _check_intervals_strand(mask)
 
-    # A k-mer is left out when its start is masked, as in R: masked positions
-    # per interval, from the mask intervals of its chromosome.
-    masked_starts: list[_numpy.ndarray | None] = [None] * len(seqs)
+    # A k-mer is left out when any of its bases is masked, as in R: masked
+    # positions per interval, from the mask intervals of its chromosome.
+    masked_pos: list[_numpy.ndarray | None] = [None] * len(seqs)
     if mask is not None:
         from .intervals import _normalize_chroms
 
@@ -416,7 +425,7 @@ def gseq_kmer_dist(
             ms, me = by_chrom[iv_chrom[i]]
             pos = iv_start[i] + _numpy.arange(len(seq), dtype=_numpy.int64)
             j = _numpy.searchsorted(ms, pos, side="right") - 1
-            masked_starts[i] = (j >= 0) & (pos < me[_numpy.maximum(j, 0)])
+            masked_pos[i] = (j >= 0) & (pos < me[_numpy.maximum(j, 0)])
 
     num_kmers = 4**k
     counts = _numpy.zeros(num_kmers, dtype=_numpy.int64)
@@ -424,13 +433,14 @@ def gseq_kmer_dist(
     # Pre-compute powers of 4 for the rolling hash
     powers = _numpy.int64(4) ** _numpy.arange(k - 1, -1, -1, dtype=_numpy.int64)
 
-    for seq, masked in zip(seqs, masked_starts, strict=True):
+    for seq, masked in zip(seqs, masked_pos, strict=True):
         if not seq or len(seq) < k:
             continue
 
         raw = _numpy.frombuffer(seq.encode("ascii", "ignore"), dtype=_numpy.uint8)
         codes = _DNA_CODE_TABLE[raw]
-        valid = codes >= 0
+        # a masked base breaks the runs as an N does
+        valid = codes >= 0 if masked is None else (codes >= 0) & ~masked
         if not valid.any():
             continue
 
@@ -469,8 +479,6 @@ def gseq_kmer_dist(
                     window_codes *= 4
                     window_codes += segment[j : j + n_windows]
 
-            if masked is not None:
-                window_codes = window_codes[~masked[start:start + n_windows]]
             counts += _numpy.bincount(window_codes, minlength=num_kmers)
 
     nonzero_idx = _numpy.flatnonzero(counts)

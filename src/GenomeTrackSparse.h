@@ -46,6 +46,8 @@ public:
 protected:
     static const int RECORD_SIZE;
 
+    void init_read_once(const char *filename, int chromid);
+
     std::vector<GInterval> m_intervals;
     std::vector<float> m_vals;
     bool m_loaded;

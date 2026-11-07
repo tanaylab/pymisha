@@ -1073,11 +1073,8 @@
   },
   "load": {},
   "lift": {},
-  "r": {
-   "error": [
-    "Source chromosome does not exist in the chain source genome"
-   ]
-  }
+  "r": {},
+  "warning": "None of the intervals' chromosomes is a source chromosome of the chain (for example sourceC); the result is empty"
  },
  "nothing_maps": {
   "name": "nothing_maps",

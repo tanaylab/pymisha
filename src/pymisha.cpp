@@ -549,32 +549,70 @@ void PyMisha::load_options()
         !opts.assign(PyDict_GetItem(dict, PMPY(PyUnicode_FromString("CONFIG"), true)), false))
         return;
 
+    // An invalid value is this call's error; no Python exception is left set
+    auto python_error = []() {
+        std::string msg = "Invalid CONFIG value";
+        PyObject *type, *value, *traceback;
+        PyErr_Fetch(&type, &value, &traceback);
+        if (value) {
+            PMPY str(PyObject_Str(value), true);
+            if (str && PyUnicode_AsUTF8(str))
+                msg = PyUnicode_AsUTF8(str);
+        }
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(traceback);
+        PyErr_Clear();
+        verror("%s", msg.c_str());
+    };
+    auto as_long = [&](const char *name) {
+        long v = PyLong_AsLong(opt);
+        if (v == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            verror("CONFIG['%s'] is out of range", name);
+        }
+        return v;
+    };
+
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("debug"), true)), false) && PyBool_Check(opt))
         m_debug = opt == Py_True;
 
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("multitasking"), true)), false) && PyBool_Check(opt))
-        m_multitasking_avail = opt == Py_True;
+    // multitasking, max_data_size and max_mem_usage are read by the functions the Python side
+    // reads them with, which reject an invalid value as R misha does
+    PMPY name(PyUnicode_FromString("pymisha._shared"), true);
+    PMPY shared(PyImport_GetModule(name), true);   // imported with pymisha, whose CONFIG is read
+    if (!shared)
+        python_error();
+    PMPY multitasking(PyObject_CallMethod(shared, "_config_multitasking", NULL), true);
+    if (!multitasking)
+        python_error();
+    m_multitasking_avail = multitasking == Py_True;
+    PMPY max_data_size(PyObject_CallMethod(shared, "_config_limit", "s", "max_data_size"), true);
+    if (!max_data_size)
+        python_error();
+    m_max_data_size = PyLong_AsUnsignedLongLong(max_data_size);
+    if (PyErr_Occurred())
+        python_error();
+    if (!PMPY(PyObject_CallMethod(shared, "_config_limit", "s", "max_mem_usage"), true))
+        python_error();
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("multitasking_stdout"), true)), false) && PyBool_Check(opt))
         s_multitasking_stdout = opt == Py_True;
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_processes"), true)), false) && PyLong_Check(opt))
-        m_min_processes = max(PyLong_AsLong(opt), 1L);
+        m_min_processes = max(as_long("min_processes"), 1L);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_processes"), true)), false) && PyLong_Check(opt))
-        m_max_processes = max((int)PyLong_AsLong(opt), m_min_processes);
-
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_data_size"), true)), false) && PyLong_Check(opt))
-        m_max_data_size = max(PyLong_AsUnsignedLong(opt), 1UL);
+        m_max_processes = max((int)as_long("max_processes"), m_min_processes);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_scope4process"), true)), false) && PyLong_Check(opt))
-        m_min_scope4process = (uint64_t)max(PyLong_AsLong(opt), 0L);
+        m_min_scope4process = (uint64_t)max(as_long("min_scope4process"), 0L);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_intervs4process"), true)), false) && PyLong_Check(opt))
-        m_min_intervs4process = (uint64_t)max(PyLong_AsLong(opt), 0L);
+        m_min_intervs4process = (uint64_t)max(as_long("min_intervs4process"), 0L);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("eval_buf_size"), true)), false) && PyLong_Check(opt))
-        m_eval_buf_size = max(PyLong_AsUnsignedLong(opt), 1UL);
+        m_eval_buf_size = max(as_long("eval_buf_size"), 1L);
 }
 
 void PyMisha::sigint_handler(int)
