@@ -3828,7 +3828,9 @@ def _intervset_loadable(
 
 
 def _normalize_chrom_column(df: pd.DataFrame, col: str) -> None:
-    if col in df.columns:
+    if col in df.columns and len(df) == 0:
+        df[col] = df[col].astype(str)   # (R's empty factor is read as numbers)
+    elif col in df.columns:
         df[col] = _normalize_chroms(_chrom_names(df[col], col).tolist())
         df[col] = _pandas.Series(df[col])
 
@@ -3898,7 +3900,7 @@ def _track_is_2d(track: str) -> bool:
 
 
 def _normalize_interval_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df is None or len(df) == 0:
+    if df is None:
         return df
     if "chrom" in df.columns:
         _normalize_chrom_column(df, "chrom")
@@ -4171,7 +4173,7 @@ def gintervals_load(
     # Try loading with pyreadr (R's RDS format)
     df = _load_serialized_dataframe(interv_path)
 
-    if df is None or len(df) == 0:
+    if df is None:
         return None
 
     # Convert column types
@@ -4184,10 +4186,7 @@ def gintervals_load(
         if "chrom" not in df.columns:
             raise ValueError("chrom parameter can be applied only to 1D intervals")
         chrom_norm = _normalize_chroms([chrom])[0]
-        df = df[df["chrom"] == chrom_norm]
-        if len(df) == 0:
-            return None
-        df = df.reset_index(drop=True)
+        df = df[df["chrom"] == chrom_norm].reset_index(drop=True)
     if chrom1 is not None or chrom2 is not None:
         if "chrom1" not in df.columns or "chrom2" not in df.columns:
             raise ValueError("chrom1/chrom2 parameters can be applied only to 2D intervals")
@@ -4197,8 +4196,6 @@ def gintervals_load(
         if chrom2 is not None:
             chrom2_norm = _normalize_chroms([chrom2])[0]
             df = df[df["chrom2"] == chrom2_norm]
-        if len(df) == 0:
-            return None
         df = df.reset_index(drop=True)
 
     return df
@@ -4258,9 +4255,8 @@ def gintervals_save(intervals: pd.DataFrame, intervals_set: str) -> None:
     path_part = intervals_set.replace(".", "/")
     interv_path = Path(_shared._names_dir()) / f"{path_part}.interv"
 
-    # Validate intervals
-    if intervals is None or len(intervals) == 0:
-        raise ValueError("Cannot save empty intervals")
+    if intervals is None:
+        raise ValueError("intervals cannot be None")
 
     # Detect 1D vs 2D
     is_2d = {"chrom1", "start1", "end1", "chrom2", "start2", "end2"}.issubset(
@@ -4523,9 +4519,6 @@ def gintervals_update(
             elif len(new_df) > 0:
                 kept = new_df
 
-    if len(kept) == 0:
-        raise ValueError("Cannot save empty intervals")
-
     _replace_intervals_set(kept, intervals_set)
 
 
@@ -4671,6 +4664,8 @@ def gintervals_mapply(
     result_df[colnames] = results
 
     if intervals_set_out is not None:
+        if len(result_df) == 0:
+            return None   # as R: no intervals, no set
         if gintervals_exists(intervals_set_out):
             # Same shape gintervals_update had: removing first means a save that
             # refuses the frame (an empty result, say) leaves neither the old set
@@ -5265,7 +5260,6 @@ def _enumerate_cartesian_grid_cells(
     spec: Any,
     intervals: pd.DataFrame | str | None,
     band: tuple[int, int] | tuple[float, float] | None,
-    intervals_set_out: str | None,
 ) -> pd.DataFrame | None:
     """Enumerate the 2D cells of a CartesianGrid iterator over a 2D scope.
 
@@ -5299,10 +5293,7 @@ def _enumerate_cartesian_grid_cells(
 
     empty_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
     if len(scope_df) == 0 or len(spec.intervals1) == 0:
-        result = _pandas.DataFrame(columns=empty_cols)
-        if intervals_set_out is not None:
-            return None
-        return result
+        return _pandas.DataFrame(columns=empty_cols)
 
     s = scope_df.copy()
     s["chrom1"] = _normalize_chroms(_chrom_names(s["chrom1"], "chrom1").tolist())
@@ -5334,7 +5325,7 @@ def _enumerate_cartesian_grid_cells(
         i1, e1, i2, e2, band_idx, scope_dict, band_arg
     )
 
-    result = _pandas.DataFrame(
+    return _pandas.DataFrame(
         {
             "chrom1": [id2chrom[i] for i in out["chrom1"]],
             "start1": out["start1"],
@@ -5345,19 +5336,11 @@ def _enumerate_cartesian_grid_cells(
         }
     )
 
-    if intervals_set_out is not None:
-        if len(result) == 0:
-            raise ValueError("Cannot save empty intervals")
-        gintervals_save(result, intervals_set_out)
-        return None
-    return result
-
 
 def _run_2d_iterator_coords(
     policy_dict: dict[str, Any],
     scope_df: pd.DataFrame,
     band: tuple[int, int] | tuple[float, float] | None,
-    intervals_set_out: str | None,
 ) -> pd.DataFrame | None:
     """Enumerate a 2D iterator policy's cells over a 2D scope (coords only).
 
@@ -5378,8 +5361,6 @@ def _run_2d_iterator_coords(
 
     empty_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
     if len(scope_df) == 0:
-        if intervals_set_out is not None:
-            return None
         return _pandas.DataFrame(columns=empty_cols)
 
     s = scope_df.copy()
@@ -5399,7 +5380,7 @@ def _run_2d_iterator_coords(
 
     out = _pymisha.pm_extract_2d_scanner(policy_dict, scope_dict, [], [], band_arg)
 
-    result = _pandas.DataFrame(
+    return _pandas.DataFrame(
         {
             "chrom1": [id2chrom[i] for i in out["_chrom1"]],
             "start1": out["_start1"],
@@ -5410,19 +5391,11 @@ def _run_2d_iterator_coords(
         }
     )
 
-    if intervals_set_out is not None:
-        if len(result) == 0:
-            raise ValueError("Cannot save empty intervals")
-        gintervals_save(result, intervals_set_out)
-        return None
-    return result
-
 
 def _enumerate_2d_fixedrect_cells(
     iterator: tuple[Any, Any] | list,
     intervals: pd.DataFrame | str | None,
     band: tuple[int, int] | tuple[float, float] | None,
-    intervals_set_out: str | None,
 ) -> pd.DataFrame | None:
     """Enumerate the cells of a fixed-size 2D iterator over a 2D scope.
 
@@ -5443,7 +5416,7 @@ def _enumerate_2d_fixedrect_cells(
     scope_df = _resolve_2d_scope(intervals)
     return _run_2d_iterator_coords(
         {"kind": "fixed_rect", "width": width, "height": height},
-        scope_df, band, intervals_set_out,
+        scope_df, band,
     )
 
 
@@ -5465,7 +5438,7 @@ def _enumerate_2d_iterator_intervals(
     from .tracks import gtrack_exists, gtrack_info
 
     if isinstance(iterator, CartesianGridSpec):
-        return _enumerate_cartesian_grid_cells(iterator, intervals, band, None)
+        return _enumerate_cartesian_grid_cells(iterator, intervals, band)
 
     if (
         isinstance(iterator, (tuple, list))
@@ -5474,7 +5447,7 @@ def _enumerate_2d_iterator_intervals(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in iterator
         )
     ):
-        return _enumerate_2d_fixedrect_cells(iterator, intervals, band, None)
+        return _enumerate_2d_fixedrect_cells(iterator, intervals, band)
 
     if (
         isinstance(iterator, str)
@@ -5484,7 +5457,7 @@ def _enumerate_2d_iterator_intervals(
         scope_df = _resolve_2d_scope(intervals)
         return _run_2d_iterator_coords(
             {"kind": "track_rects", "track_name": iterator},
-            scope_df, band, None,
+            scope_df, band,
         )
 
     return None
@@ -5572,13 +5545,22 @@ def giterator_intervals(
         )
     _checkroot()
 
+    if intervals_set_out is not None:
+        df = giterator_intervals(expr, intervals, iterator, band, None, interval_relative, partial_bins)
+        if df is None or len(df) == 0:
+            # as R: an empty set, of the iterator's dimension
+            from .expr import _expr_is_2d
+            is_2d = _expr_is_2d(expr if expr is not None else [], iterator) or _is_2d_intervals_df(intervals)
+            df = _pandas.DataFrame({c: [] for c in (
+                ["chrom1", "start1", "end1", "chrom2", "start2", "end2"] if is_2d else ["chrom", "start", "end"])})
+        gintervals_save(df, intervals_set_out)
+        return None
+
     # CartesianGrid 2D iterator: enumerate the grid cells over the 2D scope
     # (R's giterator.intervals(expr, scope, iterator = cartesian_grid[, band])).
     from ._iterator_policy import CartesianGridSpec
     if isinstance(iterator, CartesianGridSpec):
-        return _enumerate_cartesian_grid_cells(
-            iterator, intervals, band=band, intervals_set_out=intervals_set_out
-        )
+        return _enumerate_cartesian_grid_cells(iterator, intervals, band=band)
 
     # Numeric 2D iterator c(width, height): a fixed-rect grid over a 2D scope
     # (R's giterator.intervals(expr, scope, iterator = c(width, height))). The
@@ -5590,9 +5572,7 @@ def giterator_intervals(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in iterator
         )
     ):
-        return _enumerate_2d_fixedrect_cells(
-            iterator, intervals, band=band, intervals_set_out=intervals_set_out
-        )
+        return _enumerate_2d_fixedrect_cells(iterator, intervals, band=band)
 
     # Determine iterator policy
     itr = iterator
@@ -5649,11 +5629,7 @@ def giterator_intervals(
                 if res is None or len(res) == 0:
                     return None
                 cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]  # no intervalID, as R
-                df2d = res[cols].drop_duplicates().reset_index(drop=True)
-                if intervals_set_out is not None:
-                    gintervals_save(df2d, intervals_set_out)
-                    return None
-                return df2d
+                return res[cols].drop_duplicates().reset_index(drop=True)
 
             bin_size = info.get("bin_size") or info.get("bin.size")
             if bin_size is not None:
@@ -5702,11 +5678,7 @@ def giterator_intervals(
         units = _gextract_2d_units(intervals, itr, _validate_band(band))
         if units is None or len(units) == 0:
             return None
-        units = units.drop(columns=["intervalID"], errors="ignore")  # as R
-        if intervals_set_out is not None:
-            gintervals_save(units, intervals_set_out)
-            return None
-        return units
+        return units.drop(columns=["intervalID"], errors="ignore")  # as R
 
     # Handle DataFrame-as-iterator
     intervals, itr, _itr_id_map = _preprocess_intervals_iterator(intervals, itr, canonic_scope=True)
@@ -5744,12 +5716,6 @@ def giterator_intervals(
     if df is not None and not interval_relative:
         # R returns the intervals only; with interval_relative, intervalID is the input row (R misha 5.15)
         df = df.drop(columns=["intervalID"], errors="ignore")
-
-    if intervals_set_out is not None:
-        if df is None or len(df) == 0:
-            raise ValueError("Cannot save empty intervals")
-        gintervals_save(df, intervals_set_out)
-        return None
 
     return df
 

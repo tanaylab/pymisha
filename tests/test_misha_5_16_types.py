@@ -209,15 +209,20 @@ def test_chain_with_character_or_missing_strands_is_rejected():
             pm.gintervals_liftover(SRC, CHAIN.assign(chromsrc=bad))
 
 
-# --- an integer NA strand is not strand 0 ---
+# --- a missing strand is not strand 0 ---
 
-@pytest.mark.parametrize("strand", [pd.array([1, pd.NA, -1], dtype="Int64"), [1, np.nan, -1], [1, None, -1],
-                                    ["+", None, "-"], pd.Categorical(["+", None, "-"])])
-def test_missing_strand_is_an_error(strand):
+@pytest.mark.parametrize("strand,msg", [
+    # a missing number is a bad interval, as R says of NA_real_ (5.16.1)
+    (pd.array([1, pd.NA, -1], dtype="Int64"), r"Invalid strand value \(NA\) at index 2"),  # R's NA_integer_
+    ([1, np.nan, -1], "Invalid format of interval at index 2"),
+    ([1, None, -1], "Invalid format of interval at index 2"),
+    (["+", None, "-"], r"Invalid strand value \(NA\) at index 2"),
+    (pd.Categorical(["+", None, "-"]), r"Invalid strand value \(NA\) at index 2")])
+def test_missing_strand_is_an_error(strand, msg):
     df = DF(dict(chrom="chr1", start=0, end=8, strand=strand))
-    with pytest.raises(_pymisha.error, match=r"Invalid strand value \(NA\) at index 2"):
+    with pytest.raises(_pymisha.error, match=msg):
         pm.gseq_extract(df)
-    with pytest.raises(_pymisha.error, match=r"Invalid strand value \(NA\) at index 2"):
+    with pytest.raises(_pymisha.error, match=msg):
         pm.gextract("dense_track", df)
 
 

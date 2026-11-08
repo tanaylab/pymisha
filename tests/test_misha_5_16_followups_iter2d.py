@@ -374,10 +374,25 @@ def test_gtrack_create_with_a_virtual_track_and_with_multitasking(monkeypatch):
     check(created("c_mt")[1], ex_cols("c_mt"), with_values(RA_ROWS, [22, 27, NAN, 29], ids=[1, 1, 1, 2]))
 
 
-def test_gtrack_create_from_no_iterator_rectangle_makes_an_empty_sparse_track():
-    pm.gtrack_create("c_empty", "d", "rB", iterator="rA", band=(10000, 20000))
-    assert pm.gtrack_info("c_empty")["type"] == "sparse"
-    assert pm.gextract("c_empty", pm.gintervals_all()) is None
+def no_rectangle_creates_no_track():
+    """R 5.16.1: gtrack.create and gtrack.lookup over a 2D iterator that gives no
+    rectangle (none of rA is in this band) are errors and leave no track."""
+    from pymisha import _shared
+
+    for call in (lambda: pm.gtrack_create("e1", "d", "rB", iterator="rA", band=(10000, 20000)),
+                 lambda: pm.gtrack_lookup("l1", "d", np.array([1.0, 2.0, 3.0]), "rB", [0, 1, 2, 1e9],
+                                          iterator="rA", band=(10000, 20000))):
+        with pytest.raises(ValueError, match="was not created: the iterator gave no rectangles"):
+            call()
+    for name in ("e1", "l1"):
+        assert not (Path(_shared._GROOT) / "tracks" / f"{name}.track").exists()
+        assert name not in pm.gtrack_ls()
+
+
+@pytest.mark.parametrize("mt", [False, True])
+def test_gtrack_create_and_lookup_from_no_iterator_rectangle_create_no_track(monkeypatch, mt):  # R followup :93
+    monkeypatch.setitem(pm.CONFIG, "multitasking", mt)
+    no_rectangle_creates_no_track()
 
 
 def test_gtrack_create_with_a_2d_iterator_on_an_indexed_database(tmp_path):
@@ -391,9 +406,8 @@ def test_gtrack_create_with_a_2d_iterator_on_an_indexed_database(tmp_path):
         info = pm.gtrack_info("e2")
         assert (info["type"], info["format"]) == ("rectangles", "indexed")
         check(pm.gextract("e2", A2()), ex_cols("e2"), with_values(RA_ROWS, [6, 4, 3, 8], ids=[1, 1, 1, 2]))
-        pm.gtrack_create("e1", "d", "rA", iterator="rA", band=(10000, 20000))
-        info = pm.gtrack_info("e1")
-        assert (info["type"], info["format"]) == ("sparse", "indexed")
+        pm.gtrack_2d_create("rB", "d", RB, [1, 2, 3, 4])
+        no_rectangle_creates_no_track()
     finally:
         pm.gdb_init(str(TESTDB_ROOT))
 

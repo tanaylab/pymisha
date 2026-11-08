@@ -529,7 +529,10 @@ def gtrack_lookup(
     )
 
     if result is None or len(result) == 0:
-        raise ValueError("Lookup produced no values; cannot create track")
+        # as R: a 2D iterator with no rectangle creates no track, a 1D one an empty sparse track
+        if use_2d_scope:
+            raise ValueError(f"Track {track} was not created: the iterator gave no rectangles")
+        result = pd.DataFrame({"chrom": [], "start": [], "end": [], "value": []})
 
     is_2d_result = {"chrom1", "start1", "end1", "chrom2", "start2", "end2"}.issubset(result.columns)
     if is_2d_result:

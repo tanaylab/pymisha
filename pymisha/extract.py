@@ -3243,6 +3243,21 @@ def gscreen(
     # Capture caller namespace for user variable resolution
     caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
 
+    if kwargs.get("intervals_set_out") is not None:
+        # as R: the hits are saved, an empty set when there are none
+        from .intervals import gintervals_save
+
+        set_out = kwargs.pop("intervals_set_out")
+        df = gscreen(expr, intervals, vars=caller_ns, **kwargs)
+        if df is None or len(df) == 0:
+            from .expr import _expr_is_2d
+
+            is_2d = _expr_is_2d(expr, kwargs.get("iterator")) or _is_2d_intervals(intervals)
+            df = pd.DataFrame({c: [] for c in (
+                ["chrom1", "start1", "end1", "chrom2", "start2", "end2"] if is_2d else ["chrom", "start", "end"])})
+        gintervals_save(df, set_out)
+        return None
+
     from .tracks import _check_computed_tracks
 
     _check_computed_tracks(expr)
@@ -3284,14 +3299,7 @@ def gscreen(
         mask = (~_numpy.isnan(vals)) & (vals != 0.0)
         if not mask.any():
             return None
-        result_2d = extracted.loc[mask, ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].reset_index(drop=True)
-        intervals_set_out = kwargs.get("intervals_set_out")
-        if intervals_set_out is not None:
-            from .intervals import gintervals_save
-
-            gintervals_save(result_2d, intervals_set_out)
-            return None
-        return result_2d
+        return extracted.loc[mask, ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].reset_index(drop=True)
 
     # Handle DataFrame-as-iterator for 1D gscreen
     intervals, iterator, _scr_id_map = _preprocess_intervals_iterator(intervals, iterator, canonic_scope=True)
@@ -3334,14 +3342,7 @@ def gscreen(
                 _cfg,
                 vtracks_dict,
             )
-        df = _pymisha2df(result)
-        intervals_set_out = kwargs.get("intervals_set_out")
-        if df is not None and intervals_set_out is not None:
-            from .intervals import gintervals_save
-
-            gintervals_save(df[["chrom", "start", "end"]], intervals_set_out)
-            return None
-        return df
+        return _pymisha2df(result)
 
     track_arrays = {}
     base_df = None
@@ -3445,12 +3446,4 @@ def gscreen(
     if not out_rows:
         return None
 
-    filtered = _pandas.DataFrame(out_rows, columns=["chrom", "start", "end"])
-    filtered = filtered.reset_index(drop=True)
-    intervals_set_out = kwargs.get("intervals_set_out")
-    if intervals_set_out is not None:
-        from .intervals import gintervals_save
-
-        gintervals_save(filtered, intervals_set_out)
-        return None
-    return filtered
+    return _pandas.DataFrame(out_rows, columns=["chrom", "start", "end"])

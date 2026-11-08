@@ -31,11 +31,19 @@ _TRACK_DIR = str(TEST_DB / "tracks")
 
 # Removed tracks are renamed to .trash.* and deleted by a background `rm -rf`. A test
 # that copies the database meanwhile fails when files vanish under shutil.copytree,
-# so in the tests they are deleted before the removal returns (tests/test_db_trash.py
-# passes async_unlink=True to test the background path).
+# so in the tests they are deleted before the removal returns: a Popen that fails makes
+# _gdb_trash remove them itself, also where a caller asks for async_unlink=True
+# (gtrack_rm, gintervals_rm).
+import types  # noqa: E402
+
 from pymisha import _db_trash  # noqa: E402
 
-_db_trash._gdb_trash.__defaults__ = (False,)
+
+def _no_background_rm(*args, **kwargs):
+    raise OSError("the tests remove trash synchronously")
+
+
+_db_trash.subprocess = types.SimpleNamespace(Popen=_no_background_rm, DEVNULL=_db_trash.subprocess.DEVNULL)
 
 
 @pytest.fixture(scope="session", autouse=True)

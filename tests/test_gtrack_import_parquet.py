@@ -608,3 +608,15 @@ def test_a_directory_as_path_suggests_the_glob(db, tmp_path):
     expect_no_tracks_left(db, ["d_a"])
     with pytest.raises(ValueError, match="No files match"):
         pm.gtrack_import_parquet("test", str(src / "nothing"), 32)
+
+
+def test_empty_shards_written_by_pyarrow_and_pandas(db, tmp_path):  # R test-review-2026-11-followup.R :73
+    # (make_fixtures.py: one row group of no rows, column chunks with data_page_offset 0;
+    # pandas also types the chrom column null)
+    pm.gtrack_import_parquet("", pq_fixture("shard_chr1.parquet"), 32, track_prefix="one_")
+    for empty in ("empty_pyarrow.parquet", "empty_pandas.parquet"):
+        src = local_fixture_dir(tmp_path, {"shard_chr1.parquet": "shard_chr1.parquet", empty: empty}, empty)
+        prefix = empty.removesuffix(".parquet") + "_"
+        pm.gtrack_import_parquet("", str(src / "*.parquet"), 32, track_prefix=prefix)
+        assert_identical(track_values(prefix + "a"), track_values("one_a"))
+    assert pm.gextract("one_a", pm.gintervals("chr1", 0, 64))["one_a"].tolist() == [0.25, 1.25]

@@ -108,11 +108,17 @@ TARGETS = DF(dict(chrom="chr1", start=[1000, 2000], end=[1100, 2100]))
 NA_STRANDS = [["+", None, "-"], [1, np.nan, -1], pd.array([1, None, -1], dtype="Int64"),
               pd.Categorical(["+", None, "-"])]
 NA_ERROR = r"^Invalid strand value \(NA\) at index 2$"
+# a missing double is a bad interval, as R says of NA_real_ (5.16.1)
+NA_FLOAT_ERROR = r"^Invalid format of interval at index 2$"
+
+
+def na_error(strand):
+    return NA_FLOAT_ERROR if isinstance(strand, list) and any(isinstance(x, float) for x in strand) else NA_ERROR
 
 
 @pytest.mark.parametrize("strand", NA_STRANDS)
 def test_canonic_missing_strand_is_an_error(strand):
-    with pytest.raises(_pymisha.error, match=NA_ERROR):
+    with pytest.raises(_pymisha.error, match=na_error(strand)):
         pm.gintervals_canonic(BASE.assign(strand=strand))
 
 
@@ -126,7 +132,7 @@ def test_canonic_strand_without_missing_values_is_dropped(strand):
 @pytest.mark.parametrize("use_intervals1_strand", [False, True])
 @pytest.mark.parametrize("strand", NA_STRANDS)
 def test_neighbors_missing_strand_of_intervals1_is_an_error(strand, use_intervals1_strand):
-    with pytest.raises(_pymisha.error, match=NA_ERROR):
+    with pytest.raises(_pymisha.error, match=na_error(strand)):
         pm.gintervals_neighbors(BASE.assign(strand=strand), TARGETS, use_intervals1_strand=use_intervals1_strand,
                                 warn_ignored_strand=False)
 
@@ -134,7 +140,7 @@ def test_neighbors_missing_strand_of_intervals1_is_an_error(strand, use_interval
 @pytest.mark.parametrize("strand", [["+", None], [1, np.nan], pd.array([1, None], dtype="Int64"),
                                     pd.Categorical(["+", None])])
 def test_neighbors_missing_strand_of_intervals2_is_an_error(strand):
-    with pytest.raises(_pymisha.error, match=NA_ERROR):
+    with pytest.raises(_pymisha.error, match=na_error(strand)):
         pm.gintervals_neighbors(BASE, TARGETS.assign(strand=strand))
 
 

@@ -396,27 +396,37 @@ def copy_killed_at(tmp_path, kill_at):
     script = ("import sys\nimport pymisha as pm\npm.CONFIG['multitasking'] = False\npm.gdb_init(sys.argv[1])\n"
               + _KILLED_COPY)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    dirty_flag = Path(db) / ".db.cache.dirty"
+    dirty_flag.unlink(missing_ok=True)   # as after an R session's rescan
     res = subprocess.run([sys.executable, "-c", script, db, kill_at], env=env, capture_output=True, text=True)
     assert res.returncode == -9, res.stderr
+    # whether R sessions were told to rescan
+    dirty = dirty_flag.exists()
 
     # a later write in the directory sweeps what the dead process left
     pm.gdb_init(db)
+    listed = "orig" in pm.gtrack_ls()
     sparse("another", pm.gintervals("chr1", 0, 10), [1])
     leftovers = sorted(set(os.listdir(tracks)) - {"orig.track", "src.track", "another.track"})
-    return db, tracks, leftovers, orig_bytes
+    return db, tracks, leftovers, orig_bytes, dirty, listed
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL")
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the dead-owner check reads /proc, as in R")
 def test_copy_killed_during_the_copy_leaves_the_old_track_in_place(tmp_path):  # R :312
-    _, _, leftovers, _ = copy_killed_at(tmp_path, "copy")
+    _, _, leftovers, _, _, _ = copy_killed_at(tmp_path, "copy")
     assert pm.gextract("orig", pm.gintervals("chr1", 0, 200))["orig"].tolist() == [42]
     assert leftovers == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL")
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the dead-owner check reads /proc, as in R")
 def test_copy_killed_between_its_renames_keeps_the_old_track_where_no_sweep_removes_it(tmp_path):  # R :321
-    _, tracks, leftovers, orig_bytes = copy_killed_at(tmp_path, "aside")
+    _, tracks, leftovers, orig_bytes, dirty, listed = copy_killed_at(tmp_path, "aside")
     assert not (tracks / "orig.track").exists()
+    # the copy left R's cache dirty, and the next session does not list the track
+    assert dirty
+    assert not listed
     assert len(leftovers) == 1
     kept = tracks / leftovers[0]
     assert (kept / "track.dat").read_bytes() == orig_bytes
@@ -428,11 +438,53 @@ def test_copy_killed_between_its_renames_keeps_the_old_track_where_no_sweep_remo
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL")
 def test_copy_killed_once_the_copy_is_in_place_leaves_the_new_track(tmp_path):  # R :336
-    copy_killed_at(tmp_path, "swap")
-    pm.gdb_reload()
+    _, _, _, _, dirty, listed = copy_killed_at(tmp_path, "swap")
+    # listed by the next session without a gdb_reload, and R sessions rescan
+    assert dirty
+    assert listed
     res = pm.gextract("orig", pm.gintervals("chr1", 0, 200))
     assert res["start"].tolist() == [100]
     assert res["orig"].tolist() == [7]
+
+
+def test_copy_that_fails_after_another_session_rescanned_leaves_the_cache_dirty(tmp_path, monkeypatch):  # R :352
+    db = review_db(tmp_path)
+    sparse("orig", pm.gintervals("chr1", 0, 10), [42])
+    sparse("src", pm.gintervals("chr1", 100, 110), [7])
+    dirty_flag = Path(db) / ".db.cache.dirty"
+    # an R session rescans while the old track is set aside (its rescan removes the flag);
+    # then putting the copy in place fails
+    real_rename = os.rename
+
+    def rename(src, dst, *args, **kwargs):
+        if os.path.basename(str(src)) == "orig.track":
+            res = real_rename(src, dst, *args, **kwargs)
+            dirty_flag.unlink(missing_ok=True)
+            return res
+        if os.path.basename(str(dst)) == "orig.track" and ".tmp." in os.path.basename(str(src)):
+            raise OSError("no rename")
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(RuntimeError, match="Failed to rename"):
+        pm.gtrack_copy("src", "orig", overwrite=True)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert dirty_flag.exists()
+    pm.gdb_init(db)
+    assert "orig" in pm.gtrack_ls()
+    assert pm.gextract("orig", pm.gintervals("chr1", 0, 200))["orig"].tolist() == [42]
+
+
+def test_copy_that_succeeds_leaves_r_to_rescan(tmp_path):  # R :385
+    # (pymisha writes no .db.cache: R sessions rescan after any pymisha write)
+    db = review_db(tmp_path)
+    sparse("orig", pm.gintervals("chr1", 0, 10), [42])
+    sparse("src", pm.gintervals("chr1", 100, 110), [7])
+    (Path(db) / ".db.cache.dirty").unlink(missing_ok=True)
+    pm.gtrack_copy("src", "orig", overwrite=True)
+    assert (Path(db) / ".db.cache.dirty").exists()
+    assert {"orig", "src"} <= set(pm.gtrack_ls())
+    assert pm.gextract("orig", pm.gintervals("chr1", 0, 200))["orig"].tolist() == [7]
 
 
 def test_failed_copy_keeps_what_another_session_put_at_the_name(tmp_path, monkeypatch):  # R :669

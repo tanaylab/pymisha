@@ -117,8 +117,8 @@ static void bad_strand_label(PyObject *label)
 
 // R misha's check of a strand column: a boolean column (or a categorical of booleans) is not a
 // strand column ("Invalid format of intervals argument", as R says of a logical one), and the first
-// row with a missing strand (None, NaN or pandas.NA; not strand 0) or a label other than "+", "-",
-// ".", "*" or "" is an error. A categorical column arrives from _df2pymisha as
+// row with a missing strand (None, NaN or pandas.NA; not strand 0), a number other than -1, 0 or 1,
+// or a label other than "+", "-", ".", "*" or "" is an error. A categorical column arrives from _df2pymisha as
 // [categories, codes], NA as code -1.
 void check_strand_column(PyObject *py_strand)
 {
@@ -159,16 +159,19 @@ void check_strand_column(PyObject *py_strand)
     npy_intp n = PyArray_SIZE(arr);
     if (PyArray_TYPE(arr) == NPY_BOOL)
         TGLError("Invalid format of intervals argument");
-    if (PyTypeNum_ISFLOAT(PyArray_TYPE(arr))) {
-        PMPY as_double(PyArray_FROM_OTF((PyObject *)arr, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY), true);
+    if (PyTypeNum_ISFLOAT(PyArray_TYPE(arr)) || PyTypeNum_ISINTEGER(PyArray_TYPE(arr))) {
+        PMPY as_double(PyArray_FROM_OTF((PyObject *)arr, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
         if (!as_double) {
             PyErr_Clear();
             return;
         }
+        // -1, 0 or 1 only; a missing float is a bad interval, as R says of NA_real_
         const double *d = (const double *)PyArray_DATA((PyArrayObject *)*as_double);
         for (npy_intp k = 0; k < n; ++k) {
             if (std::isnan(d[k]))
-                TGLError("Invalid strand value (NA) at index %ld", (long)k + 1);
+                TGLError("Invalid format of interval at index %ld", (long)k + 1);
+            if (d[k] != -1 && d[k] != 0 && d[k] != 1)
+                TGLError("Invalid strand value %g at index %ld", d[k], (long)k + 1);
         }
     } else if (PyArray_TYPE(arr) == NPY_OBJECT) {
         // booleans with missing values (an object or a pandas "boolean" column) are logical too
@@ -183,6 +186,13 @@ void check_strand_column(PyObject *py_strand)
                 TGLError("Invalid strand value (NA) at index %ld", (long)k + 1);
             if (PyUnicode_Check(v) && !is_strand_label(PyUnicode_AsUTF8(v)))
                 bad_strand_label(v);
+            if (PyLong_Check(v) || PyFloat_Check(v) || PyArray_IsScalar(v, Number)) {
+                double x = PyFloat_AsDouble(v);
+                if (PyErr_Occurred())
+                    PyErr_Clear();
+                else if (x != -1 && x != 0 && x != 1)
+                    TGLError("Invalid strand value %g at index %ld", x, (long)k + 1);
+            }
         }
         PyErr_Clear();
     }

@@ -2265,16 +2265,15 @@ def _gtrack_create_2d_from_expr(
     whole 2D genome with *iterator* and *band* (the rectangles of the
     expression's 2D track when *iterator* is ``None``, or those of a 2D track,
     2D intervals or a rectangle size) and each iterator rectangle is written
-    with its value, NaN included. An iterator that gives no rectangle makes an
-    empty sparse track, as in R.
+    with its value, NaN included. An iterator that gives no rectangle is an
+    error and creates no track, as in R.
     """
     from .extract import gextract
     from .intervals import _whole_genome_2d
 
     res = gextract(expr, _whole_genome_2d(), iterator=iterator, band=band, colnames=["value"])
     if res is None or len(res) == 0:
-        _create_sparse(track, description, _empty_records())
-        return
+        raise ValueError(f"Track {track} was not created: the iterator gave no rectangles")
 
     coord_cols = ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]
     # gtrack_2d_create handles its own (atomic) track-dir creation, attribute
@@ -3756,6 +3755,9 @@ def _gtrack_copy_one(
             # a staging or trash name): if the copy is killed between the two renames, it is
             # the only copy of the track, kept there.
             aside_path = parent / f".{secrets.token_hex(6)}"
+            # (as R: R sessions' .db.cache is marked stale before the old track is moved, so
+            # that a copy killed right after the move leaves them to rescan)
+            _shared._touch_db_cache_dirty(str(dest_db))
             try:
                 if aside_path.exists():
                     raise FileExistsError(aside_path)

@@ -88,11 +88,14 @@ def test_iterator_modifiers_follow_the_source_dimension():
     pm.gvtrack_iterator("v1", dim=1)  # dim projects a 2D iterator onto a 1D source
 
 
-@pytest.mark.parametrize("strand", [0, 2])
-def test_directional_neighbors_reject_other_strands(strand):
+@pytest.mark.parametrize("strand,msg", [
+    (0, "Invalid strand value 0 at row 1. Strand must be -1 or 1."),
+    # 2 is no strand at all: rejected when the intervals are read (R 5.16.1)
+    (2, "Invalid strand value 2 at index 1")])
+def test_directional_neighbors_reject_other_strands(strand, msg):
     q = pd.DataFrame({"chrom": ["chr1"], "start": [5000], "end": [5100], "strand": [strand]})
     tg = pm.gintervals("chr1", [1000, 9000], [1100, 9100])
-    with pytest.raises(ValueError, match=f"Invalid strand value {strand} at row 1. Strand must be -1 or 1."):
+    with pytest.raises(Exception, match=msg):
         pm.gintervals_neighbors(q, tg, use_intervals1_strand=True)
 
 

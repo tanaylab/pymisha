@@ -192,9 +192,9 @@ class TestGintervalsMapplyIntervalsSetOut:
         assert len(loaded) == 2
         assert "value" in loaded.columns
 
-    def test_rejected_result_leaves_the_old_set_intact(self, _existing_set):
-        """An empty query frame makes the save refuse ("Cannot save empty
-        intervals"); the pre-existing set must survive that refusal.
+    def test_no_intervals_leave_the_old_set_intact(self, _existing_set):
+        """An empty query frame writes no set (R: gintervals.mapply over no intervals
+        creates none); the pre-existing set stays as it was.
         """
         import pandas as pd
 
@@ -203,12 +203,11 @@ class TestGintervalsMapplyIntervalsSetOut:
             "start": pd.Series([], dtype="int64"),
             "end": pd.Series([], dtype="int64"),
         })
-        with pytest.raises(ValueError, match="Cannot save empty intervals"):
-            pymisha.gintervals_mapply(
-                lambda x: 0.0, "dense_track", intervals=empty,
-                intervals_set_out=_existing_set,
-            )
-        assert pymisha.gintervals_exists(_existing_set), "the failed run deleted the set"
+        assert pymisha.gintervals_mapply(
+            lambda x: 0.0, "dense_track", intervals=empty,
+            intervals_set_out=_existing_set,
+        ) is None
+        assert pymisha.gintervals_exists(_existing_set), "the run deleted the set"
         loaded = pymisha.gintervals_load(_existing_set)
         assert len(loaded) == 1
         assert int(loaded.iloc[0]["end"]) == 1000

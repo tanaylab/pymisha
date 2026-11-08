@@ -501,6 +501,10 @@ def _df2pymisha(arg):
                         cat.cat.codes.to_numpy(),
                     ]
                 )
+            elif colnames[i] == "strand" and _pandas.api.types.is_integer_dtype(series.dtype) and series.hasnans:
+                # (pandas would hand a nullable integer column with NA over as floats; R tells
+                # a missing integer strand from a missing double one)
+                cols.append(series.to_numpy(dtype=object))
             else:
                 cols.append(series.to_numpy())
         return cols
@@ -1424,15 +1428,34 @@ def _bad_strand_label(col: _pandas.Series) -> tuple[int, str] | None:
 def _check_strand_column(col: _pandas.Series, prefix: str = "") -> None:
     """R's checks of a strand column, as the C++ interval converters make them
     (check_strand_column): a boolean column (a categorical of booleans too) is not a
-    strand column, and the first row with a missing strand (None, NaN, pandas.NA) or a
-    label other than "+", "-", ".", "*" or "" is an error. *prefix* starts the messages
-    R prefixes (gcis_decay's "Source intervals: ")."""
+    strand column, and the first row with a missing strand (None, NaN, pandas.NA), a
+    number other than -1, 0 or 1, or a label other than "+", "-", ".", "*" or "" is an
+    error. *prefix* starts the messages R prefixes (gcis_decay's "Source intervals: ")."""
     if _pandas.api.types.is_bool_dtype(col) or (
             col.dtype == object and any(isinstance(v, (bool, _numpy.bool_)) for v in col.to_numpy())):
         raise _pymisha.error(f"{prefix}Invalid format of intervals argument")
     na = col.isna().to_numpy()
+    if _pandas.api.types.is_numeric_dtype(col):
+        # a number is -1, 0 or 1; a missing float is a bad interval, as R says of NA_real_
+        v = col.to_numpy(dtype=float, na_value=_numpy.nan)
+        bad_rows = na | ~_numpy.isin(v, (-1.0, 0.0, 1.0))
+        if bad_rows.any():
+            i = int(_numpy.argmax(bad_rows))
+            if not na[i]:
+                raise _pymisha.error(f"{prefix}Invalid strand value {v[i]:g} at index {i + 1}")
+            if _pandas.api.types.is_float_dtype(col):
+                raise _pymisha.error(f"{prefix}Invalid format of interval at index {i + 1}")
+            raise _pymisha.error(f"{prefix}Invalid strand value (NA) at index {i + 1}")
+        return
     first_na = int(_numpy.argmax(na)) if na.any() else len(col)
     bad = _bad_strand_label(col)
+    if col.dtype == object:
+        # a number among the labels is -1, 0 or 1 too
+        for i, x in enumerate(col.to_numpy()[:first_na]):
+            if bad is not None and i == bad[0]:
+                break
+            if isinstance(x, (int, float, _numpy.number)) and x not in (-1, 0, 1):
+                raise _pymisha.error(f"{prefix}Invalid strand value {float(x):g} at index {i + 1}")
     if bad is not None and bad[0] < first_na:
         raise _pymisha.error(f'Bad strand value "{bad[1]}" (expected "+", "-", ".", "*" or "")')
     if first_na < len(col):

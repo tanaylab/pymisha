@@ -441,6 +441,7 @@ def test_track_writers_build_in_a_staging_directory_named_by_gdb_staging_name(ma
     assert staging_leftovers(db / "tracks" / "sub") == []
 
 
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the dead-owner check reads /proc, as in R")
 def test_gdb_init_sweeps_the_staging_directory_of_a_dead_process_at_once(make_db):
     db = make_db()
     tracks = db / "tracks"
@@ -457,6 +458,7 @@ def test_gdb_init_sweeps_the_staging_directory_of_a_dead_process_at_once(make_db
     assert all(p.exists() for p in kept)
 
 
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the dead-owner check reads /proc, as in R")
 def test_modify_and_parquet_import_sweep_their_directory_before_they_stage(make_db, tmp_path):
     """In a subdirectory of tracks/, which gdb_init does not sweep."""
     db = make_db()
@@ -493,6 +495,7 @@ pm.gtrack_create_sparse("victim", "", pm.gintervals("chr1", 0, 10), [1])
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL")
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the dead-owner check reads /proc, as in R")
 def test_the_staging_directory_of_a_killed_writer_is_swept_by_the_next_gdb_init(make_db):
     db = make_db()
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))

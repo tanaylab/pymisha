@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.18.1 (2026-11-08)
+
+Follows R misha 5.16.1.
+
+### Breaking
+
+* A numeric `strand` other than -1, 0 or 1 is an error ("Invalid strand value 2 at index 1") in every function that reads intervals; `gseq_extract` took 2, 0.5 and 255 as a strand. A missing value in a float strand column is "Invalid format of interval at index N", as R says of a missing double.
+* `gtrack_create` and `gtrack_lookup` with a 2D iterator that gives no rectangles stop with an error and create no track; `gtrack_create` wrote an empty track.
+* Empty interval sets work as in R: `gintervals_save` saves one (it was an error), and `gintervals_load` of an empty set, or with a `chrom` filter that matches nothing, returns a data frame of no rows instead of `None`.
+
+### Fixes
+
+* `gtrack_import_parquet` reads empty files written by pyarrow or pandas.
+* `gtrack_lookup` with a 1D iterator that gives no intervals creates an empty sparse track, as R; it was an error.
+* `gintervals_update` can leave a set empty, and `giterator_intervals` and `gscreen` with `intervals_set_out` save an empty set when there are no intervals (errors, or no set, before); `gintervals_mapply` over no intervals writes no set instead of failing.
+* `gtrack_copy(overwrite=True)` tells R sessions to rescan before it moves the old track aside, so one killed between its renames no longer leaves them listing a missing track.
+
 ## v0.18.0 (2026-11-06)
 
 Follows R misha 5.16.0. Several results change; recompute anything that depends on them.
