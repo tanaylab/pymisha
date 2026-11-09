@@ -13,10 +13,14 @@ from ._shared import (
     _check_intervals_strand,
     _check_spat_bounds,
     _checkroot,
+    _coerce_pssm_matrix,
     _coerce_score_thresh,
     _df2pymisha,
+    _is_na,
     _potts_params,
     _pymisha,
+    _seq_bytes,
+    _seq_upper,
 )
 from .extract import _maybe_load_intervals_set
 
@@ -57,7 +61,7 @@ _PWM_COMP_CODE = {"A": 3, "C": 2, "G": 1, "T": 0}  # complement base codes
 _LOG_QUARTER = _math.log(0.25)
 
 
-def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
+def gseq_extract(intervals: _pandas.DataFrame | str, pad: bool = False) -> list[str]:
     """
     Extract DNA sequences for given intervals.
 
@@ -65,12 +69,31 @@ def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
     If intervals contain an additional 'strand' column and its value is -1,
     the reverse-complementary sequence is returned.
 
+    By default (``pad=False``) each interval must lie within its chromosome:
+    an interval that starts before 0 or ends past the end of the chromosome
+    is an error.
+
+    With ``pad=True`` an interval may run past either end of its chromosome
+    (``start`` below 0, ``end`` above the chromosome length). The positions
+    outside the chromosome come back as "N", so each sequence is
+    ``end - start`` long, and an interval wholly outside its chromosome comes
+    back as all "N". ``start`` must still be below ``end``, and the chromosome
+    must exist. For a row with strand -1 the padded sequence is reverse
+    complemented as a whole, so the "N" run of the chromosome start comes
+    last. The bases inside the chromosome are returned as stored, lowercase
+    included. This gives fixed-width windows near chromosome ends, e.g. for
+    sequence models (see the examples).
+
     Parameters
     ----------
     intervals : DataFrame
         Intervals for which DNA sequence is returned. Must have 'chrom',
         'start', and 'end' columns. Optional 'strand' column (-1 for reverse
         complement).
+    pad : bool, default False
+        If True, the part of an interval outside its chromosome is returned
+        as "N". If False, an interval that runs past a chromosome end is an
+        error.
 
     Returns
     -------
@@ -85,12 +108,28 @@ def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
     >>> pm.gseq_extract(intervs)  # doctest: +ELLIPSIS
     [...]
 
+    Fixed-width windows centred on positions. The second window starts 30 bp
+    before the start of chr1, so its first 30 bases are N.
+
+    >>> import pandas as pd
+    >>> w = 100
+    >>> centers = [250000, 20]
+    >>> windows = pd.DataFrame({"chrom": "chr1", "start": [c - w // 2 for c in centers],
+    ...                         "end": [c + w // 2 for c in centers]})
+    >>> seqs = pm.gseq_extract(windows, pad=True)
+    >>> [len(s) for s in seqs]
+    [100, 100]
+    >>> seqs[1][:30] == "N" * 30
+    True
+
     See Also
     --------
     gseq_rev, gseq_comp, gseq_revcomp, gseq_kmer
     """
     if intervals is None:
-        raise ValueError("Usage: gseq_extract(intervals)")
+        raise ValueError("Usage: gseq_extract(intervals, pad=False)")
+    if not isinstance(pad, (bool, _numpy.bool_)):
+        raise ValueError("pad must be True or False")
 
     _checkroot()
 
@@ -103,7 +142,116 @@ def gseq_extract(intervals: _pandas.DataFrame | str) -> list[str]:
         # a categorical strand is read by its labels, as R reads a factor
         intervals = intervals.assign(strand=intervals["strand"].astype(object))
 
+    if pad:
+        return _gseq_extract_padded(intervals)
     return list(_pymisha.pm_seq_extract(_df2pymisha(intervals), CONFIG))
+
+
+def _gseq_extract_padded(intervals: _pandas.DataFrame | str) -> list[str]:
+    """gseq_extract(pad=True), as R's .gseq_extract_padded.
+
+    The rows that run past a chromosome end are clipped to the chromosome and
+    read with all the other rows in one call, which validates them as usual;
+    the N runs are added here. A row wholly outside its chromosome reads a 1 bp
+    placeholder at the chromosome start, so that its chrom and strand are still
+    validated, and is all N. Rows within their chromosome are read as they are,
+    and when there are only such rows the intervals are read untouched.
+    """
+
+    def read(iv: _pandas.DataFrame | str) -> list[str]:
+        return list(_pymisha.pm_seq_extract(_df2pymisha(iv), CONFIG))
+
+    # anything but a 1D intervals frame is read (or rejected) as without pad
+    if (
+        not isinstance(intervals, _pandas.DataFrame)
+        or not len(intervals)
+        or not {"chrom", "start", "end"}.issubset(intervals.columns)
+        or not _pandas.api.types.is_numeric_dtype(intervals["start"])
+        or not _pandas.api.types.is_numeric_dtype(intervals["end"])
+    ):
+        return read(intervals)
+
+    from .intervals import _normalize_chroms, gintervals_all
+
+    chrom_col = intervals["chrom"]
+    if isinstance(chrom_col.dtype, _pandas.CategoricalDtype):
+        chrom_col = chrom_col.astype(object)
+    starts = intervals["start"].to_numpy(dtype=_numpy.float64)
+    ends = intervals["end"].to_numpy(dtype=_numpy.float64)
+    uchroms, inverse = _numpy.unique(chrom_col.astype(str).to_numpy(), return_inverse=True)
+    sizes = gintervals_all()
+    size_of = dict(zip(sizes["chrom"].astype(str), sizes["end"].to_numpy(dtype=_numpy.float64), strict=True))
+    # an unknown chromosome is the same error as without pad
+    ulens = _numpy.array([size_of[c] for c in _normalize_chroms(list(uchroms))], dtype=_numpy.float64)
+    chrom_lens = ulens[inverse]
+
+    # rows with NaN or infinite coordinates are left to the read, which rejects them
+    with _numpy.errstate(invalid="ignore"):
+        idx = _numpy.flatnonzero(
+            _numpy.isfinite(starts) & _numpy.isfinite(ends) & ((starts < 0) | (ends > chrom_lens))
+        )
+    if not idx.size:
+        return read(intervals)
+
+    s = starts[idx]
+    e = ends[idx]
+    lens = chrom_lens[idx]
+    bad = _numpy.flatnonzero(s >= e)
+    if bad.size:
+        i = bad[0]
+        raise ValueError(
+            f"Interval ({chrom_col.iloc[idx[i]]}, {s[i]:.0f}, {e[i]:.0f}): "
+            "start coordinate must be lesser than end coordinate"
+        )
+
+    cs = _numpy.maximum(s, 0)
+    ce = _numpy.minimum(e, lens)
+    outside = cs >= ce
+    left = _numpy.where(outside, e - s, cs - s)
+    right = _numpy.where(outside, 0, e - ce)
+    cs[outside] = 0
+    ce[outside] = 1
+
+    clipped = _pandas.DataFrame({
+        "chrom": intervals["chrom"].to_numpy(),
+        "start": intervals["start"].to_numpy(copy=True),
+        "end": intervals["end"].to_numpy(copy=True),
+    })
+    strand = intervals["strand"] if "strand" in intervals.columns else None
+    if strand is not None:
+        clipped["strand"] = strand.to_numpy()
+    start_col = clipped.columns.get_loc("start")
+    end_col = clipped.columns.get_loc("end")
+    clipped.iloc[idx, start_col] = cs.astype(clipped["start"].dtype)
+    clipped.iloc[idx, end_col] = ce.astype(clipped["end"].dtype)
+
+    # an empty chromosome has nothing to read, not even the placeholder
+    to_read = _numpy.ones(len(clipped), dtype=bool)
+    to_read[idx[outside & (lens == 0)]] = False
+    res = [""] * len(clipped)
+    if to_read.any():
+        seqs = read(clipped if to_read.all() else clipped[to_read].reset_index(drop=True))
+        for i, seq in zip(_numpy.flatnonzero(to_read), seqs, strict=True):
+            res[i] = seq
+
+    # a strand -1 row comes back reverse complemented, so its N runs swap sides
+    def is_minus(v: object) -> bool:
+        if isinstance(v, str):
+            return v == "-"
+        return isinstance(v, (int, float, _numpy.number)) and not isinstance(v, (bool, _numpy.bool_)) and v == -1
+
+    neg = (
+        _numpy.zeros(idx.size, dtype=bool)
+        if strand is None
+        else _numpy.array([is_minus(v) for v in strand.to_numpy()[idx]], dtype=bool)
+    )
+
+    for j, i in enumerate(idx):
+        core = "" if outside[j] else res[i]
+        n_left = "N" * int(left[j])
+        n_right = "N" * int(right[j])
+        res[i] = n_right + core + n_left if neg[j] else n_left + core + n_right
+    return res
 
 
 def gseq_rev(seq: str | list[str]) -> str | list[str]:
@@ -232,6 +380,38 @@ def grevcomp(seq: str | list[str]) -> str | list[str]:
     return gseq_revcomp(seq)
 
 
+def _na_or_seq(x: object) -> bool:
+    """R's NA, or more than one value."""
+    return _is_na(x) or isinstance(x, (list, tuple, _numpy.ndarray, _pandas.Series))
+
+
+def _seq_extend_arg(extend: object) -> bool | int:
+    """``extend`` of gseq_pwm / gseq_kmer as R's .normalize_bounds takes it:
+    True, False, or a non-negative number (truncated, as as.integer())."""
+    if isinstance(extend, (bool, _numpy.bool_)):
+        return bool(extend)
+    if (isinstance(extend, (int, float, _numpy.integer, _numpy.floating))
+            and not _is_na(extend) and extend >= 0):
+        return int(extend)
+    raise ValueError("extend must be False, True, or a non-negative integer")
+
+
+def _seq_strand_arg(strand: object) -> int:
+    """``strand`` of gseq_pwm / gseq_kmer / gseq_potts: -1, 0 or 1; R also takes
+    TRUE and FALSE (1 and 0)."""
+    if (_na_or_seq(strand) or not isinstance(strand, (int, float, _numpy.number, bool, _numpy.bool_))
+            or strand not in (-1, 0, 1)):
+        raise ValueError("strand must be -1, 0, or 1")
+    return int(strand)  # type: ignore[call-overload]
+
+
+def _skip_gaps_arg(skip_gaps: object) -> bool:
+    """R reads skip_gaps as a logical: anything but NA."""
+    if _is_na(skip_gaps):
+        raise ValueError("skip_gaps must be True or False")
+    return bool(skip_gaps)
+
+
 def gseq_kmer(
     seqs: str | list[str],
     kmer: str,
@@ -311,8 +491,8 @@ def gseq_kmer(
     kmer = kmer.upper()
     if not kmer or not all(c in "ACGT" for c in kmer):
         raise ValueError("kmer must contain only A, C, G, T characters")
-    if isinstance(strand, bool) or strand not in (-1, 0, 1):
-        raise ValueError("strand must be -1, 0, or 1")
+    strand = _seq_strand_arg(strand)
+    skip_gaps = _skip_gaps_arg(skip_gaps)
     if gap_chars is None:
         gap_chars = ["-", "."]
     if skip_gaps:
@@ -322,16 +502,13 @@ def gseq_kmer(
             raise ValueError("gap_chars must be single characters")
         if len(set(gap_chars)) != len(gap_chars):
             raise ValueError("gap_chars must be distinct")
-    if isinstance(extend, (bool, _numpy.bool_)):
-        extend_val = len(kmer) - 1 if extend else 0
-    elif isinstance(extend, (int, _numpy.integer)) and extend >= 0:
-        extend_val = int(extend)
-    else:
-        raise ValueError("extend must be False, True, or a non-negative integer")
+    ext = _seq_extend_arg(extend)
+    extend_val = ext if not isinstance(ext, bool) else len(kmer) - 1 if ext else 0
 
     if isinstance(seqs, str):
         seqs = [seqs]
-    seqs = list(seqs)
+    # one character per byte, as the C++ side reads them (Latin-1)
+    seqs = [_seq_bytes(x) if isinstance(x, str) else x for x in seqs]
     n = len(seqs)
     lengths = _numpy.array([len(x) if isinstance(x, str) else 0 for x in seqs], dtype=_numpy.int64)
     roi_start = (_numpy.ones(n, dtype=_numpy.int64) if start_pos is None
@@ -346,6 +523,39 @@ def gseq_kmer(
     return result
 
 
+def _unify_overlaps(intervals: _pandas.DataFrame | str) -> _pandas.DataFrame | str:
+    """*intervals* with overlapping intervals unified and touching ones kept apart, as R's
+    GIntervals::unify_overlaps(false): a unified interval keeps the other columns (the strand) of
+    its first interval by start. Intervals without overlaps are returned as they are."""
+    if not isinstance(intervals, _pandas.DataFrame) or len(intervals) < 2 or not {
+        "chrom", "start", "end"
+    }.issubset(intervals.columns):
+        return intervals
+    from .intervals import _normalize_chroms
+
+    df = intervals.assign(chrom=_normalize_chroms(intervals["chrom"].tolist()))
+    df = df.sort_values(["chrom", "start"], kind="mergesort").reset_index(drop=True)
+    chroms = df["chrom"].to_numpy()
+    starts = df["start"].to_numpy(dtype=_numpy.float64)
+    ends = df["end"].to_numpy(dtype=_numpy.float64)
+    new_chrom = _numpy.ones(len(df), dtype=bool)
+    new_chrom[1:] = chroms[1:] != chroms[:-1]
+    # the furthest end of the rows before each one on its chromosome
+    running_end = df.assign(end=ends).groupby("chrom", sort=False)["end"].cummax().to_numpy()
+    prev_end = _numpy.empty(len(df))
+    prev_end[1:] = running_end[:-1]
+    prev_end[new_chrom] = -_numpy.inf
+    starts_new = new_chrom | (starts >= prev_end)
+    if starts_new.all():
+        return intervals
+    group = _numpy.cumsum(starts_new) - 1
+    group_end = _numpy.full(group[-1] + 1, -_numpy.inf)
+    _numpy.maximum.at(group_end, group, ends)
+    out = df[starts_new].reset_index(drop=True)
+    out["end"] = group_end.astype(df["end"].dtype)
+    return out
+
+
 def gseq_kmer_dist(
     intervals: _pandas.DataFrame | str, k: int = 6, mask: _pandas.DataFrame | None = None
 ) -> _pandas.DataFrame:
@@ -358,7 +568,9 @@ def gseq_kmer_dist(
     Parameters
     ----------
     intervals : DataFrame
-        Genomic intervals to analyze.
+        Genomic intervals to analyze. Overlapping intervals are unified
+        first, so each position is counted once; a k-mer that crosses from
+        an interval into an adjacent one is not counted.
     k : int, default 6
         K-mer size (1-10).
     mask : DataFrame, optional
@@ -393,6 +605,9 @@ def gseq_kmer_dist(
         raise ValueError("intervals cannot be None")
 
     intervals = _maybe_load_intervals_set(intervals)
+    # A position covered by several intervals is counted once. Touching intervals stay apart:
+    # a k-mer that crosses from one into the next is not counted, as before.
+    intervals = _unify_overlaps(intervals)
 
     # Extract sequences for the intervals
     seqs = gseq_extract(intervals)
@@ -437,7 +652,8 @@ def gseq_kmer_dist(
         if not seq or len(seq) < k:
             continue
 
-        raw = _numpy.frombuffer(seq.encode("ascii", "ignore"), dtype=_numpy.uint8)
+        # one byte per character, as gseq_extract returns them (Latin-1)
+        raw = _numpy.frombuffer(seq.encode("latin-1"), dtype=_numpy.uint8)
         codes = _DNA_CODE_TABLE[raw]
         # a masked base breaks the runs as an N does
         valid = codes >= 0 if masked is None else (codes >= 0) & ~masked
@@ -567,7 +783,7 @@ def _pwm_score_batch_vectorized(
     log_pssm_rev = log_pssm[::-1]  # reversed row order
 
     for i, seq in enumerate(seqs):
-        seq_upper = seq.upper()
+        seq_upper = _seq_upper(seq)
         L = len(seq_upper)
         if w > L:
             if mode == "count":
@@ -575,7 +791,7 @@ def _pwm_score_batch_vectorized(
             continue
 
         # Encode sequence to base codes
-        raw = _numpy.frombuffer(seq_upper.encode("ascii"), dtype=_numpy.uint8)
+        raw = _numpy.frombuffer(seq_upper.encode("latin-1"), dtype=_numpy.uint8)
         fwd_codes = _PWM_FWD_CODE[raw]  # A=0,C=1,G=2,T=3, other=-1
         rc_codes = _PWM_RC_CODE[raw]  # A=3,C=2,G=1,T=0, other=-1
 
@@ -589,11 +805,10 @@ def _pwm_score_batch_vectorized(
         else:
             bad_byte = _numpy.ones(256, dtype=bool)
             bad_byte[_numpy.frombuffer(b"ACGTacgt", dtype=_numpy.uint8)] = False
-            for ch in neutral_set:
-                for enc in (ch.upper(), ch.lower()):
-                    bb = enc.encode("ascii")
-                    if len(bb) == 1:
-                        bad_byte[bb[0]] = False
+            for ch in neutral_set:  # upper-cased as the sequence (_seq_upper)
+                bb = ch.encode("latin-1", "ignore")
+                if len(bb) == 1:
+                    bad_byte[bb[0]] = False
         is_bad = bad_byte[raw]
 
         n_windows = L - w + 1
@@ -1127,7 +1342,7 @@ def gseq_pwm(
         - ``"log_quarter"``: ``log(0.25)``.
         - ``"na"``: window is invalid (NaN).
     prior : float, default 0.01
-        Pseudocount added to PSSM before normalization. Must be >= 0.
+        Pseudocount added to PSSM before normalization, between 0 and 1.
 
     Returns
     -------
@@ -1183,16 +1398,28 @@ def gseq_pwm(
         score_thresh = _coerce_score_thresh(score_thresh)
     elif score_thresh is None:
         score_thresh = 0.0
-    if strand not in (-1, 0, 1):
+    if _na_or_seq(strand) or isinstance(strand, str) or strand not in (-1, 0, 1):
         raise ValueError(f"strand must be -1, 0, or 1, got {strand}")
-    if prior < 0:
-        raise ValueError(f"prior must be non-negative, got {prior}")
+    strand = int(strand)
+    # R reads bidirect as a logical: TRUE, FALSE or a number; not NA or a string
+    if _na_or_seq(bidirect) or not isinstance(bidirect, (bool, _numpy.bool_, int, float, _numpy.number)):
+        raise ValueError("bidirect must be True or False")
+    bidirect = bool(bidirect)
+    skip_gaps = _skip_gaps_arg(skip_gaps)
+    if (isinstance(prior, (bool, _numpy.bool_)) or not isinstance(prior, (int, float, _numpy.number))
+            or not 0 <= prior <= 1):
+        raise ValueError("prior must be a number between 0 and 1")
     if neutral_chars_policy not in ("average", "log_quarter", "na"):
         raise ValueError("neutral_chars_policy must be 'average', 'log_quarter', or 'na'")
+    # An NA extend is an error, as in R (it used to read as TRUE there).
+    extend = _seq_extend_arg(extend)
+    pssm = _coerce_pssm_matrix(pssm)
 
     # --- Single-string convenience ---
     if isinstance(seqs, str):
         seqs = [seqs]
+    # one character per byte, as R reads a string (Latin-1)
+    seqs = [_seq_bytes(x) if isinstance(x, str) else x for x in seqs]
 
     # spat_min / spat_max: 1-based positions counted from start_pos, as in the
     # pwm virtual tracks with the ROI in the interval's place. Windows must lie
@@ -1388,7 +1615,7 @@ def gseq_pwm(
 
     gap_set = frozenset(gap_chars)
     # Uppercase neutral chars so they match uppercased sequence
-    neutral_set = frozenset(c.upper() for c in neutral_chars)
+    neutral_set = frozenset(_seq_upper(_seq_bytes(c)) for c in neutral_chars)
 
     # --- Vectorized fast path ---
     # Use numpy-vectorized scoring when no ROI, no gaps, and neutral policy
@@ -1432,7 +1659,7 @@ def gseq_pwm(
     strand_results: list[int] = []
 
     for seq in seqs:
-        seq_upper = seq.upper()
+        seq_upper = _seq_upper(seq)
         sr = _pwm_score_sequence(
             seq_upper,
             len(seq_upper),
@@ -1539,7 +1766,7 @@ def gseq_potts(
         no default; read one off ``mode="max"`` over your own sequences.
     extend : bool, default False
         Accepted for signature parity with :func:`gseq_pwm` and ignored - a
-        bare sequence has no genome to extend into.
+        bare sequence has no genome to extend into. True or False, as in R.
 
     Returns
     -------
@@ -1583,8 +1810,9 @@ def gseq_potts(
 
     if not isinstance(bidirect, (bool, _numpy.bool_)):
         raise ValueError("bidirect must be True or False")
-    if isinstance(strand, bool) or strand not in (-1, 0, 1):
-        raise ValueError("strand must be -1, 0, or 1")
+    if not isinstance(extend, (bool, _numpy.bool_)):
+        raise ValueError("gseq_potts: extend must be True or False")
+    strand = _seq_strand_arg(strand)
     if bidirect:
         strand = 0
     elif strand == 0:
@@ -1599,6 +1827,8 @@ def gseq_potts(
 
     if isinstance(seqs, str):
         seqs = [seqs]
+    # one character per byte, as R reads a string (Latin-1)
+    seqs = [_seq_bytes(x) if isinstance(x, str) else x for x in seqs]
 
     # The same dict the potts virtual tracks build, parsed by the same C++, so
     # gseq_potts() and a potts vtrack cannot disagree about what a model means.
@@ -1646,11 +1876,16 @@ def gseq_pwm_edits(
     seqs : list of str, or pandas.DataFrame
         DNA sequences to analyse.  If a DataFrame with columns ``chrom``,
         ``start``, ``end`` is provided, sequences are automatically
-        extracted via ``gseq_extract``.
+        extracted via ``gseq_extract``, and the windows scanned are those
+        the ``pwm.edit_distance`` virtual track scans for the same
+        interval.  A ``strand`` column is ignored, as by the virtual track:
+        the strand scanned is set by *bidirect* and *strand*.
     pssm : numpy.ndarray or pandas.DataFrame
         Position-specific scoring matrix.  If ndarray, shape ``(w, 4)``
         with columns [A, C, G, T].  If DataFrame, must have columns
-        ``A``, ``C``, ``G``, ``T``.
+        ``A``, ``C``, ``G``, ``T``.  Each row is a motif position and holds
+        the probabilities or counts of the four bases; log-odds matrices,
+        NaN values and rows summing to 0 are rejected.
     score_thresh : float
         Target PWM log-likelihood score to reach.
     max_edits : int or None, default None
@@ -1661,18 +1896,29 @@ def gseq_pwm_edits(
         Needleman-Wunsch DP is used to find the optimal alignment
         between the motif and each candidate window, allowing up to
         *max_indels* insertions or deletions.  The ``edit_type`` column
-        distinguishes ``"sub"``, ``"ins"``, and ``"del"`` edits.
+        distinguishes ``"sub"``, ``"ins"``, and ``"del"`` edits.  An
+        inserted base is the best its motif column allows (the column
+        maximum for ``"above"``, the minimum for ``"below"``) and is
+        scored as such.
     bidirect : bool, default True
         Scan both DNA strands.
     prior : float, default 0.01
-        Pseudocount added to PSSM frequencies.
+        Pseudocount added to PSSM frequencies, between 0 and 1.
     score_min : float or None, default None
-        Skip windows whose PWM score is below this value.
+        Skip windows whose PWM score is below this value.  The score is the
+        window's ungapped score (the PSSM-length window from its start),
+        also with ``max_indels > 0``; a window without one (a non-ACGT base
+        among its first PSSM-length bases) is skipped when a filter is set.
     score_max : float or None, default None
-        Skip windows whose PWM score is above this value.
+        Skip windows whose PWM score is above this value.  Same score as
+        *score_min*.
     extend : bool or int, default True
         Extend sequence for boundary motifs.  ``True`` = ``w - 1``,
-        ``False`` = 0, or an explicit integer.
+        ``False`` = 0, or an explicit integer.  For interval input it means
+        what it means for the ``pwm.edit_distance`` virtual track: ``True``
+        or a positive integer lets a window start at every position of the
+        interval and read bases past its end; ``False`` or 0 keeps every
+        window (deletions included) inside the interval.
     strand : int, default 1
         When ``bidirect=False``: ``1`` = forward, ``-1`` = reverse.
     direction : str, default "above"
@@ -1682,6 +1928,13 @@ def gseq_pwm_edits(
           *score_thresh* (create/strengthen binding site).
         - ``"below"``: find minimum edits to lower score **below**
           *score_thresh* (disrupt/weaken binding site).
+
+        With ``"below"`` and ``bidirect=True``, as in the
+        ``pwm.edit_distance`` virtual track, both strand readings of a
+        window must end up below the threshold, so the strand needing more
+        edits decides ``n_edits`` (a strand that cannot be brought below
+        makes the window unreachable); the reported edits and ``strand``
+        are those of that strand's reading.
 
     Returns
     -------
@@ -1712,37 +1965,8 @@ def gseq_pwm_edits(
     gseq_pwm : Score sequences with a PWM.
     gvtrack_create : Create virtual tracks with edit distance functions.
     """
-    # Handle interval input
-    is_intervals = isinstance(seqs, _pandas.DataFrame) and {"chrom", "start", "end"}.issubset(seqs.columns)
-    intervals_df = None
-    if is_intervals:
-        assert isinstance(seqs, _pandas.DataFrame)
-        intervals_df = seqs
-        # Normalize PSSM to get motif width
-        if isinstance(pssm, _pandas.DataFrame):
-            w = len(pssm)
-        else:
-            pssm_tmp = _numpy.asarray(pssm)
-            w = pssm_tmp.shape[0] if pssm_tmp.shape[1] == 4 else pssm_tmp.shape[1]
-
-        ext = (w - 1) if extend is True else (0 if extend is False else int(extend))
-        extended = intervals_df.copy()
-        extended["end"] = extended["end"] + ext
-        # Clamp to chromosome bounds
-        from .intervals import gintervals_all
-
-        chrom_sizes = gintervals_all()
-        cs_map = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=False))
-        for i in range(len(extended)):
-            c = str(extended.iloc[i]["chrom"])
-            if c in cs_map:
-                extended.iloc[i, extended.columns.get_loc("end")] = min(extended.iloc[i]["end"], cs_map[c])
-        seqs = gseq_extract(extended)
-        extend = False  # already extended
-
-    score_thresh = _coerce_score_thresh(score_thresh)
-
-    # Validate PSSM
+    # Validate PSSM (before any sequence is extracted, as R)
+    pssm = _coerce_pssm_matrix(pssm)
     if isinstance(pssm, _pandas.DataFrame):
         for col in ("A", "C", "G", "T"):
             if col not in pssm.columns:
@@ -1754,29 +1978,88 @@ def gseq_pwm_edits(
         pssm_arr = pssm.astype(_numpy.float64).copy()
     else:
         raise ValueError("PSSM must be a numpy array or pandas DataFrame")
-
     # Ensure contiguous C order for C++
     pssm_arr = _numpy.ascontiguousarray(pssm_arr, dtype=_numpy.float64)
+    w = pssm_arr.shape[0]
 
-    # Ensure seqs is a list of strings
-    if isinstance(seqs, str):
-        seqs = [seqs]
-    seqs = [str(s) if s is not None else "" for s in seqs]
-
+    score_thresh = _coerce_score_thresh(score_thresh)
     _check_max_edits(max_edits)
-
-    # Validate max_indels
     if max_indels is not None:
         max_indels = int(max_indels)
         if max_indels < 0:
             raise ValueError("max_indels must be >= 0")
     else:
         max_indels = 0
-
-    # Validate direction
+    if not isinstance(bidirect, (bool, _numpy.bool_)):
+        raise ValueError("bidirect must be True or False")
+    # R misha #226: an NA extend acted as True on sequences
+    if _na_or_seq(extend):
+        raise ValueError("extend must be False, True, or a non-negative integer")
+    if (isinstance(prior, (bool, _numpy.bool_)) or not isinstance(prior, (int, float, _numpy.number))
+            or not 0 <= prior <= 1):
+        raise ValueError("prior must be between 0 and 1")
+    # R compares with 1 and -1, so TRUE (1) passes
+    if _na_or_seq(strand) or isinstance(strand, str) or strand not in (1, -1):
+        raise ValueError("strand must be 1 or -1")
     direction = str(direction).lower()
     if direction not in ("above", "below"):
         raise ValueError("direction must be 'above' or 'below'")
+
+    # Handle interval input: the windows scanned are the pwm.edit_distance
+    # vtrack's for the same interval and extend value. The vtrack reads
+    # extend=True or a positive integer as True: the sequence is padded at the
+    # END by (motif length + max_indels - 1), clipped at the chromosome end, and
+    # a window starts at every interval position. With extend=False or 0 nothing
+    # is padded and a window must fit in the interval (last start: interval
+    # length - motif length).
+    is_intervals = isinstance(seqs, _pandas.DataFrame) and {"chrom", "start", "end"}.issubset(seqs.columns)
+    intervals_df = None
+    roi_start = roi_end = None
+    if is_intervals:
+        assert isinstance(seqs, _pandas.DataFrame)
+        intervals_df = seqs
+        ext_flag = (isinstance(extend, (bool, _numpy.bool_)) and bool(extend)) or (
+            isinstance(extend, (int, float, _numpy.integer, _numpy.floating))
+            and not isinstance(extend, (bool, _numpy.bool_))
+            and not _is_na(extend) and extend > 0
+        )
+        ext = w - 1 + max_indels if ext_flag else 0
+        # A strand column is ignored, as the vtrack ignores it: gseq_extract()
+        # would return strand = -1 rows reverse-complemented, and the scan
+        # would then run over the other strand.
+        extended = intervals_df.drop(columns="strand", errors="ignore").copy()
+        extended["end"] = extended["end"] + ext
+        from .intervals import gintervals_all
+
+        chrom_sizes = gintervals_all()
+        cs_map = dict(zip(chrom_sizes["chrom"].astype(str), chrom_sizes["end"], strict=False))
+        max_end = extended["chrom"].astype(str).map(cs_map)
+        keep = max_end.notna().to_numpy()
+        ends = extended["end"].to_numpy(copy=True)
+        ends[keep] = _numpy.minimum(ends[keep], max_end.to_numpy()[keep])
+        extended["end"] = ends
+        seqs = gseq_extract(extended)
+        # Window starts are limited through the ROI (1-based; C++ lets a window
+        # start up to roi_end - w, and no later than where fewer than the
+        # shortest window's bases remain). Padded: roi_end = length + w - 1, so
+        # the last start is length - 1. Not padded: roi_end = length.
+        lengths = (intervals_df["end"] - intervals_df["start"]).to_numpy(dtype=_numpy.int64)
+        roi_start = _numpy.ones(len(lengths), dtype=_numpy.int64)
+        roi_end = lengths + (w - 1) if ext_flag else lengths
+        c_extend: bool | int = False
+    else:
+        if isinstance(seqs, str):
+            seqs = [seqs]
+        # The C++ side reads a bool or an int (R's logical or as.integer())
+        if isinstance(extend, (bool, _numpy.bool_)):
+            c_extend = bool(extend)
+        elif isinstance(extend, (int, float, _numpy.integer, _numpy.floating)) and not _is_na(extend):
+            c_extend = int(extend)
+        else:
+            c_extend = extend
+
+    # Ensure seqs is a list of strings, one character per byte (Latin-1)
+    seqs = [_seq_bytes(str(s)) if s is not None else "" for s in seqs]
 
     # Resolve strand mode
     strand_mode = 0 if bidirect else int(strand)
@@ -1790,11 +2073,13 @@ def gseq_pwm_edits(
         int(bidirect),
         strand_mode,
         float(prior),
-        extend,
+        c_extend,
         score_min,
         score_max,
         max_indels,
         direction,
+        roi_start,
+        roi_end,
     )
 
     df = _pandas.DataFrame(result)

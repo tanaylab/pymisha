@@ -403,8 +403,11 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     if path_norm == _normalize_path(groot):
         return {"tracks": 0, "intervals": 0, "shadowed_tracks": 0, "shadowed_intervals": 0}
 
-    if path_norm in _shared._GDATASETS:
-        gdataset_unload(path_norm, validate=False)
+    # A re-load of a loaded dataset is checked as a fresh load, against the session without it,
+    # and the dataset is unloaded only once the checks pass: a refused re-load leaves it loaded
+    # (as R misha 5.17).
+    reloading = path_norm in _shared._GDATASETS
+    other_datasets = [db for db in _shared._GDATASETS if db != path_norm]
 
     tracks_dir = Path(path_norm) / "tracks"
     if not tracks_dir.exists():
@@ -467,7 +470,7 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     for db in [groot] + ([_shared._UROOT] if _shared._UROOT else []):
         existing_tracks |= _scan_tracks(db)
         existing_intervals |= _scan_intervals(db)
-    for db in _shared._GDATASETS:
+    for db in other_datasets:
         cached = _DATASET_SCAN_CACHE.get(db)
         if cached is None:
             cached = (_scan_tracks(db), _scan_intervals(db))
@@ -491,11 +494,17 @@ def gdataset_load(path: str, force: bool = False, verbose: bool = False):
     # force does not resolve. (In a subdirectory, gdir_cd, the session lists names under the
     # working directory only, and the load adds none.)
     if not _shared._gwd_is_subdir():
-        cross = ((set(_pymisha.pm_track_names()) | dataset_tracks)
-                 & (set(_pymisha.pm_interv_names()) | dataset_intervals))
+        # (the session's names without the dataset being re-loaded are those of the other
+        # databases, scanned above)
+        session_tracks = existing_tracks if reloading else set(_pymisha.pm_track_names())
+        session_intervals = existing_intervals if reloading else set(_pymisha.pm_interv_names())
+        cross = (session_tracks | dataset_tracks) & (session_intervals | dataset_intervals)
         if cross:
             names = ", ".join(f"'{x}'" for x in sorted(cross))
             raise ValueError(f"Cannot load dataset '{path}': {names} would be both a track and an interval set")
+
+    if reloading:
+        gdataset_unload(path_norm, validate=False)
 
     # Update datasets list (load order)
     _shared._GDATASETS.append(path_norm)

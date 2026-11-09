@@ -16,7 +16,9 @@
 #include <exception>
 #include <string>
 #include "BufferedFile.h"
+#include "GenomeTrack.h"
 #include "PMDb.h"
+#include "pmutils.h"
 #include "pymisha.h"
 
 PyObject *g_module;
@@ -91,6 +93,7 @@ PyObject *pm_track_names(PyObject *self, PyObject *args);
 PyObject *pm_interv_names(PyObject *self, PyObject *args);
 PyObject *pm_interv_register(PyObject *self, PyObject *args);
 PyObject *pm_interv_unregister(PyObject *self, PyObject *args);
+PyObject *pm_tracks_refresh(PyObject *self, PyObject *args);
 PyObject *pm_track_info(PyObject *self, PyObject *args);
 PyObject *pm_track_path(PyObject *self, PyObject *args);
 PyObject *pm_track_dataset(PyObject *self, PyObject *args);
@@ -110,6 +113,7 @@ PyObject *pm_set_create_parallel_writers(PyObject *self, PyObject *args);
 PyObject *pm_intervals_all(PyObject *self, PyObject *args);
 PyObject *pm_iterate(PyObject *self, PyObject *args);
 PyObject *pm_seed(PyObject *self, PyObject *args);
+PyObject *pm_rng_stream(PyObject *self, PyObject *args);
 PyObject *pm_test_df(PyObject *self, PyObject *args);
 PyObject *pm_read_df(PyObject *self, PyObject *args);
 PyObject *pm_vtrack_compute(PyObject *self, PyObject *args);
@@ -137,6 +141,7 @@ PyObject *pm_quadtree_query_objects(PyObject *self, PyObject *args);
 PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args);
 PyObject *pm_neighbors_2d(PyObject *self, PyObject *args);
 PyObject *pm_r_2d_sort_order(PyObject *self, PyObject *args);
+PyObject *pm_verify_max_data_size(PyObject *self, PyObject *args);
 PyObject *pm_verify_no_overlaps_2d(PyObject *self, PyObject *args);
 PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
@@ -158,11 +163,17 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args);
 PyObject *pm_parquet_columns(PyObject *self, PyObject *args);
 PyObject *pm_parquet_import(PyObject *self, PyObject *args);
 PyObject *pm_parquet_write(PyObject *self, PyObject *args);
+PyObject *pm_parquet_field_metadata(PyObject *self, PyObject *args);
+PyObject *pm_parquet_writer_open(PyObject *self, PyObject *args);
+PyObject *pm_parquet_writer_add(PyObject *self, PyObject *args);
+PyObject *pm_parquet_writer_close(PyObject *self, PyObject *args);
+PyObject *pm_bedgraph_lines(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_scanner(PyObject *self, PyObject *args);
 PyObject *pm_test_scanner_reuse(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_scanner(PyObject *self, PyObject *args);
+PyObject *pm_split_by_range_shares(PyObject *self, PyObject *args);
 PyObject *pm_test_track_rects_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_cartesian_grid_iterator(PyObject *self, PyObject *args);
 PyObject *pm_extract_2d(PyObject *self, PyObject *args);
@@ -203,6 +214,7 @@ static PyMethodDef module_methods[] = {
     {"pm_interv_names", gcall<pm_interv_names>, METH_VARARGS, "Get interval-set names"},
     {"pm_interv_register", gcall<pm_interv_register>, METH_VARARGS, "Register an interval-set name in the cache"},
     {"pm_interv_unregister", gcall<pm_interv_unregister>, METH_VARARGS, "Remove an interval-set name from the cache"},
+    {"pm_tracks_refresh", gcall<pm_tracks_refresh>, METH_VARARGS, "List or drop track names as a rescan would, without rescanning the others"},
     {"pm_track_info", gcall<pm_track_info>, METH_VARARGS, "Get track information"},
     {"pm_track_path", gcall<pm_track_path>, METH_VARARGS, "Get track path on disk"},
     {"pm_track_dataset", gcall<pm_track_dataset>, METH_VARARGS, "Get track dataset root"},
@@ -222,6 +234,7 @@ static PyMethodDef module_methods[] = {
     {"pm_intervals_all", gcall<pm_intervals_all>, METH_VARARGS, "Get all genome intervals"},
     {"pm_iterate", gcall<pm_iterate>, METH_VARARGS, "Iterate intervals with iterator policy"},
     {"pm_seed", gcall<pm_seed>, METH_VARARGS, "Set random seed"},
+    {"pm_rng_stream", gcall<pm_rng_stream>, METH_VARARGS, "Let the following calls continue one random stream"},
     {"pm_vtrack_compute", gcall<pm_vtrack_compute>, METH_VARARGS, "Compute virtual track values"},
     {"pm_find_neighbors", gcall<pm_find_neighbors>, METH_VARARGS, "Find nearest neighbor intervals"},
     {"pm_seq_extract", gcall<pm_seq_extract>, METH_VARARGS, "Extract DNA sequences for intervals"},
@@ -249,6 +262,7 @@ static PyMethodDef module_methods[] = {
     {"pm_quadtree_query_stats_batch", gcall<pm_quadtree_query_stats_batch>, METH_VARARGS, "Batch query quad-tree stats for N rectangles"},
     {"pm_neighbors_2d", gcall<pm_neighbors_2d>, METH_VARARGS, "2D NN iteration on one chrom-pair via in-memory quadtree (Phase NN)"},
     {"pm_r_2d_sort_order", gcall<pm_r_2d_sort_order>, METH_VARARGS, "Row order of R's sort of 2D intervals by chromosome pair"},
+    {"pm_verify_max_data_size", gcall<pm_verify_max_data_size>, METH_VARARGS, "The error of a result over CONFIG['max_data_size']"},
     {"pm_verify_no_overlaps_2d", gcall<pm_verify_no_overlaps_2d>, METH_VARARGS, "Error on overlapping 2D intervals given in R's sorted order (GIntervals2D::verify_no_overlaps)"},
     {"pm_track2d_convert_to_indexed", gcall<pm_track2d_convert_to_indexed>, METH_VARARGS, "Convert 2D track per-pair files to indexed format"},
     {"pm_track2d_index_info", gcall<pm_track2d_index_info>, METH_VARARGS, "Get 2D track index info"},
@@ -270,6 +284,11 @@ static PyMethodDef module_methods[] = {
     {"pm_parquet_columns", gcall<pm_parquet_columns>, METH_VARARGS, "Names and types of the columns of a Parquet file"},
     {"pm_parquet_import", gcall<pm_parquet_import>, METH_VARARGS, "Import value columns of Parquet files as dense track files"},
     {"pm_parquet_write", gcall<pm_parquet_write>, METH_VARARGS, "Write intervals and values to a Parquet file"},
+    {"pm_parquet_field_metadata", gcall<pm_parquet_field_metadata>, METH_VARARGS, "The Arrow field metadata of the columns of a Parquet file"},
+    {"pm_parquet_writer_open", gcall<pm_parquet_writer_open>, METH_VARARGS, "Open a Parquet file written a part of the rows at a time"},
+    {"pm_parquet_writer_add", gcall<pm_parquet_writer_add>, METH_VARARGS, "Add rows to a Parquet file opened by pm_parquet_writer_open"},
+    {"pm_parquet_writer_close", gcall<pm_parquet_writer_close>, METH_VARARGS, "Finish a Parquet file opened by pm_parquet_writer_open"},
+    {"pm_bedgraph_lines", gcall<pm_bedgraph_lines>, METH_VARARGS, "bedGraph lines of rows, formatted as R misha writes them"},
     {"pm_liftover_aggregate", gcall<pm_liftover_aggregate>, METH_VARARGS, "Aggregate overlapping intervals per chrom (C++ fast path for liftover)"},
     {"pm_parse_chain_file", gcall<pm_parse_chain_file>, METH_VARARGS, "Parse a UCSC chain file into 10 columns (C++ fast path for gintervals_load_chain)"},
     {"pm_read_source_track_1d", gcall<pm_read_source_track_1d>, METH_VARARGS, "Read a 1D source-track directory into a (type, df_dict) tuple (C++ fast path for gtrack_liftover)"},
@@ -285,6 +304,7 @@ static PyMethodDef module_methods[] = {
     {"pm_test_fixed_rect_scanner", gcall<pm_test_fixed_rect_scanner>, METH_VARARGS, "Test-only: FixedRect iterator + 2D scanner end-to-end. Args: width, height, track, func, intervals_dict, band|None."},
     {"pm_test_scanner_reuse", gcall<pm_test_scanner_reuse>, METH_VARARGS, "Test-only: call run() twice on the same scanner to verify state reset. Args: width, height, track, func, intervals1_dict, intervals2_dict."},
     {"pm_test_2d_scanner", gcall<pm_test_2d_scanner>, METH_VARARGS, "Test-only: drive PMTrackExpr2DScanner over a 2D track + intervals"},
+    {"pm_split_by_range_shares", gcall<pm_split_by_range_shares>, METH_VARARGS, "Test-only: the bp each process gets from the multitask range split"},
     {"pm_test_track_rects_iterator", gcall<pm_test_track_rects_iterator>, METH_VARARGS, "Test-only: walk a TrackRects 2D iterator. Args: track_name, intervals_dict, band|None."},
     {"pm_test_cartesian_grid_iterator", gcall<pm_test_cartesian_grid_iterator>, METH_VARARGS, "Walk a CartesianGrid 2D iterator. Args: intervals1, expansion1, intervals2|None, expansion2|None, band_idx|None, scope, band|None."},
     {"pm_cartesian_grid_intervals", gcall<pm_test_cartesian_grid_iterator>, METH_VARARGS, "Enumerate the cells of a CartesianGrid 2D iterator over a 2D scope (used by giterator_intervals). Same args as pm_test_cartesian_grid_iterator."},
@@ -332,6 +352,8 @@ PyMODINIT_FUNC PyInit__pymisha(void)
     struct timespec tm;
     clock_gettime(CLOCK_MONOTONIC, &tm);
     srand48(tm.tv_sec ^ tm.tv_nsec);
+    // the tracks' "sample" and "quantile" draws follow numpy's generator too (pm::pm_rnd_func)
+    GenomeTrack::set_rnd_func(pm::pm_rnd_func);
 
     return g_module;
 }

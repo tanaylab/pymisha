@@ -221,7 +221,6 @@ def test_unsupported_files_error_and_create_nothing(db):
         ("zstd.parquet", 32, "ZSTD"),
         ("delta.parquet", 32, "DELTA_BINARY_PACKED"),
         ("overlap.parquet", 32, "overlap"),
-        ("beyond_end.parquet", 32, "exceeds"),
         ("pandas_default.parquet", 0, "Parquet import creates dense tracks; binsize must be > 0"),
     ]
     for file, binsize, msg in cases:
@@ -233,6 +232,80 @@ def test_unsupported_files_error_and_create_nothing(db):
         assert staging_leftovers(db) == []
     with pytest.raises(ValueError, match="No files"):
         pm.gtrack_import_parquet("test", pq_fixture("no_such_*.parquet"), 32)
+
+
+def _collect_warnings(fn):
+    """The messages of the warnings fn() raises."""
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fn()
+    return [str(w.message) for w in caught]
+
+
+def test_a_row_past_the_chromosome_end_is_clipped_with_a_warning_naming_the_row(db):
+    # the last row of chr2 is (chr2, 576, 640); chr2 is 600 bp
+    with pytest.warns(UserWarning, match=re.escape(
+        "1 row(s) running past the end of their chromosome were clipped to it, and 0 row(s) starting at or past "
+        "the chromosome end were dropped; the first is row 50 (row group 0) of "
+    )):
+        pm.gtrack_import_parquet("test", pq_fixture("beyond_end.parquet"), 32, track_prefix="x_")
+    for value_col in ("a", "b"):
+        assert_identical(track_values(f"x_{value_col}"), expected_values(value_col), value_col)
+
+
+def test_rows_past_the_chromosome_end_are_clipped_or_dropped_with_one_warning_serial_and_in_kids(db, tmp_path):
+    # 32 bp rows of a genome whose chromosomes are longer, written by gextract: 20 columns, so that
+    # the import takes two batches of columns
+    src = tmp_path / "src"
+    long_db = _mk_db(src / "long", {"chr1": 1100, "chr2": 700})
+    intervs = pm.giterator_intervals(intervals=pm.gintervals_all(), iterator=32)
+    pm.gtrack_create_dense("v", "", intervs, intervs["start"] / 32 + 0.25, 32)
+    f = str(src / "rows.parquet")
+    pm.gextract([f"v + {k}" for k in range(1, 21)], pm.gintervals_all(), iterator=32,
+                colnames=[f"c{k}" for k in range(1, 21)], file=f)
+    assert long_db != db
+    pm.gdb_init(str(db))
+
+    # (chr1, 992, 1024) and (chr2, 576, 608) are clipped, the 3 rows of each after them dropped
+    msg = ("2 row(s) running past the end of their chromosome were clipped to it, and 6 row(s) starting at or past "
+           f"the chromosome end were dropped; the first is row 31 (row group 0) of {f}: (chr1, 992, 1024), "
+           "chromosome size 1000")
+    for multitask in (False, True):
+        pm.CONFIG.update({"multitasking": multitask, "max_processes": 4, "min_processes": 4})
+        prefix = "mt_" if multitask else "s_"
+        warns = _collect_warnings(lambda prefix=prefix: pm.gtrack_import_parquet("test", f, 32, track_prefix=prefix))
+        assert warns == [msg], prefix
+        for k in (1, 20):
+            assert_identical(track_values(f"{prefix}c{k}"), BIN_K + 0.25 + k, f"{prefix} {k}")
+
+
+def test_a_value_near_the_float_limit_survives_binning(db, tmp_path):
+    f = str(tmp_path / "big.parquet")
+    pm.gtrack_create_dense("one", "", pm.gintervals_all(), [1.0, 1.0], 32)
+    pm.gextract("one * 3.4e38", pm.gintervals_all(), iterator=32, colnames=["v"], file=f)
+    pm.gtrack_import_parquet("test", f, 32, track_prefix="big_")
+    # a float product value * 32 would overflow to Inf, which reads back as NaN
+    assert_identical(track_values("big_v"), np.full(51, np.float64(np.float32(3.4e38))))
+
+
+def test_field_metadata_holding_a_nul_byte_is_left_out_with_a_warning_and_the_track_imports(db):
+    # column a's field metadata: model = "m1", nul = "a\0b" (make_fixtures.py)
+    with pytest.warns(UserWarning, match=r'Field metadata "nul" of column "a" of .*nul_metadata.parquet was left out: '
+                                         r"it holds a NUL byte"):
+        pm.gtrack_import_parquet("test", pq_fixture("nul_metadata.parquet"), 32, track_prefix="n_")
+    assert_identical(track_values("n_a"), expected_values("a"))
+    assert pm.gtrack_attr_get("n_a", "model") == "m1"
+    assert pm.gtrack_attr_get("n_a", "nul") == ""
+    # only the metadata of the columns imported is read
+    assert _collect_warnings(lambda: pm.gtrack_import_parquet(
+        "test", pq_fixture("nul_metadata.parquet"), 32, track_prefix="b_", columns="b")) == []
+    # gtrack_import of a one-column file
+    with pytest.warns(UserWarning, match='Field metadata "nul" of column "a"'):
+        pm.gtrack_import("one", "test", pq_fixture("nul_metadata_single.parquet"), 32)
+    assert_identical(track_values("one"), expected_values("a"))
+    assert pm.gtrack_attr_get("one", "model") == "m1"
 
 
 def test_arguments_are_checked_before_anything_is_read(db):

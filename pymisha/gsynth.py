@@ -20,7 +20,7 @@ import pandas as _pd
 import yaml as _yaml  # type: ignore[import-untyped]
 
 from ._safe_pickle import restricted_load
-from ._shared import _checkroot, _df2pymisha, _pymisha
+from ._shared import _checkroot, _df2pymisha, _map_forked, _pymisha
 from .extract import _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 
@@ -97,8 +97,9 @@ class GsynthModel:
         ``"explicit"``.
     prior_matrix : numpy.ndarray or None
         Resolved per-bin prior, shape ``(total_bins, 4)``. Each row sums
-        to 1. ``None`` for legacy models loaded without a prior; in that
-        case the model effectively used a uniform prior.
+        to 1. :func:`gsynth_load` gives a model saved without a prior a
+        uniform one (0.25 each), as R misha does; ``None`` means uniform
+        too.
     marginal_fallbacks : int
         Number of bins whose posterior was forced back to uniform
         (``prior_mode='marginal'`` and a bin had zero observations).
@@ -304,6 +305,67 @@ def _resolve_iter_size(iterator: int | None) -> int:
     if iter_int <= 0:
         raise ValueError(f"iterator must be a positive integer, got {iter_int}")
     return iter_int
+
+
+def _canonic_keep_touching(intervals: _pd.DataFrame) -> _pd.DataFrame:
+    """*intervals* with overlapping intervals unified, touching ones kept apart (R's
+    ``gintervals.canonic(intervals, unify_touching_intervals = FALSE)``)."""
+    from .intervals import gintervals_canonic
+
+    if not isinstance(intervals, _pd.DataFrame) or not len(intervals):
+        return intervals
+    res = gintervals_canonic(intervals, unify_touching_intervals=False)
+    if res is None:
+        return intervals
+    res = res.reset_index(drop=True)
+    res.attrs = {}
+    return res
+
+
+def _implicit_binsize(exprs: list[str]) -> int | None:
+    """The bin size of the iterator that *exprs* imply when no iterator is given (that of
+    their dense tracks), or None when that iterator is not a fixed-bin one (R's
+    C_gsynth_implicit_binsize). As gextract, physical tracks set it when the expressions hold
+    any; otherwise the sources of their virtual tracks do."""
+    from . import _shared
+    from .expr import _parse_expr_vars
+    from .extract import _infer_iterator_from_vtracks
+    from .tracks import gtrack_info
+
+    track_names = _shared._track_names_set()
+    vtrack_names = set(_shared._VTRACKS)
+    tracks: set[str] = set()
+    vtracks: set[str] = set()
+    for e in exprs:
+        _, expr_tracks, expr_vtracks, _ = _parse_expr_vars(e, track_names, vtrack_names)
+        tracks.update(expr_tracks)
+        vtracks.update(expr_vtracks)
+    if tracks:
+        sizes = set()
+        for track in tracks:
+            info = gtrack_info(track)
+            bs = info.get("bin_size") or info.get("bin.size")
+            if info.get("type") != "dense" or bs is None:
+                return None
+            sizes.add(int(float(bs)))
+        return sizes.pop() if len(sizes) == 1 else None
+    if vtracks:
+        it = _infer_iterator_from_vtracks(vtracks)
+        return it if isinstance(it, int) and not isinstance(it, bool) else None
+    return None
+
+
+def _model_iterator(model: GsynthModel, iterator: int | None = None, hint: str = "") -> int:
+    """The iterator of a model, for gsynth_sample and gsynth_score."""
+    if iterator is None:
+        iterator = model.iterator
+    if iterator is None:
+        raise ValueError(
+            "The model has no iterator: it was trained without an explicit iterator, or saved by "
+            "a version of gsynth_save that did not store it. Set it to the iterator used in "
+            f"gsynth_train (e.g. model.iterator = 200){hint}."
+        )
+    return _resolve_iter_size(iterator)
 
 
 def _compute_flat_indices(
@@ -627,7 +689,10 @@ def _extract_bin_data(
     intervals: _pd.DataFrame | None,
     iterator: int | None,
     sample_bin_merge: list[_Any] | None = None,
-) -> tuple[_numpy.ndarray, _numpy.ndarray, _numpy.ndarray, list[float], _numpy.ndarray | None, list[int]]:
+) -> tuple[
+    _numpy.ndarray, _numpy.ndarray, _numpy.ndarray, list[float], _numpy.ndarray | None, list[int],
+    _numpy.ndarray, _numpy.ndarray,
+]:
     """Extract track values and compute flat bin indices.
 
     Parameters
@@ -657,6 +722,10 @@ def _extract_bin_data(
         Combined bin mapping for the C++ layer, or None.
     dim_sizes : list of int
         Number of bins per dimension.
+    iter_ends : numpy.ndarray (int64)
+        End position per iterator position.
+    iter_ivids : numpy.ndarray (int32)
+        The row of *intervals* (0-based) each iterator position belongs to.
     """
     if not dim_specs:
         # 0D model: single bin
@@ -678,7 +747,10 @@ def _extract_bin_data(
             [chrom_to_id.get(str(c), -1) for c in all_intervals["chrom"]],
             dtype=_numpy.int32,
         )
-        return bin_indices, iter_starts, iter_chroms, [0.0, 1.0], None, [1]
+        # every position is in the single bin, whatever the iterator: each interval is one bin
+        iter_ends = all_intervals["end"].to_numpy(dtype=_numpy.int64)
+        iter_ivids = _numpy.arange(len(all_intervals), dtype=_numpy.int32)
+        return bin_indices, iter_starts, iter_chroms, [0.0, 1.0], None, [1], iter_ends, iter_ivids
 
     # Extract track values for each dimension
     from .summary import _bin_values
@@ -721,6 +793,8 @@ def _extract_bin_data(
             "bin_idx": bin_idx,
             "n_bins": n_bins,
             "starts": df["start"].to_numpy(dtype=_numpy.int64),
+            "ends": df["end"].to_numpy(dtype=_numpy.int64),
+            "ivids": df["intervalID"].to_numpy(dtype=_numpy.int64) - 1,
             "chroms": df["chrom"].to_numpy(),
         })
 
@@ -755,7 +829,12 @@ def _extract_bin_data(
     # Create flat breaks for C++: just [0, 1, 2, ..., total_bins]
     flat_breaks: list[float] = [float(x) for x in range(total_bins + 1)]
 
-    return flat_idx, iter_starts, iter_chroms, flat_breaks, None, dim_sizes
+    # Each iterator interval with the row of `intervals` it belongs to: a position takes its bin
+    # from its own interval's iterator intervals only
+    iter_ends = dim_data[0]["ends"]
+    iter_ivids = dim_data[0]["ivids"].astype(_numpy.int32)
+
+    return flat_idx, iter_starts, iter_chroms, flat_breaks, None, dim_sizes, iter_ends, iter_ivids
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +948,7 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
         })
 
     # Extract bin data for this chunk
-    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes = \
+    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes, _, _ = \
         _extract_bin_data(parsed_specs, chunk_intervals, iterator)
 
     # Call C++ backend. Workers always train with a uniform prior — the
@@ -1062,19 +1141,12 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
     cdf_list = cdf_list_data
 
     # Extract bin data for this chunk
-    bin_indices, iter_starts, iter_chroms, flat_breaks, _, _ = \
+    bin_indices, iter_starts, _, flat_breaks, _, _, iter_ends, iter_ivids = \
         _extract_bin_data(dim_specs, chunk_intervals, iterator,
                           sample_bin_merge=sample_bin_merge)
 
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
-
-    # 0D: see the comment in gsynth_sample. dim_specs is empty for 0D.
-    iter_size_for_cpp = (
-        _ITER_SIZE_NO_CONSTRAINT
-        if not dim_specs
-        else _resolve_iter_size(iterator)
-    )
 
     # Call C++ backend (vector mode)
     return list(_pymisha.pm_gsynth_sample(
@@ -1082,7 +1154,8 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         flat_breaks,
         bin_indices,
         iter_starts,
-        iter_chroms,
+        iter_ends,
+        iter_ivids,
         _df2pymisha(chunk_intervals),
         py_mask_copy,
         "",   # output_path empty -> vector mode
@@ -1090,8 +1163,8 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         int(n_samples),
         chunk_seed,
         int(k),
-        iter_size_for_cpp,
         bool(preserve_n),
+        None,  # bases without a valid context or bin are drawn uniformly
     ))
 
 
@@ -1179,13 +1252,22 @@ def gsynth_train(
         - ``"bin_merge"`` (list of dict, optional): Merge specifications for
           sparse bins, in the format accepted by :func:`gsynth_bin_map`.
     mask : DataFrame, optional
-        Intervals to exclude from training.  Regions in the mask do not
-        contribute to k-mer counts but are tallied in ``total_masked``.
+        Intervals to exclude from training.  A (k+1)-mer that overlaps the
+        mask does not contribute to k-mer counts, as in
+        :func:`gseq_kmer_dist`; such (k+1)-mers are tallied in
+        ``total_masked``.
     intervals : DataFrame, optional
         Genomic intervals to train on.  If ``None``, uses all chromosomes.
+        Overlapping intervals are unified first, so each position is counted
+        once; a (k+1)-mer that crosses from an interval into an adjacent one
+        is not counted.
     iterator : int, optional
         Iterator bin size for track extraction.  Determines the resolution
-        at which track values are evaluated.
+        at which track values are evaluated.  It is stored in the model
+        (``model.iterator``) and used by :func:`gsynth_sample` and
+        :func:`gsynth_score`.  If ``None``, the iterator the dimension
+        expressions imply is used, and its bin size (that of their dense
+        tracks) is stored.
     pseudocount : float, default 1.0
         Pseudocount added to all k-mer counts to avoid zero probabilities
         in the CDF.
@@ -1297,6 +1379,14 @@ def gsynth_train(
         intervals = gintervals_all()
 
     intervals = _maybe_load_intervals_set(intervals)
+    # A position covered by several intervals is counted once. Touching intervals stay apart:
+    # a (k+1)-mer that crosses from one into the next is not counted, as before.
+    intervals = _canonic_keep_touching(intervals)
+
+    # Without an iterator the bins are those the expressions imply (the bin size of their dense
+    # tracks): the model keeps that bin size, which gsynth_sample and gsynth_score need
+    if iterator is None and parsed_specs:
+        iterator = _implicit_binsize([sp["expr"] for sp in parsed_specs])
 
     # Compute per-dimension bin_map for storage
     for _i, spec in enumerate(parsed_specs):
@@ -1338,9 +1428,7 @@ def gsynth_train(
             for chunk in chunks
         ]
 
-        ctx = _multiprocessing.get_context("fork")
-        with ctx.Pool(processes=effective_cores) as pool:
-            chunk_results = pool.map(_worker_train_chunk, worker_args)
+        chunk_results = _map_forked(_worker_train_chunk, worker_args, effective_cores)
 
         # Merge results from all chunks (resolves prior on merged counts).
         if prior_matrix_arg is not None and prior_matrix_arg.shape[0] != total_bins:
@@ -1377,7 +1465,7 @@ def gsynth_train(
 
     # --- Single-process path (original logic) ---
 
-    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes = \
+    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes, _, _ = \
         _extract_bin_data(parsed_specs, intervals, iterator)
 
     # Call C++ backend
@@ -1497,8 +1585,13 @@ def gsynth_sample(
           (does not write to file).
     intervals : DataFrame, optional
         Genomic intervals to synthesise.  If ``None``, uses all chromosomes.
+        The bins of each interval come from its own iterator windows, so the
+        result for an interval does not depend on the other intervals.
     iterator : int, optional
         Iterator bin size for track extraction during bin-index computation.
+        Defaults to ``model.iterator``; a stratified model with neither is an
+        error (set ``model.iterator`` to the iterator used in
+        :func:`gsynth_train`). An unstratified model needs none.
     mask_copy : DataFrame, optional
         Intervals where the original reference sequence is preserved
         verbatim instead of being sampled.  Useful for keeping repetitive
@@ -1518,8 +1611,8 @@ def gsynth_sample(
         ``_sampleN`` suffix.  When ``output_format="vector"``, the returned
         list has length ``n_intervals * n_samples``.
     seed : int, optional
-        Random seed for reproducibility.  If ``None``, uses the current
-        random state.
+        Random seed for reproducibility.  If ``None``, the draws follow
+        numpy's global generator, so ``numpy.random.seed`` reproduces them.
     bin_merge : list, optional
         Sampling-time bin merge overrides, one element per model dimension.
         Each element is either ``None`` (use the training-time bin_merge)
@@ -1599,12 +1692,10 @@ def gsynth_sample(
 
     model_k = model.k
 
-    # Default iterator to the value used during training (R parity:
-    # model$iterator). Without this, the C backend would error or use the
-    # INT64_MAX sentinel, and bin extraction in _extract_bin_data would emit
-    # rows at unexpected positions.
-    if iterator is None:
-        iterator = model.iterator
+    # The iterator used in training (model.iterator) sets the stratification windows. An
+    # unstratified model needs none: every position is in its one bin.
+    if model.n_dims > 0:
+        iterator = _model_iterator(model, iterator)
 
     if intervals is None:
         intervals = gintervals_all()
@@ -1630,6 +1721,8 @@ def gsynth_sample(
             effective_cores,
         )
 
+        # In genome order, as the C++ sampler outputs them: the chunks then join in its order
+        intervals = _genome_order(intervals)
         chunks = _chunk_intervals(intervals, effective_cores)
         chunk_seeds = _generate_chunk_seeds(seed, len(chunks))
 
@@ -1646,9 +1739,9 @@ def gsynth_sample(
             for i, chunk in enumerate(chunks)
         ]
 
-        ctx = _multiprocessing.get_context("fork")
-        with ctx.Pool(processes=effective_cores) as pool:
-            chunk_results = pool.map(_worker_sample_chunk, worker_args)
+        # without a seed, each chunk draws its own numbers from numpy's generator, reseeded for
+        # its chunk (_run_forked)
+        chunk_results = _map_forked(_worker_sample_chunk, worker_args, effective_cores)
 
         # Concatenate all sequence lists
         all_seqs = []
@@ -1668,17 +1761,14 @@ def gsynth_sample(
 
         if output_format == "fasta":
             _write_fasta(output_path, intervals, all_seqs, n_samples)
+        elif output_format == "misha":
+            # the bytes of every sequence one after the other, as the C++ writer writes them
+            with open(output_path, "wb") as f:
+                for seq in all_seqs:
+                    f.write(seq.encode("latin-1"))
         else:
-            # For seq/binary format, fall back to single-process
-            # (binary format requires C++ writer)
-            pass  # fall through to single-process path below
-
-        if output_format == "fasta":
-            return None
-
-        # If we fell through for non-fasta file output,
-        # re-run single-process below
-        do_parallel = False
+            return all_seqs
+        return None
 
     # Determine output format code
     if output is None:
@@ -1693,7 +1783,7 @@ def gsynth_sample(
             _os.makedirs(parent, exist_ok=True)
 
     # Extract bin data for model dimensions
-    bin_indices, iter_starts, iter_chroms, flat_breaks, _, _ = \
+    bin_indices, iter_starts, _, flat_breaks, _, _, iter_ends, iter_ivids = \
         _extract_bin_data(model.dim_specs, intervals, iterator,
                           sample_bin_merge=bin_merge)
 
@@ -1704,26 +1794,14 @@ def gsynth_sample(
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
-    # 0D models have a single bin and no real stratification; the iter
-    # bookkeeping in C++ is per-interval (one entry per row), so passing
-    # a finite iter_size truncates the bin's effective span to that many
-    # bp on every sample interval — every position past the first
-    # iter_size bp would fall through to uniform random. Use the
-    # INT64_MAX sentinel for 0D so bin lookup always resolves to bin 0,
-    # matching gsynth_random.
-    iter_size_for_cpp = (
-        _ITER_SIZE_NO_CONSTRAINT
-        if model.n_dims == 0
-        else _resolve_iter_size(iterator)
-    )
-
     # Call C++ backend
     _raw = _pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
         iter_starts,
-        iter_chroms,
+        iter_ends,
+        iter_ivids,
         _df2pymisha(intervals),
         py_mask_copy,
         output_path,
@@ -1731,39 +1809,62 @@ def gsynth_sample(
         int(n_samples),
         seed,
         int(model_k),
-        iter_size_for_cpp,
         bool(preserve_n),
+        None,  # bases without a valid context or bin are drawn uniformly
     )
     return list(_raw) if _raw is not None else None
 
 
-def _write_fasta(output_path: str, intervals: _pd.DataFrame, sequences: list[str], n_samples: int) -> None:
-    """Write sequences to a FASTA file.
+def _genome_order(intervals: _pd.DataFrame) -> _pd.DataFrame:
+    """*intervals* by chromosome, in the database's order, then by start (stable)."""
+    from .intervals import _normalize_chroms
 
-    Parameters
-    ----------
-    output_path : str
-        Path to the output file.
-    intervals : DataFrame
-        Genomic intervals.
-    sequences : list of str
-        Sequences to write (length = n_intervals * n_samples).
-    n_samples : int
-        Number of samples per interval.
+    order = {c: i for i, c in enumerate(gintervals_all()["chrom"].astype(str))}
+    chrom_ids = [order.get(c, len(order)) for c in _normalize_chroms(intervals["chrom"].tolist())]
+    keys = _pd.DataFrame({"c": chrom_ids, "s": intervals["start"].to_numpy()})
+    idx = keys.sort_values(["c", "s"], kind="mergesort").index
+    return intervals.iloc[idx].reset_index(drop=True)
+
+
+def _write_fasta(output_path: str, intervals: _pd.DataFrame, sequences: list[str], n_samples: int) -> None:
+    """Write sequences to a FASTA file and its .fai, as the C++ sampler writes them.
+
+    *intervals* are in the order the sequences were sampled (genome order, see _genome_order);
+    an interval outside its chromosome has no sequence. A header is the chromosome name, or
+    chrom:start-end when the interval is not the whole chromosome, followed by _sample<i> when
+    *n_samples* > 1; sequence lines are 60 bases long.
     """
-    with open(output_path, "w") as f:
-        seq_idx = 0
-        for i in range(len(intervals)):
-            row = intervals.iloc[i]
-            chrom = str(row["chrom"])
-            start = int(row["start"])
-            end = int(row["end"])
+    from .intervals import _normalize_chroms
+
+    sizes = dict(zip(gintervals_all()["chrom"].astype(str), gintervals_all()["end"].astype(int), strict=True))
+    chroms = _normalize_chroms(intervals["chrom"].tolist())
+    width = 60
+    fai: list[str] = []
+    seq_idx = 0
+    with open(output_path, "wb") as f:
+        offset = 0
+        for chrom, start, end in zip(chroms, intervals["start"], intervals["end"], strict=True):
+            chrom_size = sizes.get(chrom, 0)
+            start = max(0, int(start))
+            end = min(chrom_size, int(end))
+            if chrom_size <= 0 or end <= start:
+                continue
+            name = chrom if (start == 0 and end == chrom_size) else f"{chrom}:{start}-{end}"
             for s in range(n_samples):
-                header = f">{chrom}:{start}-{end}_sample{s + 1}" if n_samples > 1 else f">{chrom}:{start}-{end}"
-                f.write(header + "\n")
-                if seq_idx < len(sequences):
-                    f.write(sequences[seq_idx] + "\n")
+                header = f"{name}_sample{s + 1}" if n_samples > 1 else name
+                seq = sequences[seq_idx].encode("latin-1")
                 seq_idx += 1
+                head = f">{header}\n".encode()
+                f.write(head)
+                offset += len(head)
+                fai.append(f"{header}\t{len(seq)}\t{offset}\t{min(width, len(seq)) if seq else 0}"
+                           f"\t{min(width, len(seq)) + 1 if seq else 0}\n")
+                for i in range(0, len(seq), width):
+                    line = seq[i:i + width] + b"\n"
+                    f.write(line)
+                    offset += len(line)
+    with open(output_path + ".fai", "w") as f:
+        f.writelines(fai)
 
 
 
@@ -1850,16 +1951,22 @@ def gsynth_score(
     description : str, optional
         Human-readable description stored as a track attribute.
     intervals : DataFrame, optional
-        Regions to score. Defaults to all chromosomes. Best results when
-        interval starts are aligned to multiples of ``model.iterator``;
-        otherwise the first stratum window is shorter than
-        ``model.iterator`` and its bin label may differ from training.
+        Regions to score. Defaults to all chromosomes. Overlapping intervals
+        are unified first, so each position is scored once. The stratum of
+        a position comes from the iterator windows of its own interval,
+        extended upstream by one ``model.iterator``: a window cut by the
+        interval end (or by the start of the extension) is evaluated on its
+        part inside, so its bin may differ from the one training saw on the
+        whole window. Intervals aligned to multiples of ``model.iterator``
+        avoid this.
     mask : DataFrame, optional
         Optional intervals to NA-out in the output (e.g. repeats). Every
         output bin containing a masked bp becomes ``NaN``.
     resolution : int, optional
         Output bin size in bp. Defaults to ``model.iterator``. ``1``
-        produces a per-bp track.
+        produces a per-bp track. A stratified model needs
+        ``model.iterator`` in any case; an unstratified one only when
+        *resolution* is not given.
     sparse_policy : {"NA", "uniform"}, default "NA"
         How to score positions whose stratification bin is marked sparse
         in the trained model. ``"NA"`` (default) propagates NA;
@@ -1902,15 +2009,10 @@ def gsynth_score(
         )
     if resolution is not None and int(resolution) <= 0:
         raise ValueError(f"resolution must be positive, got {resolution}")
-    if model.iterator is None:
-        raise ValueError(
-            "model.iterator is required to score; re-train the model "
-            "after upgrading"
-        )
-    iter_size = int(model.iterator)
     k = int(model.k)
     if resolution is None:
-        resolution = iter_size
+        # an unstratified model needs no iterator otherwise
+        resolution = _model_iterator(model, hint=", or pass resolution" if model.n_dims == 0 else "")
     resolution = int(resolution)
     sparse_uniform = sparse_policy == "uniform"
     n_uniform = n_policy == "uniform"
@@ -1932,7 +2034,8 @@ def gsynth_score(
             "intervals must resolve to a DataFrame (got "
             f"{type(intervals_loaded).__name__})"
         )
-    intervals = intervals_loaded.reset_index(drop=True)
+    # A position covered by several intervals is scored once
+    intervals = _canonic_keep_touching(intervals_loaded.reset_index(drop=True))
 
     # Build log-probability arrays from the model CDFs.
     log_p_list, bin_is_sparse = _build_log_p_from_cdf(model.model_data["cdf"])
@@ -1943,49 +2046,34 @@ def gsynth_score(
         _numpy.stack(log_p_list) if log_p_list else _numpy.empty((0, 0, 0), dtype=_numpy.float64)
     )
 
-    # Extend each interval upstream by iter_size for stratum extraction so
-    # the first k bp of every interval get bin info from the prior iter
-    # window (matches R 3fba28c2). Clamped at 0.
-    strata_intervals = intervals.copy()
-    strata_intervals["start"] = (
-        strata_intervals["start"].astype(int) - iter_size
-    ).clip(lower=0)
-
     # ----- Extract per-iter-window bin index for every input position ----
     if model.n_dims == 0:
-        # 0D: a single bin covering everything. Build the iter grid by
-        # enumerating iter_size-aligned windows inside each strata
-        # interval (clamped to the chrom size). gextract isn't used
-        # because pymisha rejects literal expressions like "1".
-        chrom_arr = []
-        start_arr: list[int] = []
-        for _, iv in strata_intervals.iterrows():
-            chrom = str(iv["chrom"])
-            cz = int(chrom_size_map.get(chrom, 0))
-            if cz <= 0:
-                continue
-            iv_start = max(0, int(iv["start"]))
-            iv_end = min(cz, int(iv["end"]))
-            if iv_end <= iv_start:
-                continue
-            window_starts = _numpy.arange(
-                iv_start, iv_end, iter_size, dtype=_numpy.int64
-            )
-            chrom_arr.extend([chrom] * window_starts.size)
-            start_arr.extend(window_starts.tolist())
-        if not start_arr:
-            raise ValueError("No positions extracted; check intervals.")
-        iter_chroms_str = _numpy.asarray(chrom_arr)
-        iter_starts = _numpy.asarray(start_arr, dtype=_numpy.int64)
+        # Every position is in the single stratum, whatever the iterator: each
+        # interval, from k bp upstream (bin lookup is at pos - k), is one bin
+        iter_starts = (intervals["start"].to_numpy(dtype=_numpy.int64) - k).clip(min=0)
+        iter_ends = intervals["end"].to_numpy(dtype=_numpy.int64)
+        iter_ivids = _numpy.arange(len(intervals), dtype=_numpy.int64)
         bin_indices = _numpy.zeros(iter_starts.size, dtype=_numpy.int32)
     else:
+        iter_size = _model_iterator(model)
+        # Bin lookup queries pos - k (the leftmost base of the (k+1)-mer
+        # context) to match training. Extend each interval upstream by one
+        # iter_size (at least k) so the first k bp of every interval get bin
+        # info from the prior iter window, matching what training saw on the
+        # same genome. Clamped at 0.
+        strata_intervals = intervals.copy()
+        strata_intervals["start"] = (
+            strata_intervals["start"].astype(_numpy.int64) - max(iter_size, k)
+        ).clip(lower=0)
         exprs = [d["expr"] for d in model.dim_specs]
         track_data = gextract(exprs, intervals=strata_intervals,
                               iterator=iter_size)
         if track_data is None or len(track_data) == 0:
             raise ValueError("No track data extracted; check intervals.")
-        iter_chroms_str = track_data["chrom"].astype(str).to_numpy()
+        # each strata interval is the interval of the same row, extended upstream
         iter_starts = track_data["start"].to_numpy(dtype=_numpy.int64)
+        iter_ends = track_data["end"].to_numpy(dtype=_numpy.int64)
+        iter_ivids = track_data["intervalID"].to_numpy(dtype=_numpy.int64) - 1
 
         # Compute per-dimension bin indices and combine to a flat index.
         bin_indices = _numpy.zeros(len(track_data), dtype=_numpy.int64)
@@ -2012,20 +2100,18 @@ def gsynth_score(
             _numpy.where(valid, bin_indices, -1).astype(_numpy.int32),
         )
 
-    # Build per-chrom (start, bin_idx) lookup, sorted.
-    bins_per_chrom: dict[str, _numpy.ndarray] = {}
-    order_idx = _numpy.lexsort((iter_starts, iter_chroms_str))
-    iter_chroms_sorted = iter_chroms_str[order_idx]
-    iter_starts_sorted = iter_starts[order_idx]
-    bin_indices_sorted = bin_indices[order_idx]
-    unique_chroms, edges_arr = _numpy.unique(
-        iter_chroms_sorted, return_index=True
-    )
-    edge_list: list[int] = [int(x) for x in edges_arr] + [len(iter_chroms_sorted)]
-    for i, c in enumerate(unique_chroms):
-        bins_per_chrom[str(c)] = _numpy.column_stack([
-            iter_starts_sorted[edge_list[i]:edge_list[i + 1]],
-            bin_indices_sorted[edge_list[i]:edge_list[i + 1]].astype(_numpy.int64),
+    # The (start, end, bin_idx) of the iterator windows of each interval, by row, sorted by
+    # start: a position takes its stratum from its own interval's windows only, so that the
+    # result for an interval does not depend on the other intervals scored with it.
+    bins_per_interval: dict[int, _numpy.ndarray] = {}
+    order_idx = _numpy.lexsort((iter_starts, iter_ivids))
+    ivids_sorted = iter_ivids[order_idx]
+    unique_ivids, edges_arr = _numpy.unique(ivids_sorted, return_index=True)
+    edge_list: list[int] = [int(x) for x in edges_arr] + [len(ivids_sorted)]
+    for i, ivid in enumerate(unique_ivids):
+        sel = order_idx[edge_list[i]:edge_list[i + 1]]
+        bins_per_interval[int(ivid)] = _numpy.column_stack([
+            iter_starts[sel], iter_ends[sel], bin_indices[sel].astype(_numpy.int64),
         ])
 
     # Mask intervals per chrom (sorted).
@@ -2052,10 +2138,10 @@ def gsynth_score(
 
         chrom_intervals = intervals[intervals["chrom"].astype(str) == chrom]
         if not chrom_intervals.empty:
-            bins = bins_per_chrom.get(chrom)
             mask_arr = mask_per_chrom.get(chrom)
 
-            for _, iv in chrom_intervals.iterrows():
+            for iv_row, iv in chrom_intervals.iterrows():
+                bins = bins_per_interval.get(int(iv_row))
                 start = max(0, int(iv["start"]))
                 end = min(chrom_size, int(iv["end"]))
                 if end <= start:
@@ -2068,7 +2154,7 @@ def gsynth_score(
                     "end": [end],
                 })
                 seq = gseq_extract(seq_iv)[0]
-                seq_bytes = _numpy.frombuffer(seq.encode("ascii"),
+                seq_bytes = _numpy.frombuffer(seq.encode("latin-1"),
                                               dtype=_numpy.uint8)
                 codes = _DNA_BASE_CODE[seq_bytes]
 
@@ -2138,14 +2224,15 @@ def gsynth_score(
                                           dtype=_numpy.int64)
                 if bins is not None and len(bins):
                     starts_col = bins[:, 0]
-                    bin_col = bins[:, 1]
+                    ends_col = bins[:, 1]
+                    bin_col = bins[:, 2]
                     insert = _numpy.searchsorted(starts_col, bin_query,
                                                  side="right") - 1
                     valid_q = insert >= 0
                     if valid_q.any():
-                        bin_first = starts_col[insert[valid_q]]
+                        bin_end = ends_col[insert[valid_q]]
                         candidate_bin = bin_col[insert[valid_q]]
-                        within = bin_query[valid_q] < bin_first + iter_size
+                        within = bin_query[valid_q] < bin_end
                         stratum_bin[valid_q] = _numpy.where(
                             within, candidate_bin, -1
                         )
@@ -2314,12 +2401,12 @@ def gsynth_random(
     n_samples : int, default 1
         Number of independent samples to generate per interval.
     seed : int, optional
-        Random seed for reproducibility.  If ``None``, uses the current
-        random state.
+        Random seed for reproducibility.  If ``None``, the draws follow
+        numpy's global generator, so ``numpy.random.seed`` reproduces them.
     iterator : int, default 1
-        Accepted for R-misha API parity. PyMisha samples every position
-        independently regardless of this value, so the parameter has no
-        effect on output. Provided so R-script ports keep working.
+        Not used: every base is drawn independently of its position, from
+        *nuc_probs*, the first bases of each interval and those after an N
+        included. Kept for R-misha API parity.
 
     Returns
     -------
@@ -2391,18 +2478,12 @@ def gsynth_random(
     cdf_list = [cdf_mat]  # Single bin
 
     assert isinstance(intervals, _pd.DataFrame)
-    # Single bin: all positions map to bin 0
+    # Every position is in the single bin: each interval is one bin (0-based)
     n_positions = len(intervals)
     bin_indices = _numpy.zeros(n_positions, dtype=_numpy.int32)
     iter_starts = intervals["start"].to_numpy(dtype=_numpy.int64)
-
-    # Convert chroms to IDs
-    all_chroms = gintervals_all()
-    chrom_to_id = {name: i for i, name in enumerate(all_chroms["chrom"])}
-    iter_chroms = _numpy.array(
-        [chrom_to_id.get(str(c), -1) for c in intervals["chrom"]],
-        dtype=_numpy.int32
-    )
+    iter_ends = intervals["end"].to_numpy(dtype=_numpy.int64)
+    iter_ivids = _numpy.arange(n_positions, dtype=_numpy.int32)
 
     flat_breaks = [0.0, 1.0]  # Single bin
 
@@ -2419,15 +2500,15 @@ def gsynth_random(
 
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
-    # gsynth_random uses a single bin (no stratification), so no iterator
-    # constraint applies; the INT64_MAX sentinel disables the per-bin extent
-    # check in the C backend.
+    # The bases the Markov sampler fills without a context (the first k of an interval,
+    # those after an N) are drawn from nuc_probs too
     _raw2 = _pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
         iter_starts,
-        iter_chroms,
+        iter_ends,
+        iter_ivids,
         _df2pymisha(intervals),
         py_mask_copy,
         output_path,
@@ -2435,8 +2516,8 @@ def gsynth_random(
         int(n_samples),
         seed,
         int(random_k),
-        _ITER_SIZE_NO_CONSTRAINT,
         bool(preserve_n),
+        cdf,
     )
     return list(_raw2) if _raw2 is not None else None
 
@@ -2474,7 +2555,8 @@ def gsynth_replace_kmer(
         K-mer to remove.  Case-insensitive (converted to uppercase
         internally).
     replacement : str
-        Replacement sequence.  Must be the same length as *target*.
+        Replacement sequence.  Must be the same length as *target* and
+        different from it (ignoring case). It is written in upper case.
     intervals : DataFrame, optional
         Genomic intervals to process.  If ``None``, uses all chromosomes.
     output : str, optional
@@ -2502,8 +2584,8 @@ def gsynth_replace_kmer(
     ------
     ValueError
         If *target* or *replacement* is empty, if they differ in length,
-        or if ``check_composition=True`` and their nucleotide compositions
-        differ.
+        if they are identical (ignoring case), or if
+        ``check_composition=True`` and their nucleotide compositions differ.
 
     See Also
     --------
@@ -2533,8 +2615,11 @@ def gsynth_replace_kmer(
     if len(target) != len(replacement):
         raise ValueError("target and replacement must have the same length")
 
+    # The sequence is matched and rewritten in upper case
     target = target.upper()
     replacement = replacement.upper()
+    if target == replacement:
+        raise ValueError("target and replacement cannot be identical (the comparison ignores case)")
 
     if check_composition and sorted(target) != sorted(replacement):
         raise ValueError(
@@ -2852,6 +2937,8 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
             "file": "prior.bin",
         }
         prior_bytes = prior_arr.tobytes()
+        # R misha reads the prior from here, one list of 4 per bin
+        metadata["prior"] = prior_arr.tolist()
 
     # Stack arrays into contiguous float64
     counts_arr = _numpy.stack(model.model_data["counts"]).astype(_numpy.float64)
@@ -2914,11 +3001,12 @@ def _load_legacy_pickle(path: str) -> GsynthModel:
     # Backfill iterator for models saved before it was tracked.
     if not hasattr(model, "iterator"):
         model.iterator = None
-    # Backfill prior fields for models saved before Dirichlet prior support.
+    # Backfill prior fields for models saved before Dirichlet prior support:
+    # a uniform prior, as R misha's gsynth.load backfills an old model
     if not hasattr(model, "prior_mode"):
         model.prior_mode = "uniform"
-    if not hasattr(model, "prior_matrix"):
-        model.prior_matrix = None
+    if getattr(model, "prior_matrix", None) is None:
+        model.prior_matrix = _numpy.full((int(model.total_bins), 4), 0.25)
     if not hasattr(model, "marginal_fallbacks"):
         model.marginal_fallbacks = 0
     return model
@@ -2982,7 +3070,8 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
         else None
     )
 
-    # Optional prior matrix (introduced in v0.1.34).
+    # Optional prior matrix (introduced in v0.1.34). R misha writes it into
+    # metadata.yaml itself, one list of 4 per bin.
     prior_matrix = None
     data_section = metadata.get("data", {})
     if isinstance(data_section, dict) and "prior" in data_section:
@@ -2991,12 +3080,26 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
         prior_matrix = _numpy.frombuffer(
             read_file(prior_meta["file"]), dtype=_numpy.float64
         ).reshape(prior_shape).copy()
+    elif isinstance(metadata.get("prior"), list):
+        rows = [_numpy.atleast_1d(_numpy.asarray(r, dtype=_numpy.float64)).ravel() for r in metadata["prior"]]
+        ncol = len(rows[0]) if rows and all(len(r) == len(rows[0]) for r in rows) else 0
+        if len(rows) != total_bins or ncol != 4:
+            raise ValueError(f"Invalid prior in .gsm: got {len(rows)} x {ncol}, expected {total_bins} x 4")
+        prior_matrix = _numpy.vstack(rows)
+    else:
+        # a model saved without a prior has a uniform one, as R misha loads it
+        prior_matrix = _numpy.full((total_bins, 4), 0.25)
     prior_mode = str(metadata.get("prior_mode", "uniform"))
+
+    # R misha writes a vector of length 1 as a YAML scalar
+    dim_sizes_raw = metadata.get("dim_sizes", [])
+    if dim_sizes_raw is not None and not isinstance(dim_sizes_raw, list):
+        dim_sizes_raw = [dim_sizes_raw]
 
     return GsynthModel(
         k=model_k,
         n_dims=int(metadata.get("n_dims", 0)),
-        dim_sizes=[int(x) for x in metadata.get("dim_sizes", [])],
+        dim_sizes=[int(x) for x in dim_sizes_raw or []],
         dim_specs=dim_specs,
         total_bins=total_bins,
         model_data={"counts": counts_list, "cdf": cdf_list},

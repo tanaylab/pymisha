@@ -487,14 +487,14 @@ def test_copy_that_succeeds_leaves_r_to_rescan(tmp_path):  # R :385
     assert pm.gextract("orig", pm.gintervals("chr1", 0, 200))["orig"].tolist() == [7]
 
 
-def test_failed_copy_keeps_what_another_session_put_at_the_name(tmp_path, monkeypatch):  # R :669
+def test_failed_copy_keeps_what_another_session_put_at_the_name_and_trashes_the_track_it_replaced(
+        tmp_path, monkeypatch):  # R :669 (R 5.17)
     db = review_db(tmp_path)
     tracks = Path(db) / "tracks"
     sparse("orig", pm.gintervals("chr1", 0, 10), [42])
     sparse("src", pm.gintervals("chr1", 100, 110), [7])
     sparse("other", pm.gintervals("chr1", 200, 210), [99])
     other_bytes = track_bytes(db, "other")
-    orig_bytes = track_bytes(db, "orig")
 
     # another session's copy lands at the name between this one's two renames
     real_rename = os.rename
@@ -506,18 +506,18 @@ def test_failed_copy_keeps_what_another_session_put_at_the_name(tmp_path, monkey
         return real_rename(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "rename", rename)
-    with pytest.warns(UserWarning, match="is kept at"), pytest.raises(RuntimeError, match="Failed to rename"):
+    with pytest.warns(UserWarning, match="was moved to the trash"), \
+            pytest.raises(RuntimeError, match="Failed to rename"):
         pm.gtrack_copy("src", "orig", overwrite=True)
     monkeypatch.undo()
     assert track_bytes(db, "orig") == other_bytes
     # the session still lists the name, which a track holds
     assert pm.gtrack_exists("orig")
-    # the track that was there is kept, under its hidden name: what took the name may be
-    # incomplete (an older misha writes in place) or go again (a copy that fails after it was
-    # placed)
-    kept = [p for p in tracks.iterdir() if p.name[0] == "." and all(c in "0123456789abcdef" for c in p.name[1:])]
-    assert len(kept) == 1
-    assert (kept[0] / "track.dat").read_bytes() == orig_bytes
+    assert pm.gextract("orig", pm.gintervals("chr1", 0, 1000))["orig"].tolist() == [99]
+    # the track that was there, replaced by the other session's, is not kept under a hidden name,
+    # nor under a staging one (the trash removes it)
+    left = {p.name for p in tracks.iterdir()} - {"orig.track", "src.track", "other.track"}
+    assert [n for n in left if not n.startswith(".trash.")] == []
 
 
 def test_copy_stops_on_a_short_copy_instead_of_committing_it(tmp_path, monkeypatch):  # R :698

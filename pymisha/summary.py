@@ -39,6 +39,13 @@ from .vtracks import _compute_vtrack_values
 _logger = get_logger(__name__)
 
 
+def _positive_zero(q: Any) -> np.ndarray:
+    """Quantiles with 0.0 for a zero of either sign, as R misha gives them: which zero a rank
+    holds is arbitrary when the values hold both -0 and 0, and differs between paths."""
+    q = _numpy.asarray(q, dtype=float)
+    return _numpy.where(q == 0, 0.0, q)
+
+
 def _interval_coord_cols(intervals: pd.DataFrame) -> list[str]:
     """Return the coordinate column names for 1D or 2D intervals."""
     if _is_2d_intervals(intervals):
@@ -386,6 +393,10 @@ def _gdist_vtrack_streaming(
 
     # Get iterated intervals (physical tracks define the iterator if present)
     if used_tracks:
+        if iterator is None and used_vtracks:
+            from .extract import _check_dense_bin_sizes
+
+            _check_dense_bin_sizes(exprs, used_vtracks)
         track_exprs = list(used_tracks)
         base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
@@ -550,6 +561,10 @@ def _gsummary_vtrack_streaming(
 
     # Get iterated intervals
     if expr_tracks:
+        if iterator is None and expr_vtracks:
+            from .extract import _check_dense_bin_sizes
+
+            _check_dense_bin_sizes([expr], expr_vtracks)
         track_exprs = list(expr_tracks)
         base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
@@ -758,6 +773,10 @@ def _gquantiles_vtrack_streaming(
 
     # Get iterated intervals
     if expr_tracks:
+        if iterator is None and expr_vtracks:
+            from .extract import _check_dense_bin_sizes
+
+            _check_dense_bin_sizes([expr], expr_vtracks)
         track_exprs = list(expr_tracks)
         base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
@@ -807,7 +826,8 @@ def _gquantiles_vtrack_streaming(
     samples = _numpy.empty(sample_cap, dtype=float)
     sample_size = 0
     stream_count = 0
-    rng = _numpy.random.default_rng()
+    # seeded from numpy's global generator, so that numpy.random.seed() reproduces the sample
+    rng = _numpy.random.default_rng(_numpy.random.randint(0, 2**32, dtype=_numpy.uint64))
 
     with _progress_context(progress, total=n_rows, desc=progress_desc or "gquantiles") as progress_cb:
         for start_idx, end_idx in _chunk_slices(n_rows, chunk_size):
@@ -1195,7 +1215,7 @@ def gquantiles(
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
         else:
             quantiles = _numpy.nanquantile(values, pct)
-        return _pandas.Series(quantiles, index=pct)
+        return _pandas.Series(_positive_zero(quantiles), index=pct)
 
     vtracks_used = _find_vtracks_in_expr(expr)
     if not vtracks_used and not user_vars:
@@ -1205,7 +1225,7 @@ def gquantiles(
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
         else:
             quantiles = _numpy.asarray(result, dtype=float)
-        return _pandas.Series(quantiles, index=pct)
+        return _pandas.Series(_positive_zero(quantiles), index=pct)
 
     quantiles, estimated = _gquantiles_vtrack_streaming(
         expr,
@@ -1225,7 +1245,7 @@ def gquantiles(
             RuntimeWarning,
             stacklevel=2,
         )
-    return _pandas.Series(quantiles, index=pct)
+    return _pandas.Series(_positive_zero(quantiles), index=pct)
 
 
 def gintervals_summary(
@@ -1527,6 +1547,11 @@ def gintervals_quantiles(
                     out[name] = _numpy.nan
             out = out.reset_index(drop=True)
 
+    coord_cols = set(_interval_coord_cols(out))
+    for c in out.columns:
+        if c not in coord_cols:
+            out[c] = _positive_zero(out[c])
+
     if intervals_set_out is not None:
         from .intervals import gintervals_save
 
@@ -1769,7 +1794,7 @@ def gsample(
         vals = _numpy.array([], dtype=_numpy.float64) if res is None else res["_v"].to_numpy(dtype=_numpy.float64)
         vals = vals[~_numpy.isnan(vals)]
         if len(vals) > int(n):
-            vals = _numpy.random.default_rng().choice(vals, size=int(n), replace=False)
+            vals = _numpy.random.choice(vals, size=int(n), replace=False)
         return vals
     if band is not None:
         raise ValueError("band parameter is only supported with 2D intervals")
@@ -2392,4 +2417,4 @@ def gbins_quantiles(
     for ub, s, e in zip(unique_bins, starts, ends, strict=False):
         result_flat[int(ub)] = _numpy.quantile(vals_sorted[s:e], pct)
 
-    return result
+    return _positive_zero(result)

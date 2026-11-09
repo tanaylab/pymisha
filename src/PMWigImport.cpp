@@ -9,6 +9,7 @@
 #include "PMDb.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,6 +104,13 @@ int64_t wig_coord(const char *str, int64_t base, const char *what, const char *p
     return (int64_t)c - base;
 }
 
+// a + b for a, b >= 0, capped at INT64_MAX (R's Wig.cpp add_capped): a record that far is past
+// the chromosome end and dropped
+inline int64_t add_capped(int64_t a, int64_t b)
+{
+    return b > INT64_MAX - a ? INT64_MAX : a + b;
+}
+
 bool is_skip_line(const char *line)
 {
     while (*line && isspace((unsigned char)*line)) ++line;
@@ -149,8 +157,9 @@ size_t split_ws(char *buf, char *out_tokens[], size_t max_tokens)
  *   - "start": numpy int64 array (0-based, inclusive)
  *   - "end":   numpy int64 array (exclusive)
  *   - "value": numpy float64 array
- *   - "step":  numpy bool array, true for a fixedStep / variableStep record
- *              (clipped at the chromosome end on import), false for bedGraph
+ *   - "step":  numpy bool array, true for a fixedStep / variableStep record, false
+ *              for bedGraph
+ *   - "line":  numpy int64 array, the line of the record (1-based)
  *
  * A file with no records gives empty arrays. Raises pymisha.error on malformed input.
  */
@@ -176,6 +185,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     std::vector<int64_t> end;
     std::vector<double> value;
     std::vector<char> step;
+    std::vector<int64_t> lines;
 
     // Reserve modestly; we'll grow as needed. Most real files are 10^5-10^7 rows.
     chrom.reserve(1u << 12);
@@ -183,6 +193,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     end.reserve(1u << 12);
     value.reserve(1u << 12);
     step.reserve(1u << 12);
+    lines.reserve(1u << 12);
 
     Mode mode = MODE_NONE;
     std::string cur_chrom;
@@ -252,6 +263,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 end.push_back(e_i);
                 value.push_back(v);
                 step.push_back(0);
+                lines.push_back(lineno);
                 mode = MODE_NONE;
                 continue;
             }
@@ -265,10 +277,11 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 if (*endp) verror("Cannot parse WIG value at %s:%ld - '%s'", path, lineno, toks[0]);
                 chrom.push_back(cur_chrom);
                 start.push_back(cur_pos0);
-                end.push_back(cur_pos0 + cur_span);
+                end.push_back(add_capped(cur_pos0, cur_span));
                 value.push_back(v);
                 step.push_back(1);
-                cur_pos0 += cur_step;
+                lines.push_back(lineno);
+                cur_pos0 = add_capped(cur_pos0, cur_step);
                 continue;
             }
             if (mode == MODE_VAR && ntok >= 2) {
@@ -278,9 +291,10 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
                 if (*endp) verror("Cannot parse variableStep value at %s:%ld - '%s'", path, lineno, toks[1]);
                 chrom.push_back(cur_chrom);
                 start.push_back(pos0);
-                end.push_back(pos0 + cur_span);
+                end.push_back(add_capped(pos0, cur_span));
                 value.push_back(v);
                 step.push_back(1);
+                lines.push_back(lineno);
                 continue;
             }
             verror("Cannot parse WIG/BedGraph line at %s:%ld - '%s'", path, lineno, l);
@@ -303,8 +317,9 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     PMPY py_end(PyArray_SimpleNew(1, &n, NPY_INT64), true);
     PMPY py_value(PyArray_SimpleNew(1, &n, NPY_DOUBLE), true);
     PMPY py_step(PyArray_SimpleNew(1, &n, NPY_BOOL), true);
+    PMPY py_line(PyArray_SimpleNew(1, &n, NPY_INT64), true);
 
-    if (!py_chrom || !py_start || !py_end || !py_value || !py_step) {
+    if (!py_chrom || !py_start || !py_end || !py_value || !py_step || !py_line) {
         return nullptr;
     }
 
@@ -313,6 +328,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     int64_t *end_data = (int64_t *)PyArray_DATA((PyArrayObject *)*py_end);
     double *value_data = (double *)PyArray_DATA((PyArrayObject *)*py_value);
     npy_bool *step_data = (npy_bool *)PyArray_DATA((PyArrayObject *)*py_step);
+    int64_t *line_data = (int64_t *)PyArray_DATA((PyArrayObject *)*py_line);
 
     for (npy_intp i = 0; i < n; ++i) {
         PyObject *s = PyUnicode_FromStringAndSize(chrom[i].data(), chrom[i].size());
@@ -322,6 +338,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
         end_data[i] = end[i];
         value_data[i] = value[i];
         step_data[i] = step[i];
+        line_data[i] = lines[i];
     }
 
     PMPY result(PyDict_New(), true);
@@ -331,6 +348,7 @@ PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args)
     PyDict_SetItemString(result, "end", py_end);
     PyDict_SetItemString(result, "value", py_value);
     PyDict_SetItemString(result, "step", py_step);
+    PyDict_SetItemString(result, "line", py_line);
 
     return_py(result);
 
@@ -377,8 +395,9 @@ static PyObject *string_list(const std::vector<std::string> &strs)
  * pm_parse_bigwig(path) -> dict
  *
  * Reads the full-resolution records of a bigWig with misha's reader (BigWig.cpp), with its checks:
- * records are sorted, non-overlapping and within the chromosome (step records clipped at its end),
- * zero-length records are skipped, a truncated or corrupt file is an error.
+ * records are sorted and non-overlapping, a record that runs past the end of its chromosome is
+ * clipped to it (dropped if it starts at or past the end), zero-length records are skipped, a
+ * truncated or corrupt file is an error.
  *
  * Returns: dict with keys
  *   - "chrom", "start", "end", "value": the records, chrom holding database chromosome names
@@ -388,6 +407,10 @@ static PyObject *string_list(const std::vector<std::string> &strs)
  *   - "unknown_primary": up to 5 of them that look like a primary chromosome
  *   - "num_primary": the number of those
  *   - "num_matched": the number of database chromosomes the file has data for
+ *   - "num_clipped", "num_dropped": the records past the end of their chromosome that were clipped,
+ *     and dropped
+ *   - "first_clipped": the first of those in the file, "(chrom, start, end), chromosome size N"
+ *     ("" if none)
  */
 PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
 {
@@ -456,8 +479,13 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
         PMPY py_truncated(PyBool_FromLong(unknown.truncated()), true);
         PMPY py_num_primary(PyLong_FromUnsignedLongLong(unknown.num_primary()), true);
         PMPY py_num_matched(PyLong_FromUnsignedLongLong(bigwig.get_num_matched_chroms()), true);
+        PMPY py_num_clipped(PyLong_FromUnsignedLongLong(bigwig.get_num_clipped()), true);
+        PMPY py_num_dropped(PyLong_FromUnsignedLongLong(bigwig.get_num_dropped()), true);
+        const string &first_clipped = bigwig.get_first_clipped();
+        PMPY py_first_clipped(PyUnicode_DecodeUTF8(first_clipped.data(), first_clipped.size(), "replace"), true);
         PMPY result(PyDict_New(), true);
-        if (!py_unknown || !py_primary || !py_num_unknown || !py_truncated || !py_num_primary || !py_num_matched || !result)
+        if (!py_unknown || !py_primary || !py_num_unknown || !py_truncated || !py_num_primary || !py_num_matched || !py_num_clipped ||
+            !py_num_dropped || !py_first_clipped || !result)
             return_err();
 
         PyDict_SetItemString(result, "chrom", py_chrom);
@@ -470,6 +498,9 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
         PyDict_SetItemString(result, "unknown_primary", py_primary);
         PyDict_SetItemString(result, "num_primary", py_num_primary);
         PyDict_SetItemString(result, "num_matched", py_num_matched);
+        PyDict_SetItemString(result, "num_clipped", py_num_clipped);
+        PyDict_SetItemString(result, "num_dropped", py_num_dropped);
+        PyDict_SetItemString(result, "first_clipped", py_first_clipped);
         return_py(result);
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());

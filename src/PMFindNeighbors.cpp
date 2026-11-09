@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <vector>
 #include <set>
+#include <limits>
+#include <utility>
 
 #include "pymisha.h"
 #include "PMDataFrame.h"
@@ -19,20 +21,85 @@
 
 using namespace std;
 
-// Result structure for 1D interval neighbors
+// Result structure for 1D interval neighbors. Neighbors are ordered by query, then by
+// distance, then by the neighbor's coordinates, so which neighbors are chosen among those at the
+// same distance, and their order, does not depend on the input order (as R misha 5.17). Only
+// neighbors with the same coordinates keep their input order (by row).
 struct IntervNeighbor {
     int64_t id1;    // Query interval index
     int64_t id2;    // Target interval index (-1 if not found)
     int64_t dist;   // Distance between intervals
+    int64_t start2; // Target coordinates
+    int64_t end2;
 
-    IntervNeighbor(int64_t _id1, int64_t _id2, int64_t _dist)
-        : id1(_id1), id2(_id2), dist(_dist) {}
+    IntervNeighbor(int64_t _id1, int64_t _id2, int64_t _dist, int64_t _start2 = 0, int64_t _end2 = 0)
+        : id1(_id1), id2(_id2), dist(_dist), start2(_start2), end2(_end2) {}
 
     bool operator<(const IntervNeighbor &o) const {
-        // Sort by query id first, then by absolute distance, then by target id
-        return id1 < o.id1 ||
-               (id1 == o.id1 && llabs(dist) < llabs(o.dist)) ||
-               (id1 == o.id1 && llabs(dist) == llabs(o.dist) && id2 < o.id2);
+        if (id1 != o.id1)
+            return id1 < o.id1;
+        if (llabs(dist) != llabs(o.dist))
+            return llabs(dist) < llabs(o.dist);
+        if (start2 != o.start2)
+            return start2 < o.start2;
+        if (end2 != o.end2)
+            return end2 < o.end2;
+        return id2 < o.id2;
+    }
+};
+
+// The intervals2 of one chromosome at distance 0 from a query - those that overlap or touch it,
+// start <= query end and end >= query start - in the order neighbors are kept: (start, end, row).
+// A query that overlaps K of them would otherwise walk all K in the nearest-neighbor iterator to
+// choose the maxneighbors with the smallest coordinates; here each one kept costs O(log n), through
+// a tree of the largest end over the sorted intervals. (R misha's ZeroDistNeighbors.)
+class ZeroDistNeighbors {
+public:
+    struct Item {
+        int64_t start;
+        int64_t end;
+        int64_t row;
+        bool operator<(const Item &o) const {
+            return start < o.start || (start == o.start && (end < o.end || (end == o.end && row < o.row)));
+        }
+    };
+
+    void clear() { m_items.clear(); m_maxend.clear(); m_cap = 0; }
+    bool empty() const { return m_items.empty() && !m_cap; }
+
+    void build(vector<Item> &&items) {
+        m_items = std::move(items);
+        sort(m_items.begin(), m_items.end());
+        m_cap = 1;
+        while (m_cap < m_items.size())
+            m_cap *= 2;
+        m_maxend.assign(2 * m_cap, numeric_limits<int64_t>::min());
+        for (size_t i = 0; i < m_items.size(); ++i)
+            m_maxend[m_cap + i] = m_items[i].end;
+        for (size_t i = m_cap - 1; i > 0; --i)
+            m_maxend[i] = max(m_maxend[2 * i], m_maxend[2 * i + 1]);
+    }
+
+    // Calls take(item) for the first n intervals at distance 0 from [qstart, qend), in order
+    template <class F> void first(int64_t qstart, int64_t qend, int n, F take) const {
+        for (size_t i = find(1, 0, m_cap, 0, qstart); n > 0 && i < m_items.size() && m_items[i].start <= qend; i = find(1, 0, m_cap, i + 1, qstart), --n)
+            take(m_items[i]);
+    }
+
+private:
+    vector<Item>    m_items;
+    vector<int64_t> m_maxend;
+    size_t          m_cap = 0;
+
+    // the first index >= from whose end is >= qstart, or the number of items
+    size_t find(size_t node, size_t lo, size_t hi, size_t from, int64_t qstart) const {
+        if (hi <= from || m_maxend[node] < qstart)
+            return m_items.size();
+        if (hi - lo == 1)
+            return lo;
+        size_t mid = lo + (hi - lo) / 2;
+        size_t res = find(2 * node, lo, mid, from, qstart);
+        return res < m_items.size() ? res : find(2 * node + 1, mid, hi, from, qstart);
     }
 };
 
@@ -198,6 +265,8 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
         // matching chromid run, so total insertion work is O(|intervals2|)
         // instead of O(|intervals1_chrom_changes| * |intervals2|).
         size_t intervals2_pos = 0;
+        size_t chrom_run_start = 0;  // the intervals2 of cur_chromid: [chrom_run_start, intervals2_pos)
+        ZeroDistNeighbors zero_dist;  // built for cur_chromid when a query first needs it
 
         // Process each query interval
         for (size_t i = 0; i < intervals1.size(); ++i) {
@@ -218,11 +287,13 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
                        intervals2[intervals2_pos].chromid < cur_chromid) {
                     ++intervals2_pos;
                 }
+                chrom_run_start = intervals2_pos;
                 while (intervals2_pos < intervals2.size() &&
                        intervals2[intervals2_pos].chromid == cur_chromid) {
                     segment_finder.insert(intervals2[intervals2_pos]);
                     ++intervals2_pos;
                 }
+                zero_dist.clear();
             }
 
             // Set up excluded area if needed (for mindist filtering)
@@ -237,6 +308,9 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
 
             int num_neighbors = 0;
             int64_t orig_idx1 = get_orig_idx(query);
+            int64_t cutoff = 0;  // |dist| of the maxneighbors-th neighbor found
+            size_t first = results.size();
+            bool zero_dist_ties = false;
 
             while (!nn_iter.is_end()) {
                 const GInterval &target = *nn_iter;
@@ -256,21 +330,52 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
                 if (llabs(dist) > abs_maxdist) {
                     break;
                 }
+                // The iterator yields the neighbors by |dist|. Once maxneighbors are found, those
+                // at the distance of the last one are taken too, and the ties are cut below.
+                if (num_neighbors >= maxneighbors && llabs(dist) > cutoff)
+                    break;
 
                 // Check distance range (signed)
                 if (dist >= (int64_t)mindist && dist <= (int64_t)maxdist) {
-                    int64_t orig_idx2 = get_orig_idx(target);
-                    results.push_back(IntervNeighbor(orig_idx1, orig_idx2, dist));
-
-                    pymisha.verify_max_data_size(results.size(), "neighbors result");
-
-                    num_neighbors++;
-                    if (num_neighbors >= maxneighbors) {
+                    results.push_back(IntervNeighbor(orig_idx1, get_orig_idx(target), dist, target.start, target.end));
+                    if (++num_neighbors == maxneighbors)
+                        cutoff = llabs(dist);
+                    // the rows kept: tied candidates beyond maxneighbors are cut below
+                    pymisha.verify_max_data_size(first + min(num_neighbors, maxneighbors), "neighbors result");
+                    // maxneighbors at distance 0: the ties can be all the intervals2 that overlap
+                    // the query, taken below in their order instead of walked here
+                    if (num_neighbors == maxneighbors && cutoff == 0) {
+                        zero_dist_ties = true;
                         break;
                     }
                 }
 
                 nn_iter.next();
+            }
+
+            // Distance 0 is in [mindist, maxdist] here (it was reached), so every interval at
+            // distance 0 is a candidate, and the ones kept are the first maxneighbors in
+            // (start, end, row) order. Their distance is 0 with any strand.
+            if (zero_dist_ties) {
+                if (zero_dist.empty()) {
+                    vector<ZeroDistNeighbors::Item> items;
+                    items.reserve(intervals2_pos - chrom_run_start);
+                    for (size_t k = chrom_run_start; k < intervals2_pos; ++k)
+                        items.push_back({intervals2[k].start, intervals2[k].end, get_orig_idx(intervals2[k])});
+                    zero_dist.build(std::move(items));
+                }
+                results.erase(results.begin() + first, results.end());
+                zero_dist.first(query.start, query.end, maxneighbors, [&](const ZeroDistNeighbors::Item &item) {
+                    results.push_back(IntervNeighbor(orig_idx1, item.row, 0, item.start, item.end));
+                    pymisha.verify_max_data_size(results.size(), "neighbors result");
+                });
+            }
+
+            // neighbors tied at the cutoff distance: keep those with the smallest coordinates
+            if (num_neighbors > maxneighbors) {
+                sort(results.begin() + first, results.end());
+                results.erase(results.begin() + first + maxneighbors, results.end());
+                num_neighbors = maxneighbors;
             }
 
             // Handle na_if_notfound
@@ -286,7 +391,7 @@ PyObject *pm_find_neighbors(PyObject *self, PyObject *args) {
             return_none();
         }
 
-        // Sort results by query, then distance, then target
+        // Sort results by query, then distance, then the target coordinates, then target
         sort(results.begin(), results.end());
 
         // Build output DataFrame

@@ -9,7 +9,7 @@ from pathlib import Path as _Path
 
 import pandas as _pd
 
-from ._shared import _checkroot
+from ._shared import _checkroot, _seq_bytes, _seq_upper
 from .db import _temporary_db_root
 from .sequence import gseq_extract
 
@@ -28,7 +28,8 @@ def _read_fasta_chroms(fasta_path: str) -> dict[str, str]:
     current: str | None = None
     chunks: list[str] = []
 
-    with open(fasta_path) as fh:
+    # one character per byte (Latin-1), as gseq_extract returns a byte above 127
+    with open(fasta_path, encoding="latin-1") as fh:
         for line in fh:
             line = line.rstrip("\n")
             if line.startswith(">"):
@@ -37,7 +38,7 @@ def _read_fasta_chroms(fasta_path: str) -> dict[str, str]:
                 current = line[1:].split()[0]
                 chunks = []
             else:
-                chunks.append(line.upper())
+                chunks.append(_seq_upper(line))
 
     if current is not None:
         chroms[current] = "".join(chunks)
@@ -147,7 +148,7 @@ def ggenome_implant(
         _logger.info("Extracting donor sequences from %s", donor_root)
         with _temporary_db_root(donor_root):
             donor_seqs: list[str] = [
-                s.upper() for s in gseq_extract(intervals[["chrom", "start", "end"]])
+                _seq_upper(s) for s in gseq_extract(intervals[["chrom", "start", "end"]])
             ]
     elif isinstance(donor, list):
         if len(donor) != len(intervals):
@@ -155,7 +156,8 @@ def ggenome_implant(
                 f"donor list length ({len(donor)}) must match "
                 f"intervals length ({len(intervals)})"
             )
-        donor_seqs = [s.upper() for s in donor]
+        # one character per byte, as the C++ side reads them (Latin-1)
+        donor_seqs = [_seq_upper(_seq_bytes(s)) for s in donor]
     else:
         raise TypeError(
             "donor must be a list of sequence strings or a misha root path"
@@ -341,7 +343,7 @@ def ggenome_transplant(
                 raise ValueError(
                     f"Chromosome '{chrom}' not found in source FASTA"
                 )
-            donor_seqs.append(ref[chrom][start:end].upper())
+            donor_seqs.append(_seq_upper(ref[chrom][start:end]))
         donor: list[str] | str = donor_seqs
     else:
         # Source is a misha root — ggenome_implant will extract via gseq_extract

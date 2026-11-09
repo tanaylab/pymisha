@@ -19,6 +19,9 @@
 #include "GenomeTrack.h"
 #include "GenomeTrackFixedBin.h"
 #include "GenomeTrackSparse.h"
+#include "GenomeTrackArray.h"
+#include "GenomeTrackInMemory.h"
+#include "PMTrackExpressionVars.h"
 #include "GenomeSeqFetch.h"
 #include "PWMScorer.h"
 #include "PottsScorer.h"
@@ -41,11 +44,6 @@ extern void verify_interval_coords(const GenomeChromKey &chromkey, int chromid,
 extern std::string py_chrom_name(PyObject *val, Py_ssize_t i);
 
 namespace {
-
-struct IntervalValue {
-    GInterval interval;
-    double value;
-};
 
 bool str_to_bool(PyObject *obj, bool default_val) {
     if (!obj) return default_val;
@@ -329,9 +327,10 @@ void convert_py_intervals_basic(PyObject *py_intervals, std::vector<GInterval> &
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
 
+        // a missing (None) or non-integer coordinate, as R says of NA (1-based)
         if (PyErr_Occurred()) {
             PyErr_Clear();
-            TGLError("Invalid start/end values at index %ld", (long)i);
+            TGLError("Invalid format of interval at index %ld", (long)i + 1);
         }
 
         if (start < 0 || start >= end ||
@@ -431,9 +430,10 @@ void convert_py_intervals_with_values(PyObject *py_intervals,
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
 
+        // a missing (None) or non-integer coordinate, as R says of NA (1-based)
         if (PyErr_Occurred()) {
             PyErr_Clear();
-            TGLError("Invalid start/end values at index %ld", (long)i);
+            TGLError("Invalid format of interval at index %ld", (long)i + 1);
         }
 
         if (start < 0 || start >= end ||
@@ -526,6 +526,287 @@ bool parse_pssm(PyObject *obj, DnaPSSM &pssm, double prior) {
 } // namespace
 
 
+// ---- value-based vtracks (a DataFrame source), as R misha's TrackExpressionVars::Value_var ----
+
+// The track of a value-based vtrack, as R misha builds it (add_vtrack_var_src_value): the
+// intervals sorted by chromosome and start, each value held as a float, and the functions func
+// reads registered.
+static void value_var_track(GenomeTrackInMemory &track, const std::vector<GInterval> &intervals,
+                            const std::vector<double> &values, const std::string &func)
+{
+    std::vector<std::pair<GInterval, float>> paired;
+    paired.reserve(intervals.size());
+    for (size_t i = 0; i < intervals.size(); ++i)
+        paired.emplace_back(intervals[i], (float)values[i]);
+    std::sort(paired.begin(), paired.end(), [](const std::pair<GInterval, float> &a, const std::pair<GInterval, float> &b) {
+        return a.first < b.first;
+    });
+    GIntervals sorted_intervals;
+    std::vector<float> sorted_values;
+    sorted_intervals.reserve(paired.size());
+    sorted_values.reserve(paired.size());
+    for (const auto &p : paired) {
+        sorted_intervals.push_back(p.first);
+        sorted_values.push_back(p.second);
+    }
+    track.init_from_data(sorted_intervals, sorted_values, sorted_intervals.empty() ? 0 : sorted_intervals.front().chromid);
+
+    if (func == "avg" || func == "mean") {
+        track.register_function(GenomeTrack1D::AVG);
+        track.register_function(GenomeTrack1D::SIZE);
+    } else if (func == "min")
+        track.register_function(GenomeTrack1D::MIN);
+    else if (func == "max")
+        track.register_function(GenomeTrack1D::MAX);
+    else if (func == "sum")
+        track.register_function(GenomeTrack1D::SUM);
+    else if (func == "lse")
+        track.register_function(GenomeTrack1D::LSE);
+    else if (func == "stddev" || func == "std") {
+        track.register_function(GenomeTrack1D::STDDEV);
+        track.register_function(GenomeTrack1D::SIZE);
+    } else if (func == "quantile")
+        track.register_quantile(10000, 1000, 1000);
+    else if (func == "nearest") {
+        track.register_function(GenomeTrack1D::NEAREST);
+        // with a filter the parts' means are merged through their value counts
+        track.register_function(GenomeTrack1D::SIZE);
+    } else if (func == "exists")
+        track.register_function(GenomeTrack1D::EXISTS);
+    else if (func == "size")
+        track.register_function(GenomeTrack1D::SIZE);
+    else if (func == "first")
+        track.register_function(GenomeTrack1D::FIRST);
+    else if (func == "last")
+        track.register_function(GenomeTrack1D::LAST);
+    else if (func == "sample") {
+        track.register_function(GenomeTrack1D::SAMPLE);
+        // with a filter one part's draw is kept with chance proportional to the part's value count
+        track.register_function(GenomeTrack1D::SIZE);
+    } else if (func == "first.pos.abs" || func == "first.pos.relative")
+        track.register_function(GenomeTrack1D::FIRST_POS);
+    else if (func == "last.pos.abs" || func == "last.pos.relative")
+        track.register_function(GenomeTrack1D::LAST_POS);
+    else if (func == "sample.pos.abs" || func == "sample.pos.relative") {
+        track.register_function(GenomeTrack1D::SAMPLE_POS);
+        track.register_function(GenomeTrack1D::SIZE);
+    } else if (func == "min.pos.abs" || func == "min.pos.relative")
+        track.register_function(GenomeTrack1D::MIN_POS);
+    else if (func == "max.pos.abs" || func == "max.pos.relative")
+        track.register_function(GenomeTrack1D::MAX_POS);
+    else if (func == "weighted.sum")
+        track.register_function(GenomeTrack1D::WEIGHTED_SUM);
+    else
+        TGLError("Unsupported value-based virtual track function %s", func.c_str());
+}
+
+// The value of a value-based vtrack over interval eval (R misha's ValueVarProcessor, no filter)
+static double value_var_unfiltered(GenomeTrackInMemory &track, const std::string &func, const GInterval &eval,
+                                   double percentile)
+{
+    track.read_interval(eval);
+    if (func == "avg" || func == "mean") return track.last_avg();
+    if (func == "min") return track.last_min();
+    if (func == "max") return track.last_max();
+    if (func == "sum") return track.last_sum();
+    if (func == "weighted.sum") return track.last_weighted_sum();
+    if (func == "lse") return track.last_lse();
+    if (func == "stddev" || func == "std") return track.last_stddev();
+    if (func == "quantile") return track.last_quantile(percentile);
+    if (func == "nearest") return track.last_nearest();
+    if (func == "exists") return track.last_exists();
+    if (func == "size") return track.last_size();
+    if (func == "first") return track.last_first();
+    if (func == "last") return track.last_last();
+    if (func == "sample") return track.last_sample();
+    if (func == "first.pos.abs") return track.last_first_pos();
+    if (func == "first.pos.relative") return track.last_first_pos() - eval.start;
+    if (func == "last.pos.abs") return track.last_last_pos();
+    if (func == "last.pos.relative") return track.last_last_pos() - eval.start;
+    if (func == "sample.pos.abs") return track.last_sample_pos();
+    if (func == "sample.pos.relative") return track.last_sample_pos() - eval.start;
+    if (func == "min.pos.abs") return track.last_min_pos();
+    if (func == "min.pos.relative") return track.last_min_pos() - eval.start;
+    if (func == "max.pos.abs") return track.last_max_pos();
+    if (func == "max.pos.relative") return track.last_max_pos() - eval.start;
+    TGLError("Unsupported value-based virtual track function %s", func.c_str());
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+// A value (pos = false) or its position (pos = true) drawn uniformly from the values of the
+// parts, each value once (R misha's TrackVarProcessor::aggregate_sample_with_filter); the track
+// computes SIZE
+static double value_var_sample(GenomeTrack1D &track, const std::vector<GInterval> &parts, bool pos)
+{
+    std::vector<double> draws, counts;
+    double total = 0;
+    for (const auto &part : track.parts_reading_items_once(parts)) {
+        track.read_interval(part);
+        const double part_n = track.last_size();
+        const double draw = pos ? track.last_sample_pos() : (double)track.last_sample();
+        if (!(part_n > 0) || std::isnan(draw))
+            continue;
+        draws.push_back(draw);
+        counts.push_back(part_n);
+        total += part_n;
+    }
+    if (draws.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+    double u = pm::pm_rnd_func() * total;
+    for (size_t i = 0; i < draws.size(); ++i) {
+        if (u < counts[i])
+            return draws[i];
+        u -= counts[i];
+    }
+    return draws.back();
+}
+
+// The value of a value-based vtrack over the unmasked parts of an interval whose start after the
+// shifts is base_start (R misha's ValueVarProcessor with a filter). "nearest" without a value in
+// the parts is NaN here: the caller looks for the nearest unmasked value outside them.
+static double value_var_filtered(GenomeTrackInMemory &track, const std::string &func, std::vector<GInterval> parts,
+                                 int64_t base_start, double percentile)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    if (func == "weighted.sum") {
+        // the parts do not overlap, so each unmasked bp of an interval counts once
+        double total = 0;
+        bool has_value = false;
+        for (const auto &part : parts) {
+            track.read_interval(part);
+            const double part_wsum = track.last_weighted_sum();
+            if (!std::isnan(part_wsum)) {
+                total += part_wsum;
+                has_value = true;
+            }
+        }
+        return has_value ? total : nan;
+    }
+
+    // The counting reductions read each value once even when the filter splits its interval;
+    // the other functions (min, max, positions, ...) read the parts as they are
+    if (func == "sum" || func == "size" || func == "lse" || func == "avg" || func == "mean" ||
+        func == "stddev" || func == "std" || func == "quantile" || func == "nearest")
+        parts = track.parts_reading_items_once(parts);
+
+    if (parts.empty())
+        return nan;
+
+    double total_sum = 0, sd_mean = 0, sd_m2 = 0;
+    int64_t total_size = 0;
+    double min_val = nan, max_val = nan, first_val = nan, last_val = nan;
+    double min_pos = nan, max_pos = nan, first_pos = nan, last_pos = nan;
+    double lse_val = -std::numeric_limits<double>::infinity();
+    bool exists = false, has_value = false;
+
+    for (const auto &part : parts) {
+        track.read_interval(part);
+        const double part_avg = track.last_avg();
+        const double part_sum = track.last_sum();
+        if (std::isnan(part_avg) || std::isnan(part_sum))
+            continue;
+
+        const double part_size = track.last_size();
+        const double part_stddev = track.last_stddev();
+        if (part_size > 0) {
+            // running mean and sum of squared deviations (Chan et al. merge)
+            const double prev_n = total_size;
+            const double part_m2 = part_size > 1 && !std::isnan(part_stddev) ? part_stddev * part_stddev * (part_size - 1) : 0;
+            const double delta = part_avg - sd_mean;
+            const double n = prev_n + part_size;
+            sd_mean += delta * part_size / n;
+            sd_m2 += part_m2 + delta * delta * prev_n * part_size / n;
+        }
+
+        total_sum += part_sum;
+        total_size += static_cast<int64_t>(part_size);
+
+        const double part_lse = track.last_lse();
+        if (!std::isnan(part_lse))
+            lse_accumulate(lse_val, part_lse);
+
+        const double part_min = track.last_min();
+        const double part_max = track.last_max();
+        if (!std::isnan(part_min) && (std::isnan(min_val) || part_min < min_val)) {
+            min_val = part_min;
+            min_pos = track.last_min_pos();
+        }
+        if (!std::isnan(part_max) && (std::isnan(max_val) || part_max > max_val)) {
+            max_val = part_max;
+            max_pos = track.last_max_pos();
+        }
+
+        const double part_first = track.last_first();
+        const double part_last = track.last_last();
+        const double part_first_pos = track.last_first_pos();
+        const double part_last_pos = track.last_last_pos();
+        if (!std::isnan(part_first) && std::isnan(first_val))
+            first_val = part_first;
+        if (!std::isnan(part_last))
+            last_val = part_last;
+        if (!std::isnan(part_first_pos) && std::isnan(first_pos))
+            first_pos = part_first_pos;
+        if (!std::isnan(part_last_pos))
+            last_pos = part_last_pos;
+
+        const double part_exists = track.last_exists();
+        exists = exists || (!std::isnan(part_exists) && part_exists != 0);
+        has_value = true;
+    }
+
+    // No unmasked value: size and exists count none, the other functions have nothing to report
+    if (!has_value)
+        return func == "size" || func == "exists" ? 0 : nan;
+
+    if (func == "quantile") {
+        // as R misha's TrackVarProcessor::aggregate_quantile_with_filter
+        StreamPercentiler<float> combined_sp;
+        combined_sp.init(g_pymisha->max_data_size(), 100000, 100000);
+        for (const auto &part : parts) {
+            track.read_interval(part);
+            const auto &sp = track.get_percentiler();
+            for (const auto *vals : {&sp.lowest_vals(), &sp.samples(), &sp.highest_vals()}) {
+                for (float val : *vals) {
+                    if (!std::isnan(val))
+                        combined_sp.add(val, pm::pm_rnd_func);
+                }
+            }
+        }
+        if (combined_sp.stream_size() > 0) {
+            bool is_estimated;
+            return combined_sp.get_percentile(percentile, is_estimated);
+        }
+        return nan;
+    }
+
+    auto rel = [&](double pos) { return std::isnan(pos) ? nan : pos - base_start; };
+    if (func == "avg" || func == "mean" || func == "nearest")
+        return total_size > 0 ? total_sum / total_size : nan;
+    if (func == "stddev" || func == "std")
+        return total_size > 1 ? std::sqrt(sd_m2 / (total_size - 1)) : nan;
+    if (func == "sum") return total_sum;
+    if (func == "lse") return std::isfinite(lse_val) ? lse_val : nan;
+    if (func == "min") return min_val;
+    if (func == "max") return max_val;
+    if (func == "exists") return exists ? 1.0 : 0.0;
+    if (func == "size") return (double)total_size;
+    if (func == "first") return first_val;
+    if (func == "last") return last_val;
+    if (func == "sample") return value_var_sample(track, parts, false);
+    if (func == "sample.pos.abs") return value_var_sample(track, parts, true);
+    if (func == "sample.pos.relative") return value_var_sample(track, parts, true) - base_start;
+    if (func == "first.pos.abs") return first_pos;
+    if (func == "first.pos.relative") return rel(first_pos);
+    if (func == "last.pos.abs") return last_pos;
+    if (func == "last.pos.relative") return rel(last_pos);
+    if (func == "min.pos.abs") return min_pos;
+    if (func == "min.pos.relative") return rel(min_pos);
+    if (func == "max.pos.abs") return max_pos;
+    if (func == "max.pos.relative") return rel(max_pos);
+    return nan;
+}
+
 PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 {
     try {
@@ -617,6 +898,12 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     double smax_d = obj_to_double(dict_get(py_spec, "score_max"), 0.0, &found_smax);
                     if (found_smin) score_min_f = (float)smin_d;
                     if (found_smax) score_max_f = (float)smax_d;
+                    // As PMTrackExpressionVars::build_vtrack_scorer(): the filtered
+                    // edit-distance path scores its parts here.
+                    const std::string dir_str = obj_to_string(dict_get(py_spec, "direction"), "above");
+                    if (dir_str != "above" && dir_str != "below")
+                        TGLError("direction parameter must be \"above\" or \"below\"");
+                    const bool below = dir_str == "below";
 
                     GenomeSeqFetch shared_seq;
                     shared_seq.set_seqdir(g_pmdb->groot() + "/seq");
@@ -631,7 +918,9 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                         PWMEditDistanceScorer scorer(pssm, &shared_seq, (float)score_thresh,
                                                      max_edits, extend, strand, mode,
-                                                     score_min_f, max_indels, score_max_f);
+                                                     score_min_f, max_indels, score_max_f,
+                                                     below ? PWMEditDistanceScorer::Direction::BELOW
+                                                           : PWMEditDistanceScorer::Direction::ABOVE);
 
                         score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                     } else {
@@ -640,7 +929,9 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
                         PWMLseEditDistanceScorer scorer(pssm, &shared_seq, (float)score_thresh,
                                                         max_edits, extend, strand, mode,
-                                                        score_min_f, score_max_f);
+                                                        score_min_f, score_max_f,
+                                                        below ? PWMLseEditDistanceScorer::Direction::BELOW
+                                                              : PWMLseEditDistanceScorer::Direction::ABOVE);
 
                         score_intervals(scorer, shared_seq, intervals, subs, sshift, eshift, chromkey, out);
                     }
@@ -969,7 +1260,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 
         // Track-based or value-based vtracks
         if (py_src && py_src != Py_None && !PyUnicode_Check(py_src)) {
-            // Value-based: intervals + values
+            // Value-based: intervals + values, read as R misha reads them (value_var_track)
             std::vector<GInterval> src_intervals;
             std::vector<double> src_values;
             bool has_values = false;
@@ -980,100 +1271,46 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 TGLError("Value-based virtual tracks require a numeric value column");
             }
 
-            std::vector<IntervalValue> entries;
-            entries.reserve(src_intervals.size());
-            for (size_t i = 0; i < src_intervals.size(); ++i) {
-                entries.push_back({src_intervals[i], src_values[i]});
-            }
-            std::sort(entries.begin(), entries.end(), [](const IntervalValue &a, const IntervalValue &b) {
-                if (a.interval.chromid != b.interval.chromid) return a.interval.chromid < b.interval.chromid;
-                if (a.interval.start != b.interval.start) return a.interval.start < b.interval.start;
-                return a.interval.end < b.interval.end;
-            });
-
             PyObject *params_obj = dict_get(py_spec, "params");
             if (params_obj && PyList_Check(params_obj) && PyList_Size(params_obj) > 0) {
                 params_obj = PyList_GetItem(params_obj, 0);
             }
-            double percentile = obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
+            const double percentile = obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
 
-            std::vector<double> vals;
+            GenomeTrackInMemory track;
+            value_var_track(track, src_intervals, src_values, func);
+
+            // With a filter the caller passes the unmasked parts of each interval, consecutive and
+            // in order, with the interval each belongs to (part_owner) and its start after the
+            // shifts (part_base); the result of an interval goes to its first part.
+            PyObject *py_owner = dict_get(py_spec, "part_owner");
+            if (py_owner && py_owner != Py_None) {
+                PMPY owner(PyArray_FROM_OTF(py_owner, NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+                PMPY base(PyArray_FROM_OTF(dict_get(py_spec, "part_base"), NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+                if (!owner || !base || PyArray_SIZE((PyArrayObject *)*owner) != (npy_intp)intervals.size() ||
+                    PyArray_SIZE((PyArrayObject *)*base) != (npy_intp)intervals.size())
+                    TGLError("pm_vtrack_compute: part_owner and part_base must hold one entry per part");
+                const int64_t *o = (const int64_t *)PyArray_DATA((PyArrayObject *)*owner);
+                const int64_t *b = (const int64_t *)PyArray_DATA((PyArrayObject *)*base);
+                std::vector<GInterval> parts;
+                for (size_t i = 0; i < intervals.size(); ) {
+                    size_t j = i;
+                    parts.clear();
+                    for (; j < intervals.size() && o[j] == o[i]; ++j)
+                        parts.push_back(intervals[j]);
+                    out[i] = value_var_filtered(track, func, parts, b[i], percentile);
+                    i = j;
+                }
+                return_py(py_vals);
+            }
+
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
                     set_nan(i);
                     continue;
                 }
-                vals.clear();
-                auto it = std::lower_bound(entries.begin(), entries.end(), eval, [](const IntervalValue &a, const GInterval &b) {
-                    if (a.interval.chromid != b.chromid) return a.interval.chromid < b.chromid;
-                    if (a.interval.start != b.start) return a.interval.start < b.start;
-                    return a.interval.end < b.end;
-                });
-                if (it != entries.begin() && (it - 1)->interval.chromid == eval.chromid) --it;
-                for (; it != entries.end() && it->interval.chromid == eval.chromid && it->interval.start < eval.end; ++it) {
-                    if (it->interval.end > eval.start) {
-                        if (!std::isnan(it->value)) vals.push_back(it->value);
-                    }
-                }
-                if (vals.empty()) {
-                    // nothing to count: exists and size are 0, as R (not NaN)
-                    if (func == "exists" || func == "size")
-                        out[i] = 0;
-                    else
-                        set_nan(i);
-                    continue;
-                }
-
-                if (func == "avg" || func == "mean") {
-                    double sum = 0.0;
-                    for (double v : vals) sum += v;
-                    out[i] = sum / vals.size();
-                } else if (func == "sum") {
-                    double sum = 0.0;
-                    for (double v : vals) sum += v;
-                    out[i] = sum;
-                } else if (func == "min") {
-                    out[i] = *std::min_element(vals.begin(), vals.end());
-                } else if (func == "max") {
-                    out[i] = *std::max_element(vals.begin(), vals.end());
-                } else if (func == "stddev" || func == "std") {
-                    if (vals.size() < 2) {
-                        out[i] = std::numeric_limits<double>::quiet_NaN();
-                    } else {
-                        double mean = 0.0;
-                        for (double v : vals) mean += v;
-                        mean /= vals.size();
-                        double ss = 0.0;
-                        for (double v : vals) ss += (v - mean) * (v - mean);
-                        out[i] = std::sqrt(ss / (vals.size() - 1));
-                    }
-                } else if (func == "quantile") {
-                    out[i] = compute_quantile(vals, percentile);
-                } else if (func == "exists") {
-                    out[i] = vals.empty() ? 0.0 : 1.0;
-                } else if (func == "size") {
-                    out[i] = (double)vals.size();
-                } else if (func == "first") {
-                    out[i] = vals.front();
-                } else if (func == "last") {
-                    out[i] = vals.back();
-                } else if (func == "sample") {
-                    size_t idx = (size_t)(pm::pm_rnd_func() * vals.size());
-                    if (idx >= vals.size()) idx = vals.size() - 1;
-                    out[i] = vals[idx];
-                } else if (func == "lse") {
-                    double m = *std::max_element(vals.begin(), vals.end());
-                    if ((std::isinf(m) && m < 0)) {
-                        out[i] = m;
-                    } else {
-                        double sum_exp = 0.0;
-                        for (double v : vals) sum_exp += std::exp(v - m);
-                        out[i] = m + std::log(sum_exp);
-                    }
-                } else {
-                    TGLError("Unsupported value-based virtual track function %s", func.c_str());
-                }
+                out[i] = value_var_unfiltered(track, func, eval, percentile);
             }
 
             return_py(py_vals);
@@ -1093,6 +1330,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         std::unique_ptr<GenomeTrack> track;
         GenomeTrackFixedBin *fixed_bin = nullptr;
         GenomeTrackSparse *sparse = nullptr;
+        GenomeTrackArray *array = nullptr;
 
         if (track_type == GenomeTrack::FIXED_BIN) {
             track = std::make_unique<GenomeTrackFixedBin>();
@@ -1100,6 +1338,12 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         } else if (track_type == GenomeTrack::SPARSE) {
             track = std::make_unique<GenomeTrackSparse>();
             sparse = static_cast<GenomeTrackSparse *>(track.get());
+        } else if (track_type == GenomeTrack::ARRAYS) {
+            // the value of an item is its columns reduced by the vtrack's slice (gvtrack.array.slice),
+            // by default their average
+            track = std::make_unique<GenomeTrackArray>();
+            array = static_cast<GenomeTrackArray *>(track.get());
+            PMTrackExpressionVars::configure_array_slice(*array, py_spec);
         } else {
             TGLError("Track type '%s' not supported for virtual track %s",
                      GenomeTrack::TYPE_NAMES[track_type], track_name.c_str());
@@ -1122,6 +1366,9 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
         if (func == "last.pos.abs" || func == "last.pos.relative") track1d->register_function(GenomeTrack1D::LAST_POS);
         if (func == "max.pos.abs" || func == "max.pos.relative") track1d->register_function(GenomeTrack1D::MAX_POS);
         if (func == "min.pos.abs" || func == "min.pos.relative") track1d->register_function(GenomeTrack1D::MIN_POS);
+        if (func == "weighted.sum") track1d->register_function(GenomeTrack1D::WEIGHTED_SUM);
+        // A sparse or array track computes lse in calc_vals, in float as R misha
+        if ((array || sparse) && func == "lse") track1d->register_function(GenomeTrack1D::LSE);
 
         // Register the primary reducer on dense tracks so read_interval can take
         // the incremental sliding-window fast path (classify_fast_path_mode).
@@ -1138,121 +1385,6 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             sparse &&
             (func == "avg" || func == "mean" || func == "sum" ||
              func == "min" || func == "max" || func == "size" || func == "exists");
-
-        // LSE for sparse tracks: collect per-interval values and reduce directly.
-        // Dense LSE falls through to the generic read_interval loop below, where
-        // the registered LSE reducer takes the incremental sliding-window path.
-        if (func == "lse" && sparse) {
-            int cur_chromid = -1;
-            bool cur_chromid_valid = false;
-            // Hybrid scan state for sparse LSE
-            size_t lse_sp_scan_idx = 0;
-            int64_t lse_sp_last_start = std::numeric_limits<int64_t>::min();
-            bool lse_sp_scan_ready = false;
-            const std::vector<GInterval> *lse_sp_intervals_ptr = nullptr;
-            const std::vector<float> *lse_sp_vals_ptr = nullptr;
-            std::vector<double> vals;
-            std::vector<float> bin_vals;
-
-            for (size_t i = 0; i < intervals.size(); ++i) {
-                GInterval eval;
-                if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                    set_nan(i);
-                    continue;
-                }
-
-                if (cur_chromid != eval.chromid) {
-                    std::string chrom_file = g_pmdb->chrom_files(track_path).filename(eval.chromid);
-                    std::string full_path = track_path + "/" + chrom_file;
-                    // Indexed tracks have no per-chrom file; init_read reads
-                    // through track.idx. Gating on the per-chrom file made
-                    // value-based vtracks over indexed sources return all-NaN.
-                    const bool indexed =
-                        access((track_path + "/track.idx").c_str(), F_OK) == 0;
-                    if (!indexed && access(full_path.c_str(), F_OK) != 0) {
-                        cur_chromid = eval.chromid;
-                        cur_chromid_valid = false;
-                    } else {
-                        if (fixed_bin) {
-                            fixed_bin->init_read(full_path.c_str(), eval.chromid);
-                        } else if (sparse) {
-                            sparse->init_read(full_path.c_str(), eval.chromid);
-                            lse_sp_intervals_ptr = &sparse->get_intervals();
-                            lse_sp_vals_ptr = &sparse->get_vals();
-                            lse_sp_scan_idx = 0;
-                            lse_sp_last_start = std::numeric_limits<int64_t>::min();
-                            lse_sp_scan_ready = false;
-                        }
-                        cur_chromid = eval.chromid;
-                        cur_chromid_valid = true;
-                    }
-                }
-
-                if (!cur_chromid_valid) {
-                    set_nan(i);
-                    continue;
-                }
-
-                // Collect non-NaN values from the interval
-                vals.clear();
-                if (fixed_bin) {
-                    unsigned bin_size = fixed_bin->get_bin_size();
-                    int64_t sbin = (int64_t)(eval.start / bin_size);
-                    int64_t ebin = (int64_t)std::ceil(eval.end / (double)bin_size);
-                    bin_vals.clear();
-                    int64_t bins_read = fixed_bin->read_bins_bulk(sbin, ebin - sbin, bin_vals);
-                    vals.reserve(bins_read);
-                    for (int64_t j = 0; j < bins_read; ++j) {
-                        if (!std::isnan(bin_vals[j])) vals.push_back((double)bin_vals[j]);
-                    }
-                } else if (sparse && lse_sp_intervals_ptr) {
-                    const std::vector<GInterval> &sp_intervals = *lse_sp_intervals_ptr;
-                    const std::vector<float> &sp_vals = *lse_sp_vals_ptr;
-
-                    // Hybrid sequential/binary scan
-                    if (!lse_sp_scan_ready || eval.start < lse_sp_last_start) {
-                        size_t lo = 0, hi = sp_intervals.size();
-                        while (lo < hi) {
-                            size_t mid = lo + (hi - lo) / 2;
-                            if (sp_intervals[mid].end <= eval.start)
-                                lo = mid + 1;
-                            else
-                                hi = mid;
-                        }
-                        lse_sp_scan_idx = lo;
-                        lse_sp_scan_ready = true;
-                    } else {
-                        while (lse_sp_scan_idx < sp_intervals.size() &&
-                               sp_intervals[lse_sp_scan_idx].end <= eval.start) {
-                            ++lse_sp_scan_idx;
-                        }
-                    }
-                    lse_sp_last_start = eval.start;
-
-                    for (size_t j = lse_sp_scan_idx; j < sp_intervals.size(); ++j) {
-                        if (sp_intervals[j].start >= eval.end) break;
-                        if (sp_intervals[j].end > eval.start && !std::isnan(sp_vals[j])) {
-                            vals.push_back((double)sp_vals[j]);
-                        }
-                    }
-                }
-
-                if (vals.empty()) {
-                    set_nan(i);
-                } else {
-                    double m = *std::max_element(vals.begin(), vals.end());
-                    if ((std::isinf(m) && m < 0)) {
-                        out[i] = m;
-                    } else {
-                        double sum_exp = 0.0;
-                        for (double v : vals) sum_exp += std::exp(v - m);
-                        out[i] = m + std::log(sum_exp);
-                    }
-                }
-            }
-
-            return_py(py_vals);
-        }
 
         int cur_chromid = -1;
         bool cur_chromid_valid = false;
@@ -1283,6 +1415,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 } else {
                     if (fixed_bin) {
                         fixed_bin->init_read(full_path.c_str(), eval.chromid);
+                    } else if (array) {
+                        array->init_read(full_path.c_str(), eval.chromid);
                     } else if (sparse) {
                         sparse->init_read(full_path.c_str(), eval.chromid);
                         if (sparse_fast_reduce) {
@@ -1381,6 +1515,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                 out[i] = track1d->last_avg();
             } else if (func == "sum") {
                 out[i] = track1d->last_sum();
+            } else if (func == "weighted.sum") {
+                out[i] = track1d->last_weighted_sum();
             } else if (func == "lse") {
                 out[i] = track1d->last_lse();
             } else if (func == "min") {

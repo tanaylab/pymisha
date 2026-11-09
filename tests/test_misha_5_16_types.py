@@ -247,14 +247,14 @@ def test_max_data_size_inf_is_no_limit_below_1_counts_as_1_nan_or_negative_is_an
         assert len(pm.gextract("dense_track", SCOPE)) == 400
     for limit in (399, 399.9, np.int64(399)):
         config["max_data_size"] = limit
-        with pytest.raises(_pymisha.error, match=r"maximal allowed \(399\)"):
+        with pytest.raises(_pymisha.error, match=r"maximum allowed \(399 rows"):
             pm.gextract("dense_track", SCOPE)
     for small in (0, 0.5):
         config["max_data_size"] = small
         with pytest.warns(RuntimeWarning, match="approximate"):
             # a sampling buffer of one value, not a crash
             assert len(pm.gquantiles("dense_track", [0.1, 0.5], SCOPE)) == 2
-        with pytest.raises(_pymisha.error, match=r"maximal allowed \(1\)"):
+        with pytest.raises(_pymisha.error, match=r"maximum allowed \(1 rows"):
             pm.gextract("dense_track", SCOPE)
     for bad, msg in ((float("nan"), "must be a number, not NA"), (pd.NA, "must be a number, not NA"),
                      (-1, r"must not be negative \(got -1\)"), (float("-inf"), r"must not be negative \(got -inf\)"),

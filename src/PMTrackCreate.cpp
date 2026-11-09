@@ -17,6 +17,8 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <system_error>
+#include <new>
 #include <thread>
 #include <vector>
 #include <climits>
@@ -192,10 +194,17 @@ static void create_empty_sparse_files_parallel(const string &track_dir,
             }
         };
 
+        // As many threads as start (misha 5.17.0): a thread that cannot start (e.g. under a limit
+        // of processes) leaves its files to the others and to this thread, as the workers take
+        // the next path until none is left. An exception here with joinable threads alive would
+        // call std::terminate.
         vector<std::thread> threads;
-        threads.reserve(nworkers - 1);
-        for (unsigned t = 0; t < nworkers - 1; ++t)
-            threads.emplace_back(worker);
+        try {
+            threads.reserve(nworkers - 1);
+            for (unsigned t = 0; t < nworkers - 1; ++t)
+                threads.emplace_back(worker);
+        } catch (...) {
+        }
         worker();  // current thread does its share
         for (auto &th : threads) th.join();
     }
@@ -243,17 +252,38 @@ static void parse_track_data(PyObject *py_df, vector<TrackRec> &out)
         out.push_back(rec);
     }
 
-    sort(out.begin(), out.end(), [](const TrackRec &a, const TrackRec &b) {
+    auto less_rec = [](const TrackRec &a, const TrackRec &b) {
         if (a.chromid != b.chromid) return a.chromid < b.chromid;
         if (a.start != b.start) return a.start < b.start;
         return a.end < b.end;
-    });
+    };
+    // Records from gextract or giterator_intervals come sorted and distinct: no sort then, as
+    // misha. Equal intervals still go through the sort, whose order of them is the order their
+    // values are summed in.
+    if (adjacent_find(out.begin(), out.end(),
+                      [&less_rec](const TrackRec &a, const TrackRec &b) { return !less_rec(a, b); }) != out.end())
+        sort(out.begin(), out.end(), less_rec);
 }
 
 static long parse_iterator_policy_local(PyObject *py_iterator, long default_policy, const char *context)
 {
     if (!py_iterator || py_iterator == Py_None) {
         return default_policy;
+    }
+
+    // A string here names no track and no intervals set (the Python side resolves those), as R
+    // says of it (TrackExpressionScanner, interv2path)
+    if (PyUnicode_Check(py_iterator)) {
+        const char *name = PyUnicode_AsUTF8(py_iterator);
+        if (!name) {
+            PyErr_Clear();
+            verror("%s: iterator must be an integer or float", context);
+        }
+        for (const char *c = name; *c; ++c) {
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '.'))
+                verror("Invalid interval name %s. Only alphanumeric characters and _ are allowed in the name.", name);
+        }
+        verror("Invalid iterator: %s is neither a name of a track nor a name of an intervals set", name);
     }
 
     if (PyLong_Check(py_iterator)) {
@@ -562,9 +592,8 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
         unsigned binsize = 0;
         double defval = std::numeric_limits<double>::quiet_NaN();
         const char *func_str = nullptr;
-        // gtrack.import's arithmetic: misha's import multiplies a record's float value by its
-        // overlap in float before adding it to the double sum; gtrack.create_dense multiplies
-        // in double. Only the weighted mean has an import counterpart.
+        // Accepted for the callers of gtrack.import's arithmetic, which is now gtrack.create_dense's:
+        // misha >= 5.17.0's import multiplies a record's value by its overlap in double too
         int float_products = 0;
 
         if (!PyArg_ParseTuple(args, "sOIds|p", &track, &py_data, &binsize, &defval, &func_str, &float_products))
@@ -685,8 +714,7 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
                         uint64_t ov_end = std::min(end, (uint64_t)recs[j].end);
                         if (ov_end > ov_start && !std::isnan((double)recs[j].value)) {
                             uint64_t ov = ov_end - ov_start;
-                            sum += float_products ? (double)(recs[j].value * (float)ov)
-                                                  : (double)recs[j].value * (double)ov;
+                            sum += (double)recs[j].value * (double)ov;
                             weight += ov;
                             add_covered(ov_start, ov_end);
                         }

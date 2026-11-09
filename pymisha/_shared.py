@@ -9,6 +9,7 @@ Use PyMisha APIs from a single controlling thread or add external locking.
 
 from __future__ import annotations
 
+import bisect as _bisect
 import contextlib as _contextlib
 import datetime as _datetime
 import os as _os
@@ -144,6 +145,135 @@ def _config_multitasking(config: dict | None = None) -> bool:
     if isinstance(value, (int, _numpy.integer)) and value in (0, 1):
         return bool(value)
     raise ValueError(f"CONFIG['multitasking'] must be True or False, not {value!r}")
+
+
+def _seed_kid_rng(kid_idx: int) -> None:
+    """In a forked worker: reseed numpy's global generator from a draw of the state inherited from
+    the parent mixed with the worker's index, as the C++ layer seeds its kids. The workers draw
+    different numbers (numpy's and the C++ layer's, which seeds from numpy's), and a seed set in
+    the parent still reproduces them."""
+    seed = int(_numpy.random.randint(0, 2**32, dtype=_numpy.uint64))
+    _numpy.random.seed((seed ^ (0x9E3779B9 * (kid_idx + 1))) & 0xFFFFFFFF)
+
+
+# The depth of _one_random_stream blocks
+_RNG_STREAM_DEPTH = 0
+
+
+@contextmanager
+def _one_random_stream() -> Any:
+    """The C++ calls made inside draw one random stream, as one call does: the first draw seeds it
+    from numpy's generator and the later calls continue it (a gextract(file=) that runs a call per
+    part of its scope draws what the call over the whole scope draws). Kids and worker processes
+    forked meanwhile still draw streams of their own."""
+    global _RNG_STREAM_DEPTH
+    if _RNG_STREAM_DEPTH == 0:
+        _pymisha.pm_rng_stream(True)
+    _RNG_STREAM_DEPTH += 1
+    try:
+        yield
+    finally:
+        _RNG_STREAM_DEPTH -= 1
+        if _RNG_STREAM_DEPTH == 0:
+            _pymisha.pm_rng_stream(False)
+
+
+def _forked_worker_main(conn: Any, fn: Any, args: Any, kid_idx: int) -> None:
+    """Body of a worker of _run_forked: sends ("ok", fn(args)) or ("error", exception)."""
+    global _RNG_STREAM_DEPTH
+    try:
+        if _RNG_STREAM_DEPTH:
+            # the worker's calls seed from its own numpy state (below), not the parent's stream
+            _RNG_STREAM_DEPTH = 0
+            _pymisha.pm_rng_stream(False)
+        _seed_kid_rng(kid_idx)
+        res: tuple[str, Any] = ("ok", fn(args))
+    except BaseException as exc:  # noqa: BLE001 - every error goes to the parent, which raises it
+        res = ("error", exc)
+    try:
+        conn.send(res)
+    except Exception as exc:  # e.g. an exception that cannot be pickled
+        conn.send(("error", RuntimeError(f"{type(res[1]).__name__}: {res[1]}" if res[0] == "error" else str(exc))))
+    finally:
+        conn.close()
+
+
+def _run_forked(fn: Any, worker_args: list[Any]) -> tuple[list[Any], list[Any]]:
+    """Runs fn(args) for each of *worker_args* in a forked process of its own. Returns the results,
+    in order, and the processes that ended without returning one (killed, e.g. by the
+    out-of-memory killer, or crashed), whose results are None. An exception of a worker is raised
+    here once every worker has ended. (multiprocessing.Pool waits forever for the task of a
+    worker that dies.) The random draws of worker i follow numpy's generator reseeded for i
+    (_seed_kid_rng)."""
+    import multiprocessing
+    from multiprocessing.connection import wait
+    from typing import cast
+
+    ctx = multiprocessing.get_context("fork")
+    procs: list[Any] = []
+    pending: dict[Any, int] = {}
+    results: list[Any] = [None] * len(worker_args)
+    got = [False] * len(worker_args)
+    try:
+        for i, args in enumerate(worker_args):
+            recv, send = ctx.Pipe(duplex=False)
+            proc = ctx.Process(target=_forked_worker_main, args=(send, fn, args, i), daemon=True)
+            proc.start()
+            send.close()  # the worker holds the only write end: its death ends the pipe
+            procs.append(proc)
+            pending[recv] = i
+        if _RNG_STREAM_DEPTH:
+            # within one random stream, the workers of the next call draw other numbers
+            _numpy.random.randint(0, 2**32, dtype=_numpy.uint64)
+        while pending:
+            for ready in wait(list(pending)):
+                conn = cast(Any, ready)  # one of the pipes waited on
+                i = pending.pop(conn)
+                try:
+                    results[i] = conn.recv()
+                    got[i] = True
+                except EOFError:
+                    pass
+                conn.close()
+        for proc in procs:
+            proc.join()
+    finally:
+        for conn in pending:
+            conn.close()
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+    dead = [proc for proc, ok in zip(procs, got, strict=True) if not ok]
+    out = []
+    for res, ok in zip(results, got, strict=True):
+        if ok and res[0] == "error" and not dead:
+            raise res[1]
+        out.append(res[1] if ok else None)
+    return out, dead
+
+
+def _map_forked(fn: Any, items: list[Any], n_workers: int) -> list[Any]:
+    """fn(item) for each of *items*, in order, in at most *n_workers* forked processes (round
+    robin; see _run_forked). A worker that ends without returning its results is an error."""
+    n_workers = max(1, min(n_workers, len(items)))
+    groups = [items[i::n_workers] for i in range(n_workers)]
+    results, dead = _run_forked(lambda group: [fn(item) for item in group], groups)
+    if dead:
+        raise RuntimeError(_dead_worker_message(dead))
+    out: list[Any] = [None] * len(items)
+    for i, res in enumerate(results):
+        out[i::n_workers] = res
+    return out
+
+
+def _dead_worker_message(dead: list[Any]) -> str:
+    """The error for workers of _run_forked that ended without a result, as the C++ layer reports
+    a kid that ended."""
+    proc = dead[0]
+    if proc.exitcode is not None and proc.exitcode < 0:
+        return f"Child process {proc.pid} ended unexpectedly (signal {-proc.exitcode})"
+    return f"Child process {proc.pid} ended unexpectedly"
 
 
 # Global state
@@ -317,6 +447,37 @@ def _track_names_set() -> frozenset[str]:
     return _TRACK_NAMES_SET
 
 
+def _update_track_names_cache(names: list[str], listed: list[bool]) -> None:
+    """Put the cached track names in line with pm_tracks_refresh's answer for *names*: the list
+    stays in the C++ order (code point order, which is UTF-8 byte order), the set is rebuilt
+    from it when next asked for."""
+    global _TRACK_NAMES_SET
+    _TRACK_NAMES_SET = None
+    if _TRACK_NAMES_LIST is None:
+        return
+    for name, is_listed in zip(names, listed, strict=True):
+        i = _bisect.bisect_left(_TRACK_NAMES_LIST, name)
+        present = i < len(_TRACK_NAMES_LIST) and _TRACK_NAMES_LIST[i] == name
+        if is_listed and not present:
+            _TRACK_NAMES_LIST.insert(i, name)
+        elif not is_listed and present:
+            del _TRACK_NAMES_LIST[i]
+
+
+def _clear_track_content_caches() -> None:
+    """Drop what was read from tracks' data: a track rewritten under the same name (or a
+    gtrack_rm + gtrack_create round trip) otherwise keeps serving values derived from the
+    old data (global.percentile ranks, the 2D reader's mmap of a deleted track.dat), and the
+    computed-track types."""
+    from ._quadtree import clear_indexed_2d_cache
+    from .tracks import _clear_computed_track_cache
+    from .vtracks import _GLOBAL_PERCENTILE_CACHE, _PV_TABLE_CACHE
+    _clear_computed_track_cache()
+    _GLOBAL_PERCENTILE_CACHE.clear()
+    _PV_TABLE_CACHE.clear()
+    clear_indexed_2d_cache()
+
+
 def _touch_db_cache_dirty(groot: str | None = None) -> None:
     """Write R misha's ``.db.cache.dirty`` sentinel for *groot*.
 
@@ -459,8 +620,14 @@ def _track_stamp(track_path: str) -> tuple[Any, ...]:
     return tuple(_file_stamp(_os.path.join(track_path, f)) for f in ("", "track.idx", "track.dat"))
 
 
-def _pm_dbreload(groot: str | None = None) -> None:
+def _pm_dbreload(groot: str | None = None, tracks: Any = None) -> None:
     """Reload the C++ track scan + clear all Python-side caches.
+
+    *tracks*: the names a track creation, removal or move touched. Only they are listed or
+    dropped again (pm_tracks_refresh), as R misha's .gdb.add_track / .gdb.rm_track do, instead
+    of rescanning every track directory of every loaded database: 0.18 s per call in a
+    50,000-track database. Tracks other sessions create show up at the next gdb_reload(), as
+    in R.
 
     Every internal track-mutation site (gtrack_rm, gtrack_create_*,
     gintervals_save, gdir / gdataset changes...) used to call
@@ -476,10 +643,15 @@ def _pm_dbreload(groot: str | None = None) -> None:
     database. Defaults to the current ``_GROOT`` (matching the previous,
     implicit behavior) when the caller doesn't know any better.
     """
-    _pymisha.pm_dbreload()
-    _clear_track_names_cache()
-    from .tracks import _clear_computed_track_cache
-    _clear_computed_track_cache()
+    if tracks is not None:
+        names = [str(t) for t in tracks]
+        _update_track_names_cache(names, _pymisha.pm_tracks_refresh(names))
+        _clear_track_content_caches()
+    else:
+        _pymisha.pm_dbreload()
+        _clear_track_names_cache()
+        from .tracks import _clear_computed_track_cache
+        _clear_computed_track_cache()
     # Also tell a sibling R session sharing this database that its
     # .db.cache is stale (R never sees pymisha's mutations otherwise).
     _touch_db_cache_dirty(groot)
@@ -1399,11 +1571,41 @@ def _same_path(a: Any, b: Any) -> bool:
     return a is not None and b is not None and _os.path.realpath(str(a)) == _os.path.realpath(str(b))
 
 
-def _check_flag(value: Any, name: str) -> Any:
-    """A TRUE/FALSE argument: a NaN or pd.NA is R's NA, an error as in R. Returned
-    unchanged otherwise (None included)."""
-    if value is _pandas.NA or (isinstance(value, (float, _numpy.floating)) and _numpy.isnan(value)):
-        raise ValueError(f"{name} argument is not logical")
+def _seq_bytes(seq: str) -> str:
+    """A sequence as R's C code reads a string: one character per byte. A str whose
+    characters are all at most U+00FF is that already (Latin-1, as gseq_extract returns a
+    .seq byte above 127); one holding a character above U+00FF is read as its UTF-8
+    bytes, one character each, as R reads a UTF-8 string."""
+    if seq.isascii():
+        return seq
+    try:
+        seq.encode("latin-1")
+    except UnicodeEncodeError:
+        return seq.encode("utf-8").decode("latin-1")
+    return seq
+
+
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _seq_upper(seq: str) -> str:
+    """Upper case for a sequence: a to z only, so one character stays one byte (str.upper()
+    maps U+00DF to "SS" and U+00FF beyond Latin-1), as the C++ toupper() of each byte."""
+    return seq.upper() if seq.isascii() else seq.translate(_ASCII_UPPER)
+
+
+def _is_na(x: Any) -> bool:
+    """R's NA: pd.NA or a float NaN."""
+    return x is _pandas.NA or (isinstance(x, (float, _numpy.floating)) and bool(_numpy.isnan(x)))
+
+
+def _check_flag(value: Any, name: str, message: str | None = None) -> Any:
+    """A TRUE/FALSE argument: a NaN or pd.NA is R's NA, an error as in R, and so is more
+    than one value (a list, tuple, array or Series). The error is *message*, or "<name>
+    argument is not logical". Returned unchanged otherwise (None included)."""
+    if (value is _pandas.NA or (isinstance(value, (float, _numpy.floating)) and _numpy.isnan(value))
+            or isinstance(value, (list, tuple, _numpy.ndarray, _pandas.Series))):
+        raise ValueError(message or f"{name} argument is not logical")
     return value
 
 
@@ -1592,6 +1794,70 @@ def _coerce_score_thresh(value: Any) -> float:
             "one; NaN is not."
         )
     return out
+
+
+def _coerce_pssm_matrix(pssm: Any) -> Any:
+    """The PSSM checks of R misha's ``.coerce_pssm_matrix`` (``R/pssm_utils.R``).
+
+    The scorers read per-position weights, normalize them to probabilities and
+    take their log, so a count matrix is fine (stored as float) and a log-odds
+    or log-probability matrix is not: its negative entries were read as weights
+    and scored NaN or -inf with no message. NA/NaN/Inf, negative entries and
+    rows summing to 0 are errors; an entry below 0 by no more than 1e-9 of its
+    row's largest entry (floating-point noise) is set to 0.
+
+    Returns the matrix as float in the same layout: a DataFrame keeps only its
+    A, C, G, T columns, in that order; an array keeps its orientation ((w, 4),
+    or (4, w) as the C++ parser also reads it). Input whose shape or type is
+    wrong is returned unchanged for the caller's own checks to report.
+    """
+    if isinstance(pssm, _pandas.DataFrame):
+        cols = {str(c).upper(): c for c in pssm.columns}
+        if not all(b in cols for b in _POTTS_BASES):
+            return pssm
+        sub = pssm[[cols[b] for b in _POTTS_BASES]]
+        try:
+            vals = sub.to_numpy(dtype=float)
+        except (TypeError, ValueError):
+            return pssm
+        return _pandas.DataFrame(_check_pssm_values(vals), index=sub.index, columns=sub.columns)
+
+    try:
+        arr = _numpy.asarray(pssm)
+    except Exception:
+        return pssm
+    if arr.ndim != 2 or not (_numpy.issubdtype(arr.dtype, _numpy.integer)
+                             or _numpy.issubdtype(arr.dtype, _numpy.floating)):
+        return pssm
+    if arr.shape[1] == 4:
+        return _check_pssm_values(arr.astype(float))
+    if arr.shape[0] == 4:
+        return _check_pssm_values(arr.astype(float).T).T
+    return pssm
+
+
+def _check_pssm_values(vals: _numpy.ndarray) -> _numpy.ndarray:
+    """R's probabilities checks on a (w, 4) float matrix (a copy); see
+    ``_coerce_pssm_matrix``."""
+    if not _numpy.isfinite(vals).all():
+        raise ValueError("pssm must not contain NA, NaN or infinite values")
+    if (vals < 0).any():
+        noise_tol = 1e-9 * _numpy.maximum(vals.max(axis=1), 0)
+        vals = vals.copy()
+        vals[(vals < 0) & (vals >= -noise_tol[:, None])] = 0.0
+    if (vals < 0).any():
+        raise ValueError(
+            "pssm has negative values: it must hold probabilities or counts for each base "
+            "(non-negative, one row per motif position), not log-odds or log-probabilities"
+        )
+    zero = [str(i + 1) for i in _numpy.flatnonzero(vals.sum(axis=1) == 0)]
+    if zero:
+        many = len(zero) > 1
+        raise ValueError(
+            f"pssm row{'s' if many else ''} {', '.join(zero)} sum{'' if many else 's'} to 0: "
+            "every motif position needs a positive probability or count for at least one base"
+        )
+    return vals
 
 
 _POTTS_BASES = ("A", "C", "G", "T")
@@ -1825,7 +2091,8 @@ def _potts_params(
         raise ValueError(f"{what}: bidirect must be True or False")
     if not isinstance(extend, (bool, _numpy.bool_)):
         raise ValueError(f"{what}: extend must be True or False")
-    if isinstance(strand, bool) or not isinstance(strand, (int, float, _numpy.number)):
+    if (isinstance(strand, bool) or not isinstance(strand, (int, float, _numpy.number))
+            or strand not in (1, -1)):
         raise ValueError(f"{what}: strand must be 1 or -1")
     strand = int(strand)
     if strand not in (1, -1):

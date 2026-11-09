@@ -134,9 +134,10 @@ def test_value_based_stddev_at_a_large_offset(tracks):
     starts = np.arange(100) * 10
     vals = 1e9 + 64 * (np.arange(1, 101) % 7)
     big = pd.DataFrame(dict(chrom="chr1", start=starts, end=starts + 5, score=vals))
-    # the exact sample sd; R 5.15.1 gives 128.1330 from float per-part means
-    np.testing.assert_allclose(vt(big, "stddev", gi("chr1", 0, 1000), filter=gi("chr1", 502, 504)),
-                               [np.std(vals, ddof=1)], rtol=1e-9)
+    # as R misha 5.17.0, which holds the values as floats and merges the parts' float means
+    # (the exact sample sd is 128.1470)
+    assert vt(big, "stddev", gi("chr1", 0, 1000), filter=gi("chr1", 502, 504)) == [128.13302787438099]
+    assert vt(big, "stddev", gi("chr1", 0, 1000)) == [128.14698791503906]
 
 
 def test_value_first_pos_relative_under_a_filter(tracks):  # R test-vtrack-values.R:383-405
@@ -207,8 +208,9 @@ def test_value_based_on_several_chromosomes(tracks):  # R :48-62
     assert r["v_ex"].tolist() == [1, 0, 1]
 
 
+# The values R misha 5.17.0 gives (5.16.1 gave -6 and -16 for lse.pos).
 @pytest.mark.parametrize("func,unfiltered,filtered", [  # R :118-141
-    ("pwm.edit_distance.pos", 1, 11), ("pwm.edit_distance.lse.pos", -6, -16),
+    ("pwm.edit_distance.pos", 1, 11), ("pwm.edit_distance.lse.pos", 12, 22),
 ])
 def test_edit_distance_positions_under_a_filter(tracks, func, unfiltered, filtered):
     part, whole = gi("chr1", 110, 140), gi("chr1", 100, 140)

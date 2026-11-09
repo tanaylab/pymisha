@@ -155,9 +155,12 @@ PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args)
                 continue;
             }
             Py_ssize_t len = 0;
-            const char *raw = PyUnicode_AsUTF8AndSize(py_seq, &len);
+            const char *raw = py_seq_bytes(py_seq, &len);
+            if (!raw)
+                return nullptr;
             std::string seq(raw, len);
-            std::transform(seq.begin(), seq.end(), seq.begin(), ::toupper);
+            std::transform(seq.begin(), seq.end(), seq.begin(),
+                           [](char c) { return (char)toupper((unsigned char)c); });
             const int L = (int)seq.size();
 
             const int rs = std::max<int64_t>(1, roi_start[i]);

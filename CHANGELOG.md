@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.19.0 (2026-11-09)
+
+Follows R misha 5.17.0. Several results change; recompute anything that depends on them.
+
+### Breaking
+
+* `gextract(file="*.parquet")` writes value columns as double; it wrote float32, which rounded values and positions past 2^24.
+* `gextract` refuses `file=` together with `intervals_set_out`, as R; it wrote both.
+* `gintervals_neighbors` breaks distance ties by the neighbor's coordinates (start, end; in 2D start1, end1, start2, end2), then by its row, whatever the input order; it kept whichever neighbor the search met first.
+* `gintervals_annotate` of 2D intervals returns both distances, `dist1` and `dist2`, and `max_dist` limits `dist1 + dist2`; it returned only `dist1`, named `dist`.
+* `gintervals_2d` sorts by chromosome pair only and keeps the given order within a pair, as R; it sorted by chrom1, start1, chrom2, start2.
+* `gintervals_mapply` refuses an `intervals_set_out` that already exists, as R ("Intervals set X already exists"), before calling the function; it replaced the set.
+* Random draws (`gsample`, "sample" and "quantile" virtual tracks, sampled quantiles, `gcor`, `gsynth_*` and `gintervals_random` without a seed) follow numpy's global generator, so `numpy.random.seed()` reproduces them as R's `set.seed()` does; the processes of a multitasked call draw different numbers. They were seeded from the clock, every process drew the same numbers, and `gintervals_random` on large genomes always used 60427.
+* PSSMs are checked as R checks them (`gvtrack_create` pwm functions, `gseq_pwm`, `gseq_pwm_edits`): NaN/Inf, negative values (log-odds) or a row summing to 0 are errors; counts are accepted, and negatives within 1e-9 of the row maximum read as 0. They were scored as NaN or -inf.
+* Flags take what R takes:
+  * pwm virtual tracks take `bidirect` and `extend` as True or False (the edit-distance functions also take a non-negative whole number for `extend`), `strand` as 1 or -1 and `prior` in [0, 1];
+  * kmer virtual tracks take `extend` as True or False and `strand` as -1, 0 or 1;
+  * `gseq_potts` takes `extend` as True or False;
+  * `gseq_pwm` refuses an NA or string `bidirect`, an NA `skip_gaps`, `extend=None` and a `prior` above 1;
+  * `gseq_pwm_edits` requires `bidirect` True or False, `strand` 1 or -1 and `prior` in [0, 1], and refuses an NA `extend`.
+* NaN, pd.NA or a list as a True/False argument is an error (`unify_touching_intervals`, `canonic`, `include_metadata`, `interval_relative`, `remove_dups`, `paired`, `allow_duplicates`, and the pwm and kmer flags above); it was read as True.
+* `gvtrack_array_slice` keeps the virtual track's function, shifts and filter, as R, and stores the slice in `gvtrack_info(v)["slice"]`; it replaced them with an average of the slice.
+* `gdb_create(db_format="per-chromosome")` names the contig of a single-record FASTA file after the file and writes chrom_sizes.txt in file order, as R; it used the header and sorted the names.
+* `gsynth_sample`, `gsynth_random` and `gsynth_replace_kmer` return a chromosome's intervals sorted by start, as R; they followed the input order. `gsynth_replace_kmer` refuses a replacement identical to the target (ignoring case).
+* `gseq_kmer_dist` and `gsynth_train` count a position covered by overlapping intervals once.
+* A track another session creates shows up after `gdb_reload()`, as in R; creating a track in this session used to list it too.
+
+### Features
+
+* `gseq_extract(pad=True)` returns "N" for the part of an interval past either chromosome end, so each sequence is end - start long; the reverse strand is the reverse complement of the padded sequence.
+* Virtual track function `weighted.sum` on dense, sparse, array and value-based tracks: each value times its bp inside the window (after the shifts, clipped to the chromosome); NaN when the window holds no value; with a filter, unmasked bp only.
+* Track attributes travel through Parquet: `gextract(file="*.parquet")` writes the attributes of a column that is exactly a track name as Arrow field metadata, and `gtrack_import_parquet` and `gtrack_import` restore them (not created.by/date/user, type, binsize, or description unless the given one is empty). Suggested names for model predictions: `value.scale`, `model`, `checkpoint`, `heldout.chroms`.
+* Multitasking calls warn once per session when the session holds so much memory in 4 KB pages that forking its processes will be slow.
+
+### Fixes
+
+* PWM edit distance (`pwm.edit_distance`, `.pos`, `pwm.max.edit_distance`, `pwm.n_mutations`, `pwm.edit_distance.lse(.pos)`) gives R misha 5.17.0's values:
+  * an inserted base scores the column maximum or minimum;
+  * 3+ indels are searched exactly;
+  * `score_min`/`score_max` apply with indels;
+  * below + bidirect is decided by the harder strand, and `pwm.n_mutations` counts substitutions that bring both strands below;
+  * the LSE search for 3+ edits gets past local optima;
+  * positions past 2^24 are exact;
+  * with indels, short windows at a chromosome end are scanned.
+  A filtered edit-distance vtrack with `direction="below"` scores below; it scored as "above".
+* `gseq_pwm_edits` uses the virtual track's search and windows for every `extend`, ignores a strand column, and for below + bidirect reports the harder strand.
+* Filtered virtual tracks:
+  * `first`, `last` and their positions skip unmasked parts without a value; they returned NaN.
+  * `sample` draws each unmasked value with the same chance.
+  * `nearest` is the average of the unmasked values, else the nearest unmasked value.
+  * value-based `size` is 0 and `exists` NaN where nothing is unmasked.
+  * They work on array tracks, which raised "Track type 'array' not supported".
+  * Quantile, stddev, and sparse and array `lse` round as R.
+* Value-based (DataFrame) virtual tracks hold their values as floats and keep rows with a missing value, as R. Their source is checked at `gvtrack_create` with R's errors: a missing, infinite or out-of-range coordinate, a start not below its end, a negative start, an end past the chromosome, an unknown chromosome, overlapping values. A start not below its end was dropped, and the other errors came later or with other wording.
+* Dense tracks of different bin sizes are read with an explicit iterator and give R's error without one; they were always refused. A stored -0 reads as +0 for the track, `avg` and `nearest`.
+* A missing, infinite or out-of-range interval coordinate is "Invalid format of interval at index i" everywhere; it gave a 0-based "missing (NaN)" error, or an OverflowError in 2D.
+* An iterator that names no track and no intervals set gives R's error ("... is neither a name of a track nor a name of an intervals set").
+* The error for a result over `CONFIG['max_data_size']` gives the number of records and how to raise the limit (for `gextract`, first: write to a file). 2D `gintervals_neighbors` checks the limit, and candidates tied with the kept neighbors no longer count against it.
+* `gintervals_rbind` gives each column the type R's rbind() gives it: categoricals with different categories become one categorical, a column of missing values takes the other columns' type, and a number bound to a string is an error.
+* `gdataset_load` of a loaded dataset that is refused leaves it loaded. `gtrack_copy(overwrite=True)` that fails after another session's track took the name moves the replaced track to the trash. The end of a multitasking call no longer waits forever for a child process that other code already reaped.
+* Every import format clips a record past the chromosome end and drops one that starts at or past it, with one warning naming the first such record; such a record was an error (a bigWig step record was clipped silently). `gtrack_array_import` of a file whose every record is past its chromosome end is an error. Dense values are binned in double (a value near the float limit came out NaN), and WIG records near 2^63 are dropped instead of overflowing.
+* `gtrack_import` finds the format of a text file by reading it, as R (WIG/bedGraph whatever its name, otherwise tab-delimited); it went by the extension.
+* `gtrack_export_bedgraph` writes values as R misha writes them (it wrote Python's repr); over intervals with no values it writes the header and warns once. `gtrack_export_bigwig` works when the chromosome order is not alphabetical (1, 2, 10).
+* `gextract(file=)` with no rows writes the header, as R; it wrote no file.
+* A parallel `gextract`, `gsynth_train`, `gsynth_sample` or indexed-format conversion whose worker process dies stops with an error; it waited forever.
+* `gtrack_2d_import_contacts(fends=)` needs memory for the fends only; it needed memory for the largest fend id.
+* `gtrack_create_sparse` works when a writer thread cannot be started.
+* `gquantiles`, `gintervals_quantiles` and `gbins_quantiles` return 0 for a zero quantile; they could return -0.
+* A sequence byte above 127 comes back from `gseq_extract`, `gsynth_*` and `gseq_pwm_edits` as a Latin-1 character (`.encode("latin-1")` gives R's bytes); it failed. `gseq_pwm`, `gseq_kmer`, `gseq_potts`, `gseq_pwm_edits` and `ggenome_implant`/`ggenome_transplant` read such a character as one base; they read it as two bytes.
+* `gseq_kmer` takes a float `extend` and `strand=True`/`False`, and `gseq_pwm_edits` and `gseq_potts` take `strand=True` as 1, as R.
+* `gseq_read_meme`, `gseq_read_jaspar` and `gseq_read_homer` de-duplicate IDs without collisions (ACGT, ACGT, ACGT.1 becomes ACGT.2, ACGT.3, ACGT.1), and each copy of a repeated ID keeps its own matrix; all copies got the last one's.
+* gsynth:
+  * `gsynth_train` leaves out every (k+1)-mer that overlaps the mask, and without an iterator stores the bin size its expressions imply.
+  * `gsynth_sample` and `gsynth_score` take the bins of each interval from its own iterator windows; an unstratified model works without an iterator.
+  * `gsynth_random` draws the first bases of each interval, and those after an N, from `nuc_probs`.
+  * `gsynth_load` reads models saved by R misha, R reads models saved by `gsynth_save`, and a model saved without a prior gets a uniform one.
+  * `gsynth_sample` split into parallel chunks writes the FASTA of the one-process writer.
+
+### Performance
+
+* `gextract(file=)` writes the rows as it computes them, a part of the scope (2D: a chromosome pair) at a time, and `CONFIG['max_data_size']` does not limit it; it built the whole result in memory (hg38, 3 tracks at 100 bp: peak memory 5.7 GB -> 1.1 GB). Random draws are the same as in memory under a seed.
+* Dense `sum`, `avg`, `nearest`, `exists` and `size` virtual tracks slide between windows of different sizes (an iterator that is not a multiple of the bin size), up to 10x faster.
+* A dense track read at its own bin size is read in runs of bins (`gsummary`/`gscreen` about 2x faster); `MISHA_DISABLE_DENSE_BULK_READ=1` turns it off.
+* Creating, removing or moving a track updates only that track's name in the track list instead of rescanning the database (0.18 s per call in a database of 50,000 tracks, now a few ms).
+* Multitasking calls split a scope of many intervals evenly between processes; the last process got about twice the share of the others.
+* `gextract_variants` with listed variants and `gtrack_create_dense` of sorted intervals are faster.
+* Potts virtual tracks scan faster (a single-substitution kernel for `potts.max` with `max_edits=1` on one strand, a four-anchor kernel, an encoded stretch for per-base scans).
+
 ## v0.18.1 (2026-11-08)
 
 Follows R misha 5.16.1.

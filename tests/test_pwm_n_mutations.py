@@ -9,6 +9,7 @@ windows of an iterator interval is MAX.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -279,30 +280,87 @@ class TestNMutationsBidirect:
         if not np.isnan(fwd) and not np.isnan(rev):
             assert bidi >= max(fwd, rev) - 1e-6, f"fwd={fwd} rev={rev} bidi={bidi}"
 
-    def test_below_uses_max_across_strands_per_position(self):
+    def test_below_counts_substitutions_that_bring_both_strands_below(self):
+        # R misha 5.17.0: one genomic substitution changes both strands, so a
+        # window counts the substitutions after which BOTH strands score <=
+        # threshold (0 if both already do, NaN if no single substitution does).
+        # It used to take the larger of the two per-strand counts.
         pssm, threshold = _pssm_acg_shifted(), -4.0
         iv = pm.gintervals("1", 200, 260)
+        pm.gvtrack_create("nmut_below_bidi", None, "pwm.n_mutations", pssm=pssm,
+                          score_thresh=threshold, score_min=-np.inf,
+                          direction="below", bidirect=True, extend=True, prior=0)
+        r = pm.gextract("nmut_below_bidi", intervals=iv, iterator=1)
 
-        for name, kw in (("nmut_below_fwd", dict(bidirect=False, strand=1)),
-                         ("nmut_below_rev", dict(bidirect=False, strand=-1)),
-                         ("nmut_below_bidi", dict(bidirect=True))):
-            pm.gvtrack_create(name, None, "pwm.n_mutations", pssm=pssm,
-                              score_thresh=threshold, score_min=-np.inf,
-                              direction="below", extend=True, prior=0, **kw)
+        lp = np.log(pssm)
+        comp = {"A": "T", "C": "G", "G": "C", "T": "A"}
 
-        r = pm.gextract(["nmut_below_fwd", "nmut_below_rev", "nmut_below_bidi"],
-                        intervals=iv, iterator=1)
+        def score(b):
+            return sum(lp[i, _BASES.index(x)] for i, x in enumerate(b))
 
-        both = r["nmut_below_fwd"].notna() & r["nmut_below_rev"].notna()
-        assert both.any(), "no position had both strands non-NaN"
+        def rc(b):
+            return [comp[x] for x in reversed(b)]
 
-        # A genomic substitution affects both strands, so below+bidirect
-        # combines the strands per position with max.
-        sub = r[both]
-        for _, row in sub.iterrows():
-            fwd, rev, bidi = (row["nmut_below_fwd"], row["nmut_below_rev"],
-                              row["nmut_below_bidi"])
-            assert bidi >= max(fwd, rev) - 1e-6, f"fwd={fwd} rev={rev} bidi={bidi}"
+        def expected_count(b):
+            if score(b) <= threshold and score(rc(b)) <= threshold:
+                return 0.0
+            n = 0
+            for j in range(len(b)):
+                for x in _BASES:
+                    if x == b[j]:
+                        continue
+                    m = list(b)
+                    m[j] = x
+                    if score(m) <= threshold and score(rc(m)) <= threshold:
+                        n += 1
+            return np.nan if n == 0 else float(n)
+
+        expected = [expected_count(list(_seq("1", s, s + len(pssm)))) for s in r["start"]]
+        expected = np.array(expected)
+        assert np.any(~np.isnan(expected) & (expected > 0))
+        np.testing.assert_array_equal(r["nmut_below_bidi"].to_numpy(), expected)
+
+    def test_below_strand_that_cannot_be_disrupted_decides(self, tmp_path):
+        # forward ACCAT scores -3.73 against the motif ACGAT, its reverse
+        # complement ATGGT -5.68
+        seq = "NNNNNACCATNNNNN"
+        (tmp_path / "tracks").mkdir()
+        (tmp_path / "seq").mkdir()
+        (tmp_path / "chrom_sizes.txt").write_text(f"chr1\t{len(seq)}\n")
+        (tmp_path / "seq" / "chr1.seq").write_bytes(seq.encode())
+        pm.gdb_init(str(tmp_path))
+
+        pssm = pd.DataFrame([[.7, .1, .1, .1], [.1, .7, .1, .1], [.1, .1, .7, .1],
+                             [.7, .1, .1, .1], [.1, .1, .1, .7]], columns=list(_BASES))
+        iv = pm.gintervals("chr1", 0, len(seq))
+        p = {"pssm": pssm, "score_thresh": -6, "direction": "below", "prior": 0}
+        pm.gvtrack_create("ed_fwd", None, "pwm.edit_distance", params={**p, "bidirect": False, "strand": 1})
+        pm.gvtrack_create("ed_rev", None, "pwm.edit_distance", params={**p, "bidirect": False, "strand": -1})
+        pm.gvtrack_create("ed_bidi", None, "pwm.edit_distance", params={**p, "bidirect": True})
+        pm.gvtrack_create("ed_bidi_cap1", None, "pwm.edit_distance",
+                          params={**p, "bidirect": True, "max_edits": 1})
+        pm.gvtrack_create("nm_bidi", None, "pwm.n_mutations", params={**p, "bidirect": True})
+        r = pm.gextract(["ed_fwd", "ed_rev", "ed_bidi", "ed_bidi_cap1", "nm_bidi"], iv, iterator=iv)
+
+        assert r["ed_fwd"].iloc[0] == 2
+        assert r["ed_rev"].iloc[0] == 1
+        assert r["ed_bidi"].iloc[0] == 2
+        # The forward strand needs 2 > max_edits: the window cannot be disrupted
+        # within the cap (it used to report the reverse strand's 1)
+        assert np.isnan(r["ed_bidi_cap1"].iloc[0])
+        # No single substitution brings both strands to <= -6 (it used to count
+        # the reverse strand's 9 alone)
+        assert np.isnan(r["nm_bidi"].iloc[0])
+
+        # A strand the score filter leaves out does not decide: with score_min
+        # above the reverse strand's score, only the forward strand counts
+        pm.gvtrack_create("ed_bidi_fwdonly", None, "pwm.edit_distance",
+                          params={**p, "bidirect": True, "score_min": -5})
+        pm.gvtrack_create("ed_bidi_fwdonly_cap1", None, "pwm.edit_distance",
+                          params={**p, "bidirect": True, "score_min": -5, "max_edits": 1})
+        r2 = pm.gextract(["ed_bidi_fwdonly", "ed_bidi_fwdonly_cap1"], iv, iterator=iv)
+        assert r2["ed_bidi_fwdonly"].iloc[0] == 2
+        assert np.isnan(r2["ed_bidi_fwdonly_cap1"].iloc[0])
 
 
 # ---------------------------------------------------------------------------

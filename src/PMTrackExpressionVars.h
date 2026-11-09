@@ -109,6 +109,21 @@ public:
     // Set variable values for current batch of intervals
     void set_vars(const GInterval &interval, unsigned idx);
 
+    // Whether the expressions hold only dense tracks named as they are (no virtual track)
+    bool dense_tracks_only() const;
+
+    // Apply an array track's column slice + reduction from the vtrack spec
+    // (gvtrack.array.slice). No-op when the spec carries no slice keys, leaving
+    // the default avg-over-all-columns reduction. (Also used by pm_vtrack_compute.)
+    static void configure_array_slice(GenomeTrackArray &track, PyObject *spec);
+
+    // The values of num_bins consecutive bins of bin_size bp from first_bin on, of the chromosome
+    // of interval, into slots idx on, one read per track (dense_tracks_only; the scanner's dense
+    // bulk read). Returns false, having set no value, if a track of that chromosome holds bins of
+    // another size.
+    bool set_vars_bins(const GInterval &interval, int64_t first_bin, unsigned num_bins, int64_t bin_size,
+                       unsigned idx);
+
     // Get number of track variables
     unsigned get_num_track_vars() const { return m_track_vars.size(); }
 
@@ -133,6 +148,10 @@ public:
 
     // Get the bin size used by tracks (0 if not uniform)
     int64_t get_bin_size() const { return m_bin_size; }
+
+    // Whether the expressions hold dense tracks of different bin sizes (read only through an
+    // explicit iterator)
+    bool has_mixed_bin_sizes() const { return m_mixed_bin_sizes; }
 
     // Get common track type (NUM_TYPES if none or mixed)
     GenomeTrack::Type get_common_track_type() const { return m_common_track_type; }
@@ -174,10 +193,18 @@ private:
     std::unordered_map<std::string, size_t> m_value_vtrack_groups;  // dense (src+sshift+eshift) -> primary vvar index
     std::unordered_map<std::string, std::string> m_varname_to_track;  // var_name -> track_name (for collision detection)
     int64_t m_bin_size;  // Uniform bin size (0 if mixed)
+    bool m_mixed_bin_sizes{false};  // dense tracks of different bin sizes
     GenomeTrack::Type m_common_track_type{GenomeTrack::NUM_TYPES};
     bool m_common_track_type_valid{false};
     bool m_mixed_track_types{false};  // dense + sparse mixed in one expression
     SeqSubstitution m_substitution;
+
+    // Bins read by set_vars_bins
+    std::vector<float> m_bin_vals;
+
+    // Open chromosome chromid of a dense track variable (cur_chromid_valid false if the track has
+    // no file for it)
+    void load_dense_chrom(TrackVar &var, int chromid);
 
     // Convert track name to valid Python variable name
     void name2var(const std::string &name, std::string &var_name) const;
@@ -200,10 +227,6 @@ private:
     // Set up value-based vtrack from physical track source
     void setup_value_based_vtrack(VTrackVar &vvar, PyObject *spec, const std::string &func);
 
-    // Apply an array track's column slice + reduction from the vtrack spec
-    // (gvtrack.array.slice). No-op when the spec carries no slice keys, leaving
-    // the default avg-over-all-columns reduction.
-    void configure_array_slice(GenomeTrackArray &track, PyObject *spec);
 
     // Evaluate a value-based vtrack for a single interval
     double eval_value_based_vtrack(VTrackVar &vvar, const GInterval &interval);

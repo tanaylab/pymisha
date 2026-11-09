@@ -13,7 +13,7 @@ import pandas as _pandas
 
 from . import _shared
 from ._safe_eval import compile_safe_expression
-from ._shared import CONFIG, _checkroot, _coerce_score_thresh, _df2pymisha, _pymisha
+from ._shared import CONFIG, _checkroot, _coerce_score_thresh, _df2pymisha, _pymisha, _seq_upper
 from .expr import _expr_safe_name, _parse_expr_vars
 from .extract import _build_vtracks_dict, _can_vtracks_use_cpp, gextract
 from .intervals import _normalize_chroms, gintervals_all
@@ -241,13 +241,16 @@ def _gextract_variants_impl(
         else:
             if not len(p):
                 continue
-            p["chrom"] = b_chrom[p["bin"].to_numpy()]
             # Only the variants this chunk can reach go into the join.
             v = variants[
-                variants["chrom"].isin(set(p["chrom"]))
+                variants["chrom"].isin(set(b_chrom[_numpy.unique(p["bin"].to_numpy())]))
                 & (variants["pos"] >= p["pos"].min())
                 & (variants["pos"] <= p["pos"].max())
             ]
+            # and only the positions that hold one of them: p has a row for every base each bin
+            # reads. Matching the position alone keeps every row the join keeps.
+            p = p[p["pos"].isin(v["pos"])].copy()
+            p["chrom"] = b_chrom[p["bin"].to_numpy()]
             r = p.merge(v, on=["chrom", "pos"])
             r = r.sort_values(["bin", "pos", "alt"], kind="mergesort")
             r = r[["bin", "pos", "ref", "alt", "ok"]].reset_index(drop=True)
@@ -339,7 +342,7 @@ def _gvariants_bin_positions(
         }))
         lens = _numpy.array([len(s) for s in seqs], dtype=_numpy.int64)
         seq_off[has] = _numpy.cumsum(lens) - lens
-        genome = "".join(seqs).upper().encode()
+        genome = _seq_upper("".join(seqs)).encode("latin-1")
     pb = p["bin"].to_numpy()
     idx = seq_off[pb] + p["pos"].to_numpy() - span_lo[pb]
     p["ref"] = _numpy.frombuffer(genome, dtype="S1")[idx].astype(str) if len(idx) else _numpy.zeros(0, dtype=str)

@@ -93,7 +93,8 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
         !has_function(STDDEV) && !m_use_quantile &&
         !has_function(EXISTS) && !has_function(FIRST) && !has_function(FIRST_POS) &&
         !has_function(LAST) && !has_function(LAST_POS) &&
-        !has_function(SAMPLE) && !has_function(SAMPLE_POS) && !has_function(SIZE);
+        !has_function(SAMPLE) && !has_function(SAMPLE_POS) && !has_function(SIZE) &&
+        !has_function(WEIGHTED_SUM) && !has_function(LSE);
 
     if (basic_only) {
         float num_vs = 0;
@@ -130,6 +131,8 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
     // a tiny nonzero stddev for constant bins).
     double stddev_mean = 0;
     double stddev_m2 = 0;
+    double wsum_accum = 0;
+    double sum_accum = 0;  // in double, rounded to float once, as R misha
 
     std::vector<float> all_values;
     std::vector<double> all_positions;
@@ -138,9 +141,10 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
     if (has_function(SAMPLE_POS))
         all_positions.reserve(m_max_overlaps);
 
-    m_last_sum = 0;
     m_last_min = std::numeric_limits<float>::max();
     m_last_max = -std::numeric_limits<float>::max();
+    if (has_function(LSE))
+        m_last_lse = -std::numeric_limits<float>::infinity();
     if (has_function(MAX_POS))
         m_last_max_pos = std::numeric_limits<double>::quiet_NaN();
     if (has_function(MIN_POS))
@@ -153,7 +157,9 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 
         float v = m_vals[i];
         if (!std::isnan(v)) {
-            m_last_sum += v;
+            sum_accum += v;
+            if (has_function(WEIGHTED_SUM))
+                wsum_accum += (double)v * (std::min(cur.end, interval.end) - std::max(cur.start, interval.start));
             if (v < m_last_min) {
                 m_last_min = v;
                 if (has_function(MIN_POS))
@@ -170,6 +176,10 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
 
             if (m_use_quantile)
                 m_sp.add(v, s_rnd_func);
+
+            // in float, as R misha
+            if (has_function(LSE))
+                lse_accumulate(m_last_lse, v);
 
             if (has_function(EXISTS))
                 m_last_exists = 1;
@@ -227,13 +237,19 @@ inline void GenomeTrackSparse::calc_vals(const GInterval &interval)
         m_last_sample_pos = all_positions[idx];
     }
 
+    m_last_sum = (float)sum_accum;
     if (num_vs > 0)
-        m_last_avg = m_last_nearest = m_last_sum / num_vs;
+        m_last_avg = m_last_nearest = (float)(sum_accum / num_vs);
     else {
         m_last_avg = m_last_nearest = m_last_min = m_last_max = m_last_sum = std::numeric_limits<float>::quiet_NaN();
+        if (has_function(LSE))
+            m_last_lse = std::numeric_limits<float>::quiet_NaN();
         if (has_function(MIN_POS))
             m_last_min_pos = std::numeric_limits<double>::quiet_NaN();
     }
+
+    if (has_function(WEIGHTED_SUM))
+        m_last_weighted_sum = num_vs > 0 ? wsum_accum : std::numeric_limits<double>::quiet_NaN();
 
     if (has_function(STDDEV))
         m_last_stddev = num_vs > 1

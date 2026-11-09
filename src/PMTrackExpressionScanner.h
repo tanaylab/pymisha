@@ -36,8 +36,15 @@ public:
     // -1, which walks the intervals as given.
     void set_row_substitutions(const std::vector<SeqSubstitution> *subs) { m_row_subs = subs; }
 
-    // Advance to next value
-    bool next();
+    // Advance to next value. Inside an evaluated batch a step only moves the index on (inline, as
+    // misha 5.17.0); at its end next_batch() evaluates the next one.
+    bool next() {
+        if (!m_isend && m_eval_buf_idx + 1 < m_eval_buf_size) {
+            ++m_eval_buf_idx;
+            return true;
+        }
+        return next_batch();
+    }
 
     // Check if scanning is complete
     bool isend() const { return m_isend; }
@@ -112,6 +119,9 @@ private:
     std::vector<PMPY> m_py_eval_out_double;   // persistent NPY_DOUBLE arrays
     std::vector<PMPY> m_py_eval_out_bool;     // persistent NPY_BOOL arrays
 
+    // whether eval_next() fills the buffers with fill_bins_bulk() (see can_fill_bins_bulk())
+    bool m_bulk_bins{false};
+
     // Iterator intervals buffer
     std::vector<GInterval> m_expr_itr_intervals;
     std::vector<uint64_t> m_expr_itr_interval_ids;  // 1-based original interval indices
@@ -160,7 +170,12 @@ private:
                int64_t iterator_policy, ValType valtype, PyObject *py_vtracks = nullptr);
     void define_py_vars(unsigned eval_buf_limit);
     void prepopulate_chrom_cache(const std::vector<GInterval> &intervals);
+    bool next_batch();
     bool eval_next();
+    void fill_slot(unsigned idx);
+    void set_coord_arrays(unsigned idx, const GInterval &interval);
+    bool can_fill_bins_bulk() const;
+    void fill_bins_bulk();
     void report_progress_impl();
     void call_progress_callback(int progress, bool final);
 

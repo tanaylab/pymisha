@@ -76,6 +76,13 @@ public:
     void register_interv(const std::string &name) const;
     void unregister_interv(const std::string &name) const;
 
+    // Lists one track name as rebuild_track_cache() would, without rescanning the others (R misha's
+    // .gdb.add_track / .gdb.rm_track): with the root of highest precedence (the user root, the
+    // working database, then the datasets from the last loaded) whose tracks/ holds its directory,
+    // or, in a subdirectory (gdir_cd), if the directory is under it; dropped if none holds it.
+    // Returns whether the name is listed. Tracks other sessions create show at the next reload().
+    bool refresh_track(const std::string &name) const;
+
     // Dataset management
     void set_datasets(const std::vector<std::string> &datasets);
 

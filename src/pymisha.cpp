@@ -3,6 +3,10 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdarg.h>
@@ -14,6 +18,7 @@
 #include <sys/wait.h>
 
 #include "pymisha.h"
+#include "pmutils.h"
 
 #include <numpy/arrayobject.h>
 #include <numpy/npy_math.h>
@@ -75,6 +80,11 @@ PyMisha::PyMisha(bool check_db)
         try {
 
         ++g_transact_id;
+
+        // the first random draw of this call seeds from numpy's generator (pm::rng_load), unless
+        // the call continues the stream of the calls before it (pm::g_rng_stream)
+        if (!pm::g_rng_stream)
+            pm::g_rng_loaded = false;
 
         s_sigint_fired = 0;
         s_sigalrm_fired = 0;
@@ -138,6 +148,8 @@ PyMisha::~PyMisha()
     if (!s_ref_count) {
         // if this is a child, do not detach from shared memory and do not deallocate the semaphore
         if (!s_is_kid) {
+            forget_reaped_kids();
+
             if (s_shm_sem != SEM_FAILED) {
                 SemLocker sl(s_shm_sem);
                 SigBlocker sb;
@@ -149,15 +161,27 @@ PyMisha::~PyMisha()
                 }
             }
 
-            // after SIGTERM is sent to all the kids let's wait till sigchld_hander() burries them all
+            // After SIGTERM is sent to all the kids, wait till they are reaped. A kid that another
+            // waitpid() reaped is no longer ours and is dropped (waitpid(-1) never returns it, so
+            // the wait would not end). A kid still alive after 10 s gets SIGKILL; after 30 s the
+            // rest are given up on (as R misha 5.17).
             struct timespec timeout;
-            while (1) {
+            for (int waited_ms = 0;; waited_ms += 10) {
                 check_kids_state(true);
+                forget_reaped_kids();
                 if (s_running_pids.empty())
                     break;
 
                 vdebug("Waiting for %ld child processes to end\n", s_running_pids.size());
-                
+                if (waited_ms == 10000) {
+                    for (vector<pid_t>::const_iterator ipid = s_running_pids.begin(); ipid != s_running_pids.end(); ++ipid)
+                        kill(*ipid, SIGKILL);
+                }
+                if (waited_ms >= 30000) {
+                    s_running_pids.clear();
+                    break;
+                }
+
                 timeout.tv_sec = 0;
                 timeout.tv_nsec = 10000000; // 10ms
                 nanosleep(&timeout, NULL);
@@ -211,8 +235,130 @@ string PyMisha::get_fifo_name()
     return buf;
 }
 
-void PyMisha::prepare4multitasking()
+// A fork copies the page tables of the parent's anonymous memory, one entry per page: the
+// cost grows with the memory the session holds in 4 KB pages, and is paid once per kid.
+// Memory in 2 MB transparent huge pages costs 512 times fewer entries. Measured by R misha on
+// CentOS 7 (Linux 3.10, no huge pages for the R heap) with 32 kids: about 0.035 s per GB per
+// kid; on AlmaLinux 8, the same 20 GB in huge pages forked in no time.
+//
+// The warning comes when the forks of this call would take about 4.5 s or more: GB in 4 KB
+// pages times kids of 128 or more (4 GB with 32 kids, 8 GB with 16, 32 GB with 4), once per
+// session, as in R misha (rdb::warn_if_forks_are_slow).
+//
+// The check is cheap on every call: the anonymous resident size comes from /proc/self/statm.
+// Only when that alone is large enough does it read how much of it is in huge pages
+// (/proc/self/smaps_rollup, or /proc/self/smaps before Linux 4.14, which walk the page tables
+// of the session). That is read again only when the anonymous memory has grown or shrunk by a
+// quarter since; in between the bytes in 4 KB pages found then (capped by the anonymous size)
+// are multiplied by each call's number of kids.
+//
+// MISHA_TEST_FORK_4K_BYTES, an environment variable for the tests, stands in for the memory:
+// "A" for A bytes of anonymous memory in 4 KB pages, "A,H" for A bytes of which H are in huge
+// pages.
+static const double FORK_COST_GB_KIDS = 128;
+static bool s_fork_cost_warned = false;
+static uint64_t s_fork_cost_checked_anon = 0;
+static uint64_t s_fork_cost_small_pages = 0;
+
+// Anonymous resident size of the process in bytes: resident minus file-backed and shared
+// memory, from /proc/self/statm. 0 on failure (or where there is no /proc).
+static uint64_t get_anon_resident_mem_usage()
 {
+    FILE *fp = fopen("/proc/self/statm", "r");
+    if (!fp)
+        return 0;
+
+    unsigned long size = 0, resident = 0, shared = 0;
+    int n = fscanf(fp, "%lu %lu %lu", &size, &resident, &shared);
+    fclose(fp);
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (n != 3 || page_size <= 0 || resident < shared)
+        return 0;
+    return (uint64_t)(resident - shared) * (uint64_t)page_size;
+}
+
+// Bytes of the process's anonymous memory in transparent huge pages: AnonHugePages of
+// /proc/self/smaps_rollup, or the sum over /proc/self/smaps where there is no smaps_rollup.
+// Both walk the page tables, so it is called rarely. 0 on failure.
+static uint64_t get_anon_huge_pages()
+{
+    char line[256];
+    uint64_t kb = 0;
+
+    FILE *fp = fopen("/proc/self/smaps_rollup", "r");
+    if (!fp) {
+        fp = fopen("/proc/self/smaps", "r");
+        if (!fp)
+            return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strncmp(line, "AnonHugePages:", 14))
+            kb += strtoull(line + 14, NULL, 10);
+    }
+    fclose(fp);
+    return kb * 1024;
+}
+
+static void warn_if_forks_are_slow(unsigned num_kids)
+{
+    if (s_fork_cost_warned || PyMisha::is_kid() || num_kids < 2)
+        return;
+
+    const double GB = 1e9;
+    const char *test_memory = getenv("MISHA_TEST_FORK_4K_BYTES");
+    uint64_t test_anon = 0, test_huge = 0;
+
+    if (test_memory) {
+        char *end = NULL;
+        test_anon = strtoull(test_memory, &end, 10);
+        if (end && *end == ',')
+            test_huge = strtoull(end + 1, NULL, 10);
+    }
+
+    uint64_t anon = test_memory ? test_anon : get_anon_resident_mem_usage();
+
+    if (anon / GB * num_kids < FORK_COST_GB_KIDS)
+        return;
+
+    if (!s_fork_cost_checked_anon || anon >= s_fork_cost_checked_anon + s_fork_cost_checked_anon / 4 ||
+        anon <= s_fork_cost_checked_anon - s_fork_cost_checked_anon / 4)
+    {
+        uint64_t huge = test_memory ? test_huge : get_anon_huge_pages();
+
+        s_fork_cost_small_pages = anon > huge ? anon - huge : 0;
+        s_fork_cost_checked_anon = anon;
+    }
+
+    uint64_t small_pages = std::min(s_fork_cost_small_pages, anon);
+
+    if (small_pages / GB * num_kids < FORK_COST_GB_KIDS)
+        return;
+
+    char msg[1000];
+    snprintf(msg, sizeof(msg),
+             "This Python session holds %.1f GB of memory in 4 KB pages (not in transparent huge pages). "
+             "Each of the %u processes pymisha starts for this call is a fork of the session, and every fork "
+             "copies the page tables of that memory: this can add seconds, up to tens of seconds, to every "
+             "multitasking call, however small. Lower CONFIG['max_processes'], free large objects (del, then "
+             "gc.collect()), or run on a host whose kernel keeps the session's memory in transparent huge pages "
+             "(such as RHEL 8 and its clones). This warning is shown once per session.",
+             small_pages / GB, num_kids);
+
+    // Python shows a warning when it is raised, so it counts as shown from here
+    s_fork_cost_warned = true;
+    if (PyErr_WarnEx(PyExc_RuntimeWarning, msg, 1) < 0) {
+        // warnings turned into errors
+        PyErr_Clear();
+        verror("%s", msg);
+    }
+}
+
+void PyMisha::prepare4multitasking(unsigned num_kids)
+{
+    warn_if_forks_are_slow(num_kids);
+
     vdebug("Cleaning old semaphores\n");
     if (s_shm_sem == SEM_FAILED) {
         sem_unlink(get_shm_sem_name().c_str());
@@ -258,6 +404,29 @@ void PyMisha::prepare4multitasking()
     }
 }
 
+bool pm::g_rng_loaded = false;
+int  pm::g_rng_kid_idx = -1;
+bool pm::g_rng_stream = false;
+
+void pm::rng_load()
+{
+    // A draw from numpy's global generator. The C++ layer holds the GIL throughout a call (it never
+    // releases it), and draws only in the thread that called it.
+    PMPY random(PyImport_ImportModule("numpy.random"), true);
+    PMPY draw(random ? PyObject_CallMethod(random, "randint", "K", (unsigned long long)4294967296ULL) : NULL, true);
+    PMPY as_long(draw ? PyNumber_Long(draw) : NULL, true);
+    unsigned long long seed = as_long ? PyLong_AsUnsignedLongLong(as_long) : 0;
+    if (!as_long || PyErr_Occurred()) {
+        PyErr_Clear();
+        verror("Failed to draw a seed from numpy's random generator");
+    }
+    uint32_t s = (uint32_t)seed;
+    if (g_rng_kid_idx >= 0)
+        s = kid_seed(s, g_rng_kid_idx);
+    srand48((long)s);
+    g_rng_loaded = true;
+}
+
 pid_t PyMisha::launch_process()
 {
     if (s_shm_sem == SEM_FAILED || s_fifo_sem == SEM_FAILED || s_shm == (Shm *)MAP_FAILED || s_fifo_fd == -1)
@@ -275,6 +444,11 @@ pid_t PyMisha::launch_process()
         if (s_shm->error_msg[0])
             verror("%s", s_shm->error_msg);
     }
+
+    // Within one random stream of several calls, the kids of every call must draw numbers of their
+    // own: they seed from the stream's state, which each fork then advances
+    if (pm::g_rng_stream && !pm::g_rng_loaded)
+        pm::rng_load();
 
     vdebug("fork\n");
 
@@ -296,8 +470,12 @@ pid_t PyMisha::launch_process()
         vdebug("%d: child process %d has been launched\n", getpid(), pid);
         s_running_pids.push_back(pid);
         ++s_kid_index;
+        if (pm::g_rng_stream)
+            drand48();
     } else {   // a child process
         s_is_kid = true;
+        // s_kid_index is this kid's index here (the parent increments it after the fork)
+        pm::reseed_kid_rng(s_kid_index);
 
         // Reinitialize Python's internal state after fork.
         // PyOS_AfterFork_Child() resets threading state, internal locks,
@@ -346,6 +524,22 @@ void PyMisha::check_kids_state(bool ignore_errors)
                 break;
             }
         }
+    }
+}
+
+// Drops from s_running_pids the kids that are already gone: one that ended is reaped here, and one
+// that someone else reaped (waitpid gives ECHILD) is no longer ours - its pid may even belong to
+// another process by now, which must not be signaled.
+void PyMisha::forget_reaped_kids()
+{
+    for (size_t i = 0; i < s_running_pids.size();) {
+        int status;
+        pid_t res = waitpid(s_running_pids[i], &status, WNOHANG);
+        if (res == s_running_pids[i] || (res < 0 && errno == ECHILD)) {
+            s_running_pids[i] = s_running_pids.back();
+            s_running_pids.pop_back();
+        } else
+            ++i;
     }
 }
 
@@ -504,12 +698,18 @@ void PyMisha::handle_error(const char *msg)
         PyErr_SetString(s_pm_err, msg);
 }
 
-void PyMisha::verify_max_data_size(uint64_t data_size, const char *data_name)
+void PyMisha::verify_max_data_size(uint64_t data_size, const char *data_name, const char *unit)
 {
+    // CONFIG['max_data_size'] is a number of records (rows of a result, values, bases), not of
+    // bytes. data_size is often the number reached so far, not the final one: no value to suggest.
     if (data_size > max_data_size())
-        verror("%s size exceeded the maximal allowed (%ld).\n"
-               "Note: the maximum data size is controlled via CONFIG['max_data_size'] option.",
-               data_name, max_data_size());
+        verror("%s size (at least %llu %s) exceeded the maximum allowed (%llu %s, set by CONFIG['max_data_size']).\n\n"
+               "Suggestions:\n"
+               "  - Raise the limit: CONFIG['max_data_size'] = <a larger number of %s>, or None for no limit\n"
+               "  - Reduce scope (use smaller genomic regions or filters)\n"
+               "  - Process data in smaller chunks",
+               data_name && *data_name ? data_name : "Result", (unsigned long long)data_size, unit,
+               (unsigned long long)max_data_size(), unit, unit);
 }
 
 void PyMisha::set_alarm(int msecs)

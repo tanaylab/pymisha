@@ -416,7 +416,7 @@ vector<char> run_kids(int num_kids, const function<char(int)> &work)
     SharedMem shm(num_kids);
     char *kids_res = (char *)shm.addr;
 
-    PyMisha::prepare4multitasking();
+    PyMisha::prepare4multitasking(num_kids);
 
     for (int kid = 0; kid < num_kids; ++kid) {
         if (!PyMisha::launch_process()) {
@@ -1021,8 +1021,104 @@ uint64_t process_contacts_as_intervals(const ImportArgs &args, UnknownChroms &un
     return matched.size();
 }
 
-// Fend ids index arrays (see process_contacts_as_fends), so they are bounded
+// The largest fend id accepted
 const int64_t MAX_FEND_ID = INT32_MAX;
+
+// R misha's FendIndex (GTrack2DImportContacts.cpp). The chromosome and coordinate of each fend, by fend
+// id. Held in arrays indexed by the id (12 bytes an id) while the ids are dense enough, as real fends
+// files number their fends 1..N; once an id would make the arrays too sparse for the number of fends
+// (ids near 1e9 would take 12 GB), in a hash table, and back in arrays as soon as the fends added since
+// make the ids dense again (a file not sorted by id can start with large ids). The two thresholds differ
+// by a factor of 2, so that the number of fends at least doubles between two switches: each switch
+// copies every fend.
+class FendIndex {
+public:
+    enum { NOT_LISTED = -2, UNKNOWN_CHROM = -1 };
+
+    // Adds a fend; returns false if the id is already there
+    bool add(int64_t id, int chromid, int64_t coord)
+    {
+        ++m_num_fends;
+        m_max_id = max(m_max_id, id);
+        if (m_sparse) {
+            bool added = m_map.emplace(id, Fend{ chromid, coord }).second;
+            if ((uint64_t)m_max_id < max(MIN_DENSE_IDS, DENSE_IDS_PER_FEND * m_num_fends))
+                to_dense();
+            return added;
+        }
+
+        if ((uint64_t)id >= m_chromids.size()) {
+            if ((uint64_t)id >= max(MIN_DENSE_IDS, MAX_IDS_PER_FEND * m_num_fends)) {
+                to_sparse();
+                return m_map.emplace(id, Fend{ chromid, coord }).second;
+            }
+            // grow only: the ids need not be sorted, and shrinking would drop the fends read so far
+            m_chromids.resize(id + 1, NOT_LISTED);
+            m_coords.resize(id + 1);
+        }
+        if (m_chromids[id] != NOT_LISTED)
+            return false;
+        m_chromids[id] = chromid;
+        m_coords[id] = coord;
+        return true;
+    }
+
+    // The chromosome of the fend (NOT_LISTED if the file does not list it) and its coordinate
+    int chromid(int64_t id) const
+    {
+        if (m_sparse) {
+            auto it = m_map.find(id);
+            return it == m_map.end() ? NOT_LISTED : it->second.chromid;
+        }
+        return id >= 0 && (uint64_t)id < m_chromids.size() ? m_chromids[id] : NOT_LISTED;
+    }
+
+    int64_t coord(int64_t id) const { return m_sparse ? m_map.find(id)->second.coord : m_coords[id]; }
+
+private:
+    struct Fend {
+        int     chromid;
+        int64_t coord;
+    };
+
+    // Arrays of MIN_DENSE_IDS ids are kept whatever the number of fends. Past that, an id of
+    // MAX_IDS_PER_FEND ids a fend or more moves the fends to the hash table, and they move back once the
+    // largest id is below DENSE_IDS_PER_FEND ids a fend.
+    static constexpr uint64_t MIN_DENSE_IDS = 1 << 24;
+    static constexpr uint64_t MAX_IDS_PER_FEND = 8;
+    static constexpr uint64_t DENSE_IDS_PER_FEND = 4;
+
+    bool                              m_sparse{false};
+    uint64_t                          m_num_fends{0};
+    int64_t                           m_max_id{-1};
+    vector<int>                       m_chromids;
+    vector<int64_t>                   m_coords;
+    unordered_map<int64_t, Fend>      m_map;
+
+    void to_sparse()
+    {
+        m_map.reserve(m_num_fends);
+        for (size_t id = 0; id < m_chromids.size(); ++id) {
+            if (m_chromids[id] != NOT_LISTED)
+                m_map.emplace(id, Fend{ m_chromids[id], m_coords[id] });
+        }
+        vector<int>().swap(m_chromids);
+        vector<int64_t>().swap(m_coords);
+        m_sparse = true;
+    }
+
+    void to_dense()
+    {
+        m_chromids.assign(m_max_id + 1, NOT_LISTED);
+        m_coords.assign(m_max_id + 1, 0);
+        for (const auto &fend : m_map) {
+            m_chromids[fend.first] = fend.second.chromid;
+            m_coords[fend.first] = fend.second.coord;
+        }
+        unordered_map<int64_t, Fend>().swap(m_map);
+        m_sparse = false;
+    }
+};
 
 // STAGE 1, fends-value format: the fends file is read here, then each kid reads a contiguous block of the
 // contacts files. unknown receives the chromosome names of the fends file that the database does not have; the
@@ -1043,11 +1139,8 @@ uint64_t process_contacts_as_fends(const ImportArgs &args, const char *fends_fna
     BufferedFile fends_file;
     fends_cols_total = read_header(fends_file, fends_fname, "fragment ends", FENDS_COLS, NUM_FENDS_COLS, fends_col_idx);
 
-    // Indexed by fend id, so their size follows the largest id (12 bytes an id): real fends files number their
-    // fends 1..N. chromids: FEND_NOT_LISTED, FEND_UNKNOWN_CHROM, or the chromosome of the fend.
-    enum { FEND_NOT_LISTED = -2, FEND_UNKNOWN_CHROM = -1 };
-    vector<int> chromids;
-    vector<int64_t> coords;
+    // chromid of a fend: FendIndex::NOT_LISTED, FendIndex::UNKNOWN_CHROM, or the chromosome of the fend
+    FendIndex fends;
     set<int> matched_chromids;
     int64_t lineno;
     char *endptr;
@@ -1077,33 +1170,27 @@ uint64_t process_contacts_as_fends(const ImportArgs &args, const char *fends_fna
             verror("Error reading fragment ends file %s, line %ld: %s %s is out of range (0 - %lld)", fends_fname, (long)lineno,
                    FENDS_COLS[COL_FEND], fendid_str, (long long)MAX_FEND_ID);
 
-        // grow only: the ids need not be sorted, and shrinking would drop the fends read so far
-        if ((uint64_t)fendid >= chromids.size()) {
-            chromids.resize(fendid + 1, FEND_NOT_LISTED);
-            coords.resize(fendid + 1);
-        }
-
-        if (chromids[fendid] != FEND_NOT_LISTED)
+        if (fends.chromid(fendid) != FendIndex::NOT_LISTED)
             verror("Error reading fragment ends file %s, line %ld: %s %lld appears more than once", fends_fname, (long)lineno,
                    FENDS_COLS[COL_FEND], (long long)fendid);
 
         // Use chromosome name as-is (no forced chr prefix)
-        chromids[fendid] = args.chromkey->find_chromid(chr_str);
-        if (chromids[fendid] < 0)
-            chromids[fendid] = FEND_UNKNOWN_CHROM;
+        int chromid = args.chromkey->find_chromid(chr_str);
+        if (chromid < 0)
+            chromid = FendIndex::UNKNOWN_CHROM;
 
         coord = strtoll(coord_str, &endptr, 10);
         if (*endptr)
             verror("Error reading fragment ends file %s, line %ld: invalid %s", fends_fname, (long)lineno, FENDS_COLS[COL_COORD]);
 
-        if (chromids[fendid] == FEND_UNKNOWN_CHROM)
+        if (chromid == FendIndex::UNKNOWN_CHROM)
             unknown.record(chr_str);
-        else if (coord < 0 || coord >= (int64_t)args.chromkey->get_chrom_size(chromids[fendid]))
+        else if (coord < 0 || coord >= (int64_t)args.chromkey->get_chrom_size(chromid))
             verror("Error reading fragment ends file %s, line %ld: %s is out of range", fends_fname, (long)lineno, FENDS_COLS[COL_COORD]);
         else
-            matched_chromids.insert(chromids[fendid]);
+            matched_chromids.insert(chromid);
 
-        coords[fendid] = coord;
+        fends.add(fendid, chromid, coord);
         check_interrupt();
     }
     fends_file.close();
@@ -1143,23 +1230,29 @@ uint64_t process_contacts_as_fends(const ImportArgs &args, const char *fends_fna
                 fend1 = strtoll(fend1_str, &endptr, 10);
                 if (*endptr)
                     verror("Error reading contacts file %s, line %ld: invalid %s", contacts_fname, (long)lineno, CONTACTS_COLS[COL_FEND1]);
-                if (fend1 < 0 || fend1 >= (int64_t)chromids.size() || chromids[fend1] < 0)
+                int chromid1 = fends.chromid(fend1);
+                if (chromid1 < 0)
                     continue;
 
                 fend2 = strtoll(fend2_str, &endptr, 10);
                 if (*endptr)
                     verror("Error reading contacts file %s, line %ld: invalid %s", contacts_fname, (long)lineno, CONTACTS_COLS[COL_FEND2]);
-                if (fend2 < 0 || fend2 >= (int64_t)chromids.size() || chromids[fend2] < 0)
+                int chromid2 = fends.chromid(fend2);
+                if (chromid2 < 0)
                     continue;
 
                 value = strtod(value_str, &endptr);
                 if (*endptr)
                     verror("Error reading contacts file %s, line %ld: invalid %s", contacts_fname, (long)lineno, CONTACTS_COLS[COL_COUNT]);
 
-                if (chromids[fend1] > chromids[fend2] || (chromids[fend1] == chromids[fend2] && coords[fend1] > coords[fend2]))
-                    swap(fend1, fend2);
+                int64_t coord1 = fends.coord(fend1);
+                int64_t coord2 = fends.coord(fend2);
+                if (chromid1 > chromid2 || (chromid1 == chromid2 && coord1 > coord2)) {
+                    swap(chromid1, chromid2);
+                    swap(coord1, coord2);
+                }
 
-                write_contact(out_files.get(args.dirname, chromids[fend1], chromids[fend2], kid), coords[fend1], coords[fend2], value);
+                write_contact(out_files.get(args.dirname, chromid1, chromid2, kid), coord1, coord2, value);
                 check_interrupt();
             }
         }

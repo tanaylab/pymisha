@@ -1221,6 +1221,58 @@ def _filter_track_lines(path: str, skip_prefixes: tuple[str, ...]) -> list[str]:
         _close_text_auto(stream)
 
 
+def _filter_track_lines_numbered(path: str, skip_prefixes: tuple[str, ...]) -> tuple[list[str], list[int]]:
+    """_filter_track_lines, with the (1-based) line number of each line kept."""
+    stream = _open_text_auto(path)
+    kept: list[str] = []
+    numbers: list[int] = []
+    try:
+        for lineno, raw in enumerate(stream, 1):
+            if (s := raw.strip()) and not s.startswith(skip_prefixes):
+                kept.append(raw)
+                numbers.append(lineno)
+        return kept, numbers
+    finally:
+        _close_text_auto(stream)
+
+
+def _clip_warning(path: str, num_clipped: int, num_dropped: int, first: str) -> str:
+    """The warning of an import about the records past the end of their chromosome (R misha's
+    gtrackimportwig): *first* names the first of them in the file."""
+    return (f"File {path}: {num_clipped} record(s) running past the end of their chromosome were clipped to it, "
+            f"and {num_dropped} record(s) starting at or past the chromosome end were dropped; the first: {first}")
+
+
+def _clip_to_chroms(
+    df: pd.DataFrame, path: str, step: NumpyArray | None = None
+) -> tuple[pd.DataFrame, str | None]:
+    """Records (chrom: database names, start, end, value, line) of an imported file that run past
+    the end of their chromosome are clipped to it, and records that start at or past the end are
+    dropped, as R misha's importers do, with the warning that gives the counts and the first such
+    record in the file. An inverted record (start >= end) is left for the caller to reject, unless
+    it is a WIG step record (*step*), whose end is start + span capped at 2^63 - 1.
+    Returns the records without the line column, and the warning (None if no record was past the
+    end)."""
+    from .intervals import gintervals_all
+
+    lines = df["line"].to_numpy(dtype=np.int64)
+    df = df.drop(columns="line")
+    if not len(df):
+        return df, None
+    size = df["chrom"].map(gintervals_all().set_index("chrom")["end"]).to_numpy(dtype=np.int64)
+    start = df["start"].to_numpy(dtype=np.int64)
+    end = df["end"].to_numpy(dtype=np.int64)
+    past = (end > size) & ((start < end) if step is None else ((start < end) | step))
+    if not past.any():
+        return df, None
+    drop = past & (start >= size)
+    i = np.flatnonzero(past)[np.argmin(lines[past])]
+    msg = _clip_warning(path, int((past & ~drop).sum()), int(drop.sum()),
+                        f"line {lines[i]}: ({df['chrom'].iat[i]}, {start[i]}, {end[i]}), chromosome size {size[i]}")
+    out = df.assign(end=np.where(past, size, end)).loc[~drop].reset_index(drop=True)
+    return out, msg
+
+
 def _parse_bed(path: str) -> pd.DataFrame:
     kept = _filter_track_lines(path, ("#", "track", "browser"))
     if not kept:
@@ -1346,64 +1398,100 @@ def _unzip_import_file(path: str, tmpdir: str) -> str:
 def _parse_wig_or_bedgraph(path: str) -> pd.DataFrame:
     """The records of a plain-text WIG / bedGraph file (gtrack_import unzips first), in C++."""
     cols = _pymisha.pm_parse_wig_or_bedgraph(str(path))
-    return pd.DataFrame({c: cols[c] for c in ("chrom", "start", "end", "value", "step")})
+    return pd.DataFrame({c: cols[c] for c in ("chrom", "start", "end", "value", "step", "line")})
 
 
-def _check_wig_records(parsed: pd.DataFrame, path: str) -> tuple[pd.DataFrame, dict[str, Any], int]:
+class _NotWig(ValueError):
+    """A text file that is not a WIG / bedGraph file, as R misha's Wig parser finds when it reads
+    the file in (its records out of chromosome order, say): gtrack_import reads it as a
+    tab-delimited file."""
+
+
+class _NotTabular(ValueError):
+    """A file that is not a tab-delimited track file (its header is not chrom, start, end and a
+    value column), as R misha's GenomeArraysCsv finds when it reads the file in."""
+
+
+def _read_wig_or_tabular(src: str, path: str) -> tuple[pd.DataFrame, dict[str, Any], int, str | None]:
+    """The records of a text file that is not BED, bigWig or Parquet, read as R misha's
+    gtrackimportwig reads it, whatever its name: as WIG / bedGraph, or, if it is not one, as a
+    tab-delimited file with a header (chrom, start, end and one value column). Returns what
+    _check_wig_records returns; *path* is what messages call the file (src may be its unzipped
+    copy)."""
+    try:
+        return _check_wig_records(_parse_wig_or_bedgraph(src), path)
+    except (_pymisha.error, _NotWig) as exc:
+        wig_error = exc
+    try:
+        records = _parse_tabular_track(src)
+    except _NotTabular as exc:
+        raise ValueError(f"Unrecognized format of file {path}.\nWIG parser error: {wig_error}\n"
+                         f"CSV parser error: {exc}") from None
+    parsed, unknown, n_matched = _known_chroms_records(records, path)
+    parsed, warning = _clip_to_chroms(parsed, path)
+    return parsed, unknown, n_matched, warning
+
+
+def _check_wig_records(
+    parsed: pd.DataFrame, path: str
+) -> tuple[pd.DataFrame, dict[str, Any], int, str | None]:
     """misha's rules for WIG / bedGraph records, which a bigWig's records follow too.
 
     A chromosome's records must be together: a block of a chromosome that
     resumes after another one, known to the database or not, is an error. A
-    file that names chromosomes and matches none is an error. A fixedStep /
-    variableStep record that crosses the chromosome end is clipped to it; one
-    that starts past it is an error, as is a bedGraph record that is empty or
-    does not fit the chromosome. A chromosome's records must be sorted and not
-    overlapping. Returns the records of the database chromosomes, the
-    _unknown_chroms of the other names and the number of database chromosomes
-    the file names.
+    file that names chromosomes and matches none is an error. An empty
+    bedGraph record is an error. A record that runs past the chromosome end
+    is clipped to it, and one that starts at or past the end is dropped. A
+    chromosome's records must be sorted and not overlapping. Returns the
+    records of the database chromosomes, the _unknown_chroms of the other
+    names, the number of database chromosomes the file names and the warning
+    about the records past the end of their chromosome (None if none).
     """
     from .intervals import gintervals_all
 
     if len(parsed) == 0:   # no records at all: an empty track, as in misha
-        return parsed.drop(columns="step"), _unknown_chroms([]), 0
+        return parsed.drop(columns=["step", "line"]), _unknown_chroms([]), 0, None
     canon, unknown, n_matched = _resolve_import_chroms(parsed["chrom"])
     # the chromosome of each block, -1 for one the database does not have
     codes = pd.factorize(pd.Series(canon, dtype=object))[0]
     runs = codes[np.r_[True, codes[1:] != codes[:-1]]]
     runs = runs[runs >= 0]
     if len(np.unique(runs)) < len(runs):
-        raise ValueError(f"Invalid format of WIG file {path}: file is not sorted by chromosomes")
+        raise _NotWig(f"Invalid format of WIG file {path}: file is not sorted by chromosomes")
     _verify_chroms_matched(unknown, n_matched, path)
 
     keep = codes >= 0
     df = parsed.loc[keep].reset_index(drop=True)
     df["chrom"] = canon[keep]
     sizes = gintervals_all().set_index("chrom")["end"]
-    chrom = df["chrom"].to_numpy()
     size = df["chrom"].map(sizes).to_numpy(dtype=np.int64)
     step = df.pop("step").to_numpy(dtype=bool)
     start = df["start"].to_numpy(dtype=np.int64)
     end = df["end"].to_numpy(dtype=np.int64)
 
-    bad = np.flatnonzero(np.where(step, start >= size, (end > size) | (start >= end)))
+    bad = np.flatnonzero(~step & (start >= end))
     if bad.size:
         i = bad[0]
-        raise ValueError(f"WIG file {path}: invalid record {chrom[i]}:{start[i]}-{end[i]} "
+        raise ValueError(f"WIG file {path}: invalid record {df['chrom'].iat[i]}:{start[i]}-{end[i]} "
                          f"(chromosome size {size[i]})")
+    df, warning = _clip_to_chroms(df, path, step)
+    chrom = df["chrom"].to_numpy()
+    start = df["start"].to_numpy(dtype=np.int64)
+    end = df["end"].to_numpy(dtype=np.int64)
     same = chrom[1:] == chrom[:-1]
-    end = np.where(step, np.minimum(end, size), end)
     bad = np.flatnonzero(same & (start[1:] < end[:-1]))
     if bad.size:
         i = bad[0] + 1
         raise ValueError(f"WIG file {path}: records of {chrom[i]} are overlapping or unsorted at {start[i]}")
-    df["end"] = end
-    return df, unknown, n_matched
+    return df, unknown, n_matched, warning
 
 
 def _parse_tabular_track(path: str) -> pd.DataFrame:
-    kept = _filter_track_lines(path, ("#",))
+    """The records of a tab-delimited file, with the line of each in a column "line"."""
+    kept, numbers = _filter_track_lines_numbered(path, ("#",))
     if not kept:   # no records at all: an empty track, as in misha
-        return _empty_records()
+        return _empty_records().assign(line=pd.Series([], dtype=np.int64))
+    lines = np.asarray(numbers[1:], dtype=np.int64)
 
     # Fast path for tab-delimited tables (the common case): one vectorized
     # C-engine read + numeric coercion instead of a per-row Python loop. Any
@@ -1420,17 +1508,17 @@ def _parse_tabular_track(path: str) -> pd.DataFrame:
             _logger.debug("the fast tab-delimited parse of %s failed; using the general parser",
                           path, exc_info=True)
             df = None
-        if df is not None:
+        if df is not None and len(df) == len(lines):
             df.columns = [str(c).strip() for c in df.columns]
-            return _tabular_finish(df, path)
-    return _parse_tabular_generic(kept, path)
+            return _tabular_finish(df, path, lines)
+    return _parse_tabular_generic(kept, path, lines)
 
 
-def _tabular_finish(df: pd.DataFrame, path: str) -> pd.DataFrame:
+def _tabular_finish(df: pd.DataFrame, path: str, lines: NumpyArray) -> pd.DataFrame:
     req = ["chrom", "start", "end"]
     for c in req:
         if c not in df.columns:
-            raise ValueError(f"Tabular track file must contain '{c}' column")
+            raise _NotTabular(f"Tabular track file must contain '{c}' column")
     val_cols = [c for c in df.columns if c not in req]
     if len(val_cols) != 1:
         raise ValueError("Tabular track file must contain exactly one value column besides chrom/start/end")
@@ -1442,7 +1530,7 @@ def _tabular_finish(df: pd.DataFrame, path: str) -> pd.DataFrame:
     sel = df[[*req, c_val]]
     keep = sel.notna().all(axis=1)
     if len(sel) and not keep.any():
-        raise ValueError(f"File '{path}' contains no data rows")
+        raise _NotTabular(f"File '{path}' contains no data rows")
     sel = sel[keep]
     start = pd.to_numeric(sel["start"], errors="coerce")
     end = pd.to_numeric(sel["end"], errors="coerce")
@@ -1454,24 +1542,25 @@ def _tabular_finish(df: pd.DataFrame, path: str) -> pd.DataFrame:
         "start": start.to_numpy().astype(np.int64),
         "end": end.to_numpy().astype(np.int64),
         "value": value.to_numpy().astype(float),
+        "line": lines[keep.to_numpy()],
     })
 
 
-def _parse_tabular_generic(kept: list[str], path: str) -> pd.DataFrame:
+def _parse_tabular_generic(kept: list[str], path: str, lines: NumpyArray) -> pd.DataFrame:
     header_line = kept[0].strip()
     header = header_line.split("\t") if "\t" in header_line else header_line.split()
     cols = [c.strip() for c in header]
     req = ["chrom", "start", "end"]
     for c in req:
         if c not in cols:
-            raise ValueError(f"Tabular track file must contain '{c}' column")
+            raise _NotTabular(f"Tabular track file must contain '{c}' column")
     val_cols = [c for c in cols if c not in req]
     if len(val_cols) != 1:
         raise ValueError("Tabular track file must contain exactly one value column besides chrom/start/end")
     idx = {c: i for i, c in enumerate(cols)}
     c_val = val_cols[0]
-    out: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": []}
-    for raw in kept[1:]:
+    out: dict[str, list[Any]] = {"chrom": [], "start": [], "end": [], "value": [], "line": []}
+    for raw, lineno in zip(kept[1:], lines, strict=True):
         line = raw.strip()
         fields = line.split("\t") if "\t" in line else line.split()
         if len(fields) < len(cols):
@@ -1480,26 +1569,33 @@ def _parse_tabular_generic(kept: list[str], path: str) -> pd.DataFrame:
         out["start"].append(int(float(fields[idx["start"]])))
         out["end"].append(int(float(fields[idx["end"]])))
         out["value"].append(float(fields[idx[c_val]]))
+        out["line"].append(int(lineno))
     if len(out["chrom"]) == 0:
         if len(kept) > 1:
-            raise ValueError(f"File '{path}' contains no data rows")
-        return _empty_records()
+            raise _NotTabular(f"File '{path}' contains no data rows")
+        return _empty_records().assign(line=pd.Series([], dtype=np.int64))
     return pd.DataFrame(out)
 
 
-def _parse_bigwig(path: str, name: str) -> tuple[pd.DataFrame, dict[str, Any], int]:
+def _parse_bigwig(path: str, name: str) -> tuple[pd.DataFrame, dict[str, Any], int, str | None]:
     """Read a bigWig's full-resolution records with misha's reader; zoom levels are not used.
 
-    Records come back sorted, non-overlapping and within their chromosome, as
+    Records come back sorted, non-overlapping and within their chromosome
+    (clipped to it, or dropped if they start at or past its end), as
     _check_wig_records makes the text ones. A truncated or corrupt file is an
     error, as is one whose chromosomes are all unknown to the database. Returns
-    the records, the _unknown_chroms of the file and the number of database
-    chromosomes it has data for; messages name *name*, the file the user gave
-    (path may be its unzipped copy).
+    the records, the _unknown_chroms of the file, the number of database
+    chromosomes it has data for and the warning about the records past the end
+    of their chromosome (None if none); messages name *name*, the file the user
+    gave (path may be its unzipped copy).
     """
     res = _pymisha.pm_parse_bigwig(path)
     _verify_chroms_matched(res, res["num_matched"], name)
-    return pd.DataFrame({c: res[c] for c in ("chrom", "start", "end", "value")}), res, res["num_matched"]
+    warning = None
+    if res["num_clipped"] or res["num_dropped"]:
+        warning = _clip_warning(name, res["num_clipped"], res["num_dropped"], res["first_clipped"])
+    records = pd.DataFrame({c: res[c] for c in ("chrom", "start", "end", "value")})
+    return records, res, res["num_matched"], warning
 
 
 def _ensure_track_absent(track: str) -> None:
@@ -1633,7 +1729,7 @@ def _create_sparse(track: str, description: str, intervals: Intervals, values: A
             track_dir, description,
             f'gtrack.create_sparse("{track}", description, intervals, values)',
         )
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -1832,7 +1928,7 @@ def _create_dense(track: str, description: str, intervals: Intervals, values: An
             created_by,
             {"type": "dense", "binsize": str(binsize)},
         )
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2008,10 +2104,10 @@ def gtrack_create_dense_direct(
 
     if reload:
         try:
-            _pm_dbreload(_target_root())
+            _pm_dbreload(_target_root(), tracks=[track])
             if _db_is_indexed(_shared._GROOT):
                 _index_created_track(track, remove_old=True)
-                _pm_dbreload(_target_root())
+                _pm_dbreload(_target_root(), tracks=[track])
         except Exception as exc:
             warnings.warn(
                 f"post-create steps failed for track '{track}': {exc}; "
@@ -2144,6 +2240,16 @@ def gtrack_smooth(
     units) around C. The smoothing algorithm and handling of NaN /
     edge-of-chromosome gaps are controlled by the remaining parameters.
 
+    The window is a whole number of iterator bins: the central bin and
+    ``k`` bins on each side, ``2 * k + 1`` bins in all, where
+    ``k = winsize / (2 * binsize)`` rounded to the nearest integer, a half
+    rounded up (``binsize`` being the bin size of the iterator). The window
+    can therefore be wider than *winsize*: ``winsize=100`` with a 20 bp
+    iterator gives ``k = 3`` (2.5 rounded up), 7 bins or 140 bp;
+    ``winsize=288`` with a 32 bp iterator gives ``k = 5`` (4.5 rounded up),
+    11 bins or 352 bp, and ``winsize=256`` gives 9 bins. A *winsize* below
+    the bin size (``k = 0``) is an error.
+
     Parameters
     ----------
     track : str
@@ -2229,7 +2335,7 @@ def gtrack_smooth(
         )
 
     try:
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
         created_by = (
             f'gtrack.smooth({track}, description, {str(expr)}, {winsize}, '
             f'{weight_thr}, {smooth_nans}, {alg})'
@@ -2242,7 +2348,7 @@ def gtrack_smooth(
                 gtrack_attr_set(track, "binsize", str(int(new_info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             _index_created_track(track, remove_old=True)
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2416,7 +2522,7 @@ def gtrack_create(
         )
 
     try:
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
         _set_created_attrs(track, description, created_by)
         info = gtrack_info(track)
         if info.get("type") == "dense":
@@ -2425,7 +2531,7 @@ def gtrack_create(
                 gtrack_attr_set(track, "binsize", str(int(info["bin_size"])))
         if _db_is_indexed(_shared._GROOT):
             _index_created_track(track, remove_old=True)
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
     except Exception as exc:
         warnings.warn(
             f"post-create steps failed for track '{track}': {exc}; "
@@ -2646,22 +2752,29 @@ def gtrack_import(
     Create a track from a WIG, BigWig, BedGraph, BED, or tab-delimited file.
 
     Parses the input file and creates either a Sparse or Dense track
-    depending on *binsize*. File format is detected from the extension; a
-    bigWig is also recognized by its first bytes, whatever its name.
+    depending on *binsize*. The format is found as R misha finds it.
     Compressed files (``.gz``, or a ``.zip`` holding one file) are unzipped
-    to a temporary file first, and the format is detected on it, so a
-    compressed bigWig is read too. Tab-delimited files must have a header
-    with columns ``chrom``, ``start``, ``end``, and exactly one value column.
+    to a temporary file first, and the format is detected on it. A Parquet
+    file is recognized by its first bytes, a BED file by its name (``.bed``,
+    ``.bed.gz``, ``.bed.zip``), a bigWig by its first bytes or its name
+    (``.bw``, ``.bigwig``). Any other file is read as WIG / bedGraph,
+    whatever its name, and, if it is not one, as a tab-delimited file, which
+    must have a header with columns ``chrom``, ``start``, ``end``, and
+    exactly one value column; a file that is neither is an error giving
+    both readers' reasons.
     A WIG / bedGraph / tab-delimited file with no records at all makes an
     empty track; one whose records are all on chromosomes the database
     lacks is an error. Records on a chromosome the database lacks are
     skipped and reported: a log message for a scaffold or patch, a warning
     when the name looks like a primary chromosome.
 
-    BED records that run past the end of their chromosome are clipped to
-    it, and records left empty (zero length, or starting at or past the
-    chromosome end) are dropped, with one warning giving the counts; a BED
-    file with no record left is an error.
+    Empty BED records (zero length) are dropped; a BED file with no record
+    left is an error.
+
+    In every format, records that run past the end of their chromosome are
+    clipped to it, and records that start at or past the end are dropped,
+    with one warning giving the counts and the first such record in the
+    file.
 
     BigWig files are read directly at full resolution and full float
     precision (zoom levels are not used). A truncated or corrupt bigWig is
@@ -2669,9 +2782,7 @@ def gtrack_import(
     was made from, and both follow the same rules: the records of a
     chromosome must be together (a block that resumes after another
     chromosome, known to the database or not, is an error), sorted and
-    must not overlap, a bedGraph record must fit its chromosome, and a
-    fixedStep / variableStep record that crosses the chromosome end is
-    clipped to it. An empty bedGraph
+    must not overlap. An empty bedGraph
     record is an error in text and skipped in a bigWig. Two bigWig
     chromosomes that name the same database chromosome (``chr1`` and ``1``)
     are an error. A WIG file may mix fixedStep / variableStep sections and
@@ -2684,7 +2795,9 @@ def gtrack_import(
     A Parquet file (recognized by its first bytes, whatever its name) is
     imported when it has exactly one value column besides ``chrom``,
     ``start`` and ``end``; it always makes a Dense track, so *binsize* must
-    be > 0. Use :func:`gtrack_import_parquet` for several columns.
+    be > 0, and the column's field metadata becomes attributes of the track
+    as in :func:`gtrack_import_parquet` (*attrs* wins over it). Use
+    :func:`gtrack_import_parquet` for several columns.
 
     Parameters
     ----------
@@ -2693,10 +2806,8 @@ def gtrack_import(
     description : str
         Human-readable description stored as a track attribute.
     file : str
-        Path to the input file. Supported extensions: ``.wig``,
-        ``.bedgraph``, ``.bed``, ``.bw`` / ``.bigwig``, or tab-delimited
-        (any other extension). May include ``.gz`` or ``.zip`` suffix.
-        A Parquet file is recognized by its content.
+        Path to the input file: WIG, bedGraph, BED, bigWig, Parquet or
+        tab-delimited (see above). May include ``.gz`` or ``.zip`` suffix.
     binsize : int or None, optional
         Bin size for a Dense track. If None or 0, a Sparse track is
         created. If positive, a Dense track with the given bin size is
@@ -2760,6 +2871,7 @@ def gtrack_import(
         )
 
     bed_warning = None
+    clip_warning = None
     with tempfile.TemporaryDirectory() as tmpdir:
         # As in misha, a .gz / .zip file is unzipped first and its format found on the
         # plain copy, so a compressed bigWig reads like any other. The records on chromosomes
@@ -2770,11 +2882,9 @@ def gtrack_import(
             parsed, unknown, n_matched = _known_chroms_records(_parse_bed(src), file_path)
             parsed, bed_warning = _bed_fit_chroms(parsed, file_path)
         elif _pymisha.pm_is_bigwig(src):
-            parsed, unknown, n_matched = _parse_bigwig(src, file_path)
-        elif src.lower().endswith((".wig", ".bedgraph")):
-            parsed, unknown, n_matched = _check_wig_records(_parse_wig_or_bedgraph(src), file_path)
+            parsed, unknown, n_matched, clip_warning = _parse_bigwig(src, file_path)
         else:
-            parsed, unknown, n_matched = _known_chroms_records(_parse_tabular_track(src), file_path)
+            parsed, unknown, n_matched, clip_warning = _read_wig_or_tabular(src, file_path)
 
     # r_import: misha's import arithmetic, and a file without records makes an empty track
     if binsize > 0:
@@ -2783,6 +2893,8 @@ def gtrack_import(
                       func=func, r_import=True)
     else:
         _create_sparse(track, description, parsed[["chrom", "start", "end"]], parsed["value"], r_import=True)
+    if clip_warning is not None:
+        warnings.warn(clip_warning, stacklevel=user_stacklevel())
     _report_unknown_chroms(unknown, n_matched, file_path)
     if bed_warning is not None:
         warnings.warn(bed_warning, stacklevel=user_stacklevel())
@@ -3031,11 +3143,69 @@ def _gtrack_import_parquet_file(
                 f"gtrack_import needs a Parquet file with exactly one value column, but {file_path} has "
                 f"{len(columns)} ({', '.join(columns)}); use gtrack_import_parquet to import several columns"
             )
+        field_md = _parquet_field_metadata(src, file_path, columns)
         created_by = (
             f'gtrack.import("{track}", description, "{file_path}", '
             f"{int(binsize)}, {float(defval):g}, attrs)"
         )
-        _import_parquet_tracks([track], columns, [src], [file_path], binsize, defval, description, [created_by], attrs)
+        restored = [_parquet_restored_attrs(field_md.get(columns[0], []), description, attrs)]
+        _import_parquet_tracks([track], columns, [src], [file_path], binsize, defval, description, [created_by], attrs,
+                               restored)
+
+
+def _parquet_field_metadata(file: str, name: str, columns: list[str]) -> dict[str, list[tuple[str, str]]]:
+    """The Arrow field metadata of the columns of a Parquet file (as gextract writes the
+    attributes of a track column, or pyarrow writes ``pa.field(name, type, metadata=...)``),
+    by column, for the columns given. A column name, key or value that holds a NUL byte, which
+    an attribute cannot, is left out with a warning. *name* is what messages call the file."""
+    res: dict[str, list[tuple[str, str]]] = {}
+    for col_bytes, kvs in _pymisha.pm_parquet_field_metadata(file, name, list(columns)):
+        col = col_bytes.decode("utf-8", errors="replace")
+        if b"\x00" in col_bytes:
+            warnings.warn(
+                f'The field metadata of column "{col.replace(chr(0), chr(92) + "0")}" of {name} was left out: '
+                "the column name holds a NUL byte",
+                stacklevel=user_stacklevel(),
+            )
+            continue
+        kept = []
+        for key, value in kvs:
+            if b"\x00" in key or b"\x00" in value:
+                shown = key.decode("utf-8", errors="replace").replace(chr(0), chr(92) + "0")
+                warnings.warn(
+                    f'Field metadata "{shown}" of column "{col}" of {name} was left out: it holds a NUL byte, '
+                    "which an attribute cannot",
+                    stacklevel=user_stacklevel(),
+                )
+                continue
+            kept.append((key.decode("utf-8", errors="replace"), value.decode("utf-8", errors="replace")))
+        res[col] = kept
+    return res
+
+
+# Attributes of a Parquet column that an import does not restore: those it sets itself, and those
+# that describe how the source track was stored (gtrack_create_dense and gsynth set them)
+_PARQUET_UNRESTORED_ATTRS = ("created.by", "created.date", "created.user", "type", "binsize")
+
+
+def _parquet_restored_attrs(
+    md: list[tuple[str, str]], description: str, attrs: dict[str, str] | None = None
+) -> dict[str, str]:
+    """The attributes a track created from a Parquet column takes from the column's field metadata
+    *md* (R misha's .gtrack_restore_parquet_attrs): all but created.by, created.date,
+    created.user, type and binsize, the description unless the *description* given is empty,
+    and the names of *attrs* (the caller's, which win). Empty names and values are left out; the
+    first of a repeated name is kept."""
+    skip = set(_PARQUET_UNRESTORED_ATTRS)
+    if str(description) != "":
+        skip.add("description")
+    if attrs:
+        skip.update(attrs)
+    res: dict[str, str] = {}
+    for key, value in md:
+        if key and value and key not in skip and key not in res:
+            res[key] = value
+    return res
 
 
 def _import_parquet_tracks(
@@ -3048,12 +3218,14 @@ def _import_parquet_tracks(
     description: str,
     created_by: list[str],
     attrs: dict[str, str] | None = None,
+    restored: list[dict[str, str]] | None = None,
 ) -> None:
     """Import columns[i] of the files as Dense track tracks[i], all or nothing.
 
     Each track is written into a hidden staging directory and renamed into place only once
     all of them are complete; if anything fails, none of the tracks is left. names[i] is
-    what messages call files[i].
+    what messages call files[i]. restored[i] holds the attributes tracks[i] takes from the
+    field metadata of its column (see _parquet_restored_attrs); *attrs* win over them.
     """
     root = _target_root()
     finals = [_track_dir_for_create(t) for t in tracks]
@@ -3068,13 +3240,15 @@ def _import_parquet_tracks(
             with _shared._with_umask():
                 stage_dir.mkdir()
 
-        chrom_names, unknown_files = _pymisha.pm_parquet_import(
+        chrom_names, unknown_files, clip_message = _pymisha.pm_parquet_import(
             [str(d) for d in staging], files, names, columns, float(binsize), float(defval)
         )
         _, unknown, n_matched = _resolve_import_chroms(chrom_names)
         _verify_chroms_matched(unknown, n_matched, unknown_files)
 
-        for track, stage_dir, final, cb in zip(tracks, staging, finals, created_by, strict=True):
+        if restored is None:
+            restored = [{} for _ in tracks]
+        for track, stage_dir, final, cb, md in zip(tracks, staging, finals, created_by, restored, strict=True):
             _fsync_tree(stage_dir)
             if final.exists():
                 raise ValueError(f"Refusing to overwrite existing {final}")
@@ -3082,8 +3256,8 @@ def _import_parquet_tracks(
             created.append((track, final))
             _fsync_dir(final.parent)
             _shared._invalidate_dir_cache(final)
-            _write_created_attrs_at_path(final, description, cb, attrs)
-        _pm_dbreload(root)
+            _write_created_attrs_at_path(final, description, cb, {**md, **(attrs or {})})
+        _pm_dbreload(root, tracks=tracks)
         if _db_is_indexed(root):
             for track in tracks:
                 _index_created_track(track, remove_old=True)
@@ -3101,12 +3275,14 @@ def _import_parquet_tracks(
                 )
         if created:
             try:
-                _pm_dbreload(root)
+                _pm_dbreload(root, tracks=[track for track, _ in created])
             except Exception:
                 _logger.warning("could not reload the database after removing %s", tracks, exc_info=True)
         raise
 
     # Only now, when the import can no longer fail
+    if clip_message:
+        warnings.warn(clip_message, stacklevel=user_stacklevel())
     _report_unknown_chroms(unknown, n_matched, unknown_files)
 
 
@@ -3146,6 +3322,22 @@ def gtrack_import_parquet(
     order, but may not overlap. Chromosome names are matched through the
     chromosome alias chain as in :func:`gtrack_import`, with the same
     reporting of names the database does not have.
+
+    Rows that run past the end of their chromosome (such as a last 32 bp
+    bin written with ``end = start + 32``) are clipped to it, and rows that
+    start at or past the end are dropped, with one warning that gives the
+    counts and the first such row. Messages number the rows of a file from
+    0, as pyarrow and pandas do.
+
+    The field metadata of a column in the first file (Arrow field metadata,
+    as :func:`gextract` writes the attributes of a track column, or as
+    pyarrow writes ``pa.field(name, type, metadata=...)``) becomes
+    attributes of its track, except ``created.by``, ``created.date`` and
+    ``created.user``, which the import sets, ``type`` and ``binsize``,
+    which describe how the source track was stored, and ``description``
+    unless the *description* argument is an empty string. A file without
+    field metadata imports with only those attributes. See
+    :func:`gtrack_attr_set` for the attributes of model predictions.
 
     The import is all or nothing: if it fails or is interrupted, none of
     the tracks is created.
@@ -3266,6 +3458,9 @@ def gtrack_import_parquet(
                 f"{', '.join(first_values)}: all files must have the same value columns"
             )
 
+    # the attributes gextract(file="*.parquet") wrote for track columns: Arrow field metadata
+    field_md = _parquet_field_metadata(files[0], files[0], columns)
+
     tracks = [track_prefix + c for c in columns]
     # the rule gintervals_save applies to interval set names; dots are directories
     bad = [c for c, t in zip(columns, tracks, strict=True) if not re.fullmatch(r"[A-Za-z][\w.]*", t, re.ASCII)]
@@ -3285,7 +3480,9 @@ def gtrack_import_parquet(
         f'gtrack.import_parquet(description, "{path}", {int(binsize)}, "{track_prefix}", "{c}", {float(defval):g})'
         for c in columns
     ]
-    _import_parquet_tracks(tracks, columns, files, files, binsize, defval, description, created_by)
+    restored = [_parquet_restored_attrs(field_md.get(c, []), description) for c in columns]
+    _import_parquet_tracks(tracks, columns, files, files, binsize, defval, description, created_by,
+                           restored=restored)
     return tracks
 
 
@@ -3376,7 +3573,7 @@ def gtrack_mv(src: str, dest: str) -> None:
     _shared._invalidate_dir_cache(src_dir, dest_dir)
 
     _cleanup_empty_track_parents(src_dir, src_db)
-    _pm_dbreload(src_db)
+    _pm_dbreload(src_db, tracks=[src, dest])
 
 
 _TRACK_INTERNAL_FILES = frozenset(
@@ -3781,7 +3978,7 @@ def _gtrack_copy_one(
         try:
             if dest_db_loaded:
                 # dest_db can be the primary GROOT or a loaded secondary dataset
-                _pm_dbreload(str(dest_db))
+                _pm_dbreload(str(dest_db), tracks=[destname])
             if convert_2d:
                 gtrack_2d_convert_to_indexed(destname, remove_old=True)
         except BaseException:
@@ -3795,8 +3992,8 @@ def _gtrack_copy_one(
             _gdb_trash(stage_dir, async_unlink=True)
         if not success and aside is not None and aside.exists():
             # the failed copy is moved away first, then the existing track comes back. Only
-            # this call's copy: what another session put at the name meanwhile stays, and the
-            # track set aside is then kept where it is.
+            # this call's copy: what another session put at the name meanwhile stays, and
+            # replaced the track set aside, which goes to the trash.
             failed: Path | None = None
             if placed and dest_dir.exists():
                 failed = parent / _gdb_staging_name(dest_dir.name)
@@ -3804,6 +4001,8 @@ def _gtrack_copy_one(
                     os.rename(dest_dir, failed)
                 except OSError:
                     failed = None
+            # this call's copy, placed, still holds the name: it could not be moved away
+            own_copy_there = placed and failed is None and dest_dir.exists()
             restored = False
             if not dest_dir.exists():
                 try:
@@ -3812,7 +4011,23 @@ def _gtrack_copy_one(
                 except OSError:
                     restored = False
             _shared._invalidate_dir_cache(dest_dir)
-            if not restored:
+            if not restored and dest_dir.exists() and not own_copy_there:
+                # given a staging name first, so that the sweep of staging directories removes
+                # it if the trash fails
+                replaced = parent / _gdb_staging_name(dest_dir.name)
+                try:
+                    os.rename(aside, replaced)
+                except OSError:
+                    replaced = aside
+                _gdb_trash(replaced, async_unlink=True)
+                warnings.warn(
+                    f"The copy over {dest_dir} failed, and another session's track holds the name now; "
+                    "the track that was there was moved to the trash",
+                    stacklevel=user_stacklevel(),
+                )
+            elif not restored:
+                # (the name holds nothing, or this call's failed copy: the track set aside is
+                # the only copy of it)
                 warnings.warn(
                     f"The copy over {dest_dir} failed; the track that was there is kept at {aside}",
                     stacklevel=user_stacklevel(),
@@ -3821,7 +4036,7 @@ def _gtrack_copy_one(
                 _gdb_trash(failed, async_unlink=True)
         if not success:
             if dest_db_loaded:
-                _pm_dbreload(str(dest_db))
+                _pm_dbreload(str(dest_db), tracks=[destname])
             else:
                 _shared._touch_db_cache_dirty(str(dest_db))
 
@@ -4039,7 +4254,7 @@ def gtrack_rm(track: str, force: bool = False, db: str | None = None) -> None:
             f"failed to remove track directory: {track_dir}"
         )
     _cleanup_empty_track_parents(track_dir, db_root)
-    _pm_dbreload(db_root)
+    _pm_dbreload(db_root, tracks=[track])
 
 
 _DEFAULT_MAPPEDSEQ_COLS = (9, 11, 13, 14)
@@ -4223,6 +4438,9 @@ def gtrack_import_mappedseq(
 
     pileup_i = int(pileup)
     binsize_i = int(binsize)
+    # an NA flag is an error, as in R (it was read as True)
+    _check_flag(remove_dups, "remove_dups", "remove_dups argument must be True or False")
+    _check_flag(paired, "paired", "paired argument must be True or False")
     paired = bool(paired)
     if pileup_i < 0:
         raise ValueError("pileup cannot be negative")
@@ -4305,7 +4523,7 @@ def gtrack_import_mappedseq(
         else:
             _write_created_attrs_at_path(tmp_dir, description, created_by)
 
-    _pm_dbreload(_target_root())
+    _pm_dbreload(_target_root(), tracks=[track])
 
     if res["total"]["total.mapped"] == 0:
         if not paired:
@@ -4659,6 +4877,14 @@ def gtrack_2d_convert_to_indexed(track: str, remove_old: bool = True, force: boo
 def gtrack_attr_set(track: str, attr: str, value: str) -> None:
     """
     Set a track attribute value.
+
+    Tracks of model predictions conventionally carry these attributes, which
+    pymisha only stores and carries along: ``value.scale``, the scale of the
+    values (e.g. ``"log2(x+1)"`` or ``"linear"``); ``model``, the model that
+    made them; ``checkpoint``, the model checkpoint; and ``heldout.chroms``,
+    the chromosomes held out of training. Like any attribute, they are
+    written with the track's column by ``gextract(file="x.parquet")`` and
+    restored by :func:`gtrack_import_parquet`.
 
     Parameters
     ----------
@@ -5331,7 +5557,7 @@ def gtrack_2d_create(track: str, description: str, intervals: pd.DataFrame, valu
         )
 
     try:
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
         _set_created_attrs(
             track,
             description,
@@ -5460,7 +5686,7 @@ def gtrack_2d_import(track: str, description: str, file: str | list[str]) -> Non
     _report_unknown_chroms(res, res["num_data_chroms"], srcname)
 
     try:
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
         files_str = '", "'.join(files)
         _set_created_attrs(track, description, f'gtrack.2d.import("{track}", description, c("{files_str}"))')
         if _db_is_indexed(_shared._GROOT):
@@ -5572,6 +5798,7 @@ def gtrack_2d_import_contacts(
             "Usage: gtrack_2d_import_contacts(track, description, contacts, "
             "fends=None, allow_duplicates=True)"
         )
+    _check_flag(allow_duplicates, "allow_duplicates", "allow_duplicates argument is not a boolean")
 
     if fends is not None and not os.path.exists(fends):
         raise ValueError(f"Fends file not found: {fends}")
@@ -5606,7 +5833,7 @@ def gtrack_2d_import_contacts(
     _report_unknown_chroms(res, res["num_data_chroms"], srcname)
 
     try:
-        _pm_dbreload(_target_root())
+        _pm_dbreload(_target_root(), tracks=[track])
 
         contacts_str = '", "'.join(contacts)
         fends_str = f'"{fends}"' if fends else "NULL"
@@ -5800,8 +6027,9 @@ def gtrack_array_create(
             blocks = build_value_blocks(block_rows)
             write_chrom_file(chrom_path, starts, ends, blocks)
 
-    # Reload the database so the new track is visible, then set attrs.
-    _pymisha.pm_dbreload()
+    # List the new track, then set attrs. It was written through _atomic_track_create(), i.e.
+    # _target_root() (_UROOT if set, else _GROOT) - not necessarily _GROOT.
+    _pm_dbreload(_target_root(), tracks=[track])
     _set_created_attrs(
         track,
         description,
@@ -5810,12 +6038,6 @@ def gtrack_array_create(
             f"values, colnames=[{', '.join(repr(n) for n in colnames)}])"
         ),
     )
-    _pymisha.pm_dbreload()
-    # gtrack_array_create predates _pm_dbreload() and still calls the raw
-    # C++ rescan directly, so the sentinel has to be touched explicitly
-    # here. It writes through _atomic_track_create(), i.e. _target_root()
-    # (_UROOT if set, else _GROOT) - not necessarily _GROOT.
-    _shared._touch_db_cache_dirty(_target_root())
 
 
 def gtrack_array_import(
@@ -5840,6 +6062,11 @@ def gtrack_array_import(
     and the names reported, as :func:`gtrack_import` reports them; a file
     that names chromosomes and matches none is an error. On an indexed
     database the track is written in the indexed format.
+
+    As in :func:`gtrack_import`, records of a file that run past the end
+    of their chromosome are clipped to it, and records that start at or
+    past the end are dropped, with one warning giving the counts; a file
+    whose every record starts at or past the end is an error.
 
     Parameters
     ----------
@@ -5883,6 +6110,26 @@ def gtrack_array_import(
             sources.append(_CSVSource(src))
             _verify_chroms_matched(sources[-1].unknown, sources[-1].num_matched, src)
 
+    # One warning for the records past the end of their chromosome that the files held: clipped
+    # to it, or dropped when they start at or past it, as gtrack_import does
+    clipped = [(src, s) for src, s in zip(srcs, sources, strict=True)
+               if isinstance(s, _CSVSource) and (s.num_clipped or s.num_dropped)]
+    # as for BED: a file whose every record started past the end of its chromosome leaves nothing to import
+    for src, source in clipped:
+        if not source.num_kept and source.num_dropped:
+            raise ValueError(f"File {src}: all of its {source.num_dropped} record(s) start at or past the end of "
+                             "their chromosome: nothing to import")
+    clip_warning = None
+    if clipped:
+        first_src, first = clipped[0]
+        clip_warning = (
+            f"{'File' if len(clipped) == 1 else 'Files'} {', '.join(src for src, _ in clipped)}: "
+            f"{sum(s.num_clipped for _, s in clipped)} record(s) running past the end of their chromosome were "
+            f"clipped to it, and {sum(s.num_dropped for _, s in clipped)} record(s) starting at or past the "
+            "chromosome end were dropped; the first: "
+            + (first.first_clipped if len(clipped) == 1 else f"file {first_src}, {first.first_clipped}")
+        )
+
     chrom_order = [str(c) for c in gintervals_all()["chrom"].tolist()]
 
     # Atomic create: directory layout mirrors gtrack_array_create -- per-chrom
@@ -5895,23 +6142,20 @@ def gtrack_array_import(
         colnames = _import_sources(track_dir, sources, chrom_order)
         write_colnames(track_dir, colnames)
 
+    if clip_warning is not None:
+        warnings.warn(clip_warning, stacklevel=user_stacklevel())
     for src, source in zip(srcs, sources, strict=True):
         if isinstance(source, _CSVSource):
             _report_unknown_chroms(source.unknown, source.num_matched, src)
 
-    _pymisha.pm_dbreload()
+    # (written through _atomic_track_create(), i.e. _target_root(): _UROOT if set, else _GROOT)
+    _pm_dbreload(_target_root(), tracks=[track])
     created_by = (
         f'gtrack_array_import("{track}", description, src = c("'
         + '", "'.join(srcs)
         + '"))'
     )
     _set_created_attrs(track, description, created_by)
-    _pymisha.pm_dbreload()
-    # gtrack_array_import predates _pm_dbreload() and still calls the raw
-    # C++ rescan directly, so the sentinel has to be touched explicitly
-    # here. It writes through _atomic_track_create(), i.e. _target_root()
-    # (_UROOT if set, else _GROOT) - not necessarily _GROOT.
-    _shared._touch_db_cache_dirty(_target_root())
     if _db_is_indexed(_shared._GROOT):
         _index_created_track(track, remove_old=True)
 

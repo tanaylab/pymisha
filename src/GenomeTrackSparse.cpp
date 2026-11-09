@@ -204,6 +204,10 @@ void GenomeTrackSparse::read_interval(const GInterval &interval)
         m_last_last = std::numeric_limits<float>::quiet_NaN();
     if (has_function(LAST_POS))
         m_last_last_pos = std::numeric_limits<double>::quiet_NaN();
+    if (has_function(WEIGHTED_SUM))
+        m_last_weighted_sum = std::numeric_limits<double>::quiet_NaN();
+    if (has_function(LSE))
+        m_last_lse = std::numeric_limits<float>::quiet_NaN();
 
     if (m_use_quantile)
         m_sp.reset();

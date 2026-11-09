@@ -97,8 +97,10 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
                 continue;
             }
             Py_ssize_t seq_len = 0;
-            const char *seq = PyUnicode_AsUTF8AndSize(el, &seq_len);
-            if (!seq || (int)seq_len < W) {
+            const char *seq = py_seq_bytes(el, &seq_len);
+            if (!seq)
+                return nullptr;
+            if ((int)seq_len < W) {
                 out[r] = std::numeric_limits<double>::quiet_NaN();
                 continue;
             }
@@ -204,8 +206,12 @@ PyObject *pm_gseq_potts(PyObject *self, PyObject *args)
  * string. Also returns use_blocked: which kernel score_codes() runs for the
  * model and for its reverse complement. Not reachable from the pymisha API.
  *
- * Returns: dict with "naive" and "blocked" (float64 arrays of n) and
- * "use_blocked" (a tuple of two bools).
+ * Returns: dict with "naive" and "blocked" (float64 arrays of n),
+ * "use_blocked" (a tuple of two bools), "delta_max" and "best_delta" (float64
+ * arrays of n: the largest single-substitution change from delta_codes() one
+ * (position, base) at a time and from best_delta()) and "score4_mismatch"
+ * (how many score_codes4() values differ from score_codes() on four
+ * consecutive anchors: window i followed by the first codes of window i + 1).
  */
 PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args)
 {
@@ -242,8 +248,12 @@ PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args)
         npy_intp dims[1] = {n};
         PMPY py_naive(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
         PMPY py_blocked(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+        PMPY py_delta_max(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+        PMPY py_best_delta(PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
         double *naive = (double *)PyArray_DATA((PyArrayObject *)*py_naive);
         double *blocked = (double *)PyArray_DATA((PyArrayObject *)*py_blocked);
+        double *delta_max = (double *)PyArray_DATA((PyArrayObject *)*py_delta_max);
+        double *best_delta = (double *)PyArray_DATA((PyArrayObject *)*py_best_delta);
 
         // One base past the window, for the trailing block's second base.
         std::vector<int8_t> win((size_t)W + 1), win_block_codes;
@@ -264,12 +274,46 @@ PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args)
             potts_block_codes(win, win_block_codes, 0, (size_t)W);
             naive[i] = model.score_codes_naive(win.data());
             blocked[i] = model.score_codes_blocked(win_block_codes.data());
+            double dm = -std::numeric_limits<double>::infinity();
+            for (int j = 0; j < W; ++j)
+                for (int b = 0; b < 4; ++b)
+                    if (b != win[j]) {
+                        const double d = model.delta_codes(win.data(), j, b);
+                        if (d > dm)
+                            dm = d;
+                    }
+            delta_max[i] = dm;
+            best_delta[i] = model.best_delta(win.data());
         }
 
-        PMPY res(Py_BuildValue("{s:O,s:O,s:(OO)}", "naive", (PyObject *)py_naive,
+        // score_codes4() against score_codes() on four consecutive anchors:
+        // window i followed by the first three codes of window i + 1.
+        long n4_mismatch = 0;
+        {
+            std::vector<int8_t> seq((size_t)W + 4), seq_bc;
+            for (npy_intp i = 0; i + 1 < n; ++i) {
+                const int64_t *col = codes + (size_t)i * W;
+                const int64_t *nxt = codes + (size_t)(i + 1) * W;
+                for (int j = 0; j < W; ++j)
+                    seq[j] = (int8_t)col[j];
+                for (int j = 0; j < 4; ++j)
+                    seq[W + j] = (int8_t)nxt[j % W];
+                potts_block_codes(seq, seq_bc, 0, seq.size());
+                double out[4];
+                model.score_codes4(seq.data(), seq_bc.data(), out);
+                for (int k = 0; k < 4; ++k)
+                    if (out[k] != model.score_codes(seq.data() + k, seq_bc.data() + k))
+                        ++n4_mismatch;
+            }
+        }
+
+        PMPY res(Py_BuildValue("{s:O,s:O,s:(OO),s:O,s:O,s:l}", "naive", (PyObject *)py_naive,
                                "blocked", (PyObject *)py_blocked, "use_blocked",
                                model.use_blocked() ? Py_True : Py_False,
-                               model.rc().use_blocked() ? Py_True : Py_False),
+                               model.rc().use_blocked() ? Py_True : Py_False,
+                               "delta_max", (PyObject *)py_delta_max,
+                               "best_delta", (PyObject *)py_best_delta,
+                               "score4_mismatch", n4_mismatch),
                  true);
         res.to_be_stolen();
         return (PyObject *)res;

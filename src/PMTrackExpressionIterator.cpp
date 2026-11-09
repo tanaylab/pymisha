@@ -129,6 +129,17 @@ void PMFixedBinIterator::next()
     m_cur_interval.end = std::min(coord + m_bin_size, m_last_scope_interval.end);
 }
 
+void PMFixedBinIterator::advance(int64_t k)
+{
+    // the k - 1 skipped calls of next() would only move the bin and the index and set
+    // m_cur_interval, which the last one sets
+    if (k > 1 && !m_isend) {
+        m_cur_bin += k - 1;
+        m_idx += k - 1;
+    }
+    next();
+}
+
 
 // ========================= PMIntervalsIterator =========================
 

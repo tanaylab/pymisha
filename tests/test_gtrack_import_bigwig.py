@@ -53,9 +53,14 @@ def extract_all(track, iterator):
     return pm.gextract(track, pm.gintervals_all(), iterator=iterator, colnames=["v"])
 
 
-def import_both(text, bw, binsize, defval=np.nan):
-    pm.gtrack_import("from_text", "", str(FIXTURES / text), binsize=binsize, defval=defval)
-    pm.gtrack_import("from_bw", "", str(FIXTURES / bw), binsize=binsize, defval=defval)
+def import_both(text, bw, binsize, defval=np.nan, warns=None):
+    """Imports the text and the bigWig; with warns, each import must warn matching it."""
+    for track, f in (("from_text", text), ("from_bw", bw)):
+        if warns is None:
+            pm.gtrack_import(track, "", str(FIXTURES / f), binsize=binsize, defval=defval)
+        else:
+            with pytest.warns(UserWarning, match=warns):
+                pm.gtrack_import(track, "", str(FIXTURES / f), binsize=binsize, defval=defval)
     return extract_all("from_bw", binsize or "from_bw"), extract_all("from_text", binsize or "from_text")
 
 
@@ -78,11 +83,37 @@ def test_bigwig_imports_exactly_like_its_text(bigwig_db, bw, text):
 
 def test_step_records_are_clipped_at_chromosome_end(short_db):
     for binsize in (0, 7):
-        got, want = import_both("step.wig", "step.bw", binsize)
+        got, want = import_both("step.wig", "step.bw", binsize,
+                                warns=r"1 record\(s\) running past the end of their chromosome were clipped to it")
         pd.testing.assert_frame_equal(got, want, check_exact=True)
         assert got.loc[got["chrom"] == "chr2", "end"].max() == 9985
         pm.gtrack_rm("from_text", force=True)
         pm.gtrack_rm("from_bw", force=True)
+
+
+def test_bedgraph_records_past_the_chromosome_end_are_clipped_or_dropped_as_in_the_text_route(tmp_path, caplog):
+    # chr2 ends inside the record 9870-9910, before the record 9933-9981
+    make_db(tmp_path / "short_bg_db", {"chr1": 10000, "chr2": 9900})
+    msg = (r"1 record\(s\) running past the end of their chromosome were clipped to it, and 1 record\(s\) starting "
+           r"at or past the chromosome end were dropped; the first: .*\(chr2, 9870, 9910\), chromosome size 9900")
+    for binsize in (0, 7):
+        got, want = import_both("bg.bedGraph", "bg.bw", binsize, warns=msg)
+        pd.testing.assert_frame_equal(got, want, check_exact=True)
+        if binsize == 0:
+            assert got.loc[got["chrom"] == "chr2", "end"].iloc[-1] == 9900
+        pm.gtrack_rm("from_text", force=True)
+        pm.gtrack_rm("from_bw", force=True)
+
+
+def test_the_bigwig_record_past_the_chromosome_end_that_the_warning_names_is_the_first_in_the_file(tmp_path):
+    # chr2 first in the database, chr1 first in the files; both end inside a record
+    make_db(tmp_path / "rev_db", {"chr2": 9900, "chr1": 9900})
+    if pm.gintervals_all()["chrom"].astype(str).tolist() != ["chr2", "chr1"]:
+        pytest.skip("the database sorts its chromosomes")
+    for f in ("bg.bw", "bg.bedGraph"):
+        with pytest.warns(UserWarning, match=r"the first: (line [0-9]+: )?\(chr1, 9888, 9925\)"):
+            pm.gtrack_import("first", "", str(FIXTURES / f), binsize=0)
+        pm.gtrack_rm("first", force=True)
 
 
 def test_full_float_precision_and_zero_length_records_skipped(bigwig_db):
@@ -159,8 +190,6 @@ def test_two_bigwig_chromosomes_for_one_database_chromosome(bigwig_db, tmp_path)
 @pytest.mark.parametrize(("text", "match"), [
     ("chr1\t0\t100\t1\nchr1\t50\t150\t2\n", "overlapping or unsorted"),
     ("chr1\t200\t300\t1\nchr1\t0\t100\t2\n", "overlapping or unsorted"),
-    ("chr1\t9990\t10001\t1\n", "invalid record"),
-    ("fixedStep chrom=chr1 start=10001 step=10 span=5\n1\n", "invalid record"),
     ("variableStep chrom=chr2 span=5\n10 1\n8 2\n", "overlapping or unsorted"),
     ("fixedStep chrom=chr1 start=1 step=5 span=10\n1\n2\n", "overlapping or unsorted"),   # span > step
     ("chr1\t0\t10\t1\nchr2\t0\t10\t1\nchr1\t20\t30\t1\n", "not sorted by chromosomes"),
@@ -209,9 +238,10 @@ def test_wig_and_bedgraph_lines_mix(bigwig_db, tmp_path, text, want):
     ("fixedStep chrom=chr1 start=1 step=10\n1\nchr2\t0\t10\t3\n20 4\n", "variableStep"),
 ])
 def test_value_after_bedgraph_line_is_an_error(bigwig_db, tmp_path, text, header):
+    # not a WIG file, nor a tab-delimited one: the error gives both reasons, as misha's
     f = tmp_path / "mix.wig"
     f.write_text(text)
-    with pytest.raises(_pymisha.error, match=f"value is not preceded by {header} header"):
+    with pytest.raises(ValueError, match=f"(?s)Unrecognized format.*value is not preceded by {header} header"):
         pm.gtrack_import("mix", "", str(f), binsize=0)
     assert not pm.gtrack_exists("mix")
 

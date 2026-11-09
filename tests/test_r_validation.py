@@ -144,9 +144,9 @@ PSSM3 = np.array([[0.7, 0.1, 0.1, 0.1], [0.1, 0.7, 0.1, 0.1], [0.1, 0.1, 0.7, 0.
 @pytest.mark.parametrize("func", ["pwm.edit_distance", "pwm.edit_distance.lse"])
 @pytest.mark.parametrize("kw,msg", [
     ({"score_min": "abc"}, "score.min must be NULL or a single numeric value"),
-    ({"extend": -1}, "extend must be TRUE, FALSE, or a non-negative integer"),
-    ({"extend": 2.5}, "extend must be TRUE, FALSE, or a non-negative integer"),
-    ({"extend": "yes"}, "extend must be TRUE, FALSE, or a non-negative integer"),
+    ({"extend": -1}, "extend must be True, False, or a non-negative integer"),
+    ({"extend": 2.5}, "extend must be True, False, or a non-negative integer"),
+    ({"extend": "yes"}, "extend must be True, False, or a non-negative integer"),
 ])
 def test_edit_distance_argument_checks(func, kw, msg):  # test-pwm-edit-distance.R:1558, 2133-2237
     with pytest.raises(ValueError, match=msg):

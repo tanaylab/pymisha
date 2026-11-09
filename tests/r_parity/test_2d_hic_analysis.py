@@ -33,7 +33,6 @@ from .baseline import assert_matches_baseline, assert_matches_list_baseline
 
 GAP_2D_BAND = "2D band query near the diagonal returns a different contact set/coords than R"
 GAP_BAND_GITER = "giterator_intervals has no band= argument"
-GAP_NN_TIE = "equidistant 2D neighbors tie-break differs from R (priority_queue pop order not portable)"
 GAP_R_POSTPROC = "baseline is pure R post-processing (cut/table or rpois seed) not reproducible cross-impl"
 GAP_GCIS_DECAY = "gcis_decay over Hi-C differs from R (valued-source gcis_decay gap)"
 
@@ -295,12 +294,9 @@ def test_giterator_intervals_band(hg19_overlay):
             pm.gintervals_rm("test.band_set", force=True)
 
 
-@pytest.mark.xfail(reason=GAP_NN_TIE, strict=True)
 def test_gintervals_neighbors_2d(hg19_overlay):
-    # giterator_intervals(band=...) and 2D `gintervals_neighbors` are both
-    # implemented; the residual diff is an equidistant tie-break artifact
-    # (~58 of 789 rows pick a different equidistant target on the grid-cell
-    # boundary). Both choices have ``dist1 == dist2 == 0``.
+    # equidistant neighbors are chosen by their coordinates (R misha 5.17), so the
+    # result matches R's _v2 snapshot
     pm.giterator_intervals("hic.test_basic", band=(-5e5, -1e4), intervals_set_out="test.neigh_set")
     try:
         s1 = np.arange(5e5, 1e6 + 1, 1e5)
@@ -311,7 +307,7 @@ def test_gintervals_neighbors_2d(hg19_overlay):
             "chrom2": "chr1", "start2": [x[1] for x in g], "end2": [x[1] + 1e5 for x in g],
         })
         r = pm.gintervals_neighbors("test.neigh_set", grid, mindist1=-5e4, maxdist1=5e4, mindist2=-5e4, maxdist2=5e4)
-        assert_matches_baseline(r, "gintervals.neighbors.2d.hic.1")
+        assert_matches_baseline(r, "gintervals.neighbors.2d.hic.1_v2")
     finally:
         import contextlib
         with contextlib.suppress(Exception):

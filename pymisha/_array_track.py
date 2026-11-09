@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import io
 import struct
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as _numpy
@@ -456,62 +455,6 @@ def extract_array(
 ARRAY_REDUCE_FUNCS = {"avg", "min", "max", "sum", "stddev"}
 
 
-def reduce_array_extract(
-    extracted: _pd.DataFrame,
-    val_cols: list[str],
-    func: str,
-    n_intervals: int,
-) -> _numpy.ndarray:
-    """Reduce *extracted* (output of ``extract_array``) to one scalar per interval.
-
-    Groups extracted rows by ``intervalID`` and applies *func* over all
-    non-NaN values in all selected columns (matching R's
-    ``GenomeTrackArrays::get_sliced_val`` cross-position / cross-column
-    aggregation semantics).  Rows for interval IDs absent from *extracted*
-    get NaN.
-    """
-    func = func.lower()
-    if func not in ARRAY_REDUCE_FUNCS:
-        raise ValueError(
-            f"Array track aggregation function must be one of "
-            f"{sorted(ARRAY_REDUCE_FUNCS)!r}, got {func!r}"
-        )
-
-    out = _numpy.full(n_intervals, _numpy.nan, dtype=_numpy.float64)
-
-    if extracted.empty or not val_cols:
-        return out
-
-    vals = extracted[val_cols].to_numpy(dtype=_numpy.float64)  # (nrows, ncols)
-    iids = extracted["intervalID"].to_numpy(dtype=_numpy.int64)  # 1-based
-
-    # Group rows by intervalID
-    groups: dict[int, list] = defaultdict(list)
-    for row_i, iid in enumerate(iids):
-        idx = int(iid) - 1  # 0-based
-        if 0 <= idx < n_intervals:
-            groups[idx].append(vals[row_i])
-
-    for idx, rows in groups.items():
-        # Concatenate all values across selected columns and all rows
-        all_vals = _numpy.concatenate(list(rows))
-        finite = all_vals[~_numpy.isnan(all_vals)]
-        if finite.size == 0:
-            continue
-        if func in ("avg", "mean"):
-            out[idx] = float(_numpy.mean(finite))
-        elif func == "min":
-            out[idx] = float(_numpy.min(finite))
-        elif func == "max":
-            out[idx] = float(_numpy.max(finite))
-        elif func == "sum":
-            out[idx] = float(_numpy.sum(finite))
-        elif func == "stddev":
-            out[idx] = float(_numpy.std(finite, ddof=1)) if finite.size > 1 else _numpy.nan
-
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Multi-source array-track import (R parity for garrays_import)
 # ---------------------------------------------------------------------------
@@ -531,7 +474,8 @@ class _CSVSource:
             raise FileNotFoundError(
                 f"gtrack_array_import: source file not found: {self._path}"
             )
-        df = _pd.read_csv(self._path, sep="\t", dtype={"chrom": str})
+        # blank lines kept as empty rows, so that a row's index gives its line
+        df = _pd.read_csv(self._path, sep="\t", dtype={"chrom": str}, skip_blank_lines=False)
         cols = list(df.columns)
         required = ["chrom", "start", "end"]
         if cols[:3] != required:
@@ -540,6 +484,10 @@ class _CSVSource:
                 f"chrom\\tstart\\tend; got {cols[:3]!r})"
             )
         self.colnames: list[str] = cols[3:]
+        lines = _numpy.arange(len(df), dtype=_numpy.int64) + 2
+        blank = df.isna().all(axis=1).to_numpy()
+        df = df.loc[~blank].reset_index(drop=True)
+        lines = lines[~blank]
         # Rows by chromosome, a chromosome given by any of its names (as R's chrom2id
         # resolves them). The rows of a name the database does not have are skipped: the
         # names (an _unknown_chroms) and the number of database chromosomes the file names
@@ -550,9 +498,41 @@ class _CSVSource:
         keep = _numpy.array([c is not None for c in canon], dtype=bool)
         df = df.loc[keep].copy()
         df["chrom"] = canon[keep]
+        df = self._clip_to_chroms(df, lines[keep])
         self._by_chrom: dict[str, _pd.DataFrame] = {
             str(c): g.reset_index(drop=True) for c, g in df.groupby("chrom", sort=False)
         }
+
+    def _clip_to_chroms(self, df, lines):
+        """Clips the records that run past the end of their chromosome to it and drops those
+        that start at or past it, as R misha's GenomeArraysCsv does for gtrack.array.import;
+        notes their counts, the first of them in the file ("line N: (chrom, start, end),
+        chromosome size N", "" if none) and the number of records kept. An inverted record is
+        left for read_chrom to reject."""
+        from .intervals import gintervals_all
+
+        self.num_clipped = self.num_dropped = 0
+        self.first_clipped = ""
+        self.num_kept = len(df)
+        if not len(df):
+            return df
+        size = df["chrom"].map(gintervals_all().set_index("chrom")["end"]).to_numpy(dtype=_numpy.int64)
+        start = _pd.to_numeric(df["start"], errors="coerce").to_numpy(dtype=_numpy.float64)
+        end = _pd.to_numeric(df["end"], errors="coerce").to_numpy(dtype=_numpy.float64)
+        with _numpy.errstate(invalid="ignore"):
+            past = (end > size) & (start < end) & (start >= 0)
+        if not past.any():
+            return df
+        drop = past & (start >= size)
+        i = _numpy.flatnonzero(past)[_numpy.argmin(lines[past])]
+        self.num_clipped = int((past & ~drop).sum())
+        self.num_dropped = int(drop.sum())
+        self.num_kept = len(df) - self.num_dropped
+        self.first_clipped = (f"line {lines[i]}: ({df['chrom'].iat[i]}, {int(start[i])}, {int(end[i])}), "
+                              f"chromosome size {size[i]}")
+        df = df.copy()
+        df.loc[past, "end"] = size[past]
+        return df.loc[~drop]
 
     @property
     def src(self) -> str:

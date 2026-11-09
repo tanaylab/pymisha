@@ -1,5 +1,5 @@
-"""R misha test-gintervals.neighbors.R blocks 144-560, against R 5.14.2's own
-output for the same fixtures (tests/test_data/neighbors_r_5_14_2.json; R's
+"""R misha test-gintervals.neighbors.R blocks 144-560, against R 5.17.0's own
+output for the same fixtures (tests/test_data/neighbors_r_5_17_0.json; R's
 chr3 is chrX here). Rows, row order, columns and distances must all match."""
 
 import json
@@ -11,7 +11,7 @@ import pytest
 
 import pymisha as pm
 
-with open(os.path.join(os.path.dirname(__file__), "test_data", "neighbors_r_5_14_2.json")) as fh:
+with open(os.path.join(os.path.dirname(__file__), "test_data", "neighbors_r_5_17_0.json")) as fh:
     CASES = json.load(fh)
 
 

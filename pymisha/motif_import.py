@@ -19,24 +19,32 @@ import pandas as _pandas
 # ---------------------------------------------------------------------------
 
 def _dedup_motif_ids(ids: list[str]) -> list[str]:
-    """Append .1, .2, ... suffixes to duplicate motif IDs."""
-    if not ids:
-        return ids
-    seen: dict[str, int] = {}
-    for mid in ids:
-        seen[mid] = seen.get(mid, 0) + 1
-    dups = {k for k, v in seen.items() if v > 1}
-    if not dups:
+    """Append .1, .2, ... suffixes to duplicate motif IDs.
+
+    Every copy of a repeated ID gets a suffix. A suffixed name that is already
+    taken (by another ID of the input, or by an earlier suffix) is skipped, so
+    the result is unique: ACGT, ACGT, ACGT.1 -> ACGT.2, ACGT.3, ACGT.1.
+    """
+    positions: dict[str, list[int]] = {}
+    dup_names: list[str] = []  # in the order of their second appearance, as R's unique(ids[duplicated(ids)])
+    for i, mid in enumerate(ids):
+        pos = positions.setdefault(mid, [])
+        if len(pos) == 1:
+            dup_names.append(mid)
+        pos.append(i)
+    if not dup_names:
         return ids
     warnings.warn("Duplicate motif IDs found; appending numeric suffixes to disambiguate", stacklevel=2)
-    counters: dict[str, int] = {}
-    result: list[str] = []
-    for mid in ids:
-        if mid in dups:
-            counters[mid] = counters.get(mid, 0) + 1
-            result.append(f"{mid}.{counters[mid]}")
-        else:
-            result.append(mid)
+    taken = set(positions)
+    result = list(ids)
+    for nm in dup_names:
+        suffix = 0
+        for i in positions[nm]:
+            while f"{nm}.{suffix + 1}" in taken:
+                suffix += 1
+            suffix += 1
+            taken.add(f"{nm}.{suffix}")
+            result[i] = f"{nm}.{suffix}"
     return result
 
 
@@ -156,7 +164,8 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
     if not motif_starts:
         raise ValueError(f"No motifs found in {file}")
 
-    results: dict[str, _pandas.DataFrame] = {}
+    # In file order: a repeated ID keeps each of its motifs
+    results: list[_pandas.DataFrame] = []
     ids: list[str] = []
 
     for mi, start_line in enumerate(motif_starts):
@@ -272,15 +281,14 @@ def gseq_read_meme(file: str) -> dict[str, _pandas.DataFrame]:
         df.attrs["background"] = background
 
         ids.append(motif_id)
-        results[motif_id] = df  # temporary; will rebuild with deduped ids
+        results.append(df)
 
     if not ids:
         raise ValueError(f"No motifs found in {file}")
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped, strict=False):
-        df = results[orig_id]
+    for new_id, df in zip(deduped, results, strict=True):
         final[new_id] = df
     return final
 
@@ -341,7 +349,8 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
     if not header_idx:
         raise ValueError(f"No motifs found in {file}")
 
-    results: dict[str, _pandas.DataFrame] = {}
+    # In file order: a repeated ID keeps each of its motifs
+    results: list[_pandas.DataFrame] = []
     ids: list[str] = []
 
     for hi, start in enumerate(header_idx):
@@ -433,12 +442,12 @@ def _parse_jaspar_header(lines: list[str], file: str) -> dict[str, _pandas.DataF
         df.attrs["format"] = "jaspar"
 
         ids.append(motif_id)
-        results[motif_id] = df
+        results.append(df)
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped, strict=False):
-        final[new_id] = results[orig_id]
+    for new_id, df in zip(deduped, results, strict=True):
+        final[new_id] = df
     return final
 
 
@@ -451,7 +460,8 @@ def _parse_jaspar_simple(lines: list[str], file: str) -> dict[str, _pandas.DataF
         )
 
     n_motifs = len(lines) // 4
-    results: dict[str, _pandas.DataFrame] = {}
+    # In file order: a repeated ID keeps each of its motifs
+    results: list[_pandas.DataFrame] = []
     ids: list[str] = []
 
     base_id = os.path.splitext(os.path.basename(file))[0]
@@ -513,12 +523,12 @@ def _parse_jaspar_simple(lines: list[str], file: str) -> dict[str, _pandas.DataF
         df.attrs["format"] = "simple"
 
         ids.append(motif_id)
-        results[motif_id] = df
+        results.append(df)
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped, strict=False):
-        final[new_id] = results[orig_id]
+    for new_id, df in zip(deduped, results, strict=True):
+        final[new_id] = df
     return final
 
 
@@ -564,7 +574,8 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
     if not header_idx:
         raise ValueError(f"No motifs found in HOMER file {file}")
 
-    results: dict[str, _pandas.DataFrame] = {}
+    # In file order: a repeated ID keeps each of its motifs
+    results: list[_pandas.DataFrame] = []
     ids: list[str] = []
 
     for hi, start in enumerate(header_idx):
@@ -639,13 +650,13 @@ def gseq_read_homer(file: str) -> dict[str, _pandas.DataFrame]:
         df.attrs["source"] = "homer"
 
         ids.append(motif_id)
-        results[motif_id] = df
+        results.append(df)
 
     if not ids:
         raise ValueError(f"No motifs found in HOMER file {file}")
 
     deduped = _dedup_motif_ids(ids)
     final: dict[str, _pandas.DataFrame] = {}
-    for orig_id, new_id in zip(ids, deduped, strict=False):
-        final[new_id] = results[orig_id]
+    for new_id, df in zip(deduped, results, strict=True):
+        final[new_id] = df
     return final

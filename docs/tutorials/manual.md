@@ -995,10 +995,10 @@ pm.CONFIG['multitasking'] = False
 
 ### Limiting the Memory Consumption
 
-For certain functions, multitasking might result in higher memory consumption. The `pm.CONFIG['max_data_size']` parameter controls the maximum number of rows in memory.
+For certain functions, multitasking might result in higher memory consumption. The `pm.CONFIG['max_data_size']` parameter is the maximal number of records (rows of a result, values) that a call holds in memory: `gextract`, `gscreen` and the like fail above it, and `gquantiles` samples. It is a count, not a size in bytes. A result too big for memory can be written to a file instead (`gextract(..., file="x.tsv")` or `file="x.parquet"`), which the limit does not bound.
 
 ```python
-# View current buffer size
+# View the current limit, in records
 print(pm.CONFIG['max_data_size'])   # Default: 10,000,000
 
 # Reduce if memory is limited
@@ -1011,6 +1011,10 @@ Some functions such as `pm.gscreen()` or `pm.gextract()` consume memory proporti
 
 !!! tip
     To limit memory consumption in multitasking mode, lower `max_data_size` or switch off multitasking entirely.
+
+### Multitasking from a Large Python Session
+
+Each child process is a fork of the Python session. A fork copies the page tables of the session, once per child, so its cost grows with the memory the session holds. When that memory is in 4 KB pages (not transparent huge pages), forking many children from a session that holds tens of GB can take longer than the call itself. pymisha warns once per session when this is likely; such calls are then better run with fewer processes (`pm.CONFIG['max_processes'] = 4`) or with `pm.CONFIG['multitasking'] = False`, and freeing large objects before them also helps.
 
 ### Other Considerations
 

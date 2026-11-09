@@ -568,7 +568,9 @@ def gintervals_2d(
     Returns
     -------
     DataFrame
-        Sorted 2D intervals with columns: chrom1, start1, end1, chrom2, start2, end2.
+        2D intervals with columns: chrom1, start1, end1, chrom2, start2, end2,
+        sorted by chromosome pair (as R misha); within a pair the intervals keep
+        the order given.
 
     See Also
     --------
@@ -627,7 +629,11 @@ def gintervals_2d(
         'chrom2': c2, 'start2': s2, 'end2': e2,
     })
 
-    return df.sort_values(['chrom1', 'start1', 'chrom2', 'start2']).reset_index(drop=True)
+    # As R (gintervsort): sorted by chromosome pair only, as R's std::sort orders them; within a
+    # pair the intervals keep their order
+    cids = [_numpy.asarray(_pymisha.pm_chrom_ids(list(df[c])), dtype=_numpy.int64) for c in ("chrom1", "chrom2")]
+    order = _numpy.asarray(_pymisha.pm_r_2d_sort_order(cids[0], cids[1]), dtype=_numpy.int64)
+    return df.iloc[order].reset_index(drop=True)
 
 
 def gintervals_2d_all(mode: str | None = None) -> pd.DataFrame:
@@ -970,8 +976,15 @@ def _chrom_sizes_for_2d_verify() -> dict[str, int] | None:
     return sizes
 
 
+def _valid_coord(values: Any) -> Any:
+    """Which coordinates (floats) can be one: not missing, not infinite and within the int64 range,
+    as R misha's is_valid_coord (|v| < 9.2e18)."""
+    with _numpy.errstate(invalid="ignore"):
+        return _numpy.abs(values) < 9.2e18
+
+
 def _verify_2d_intervals(intervals: pd.DataFrame) -> None:
-    """Reject NaN, negative, inverted (``start >= end``), and
+    """Reject missing, infinite, negative, inverted (``start >= end``), and
     past-the-chromosome 2D interval coordinates.
 
     The 1D path validates coordinates in C++ (``verify_interval_coords`` in
@@ -1002,7 +1015,7 @@ def _verify_2d_intervals(intervals: pd.DataFrame) -> None:
     end2 = pd.to_numeric(intervals['end2'], errors='coerce').to_numpy(dtype='float64')
 
     def _coord(v: float) -> str:
-        # Only called on finite values (NaN is handled separately, below).
+        # Only called on valid values (the others are handled separately, below).
         return str(int(v))
 
     def _raise(i: int, msg: str) -> None:
@@ -1011,10 +1024,10 @@ def _verify_2d_intervals(intervals: pd.DataFrame) -> None:
             f"{chrom2[i]}, {_coord(start2[i])}, {_coord(end2[i])}): {msg}"
         )
 
-    nan_mask = np.isnan(start1) | np.isnan(end1) | np.isnan(start2) | np.isnan(end2)
-    if nan_mask.any():
-        i = int(np.argmax(nan_mask))
-        raise ValueError(f"Interval coordinates contain a missing (NaN) value at index {i}")
+    # a missing, infinite or out-of-range coordinate, as R's convert_rintervs (1-based index)
+    bad_mask = ~(_valid_coord(start1) & _valid_coord(end1) & _valid_coord(start2) & _valid_coord(end2))
+    if bad_mask.any():
+        raise ValueError(f"Invalid format of interval at index {int(np.argmax(bad_mask)) + 1}")
 
     neg_mask = (start1 < 0) | (start2 < 0)
     if neg_mask.any():
@@ -2046,8 +2059,15 @@ def _validate_interval_coords(
     (e.g. in gintervals.canonic / intersect / union / diff). Without this
     check pymisha silently dropped zero-width intervals and passed inverted
     (start > end) intervals straight through, corrupting downstream results.
-    Vectorized so it adds negligible cost on large inputs.
+    Vectorized so it adds negligible cost on large inputs. A missing, infinite
+    or out-of-range coordinate is first an invalid interval, as in R's
+    convert_rintervs.
     """
+    if start_arr.dtype.kind not in "iu" or end_arr.dtype.kind not in "iu":
+        valid = (_valid_coord(_pandas.to_numeric(_pandas.Series(start_arr), errors="coerce").to_numpy(dtype=float))
+                 & _valid_coord(_pandas.to_numeric(_pandas.Series(end_arr), errors="coerce").to_numpy(dtype=float)))
+        if not valid.all():
+            raise ValueError(f"Invalid format of interval at index {int(_numpy.argmax(~valid)) + 1}")
     bad = start_arr >= end_arr
     if bad.any():
         i = int(_numpy.argmax(bad))
@@ -2338,6 +2358,8 @@ def gintervals_canonic(
     if intervals is None:
         raise ValueError("intervals cannot be None")
     assert isinstance(intervals, pd.DataFrame)
+    _check_flag(unify_touching_intervals, "unify_touching_intervals",
+                "unify_touching_intervals argument must be True or False")
     if len(intervals) == 0:
         return None
 
@@ -2590,6 +2612,7 @@ def _neighbors_2d_via_cpp_nn(
             out_d1.append(float(d1_arr[j]))
             out_d2.append(float(d2_arr[j]))
             queries_with_any_match.add(int(q_global[j]))
+        _verify_neighbors_size(len(out_q))
 
     # NA-if-notfound: every query in i1 that produced zero matches.
     if na_if_notfound:
@@ -2599,16 +2622,19 @@ def _neighbors_2d_via_cpp_nn(
                 out_t.append(-1)
                 out_d1.append(float("nan"))
                 out_d2.append(float("nan"))
+        _verify_neighbors_size(len(out_q))
 
     if not out_q:
         return None
 
-    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, id2).
+    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, the neighbor's start1, end1,
+    # start2, end2, id2)
     order = sorted(
         range(len(out_q)),
         key=lambda i: (
             out_q[i],
             abs((out_d1[i] + out_d2[i]) if out_t[i] >= 0 else 0.0),
+            *_neighbor_2d_coords(out_t[i], tx1, tx2, ty1, ty2),
             out_t[i],
         ),
     )
@@ -2647,6 +2673,22 @@ def _neighbors_2d_via_cpp_nn(
     return res_df
 
 
+def _verify_neighbors_size(n: int) -> None:
+    """R's check of a 2D neighbors result of n rows (the neighbors kept and the rows of queries
+    with none) against CONFIG['max_data_size']: R stops at the first row over the limit."""
+    limit = _config_limit("max_data_size")
+    if n > limit:
+        _pymisha.pm_verify_max_data_size(limit + 1)
+
+
+def _neighbor_2d_coords(k: int, x1: Any, x2: Any, y1: Any, y2: Any) -> tuple[int, int, int, int]:
+    """The coordinates of neighbor row *k* (start1, end1, start2, end2) by which 2D neighbors at
+    the same distance are ordered; (0, 0, 0, 0) for a query with no neighbor (k < 0)."""
+    if k < 0:
+        return (0, 0, 0, 0)
+    return (int(x1[k]), int(x2[k]), int(y1[k]), int(y2[k]))
+
+
 def _neighbors_2d(
     i1: pd.DataFrame,
     i2: pd.DataFrame,
@@ -2661,10 +2703,11 @@ def _neighbors_2d(
 
     For each rectangle of *i1*, finds up to *maxneighbors* rectangles of *i2* on
     the SAME chrom-pair whose per-axis unsigned gaps ``(dist1, dist2)`` lie in
-    ``[mindist1, maxdist1] x [mindist2, maxdist2]``, ordered by Manhattan
-    distance ``dist1 + dist2`` (then by target index).  Mirrors R's
-    ``gfind_neighbors`` 2D branch (``StatQuadTree::NNIterator``); the result is
-    sorted by ``(query index, dist1 + dist2, target index)``.
+    ``[mindist1, maxdist1] x [mindist2, maxdist2]``, the nearest by Manhattan
+    distance ``dist1 + dist2``, ties broken by the neighbor's ``(start1, end1,
+    start2, end2)`` and then by its row.  Mirrors R's ``gfind_neighbors`` 2D
+    branch; the result is sorted by ``(query index, dist1 + dist2, start1, end1,
+    start2, end2, target index)``.
 
     A bounded distance window uses the in-memory quadtree (expanded-rectangle
     query); an unbounded window (the default ``maxdist = 1e9`` sentinel) falls
@@ -2752,17 +2795,18 @@ def _neighbors_2d(
     for j in range(len(i1)):
         key = (c1q[j], c2q[j])
         cands = _candidates(key, j)
-        kept: list[tuple[int, int, int, int]] = []
+        kept: list[tuple[int, int, int, int, int, int, int, int]] = []
         if cands is not None:
             for k in cands:
                 k = int(k)
                 d1 = _axis_gap(int(qx1[j]), int(qx2[j]), int(tx1[k]), int(tx2[k]))
                 d2 = _axis_gap(int(qy1[j]), int(qy2[j]), int(ty1[k]), int(ty2[k]))
                 if mindist1 <= d1 <= maxdist1 and mindist2 <= d2 <= maxdist2:
-                    kept.append((d1 + d2, k, d1, d2))
-        kept.sort(key=lambda t: (t[0], t[1]))
+                    kept.append((d1 + d2, int(tx1[k]), int(tx2[k]), int(ty1[k]), int(ty2[k]), k, d1, d2))
+        # the nearest by dist1 + dist2, ties by the neighbor's coordinates, then its row (R 5.17)
+        kept.sort(key=lambda t: t[:6])
         if kept:
-            for (_m, k, d1, d2) in kept[:maxneighbors]:
+            for (_m, _x1, _x2, _y1, _y2, k, d1, d2) in kept[:maxneighbors]:
                 out_id1.append(j)
                 out_id2.append(k)
                 out_d1.append(float(d1))
@@ -2772,16 +2816,19 @@ def _neighbors_2d(
             out_id2.append(-1)
             out_d1.append(float("nan"))
             out_d2.append(float("nan"))
+        _verify_neighbors_size(len(out_id1))
 
     if not out_id1:
         return None
 
-    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, id2).
+    # Sort by R's IntervNeighbor2D order: (id1, |dist1+dist2|, the neighbor's start1, end1,
+    # start2, end2, id2)
     order = sorted(
         range(len(out_id1)),
         key=lambda i: (
             out_id1[i],
             abs((out_d1[i] + out_d2[i]) if out_id2[i] >= 0 else 0.0),
+            *_neighbor_2d_coords(out_id2[i], tx1, tx2, ty1, ty2),
             out_id2[i],
         ),
     )
@@ -4597,6 +4644,9 @@ def gintervals_mapply(
 
     if intervals is None:
         raise ValueError("intervals parameter is required")
+    # as R, before FUN runs (also when there are no intervals)
+    if intervals_set_out is not None and gintervals_exists(intervals_set_out):
+        raise ValueError(f"Intervals set '{intervals_set_out}' already exists")
 
     intervals = _maybe_load_intervals_set(intervals)
     assert isinstance(intervals, pd.DataFrame)
@@ -4666,13 +4716,7 @@ def gintervals_mapply(
     if intervals_set_out is not None:
         if len(result_df) == 0:
             return None   # as R: no intervals, no set
-        if gintervals_exists(intervals_set_out):
-            # Same shape gintervals_update had: removing first means a save that
-            # refuses the frame (an empty result, say) leaves neither the old set
-            # nor the new one. Swap the new content in instead.
-            _replace_intervals_set(result_df, intervals_set_out)
-        else:
-            gintervals_save(result_df, intervals_set_out)
+        gintervals_save(result_df, intervals_set_out)
         return None
 
     return result_df
@@ -5544,6 +5588,7 @@ def giterator_intervals(
             "At least one of 'expr' or 'iterator' must be provided."
         )
     _checkroot()
+    _check_flag(interval_relative, "interval_relative", "interval_relative must be True or False")
 
     if intervals_set_out is not None:
         df = giterator_intervals(expr, intervals, iterator, band, None, interval_relative, partial_bins)
@@ -5767,6 +5812,7 @@ def gintervals_rbind(*intervals: pd.DataFrame | str, intervals_set_out: str | No
     _checkroot()
 
     loaded = []
+    positions = []  # the 1-based argument of each frame in loaded
     expected_cols = None
     for idx, item in enumerate(intervals):
         if isinstance(item, str):
@@ -5790,15 +5836,116 @@ def gintervals_rbind(*intervals: pd.DataFrame | str, intervals_set_out: str | No
             raise ValueError("Cannot rbind interval sets: columns differ")
 
         loaded.append(df)
+        positions.append(idx + 1)
 
     if not loaded:
         return None
 
+    if len(loaded) > 1:
+        loaded = _rbind_unify_cols(loaded, positions)
     result = _pandas.concat(loaded, ignore_index=True, sort=False)
     if intervals_set_out is not None:
         gintervals_save(result, intervals_set_out)
         return None
     return result
+
+
+def _rbind_kind(col: pd.Series) -> str:
+    """The R type a column binds as in gintervals_rbind: "factor" (a Categorical),
+    "character" (strings), "logical", "integer", "double", or else its dtype's name."""
+    dtype = col.dtype
+    if isinstance(dtype, _pandas.CategoricalDtype):
+        return "factor"
+    if _pandas.api.types.is_bool_dtype(dtype):
+        return "logical"
+    if _pandas.api.types.is_integer_dtype(dtype):
+        return "integer"
+    if _pandas.api.types.is_float_dtype(dtype):
+        return "double"
+    if _pandas.api.types.is_string_dtype(dtype) and (
+            not _pandas.api.types.is_object_dtype(dtype) or all(isinstance(v, str) for v in col.dropna())):
+        return "character"
+    return str(dtype)
+
+
+def _rbind_unify_cols(frames: list[pd.DataFrame], positions: list[int]) -> list[pd.DataFrame]:
+    """Give each column of the frames bound by gintervals_rbind the type R's rbind() gives
+    it (R misha 5.17):
+
+    - Categoricals, and strings bound to a categorical, become one Categorical whose
+      categories are those of the categoricals and the values of the strings, in the order
+      met (ordered when the first one and every other with categories is).
+    - Categoricals bound to a string column become strings.
+    - Boolean, integer and float columns become the widest of them.
+    - A column of missing values only (None or NaN) takes the type of the others.
+
+    Other columns whose types differ (a number and a string) are an error naming the column
+    and the arguments it differs in (*positions*: the 1-based argument of each frame)."""
+    np = _numpy
+    frames = list(frames)
+    copied: set[int] = set()
+    describe = {"factor": "a factor", "double": "numeric"}
+    for j, name in enumerate(frames[0].columns):
+        cols = [f.iloc[:, j] for f in frames]
+        dtypes = [c.dtype for c in cols]
+        # (categoricals of the same categories have the same dtype)
+        if all(d == dtypes[0] for d in dtypes):
+            continue
+        kinds = [_rbind_kind(c) for c in cols]
+        # a column of missing values only (None or NaN: object, float or boolean), which R makes
+        # logical (data.frame(x = NA)), takes the type of the others
+        untyped = [(_pandas.api.types.is_object_dtype(c.dtype) or kinds[i] in ("double", "logical"))
+                   and bool(c.isna().all())
+                   for i, c in enumerate(cols)]
+        typed = [i for i, u in enumerate(untyped) if not u] if not all(untyped) else list(range(len(cols)))
+        first = typed[0]
+        typed_kinds = {kinds[i] for i in typed}
+        new: list[Any] = list(cols)
+        if typed_kinds <= {"factor", "character"}:
+            if kinds[first] == "factor":
+                levels: dict[Any, None] = {}
+                for i in typed:
+                    vals = cols[i].cat.categories if kinds[i] == "factor" else cols[i].dropna()
+                    levels.update(dict.fromkeys(vals))
+                with_levels = [cols[i] for i in typed if kinds[i] == "factor" and len(cols[i].cat.categories)]
+                ordered = bool(cols[first].cat.ordered) and all(c.cat.ordered for c in with_levels)
+                for i, c in enumerate(cols):
+                    new[i] = _pandas.Series(_pandas.Categorical(c.astype(object).where(c.notna(), None),
+                                                                categories=list(levels), ordered=ordered),
+                                            index=c.index)
+            else:
+                for i, c in enumerate(cols):
+                    if kinds[i] == "factor" or untyped[i]:
+                        new[i] = c.astype(object).where(c.notna(), None).astype(dtypes[first])
+        elif typed_kinds <= {"logical", "integer", "double"}:
+            widest = max(typed_kinds, key=("logical", "integer", "double").index)
+            has_na = any(bool(c.isna().any()) for c in cols)
+            if widest == "logical" and has_na:
+                continue  # booleans with missing values: objects, as pandas binds them
+            if widest == "integer" and has_na:
+                widest = "double"  # a missing value is NaN
+            target = {"logical": bool, "integer": np.int64, "double": np.float64}[widest]
+            for i, c in enumerate(cols):
+                new[i] = c.astype(target) if kinds[i] != widest or untyped[i] or widest == "double" else c
+        elif all(dtypes[i] == dtypes[first] for i in typed) or (
+                dtypes[first].kind in "mM" and all(dtypes[i].kind == dtypes[first].kind for i in typed)):
+            # (dates or durations of different resolutions are bound by pandas)
+            for i, c in enumerate(cols):
+                if untyped[i]:
+                    new[i] = _pandas.Series(_pandas.array([None] * len(c), dtype=dtypes[first]), index=c.index)
+        else:
+            other = next(i for i in typed if dtypes[i] != dtypes[first])
+            raise ValueError(
+                f"Cannot rbind objects: column '{name}' is {describe.get(kinds[first], kinds[first])} in object "
+                f"{positions[first]} and {describe.get(kinds[other], kinds[other])} in object {positions[other]}"
+            )
+        for i in range(len(frames)):
+            if new[i] is not cols[i]:
+                if i not in copied:
+                    frames[i] = frames[i].copy()
+                    copied.add(i)
+                frames[i].isetitem(j, new[i])
+    return frames
 
 
 def gintervals_mark_overlaps(
@@ -5898,7 +6045,7 @@ def gintervals_annotate(
     Parameters
     ----------
     intervals : DataFrame
-        1D query intervals.
+        Query intervals (1D or 2D).
     annotation_intervals : DataFrame
         Source intervals containing annotation data.
     annotation_columns : str or list of str, optional
@@ -5908,10 +6055,15 @@ def gintervals_annotate(
         Output names for the annotation columns (must match length of
         *annotation_columns*).
     dist_column : str or None, default ``"dist"``
-        Name for the distance column.  ``None`` to omit.
+        Name for the distance column.  ``None`` to omit.  For 2D intervals
+        two columns are added, with "1" and "2" appended to the name
+        (``dist1`` and ``dist2`` by default, as in
+        :func:`gintervals_neighbors`).
     max_dist : float, default ``inf``
         Maximum absolute distance.  Annotations farther away are replaced
-        with *na_value*.
+        with *na_value*.  For 2D intervals a neighbor is within *max_dist*
+        when ``dist1 + dist2 <= max_dist``, the distance by which
+        :func:`gintervals_neighbors` ranks 2D neighbors.
     na_value : scalar or dict, default ``NaN``
         Fill value for annotations beyond *max_dist* or when no neighbor
         is found.  Can be a dict mapping column names to individual fill
@@ -5989,8 +6141,12 @@ def gintervals_annotate(
             f"tie_method must be one of {_valid_tie_methods}, got '{tie_method}'"
         )
     # ties are broken by start or end, which 2D intervals do not have
-    if tie_method != "first" and maxneighbors > 1 and _is_2d_intervals_df(annotation_intervals):
+    is2d = _is_2d_intervals_df(annotation_intervals)
+    if tie_method != "first" and maxneighbors > 1 and is2d:
         raise ValueError('tie_method other than "first" is supported for 1D intervals only')
+    # the distance columns: for 2D intervals the two distances of gintervals_neighbors (dist1,
+    # dist2 with the default dist_column)
+    dist_columns = [] if dist_column is None else [dist_column + "1", dist_column + "2"] if is2d else [dist_column]
 
     _checkroot()
 
@@ -6031,11 +6187,12 @@ def gintervals_annotate(
     # Check for column conflicts
     if not overwrite:
         existing_cols = set(intervals.columns)
-        if dist_column is not None and dist_column in existing_cols:
-            raise ValueError(
-                f"Distance column '{dist_column}' already exists in intervals. "
-                "Use overwrite=True or choose a different name."
-            )
+        for dist_col in dist_columns:
+            if dist_col in existing_cols:
+                raise ValueError(
+                    f"Distance column '{dist_col}' already exists in intervals. "
+                    "Use overwrite=True or choose a different name."
+                )
         conflicts = [c for c in column_names if c in existing_cols]
         if conflicts:
             raise ValueError(
@@ -6059,8 +6216,8 @@ def gintervals_annotate(
         for _i, col_name in enumerate(column_names):
             fill = na_value[col_name] if isinstance(na_value, dict) and col_name in na_value else na_value
             result[col_name] = [fill] * n
-        if dist_column is not None:
-            result[dist_column] = _numpy.nan
+        for dist_col in dist_columns:
+            result[dist_col] = _numpy.nan
         return result.drop(columns=["_orig_order"])
 
     # Apply tie-breaking when maxneighbors > 1
@@ -6072,15 +6229,18 @@ def gintervals_annotate(
     ann_part = nbrs.iloc[:, n1:n1 + n2].copy()
     ann_part.columns = annotation_intervals.columns
     dist = nbrs.iloc[:, n1 + n2].to_numpy(dtype=float)
+    dist2 = nbrs.iloc[:, n1 + n2 + 1].to_numpy(dtype=float) if is2d else None
     if tie_method != "first" and maxneighbors > 1:
         tie = ann_part["start" if tie_method == "min.start" else "end"].to_numpy()
         order = _numpy.lexsort((tie, _numpy.abs(dist), query_part["_orig_order"].to_numpy()))
         query_part, ann_part, dist = query_part.iloc[order], ann_part.iloc[order], dist[order]
 
+    # annotations of a neighbor beyond max_dist are replaced: in 2D by its dist1 + dist2, the
+    # distance gintervals_neighbors ranks 2D neighbors by
     to_fill = _numpy.isnan(dist)
     if _numpy.isfinite(max_dist):
-        to_fill |= _numpy.abs(dist) > max_dist
-    replaced = set(column_names) | ({dist_column} if dist_column is not None else set())
+        to_fill |= _numpy.abs(dist if dist2 is None else dist + dist2) > max_dist
+    replaced = set(column_names) | set(dist_columns)
     output = query_part[[c for c in query_part.columns if c not in replaced]].reset_index(drop=True)
     for src_col, out_name in zip(annotation_columns, column_names, strict=True):
         col = ann_part[src_col].reset_index(drop=True)
@@ -6088,8 +6248,10 @@ def gintervals_annotate(
             fill = na_value[out_name] if isinstance(na_value, dict) and out_name in na_value else na_value
             col = col.where(~to_fill, other=fill)
         output[out_name] = col
-    if dist_column is not None:
-        output[dist_column] = dist
+    if dist_columns:
+        output[dist_columns[0]] = dist
+    if dist2 is not None and dist_columns:
+        output[dist_columns[1]] = dist2
     if keep_order:
         output = output.sort_values("_orig_order", kind="stable").reset_index(drop=True)
     return output.drop(columns=["_orig_order"])
@@ -6104,14 +6266,18 @@ def gintervals_normalize(
     Normalize intervals to a specified size by centering.
 
     Each interval is resized to the target *size* while keeping its center
-    position.  Results are clamped to chromosome boundaries.
+    position.  A window that would cross a chromosome end is clipped at that
+    end, so near the start or the end of a chromosome the returned interval is
+    shorter than *size* (no warning is given).  Filter on ``end - start`` if
+    the windows must all have the full size.
 
     Parameters
     ----------
     intervals : DataFrame
         1D intervals with columns ``chrom``, ``start``, ``end``.
     size : int or array-like
-        Target interval size(s) in basepairs.  Can be:
+        Target interval size(s) in basepairs, before the clipping at
+        chromosome ends.  Can be:
 
         - A single positive integer: all intervals get this size.
         - A vector matching the number of intervals: each interval gets its
@@ -6359,12 +6525,10 @@ def gintervals_random(
     For million-contig genomes the implementation dispatches to a C++
     fast path that avoids per-chrom Python overhead. The heuristic is
     "> 1000 contigs OR > 10M bp total". The C++ path uses
-    ``std::mt19937_64`` seeded with *seed* (default 60427) and is NOT
-    bit-identical to the Python path, which uses numpy's global RNG.
-    Set *seed* explicitly to make C++ runs reproducible. To force the
-    Python path (e.g. for numpy-seed reproducibility on a large genome),
-    leave *seed* as ``None`` and the function falls back to the Python
-    implementation only when the genome is small.
+    ``std::mt19937_64`` seeded with *seed* (without one, with a seed drawn
+    from numpy's global generator) and is NOT bit-identical to the Python
+    path, which uses numpy's global RNG. Either way ``numpy.random.seed``
+    reproduces a call made without *seed*.
 
     Parameters
     ----------
@@ -6381,9 +6545,9 @@ def gintervals_random(
         ``end``). Sampled intervals are guaranteed not to overlap any
         masked region.
     seed : int, optional
-        Seed for the C++ RNG. Defaults to 60427 (project convention).
-        Ignored when the Python fallback path is taken; set
-        ``numpy.random.seed`` for that path.
+        Seed for the C++ RNG. Without it the seed is drawn from numpy's
+        global generator. Ignored when the Python fallback path is taken,
+        which draws from numpy's global generator.
     filter : DataFrame, optional
         Backward-compatible alias for ``mask``.
 
@@ -6466,7 +6630,8 @@ def gintervals_random(
     if use_cpp:
         return _gintervals_random_cpp(
             size, n, dist_from_edge, all_genome, mask,
-            seed if seed is not None else 60427,
+            # without a seed, one is drawn from numpy's global generator (numpy.random.seed)
+            seed if seed is not None else int(_numpy.random.randint(0, 2**62, dtype=_numpy.int64)),
         )
     return _gintervals_random_python(size, n, dist_from_edge, all_genome, mask)
 

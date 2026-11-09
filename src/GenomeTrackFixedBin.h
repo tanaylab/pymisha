@@ -9,6 +9,7 @@
 #define GENOMETRACKFIXEDBIN_H_
 
 #include <cstdint>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -92,9 +93,20 @@ protected:
 	int64_t   m_sliding_num_vs{0};         // count of non-NaN values in window
 	bool      m_lse_sliding_valid{false};
 	bool      m_running_lse_initialized{false};
+	// The smallest and the largest exponent field of the values that entered the sliding sum since
+	// it was last computed afresh, and whether every sum of them is exact (see slide_window)
+	int       m_sum_lo_exp{INT_MAX};
+	int       m_sum_hi_exp{INT_MIN};
+	bool      m_sum_exact{false};
 
 	void classify_fast_path_mode();
 	void read_interval_reducers_only(const GInterval &interval);
+	void read_interval_weighted_sum(const GInterval &interval);
+	bool sliding_step(int64_t sbin, int64_t ebin, int64_t &drop, int64_t &add) const;
+	bool slide_window(int64_t drop, int64_t add, bool need_lse, bool need_exact_sum);
+	void start_sum_range() { m_sum_lo_exp = INT_MAX; m_sum_hi_exp = INT_MIN; }
+	static bool add_to_exp_range(float v, int &lo_exp, int &hi_exp);
+	static bool sums_exact(int lo_exp, int hi_exp, int64_t num_vals);
 
 	inline void kahan_add_to_sliding_sum(double value) {
 		double y = value - m_sliding_sum_comp;
@@ -112,12 +124,15 @@ protected:
 		m_sliding_num_vs = 0;
 		m_lse_sliding_valid = false;
 		m_running_lse_initialized = false;
+		m_sum_exact = false;
+		start_sum_range();
 	}
 
 	// Reusable scratch buffers for multi-bin path (avoids per-call allocation)
 	std::vector<float> m_scratch_bin_vals;
 	std::vector<float> m_scratch_all_values;
 	std::vector<double> m_scratch_all_positions;
+	std::vector<float> m_scratch_wsum_vals;
 
 	// State for indexed "smart handle"
 	std::string m_dat_path;

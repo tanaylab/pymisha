@@ -567,6 +567,49 @@ void PMDb::unregister_interv(const std::string &name) const {
     m_interv_cache.erase(name);
 }
 
+bool PMDb::refresh_track(const std::string &name) const {
+    if (!m_initialized) {
+        TGLError("Database not initialized. Call gdb_init() first.");
+    }
+
+    std::string path_name = name;
+    std::replace(path_name.begin(), path_name.end(), '.', '/');
+    auto is_dir = [](const std::string &path) {
+        struct stat st;
+        return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    };
+
+    bool found = false;
+    std::string root;
+    if (m_gwd_subdir) {
+        // the names under the working directory, relative to it (rebuild_track_cache)
+        found = is_dir(m_gwd + "/" + path_name + ".track");
+    } else {
+        std::vector<std::string> roots;
+        if (!m_uroot.empty())
+            roots.push_back(m_uroot);
+        if (!m_groot.empty())
+            roots.push_back(m_groot);
+        roots.insert(roots.end(), m_datasets.rbegin(), m_datasets.rend());
+        for (const auto &r : roots) {
+            if (is_dir(r + "/tracks/" + path_name + ".track")) {
+                found = true;
+                root = r;
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        m_track_cache.insert(name);
+        m_track_db[name] = root;
+    } else {
+        m_track_cache.erase(name);
+        m_track_db.erase(name);
+    }
+    return found;
+}
+
 std::string PMDb::track_path(const std::string &track_name) const {
     if (!m_initialized) {
         TGLError("Database not initialized. Call gdb_init() first.");

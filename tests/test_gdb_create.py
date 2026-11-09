@@ -942,10 +942,11 @@ class TestGdbCreatePerChromosome:
 
         pm.gdb_init(str(groot))
         try:
-            fwd = pm.gseq_extract(pm.gintervals(["test"], 0, 8, strand=1))
+            # a file of one record names its chromosome, as in R
+            fwd = pm.gseq_extract(pm.gintervals(["revcomp"], 0, 8, strand=1))
             assert fwd == ["ACTGACTG"]
 
-            rev = pm.gseq_extract(pm.gintervals(["test"], 0, 8, strand=-1))
+            rev = pm.gseq_extract(pm.gintervals(["revcomp"], 0, 8, strand=-1))
             assert rev == ["CAGTCAGT"]
         finally:
             pm.gdb_init(str(TEST_DB))
@@ -961,9 +962,10 @@ class TestGdbCreatePerChromosome:
         result = pm.gdb_create(str(groot), [str(fasta1), str(fasta2)],
                                db_format="per-chromosome")
 
-        assert len(result) == 2
-        assert (groot / "seq" / "chr1.seq").is_file()
-        assert (groot / "seq" / "chr2.seq").is_file()
+        # a file of one record gives a chromosome named after the file, as in R
+        assert result["name"].tolist() == ["part1", "part2"]
+        assert (groot / "seq" / "part1.seq").is_file()
+        assert (groot / "seq" / "part2.seq").is_file()
 
     def test_gzipped_fasta(self, tmpdir, gzipped_fasta):
         """Per-chromosome format works with gzipped FASTA files."""
@@ -975,16 +977,17 @@ class TestGdbCreatePerChromosome:
         assert (groot / "seq" / "chrX.seq").is_file()
         assert (groot / "seq" / "chrY.seq").is_file()
 
-    def test_chromosomes_sorted(self, tmpdir):
-        """Per-chromosome format sorts chromosomes alphabetically."""
+    def test_chromosomes_in_file_order(self, tmpdir):
+        """Per-chromosome format keeps the chromosomes in file order, as R."""
         fasta = tmpdir / "unsorted.fa"
         fasta.write_text(">chrZ\nACGT\n>chrA\nTTTT\n>chrM\nGGGG\n")
 
         groot = tmpdir / "newdb"
         result = pm.gdb_create(str(groot), str(fasta), db_format="per-chromosome")
 
-        names = result["name"].tolist()
-        assert names == sorted(names)
+        assert result["name"].tolist() == ["chrZ", "chrA", "chrM"]
+        sizes = pd.read_csv(groot / "chrom_sizes.txt", sep="\t", header=None)
+        assert sizes[0].tolist() == ["chrZ", "chrA", "chrM"]
 
     def test_gintervals_all_works(self, tmpdir):
         """Per-chromosome database works with gintervals_all."""

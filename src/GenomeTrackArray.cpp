@@ -318,7 +318,8 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
     double sum = 0;
     double stddev_mean = 0;
     double stddev_m2 = 0;
-    double lse = -std::numeric_limits<double>::infinity();  // log-sum-exp of the values
+    float lse = -std::numeric_limits<float>::infinity();  // log-sum-exp of the values, in float as R misha
+    double wsum = 0;  // value x the bp of its interval inside the interval
     std::vector<float> sample_vals;      // values and positions that "sample" and "sample.pos" draw from
     std::vector<double> sample_positions;
     m_last_min = std::numeric_limits<float>::max();
@@ -338,6 +339,8 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
             continue;
 
         sum += v;
+        if (has_function(WEIGHTED_SUM))
+            wsum += (double)v * (std::min(cur.end, interval.end) - std::max(cur.start, interval.start));
         if (v < m_last_min) {
             m_last_min = v;
             if (has_function(MIN_POS))
@@ -374,17 +377,18 @@ void GenomeTrackArray::calc_vals(const GInterval &interval)
         if (m_use_quantile)
             m_sp.add(v, s_rnd_func);
         if (has_function(LSE)) {
-            const double hi = std::max(lse, (double)v), lo = std::min(lse, (double)v);
-            lse = std::isinf(lo) ? hi : hi + std::log1p(std::exp(lo - hi));
+            lse_accumulate(lse, v);
         }
     }
 
     if (has_function(SIZE))
         m_last_size = num_vs;
     if (has_function(LSE))
-        m_last_lse = num_vs > 0 ? (float)lse : std::numeric_limits<float>::quiet_NaN();
+        m_last_lse = num_vs > 0 ? lse : std::numeric_limits<float>::quiet_NaN();
 
     m_last_sum = (float)sum;
+    if (has_function(WEIGHTED_SUM))
+        m_last_weighted_sum = num_vs > 0 ? wsum : std::numeric_limits<double>::quiet_NaN();
     if (num_vs > 0)
         m_last_avg = m_last_nearest = (float)(sum / num_vs);
     else {
@@ -429,6 +433,7 @@ void GenomeTrackArray::read_interval(const GInterval &interval)
     // also for the intervals that return before calc_vals()
     m_last_lse = m_last_sample = std::numeric_limits<float>::quiet_NaN();
     m_last_sample_pos = std::numeric_limits<double>::quiet_NaN();
+    m_last_weighted_sum = std::numeric_limits<double>::quiet_NaN();
     if (m_use_quantile)
         m_sp.reset();
 

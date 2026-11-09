@@ -132,10 +132,33 @@ def _ref_track_values(track, func, J, mask, sshift, eshift, q):
                 means = (sums / ns).astype(np.float32).astype(float)
                 out[o] = float(np.cumsum(means * ns)[-1] / ns.sum())
         elif func == "stddev":
-            if len(vals) >= 2:
-                out[o] = float(np.std(vals.tolist(), ddof=1))
+            # as R misha 5.17: the parts' counts, float means and float deviations merged (Chan)
+            n = mean = m2 = 0.0
+            for part in np.split(vals, np.flatnonzero(np.diff(j)) + 1):
+                pn = float(len(part))
+                pmean = float(np.float32(float(np.cumsum(part)[-1]) / pn))
+                pm2 = 0.0
+                if len(part) > 1:
+                    w_mean = w_m2 = 0.0
+                    for k, v in enumerate(part.tolist(), 1):
+                        d = v - w_mean
+                        w_mean += d / k
+                        w_m2 += d * (v - w_mean)
+                    psd = float(np.float32(np.sqrt(w_m2 / (len(part) - 1))))
+                    pm2 = psd * psd * (pn - 1)
+                delta = pmean - mean
+                total = n + pn
+                mean += delta * pn / total
+                m2 += pm2 + delta * delta * n * pn / total
+                n = total
+            if n > 1:
+                out[o] = float(np.sqrt(m2 / (n - 1)))
         elif func == "quantile":
-            out[o] = float(np.quantile(vals.tolist(), q))
+            # as R misha 5.17: interpolated between the sorted float values, rounded to a float
+            v = np.sort(vals.astype(np.float32)).astype(float)
+            idx = (len(v) - 1) * q
+            i1, i2 = int(np.floor(idx)), int(np.ceil(idx))
+            out[o] = float(np.float32(v[i1] * (1 - (idx - i1)) + v[i2] * (idx - i1)))
         elif func == "lse":
             out[o] = vt._logsumexp(vals.tolist())
         else:
@@ -168,21 +191,3 @@ def test_filtered_track_vtrack_matches_reading_each_interval(track, read_rows, m
             got = got.sort_values("intervalID")["vt_filt"].to_numpy(dtype=float).tolist()
             want = _ref_track_values(track, func, J, mask, sshift, eshift, 0.3)
             assert repr(got) == repr(want), (track, func)
-
-
-def test_value_source_finds_overlapping_and_nearest_intervals():
-    rng = np.random.default_rng(SEED)
-    for _ in range(200):
-        n = int(rng.integers(1, 60))
-        start = rng.integers(0, 2000, n)
-        end = start + rng.integers(1, 300, n)
-        value = rng.normal(size=n)
-        value[rng.random(n) < 0.2] = np.nan
-        src = vt._ValueSource(pd.DataFrame({"start": start, "end": end, "value": value}))
-        s = int(rng.integers(0, 2300))
-        e = s + int(rng.integers(1, 400))
-        assert src.overlapping(s, e).tolist() == np.flatnonzero((start < e) & (end > s)).tolist()
-        valid = ~np.isnan(value)
-        dist = (np.maximum(s - end, 0) + np.maximum(start - e, 0))[valid]
-        want = np.flatnonzero(dist == dist.min()).tolist() if valid.any() else []
-        assert src.nearest(s, e).tolist() == want

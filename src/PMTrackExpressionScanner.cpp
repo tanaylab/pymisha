@@ -6,6 +6,8 @@
 
 #include <sys/time.h>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -207,6 +209,16 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
         if (m_expr_vars.has_common_track_type() &&
             m_expr_vars.get_common_track_type() == GenomeTrack::ARRAYS) {
             return std::make_unique<PMArrayIterator>(intervals, m_expr_vars.first_track_path());
+        }
+
+        if (m_expr_vars.has_mixed_bin_sizes()) {
+            // R misha's message
+            if (m_track_exprs.size() == 1)
+                TGLError("Cannot implicitly determine iterator policy:\n"
+                         "track expression \"%s\" contains tracks with different bin sizes.",
+                         m_track_exprs[0].c_str());
+            TGLError("Cannot implicitly determine iterator policy: track expressions contain tracks with "
+                     "different bin sizes.");
         }
 
         int64_t bin_size = m_expr_vars.get_bin_size();
@@ -421,6 +433,7 @@ bool PMTrackExprScanner::begin(const std::vector<std::string> &exprs, ValType va
     m_eval_buf_size = 0;
 
     m_itr->begin();
+    m_bulk_bins = can_fill_bins_bulk();
 
     return next();
 }
@@ -443,7 +456,7 @@ void PMTrackExprScanner::prepopulate_chrom_cache(const std::vector<GInterval> &i
     vdebug("Pre-populated chrom string cache with %lu unique chromosomes\n", seen.size());
 }
 
-bool PMTrackExprScanner::next()
+bool PMTrackExprScanner::next_batch()
 {
     if (isend())
         return false;
@@ -476,6 +489,115 @@ void PMTrackExprScanner::set_progress_callback(PyObject *cb)
     }
 }
 
+// Fills slot idx of the buffers from the iterator's current interval and moves the iterator on.
+void PMTrackExprScanner::fill_slot(unsigned idx)
+{
+    const GInterval &interval = m_itr->last_interval();
+    m_expr_itr_intervals[idx] = interval;
+    m_expr_itr_interval_ids[idx] = m_itr->original_interval_idx();
+    set_coord_arrays(idx, interval);
+
+    // Set track variable values
+    if (m_row_subs)
+        m_expr_vars.set_substitution((*m_row_subs)[m_itr->idx()]);
+    m_expr_vars.set_vars(interval, idx);
+
+    m_itr->next();
+}
+
+void PMTrackExprScanner::set_coord_arrays(unsigned idx, const GInterval &interval)
+{
+    if (!m_use_python || !(m_need_chrom || m_need_start || m_need_end))
+        return;
+    if (m_need_chrom) {
+        Py_DECREF(m_chrom_array[idx]);
+        auto it = m_chrom_str_cache.find(interval.chromid);
+        if (it == m_chrom_str_cache.end()) {
+            const std::string &chrom = g_pmdb->chromkey().id2chrom(interval.chromid);
+            PyObject *chrom_str = PyUnicode_FromString(chrom.c_str());
+            m_chrom_str_cache[interval.chromid] = chrom_str;
+            it = m_chrom_str_cache.find(interval.chromid);
+        }
+        Py_INCREF(it->second);
+        m_chrom_array[idx] = it->second;
+    }
+    if (m_need_start)
+        m_start_array[idx] = interval.start;
+    if (m_need_end)
+        m_end_array[idx] = interval.end;
+}
+
+// With a fixed-bin iterator whose bin size is that of every track, and only dense tracks named as
+// they are in the expressions (PMTrackExpressionVars::dense_tracks_only), every iterator interval
+// lies in one bin and takes its value. fill_bins_bulk() then fills a run of bins with one read per
+// track, not a read_interval() per interval and track (as misha 5.17.0). The environment variable
+// MISHA_DISABLE_DENSE_BULK_READ=1 turns this off, so that tests can compare the two.
+bool PMTrackExprScanner::can_fill_bins_bulk() const
+{
+    if (m_row_subs)
+        return false;
+    const PMFixedBinIterator *itr = dynamic_cast<const PMFixedBinIterator *>(m_itr.get());
+    if (!itr || itr->is_interval_relative() || !m_expr_vars.dense_tracks_only())
+        return false;
+    const char *disable = std::getenv("MISHA_DISABLE_DENSE_BULK_READ");
+    if (disable && !strcmp(disable, "1"))
+        return false;
+    for (unsigned ivar = 0; ivar < m_expr_vars.get_num_track_vars(); ++ivar) {
+        const PMTrackExpressionVars::TrackVar *var = m_expr_vars.var(m_expr_vars.get_track_name(ivar).c_str());
+        if (!var || var->bin_size != itr->get_bin_size())
+            return false;
+    }
+    return true;
+}
+
+// Fills the buffers as fill_slot() would, a run of bins of one scope interval at a time: the
+// intervals are clipped to the scope interval as PMFixedBinIterator::next() clips them, and the
+// values come from PMTrackExpressionVars::set_vars_bins().
+void PMTrackExprScanner::fill_bins_bulk()
+{
+    PMFixedBinIterator &itr = *static_cast<PMFixedBinIterator *>(m_itr.get());
+    const int64_t binsize = itr.get_bin_size();
+
+    m_eval_buf_size = 0;
+    while (m_eval_buf_size < m_eval_buf_limit && !itr.isend()) {
+        const int64_t first_bin = itr.get_cur_bin();
+        const int64_t num_bins = std::min(itr.get_end_bin() - first_bin, (int64_t)(m_eval_buf_limit - m_eval_buf_size));
+
+        if (num_bins <= 0) {
+            fill_slot(m_eval_buf_size++);
+            continue;
+        }
+
+        const GInterval &scope_interval = itr.last_scope_interval();
+        const GInterval cur_interval = itr.last_interval();
+        const int64_t scope_start = scope_interval.start;
+        const int64_t scope_end = scope_interval.end;
+        const uint64_t interval_id = itr.original_interval_idx();
+        const unsigned first = m_eval_buf_size;
+        int64_t coord = first_bin * binsize;
+
+        for (int64_t i = 0; i < num_bins; ++i, coord += binsize) {
+            GInterval &interval = m_expr_itr_intervals[first + i];
+            interval = cur_interval;
+            interval.start = std::max(coord, scope_start);
+            interval.end = std::min(coord + binsize, scope_end);
+            m_expr_itr_interval_ids[first + i] = interval_id;
+            set_coord_arrays(first + i, interval);
+        }
+
+        if (!m_expr_vars.set_vars_bins(m_expr_itr_intervals[first + num_bins - 1], first_bin, (unsigned)num_bins,
+                                       binsize, first)) {
+            // a track holds bins of another size on this chromosome: from here on, one interval at a time
+            m_bulk_bins = false;
+            while (m_eval_buf_size < m_eval_buf_limit && !itr.isend())
+                fill_slot(m_eval_buf_size++);
+            return;
+        }
+        m_eval_buf_size += num_bins;
+        itr.advance(num_bins);
+    }
+}
+
 bool PMTrackExprScanner::eval_next()
 {
     m_eval_buf_idx++;
@@ -485,55 +607,29 @@ bool PMTrackExprScanner::eval_next()
         m_eval_buf_idx = 0;
 
         // Fill buffer with iterator values
-        for (m_eval_buf_size = 0; m_eval_buf_size < m_eval_buf_limit; ++m_eval_buf_size) {
-            if (m_itr->isend()) {
-                // Pad remainder with NaN/sentinel values to prevent stale data
-                // from affecting non-elementwise expressions (np.mean, np.sort, etc.)
-                if (m_use_python) {
-                    if (!m_empty_chrom_str)
-                        m_empty_chrom_str = PyUnicode_FromString("");
-                    for (unsigned i = m_eval_buf_size; i < m_eval_buf_limit; ++i) {
-                        Py_DECREF(m_chrom_array[i]);
-                        Py_INCREF(m_empty_chrom_str);
-                        m_chrom_array[i] = m_empty_chrom_str;
-                        m_start_array[i] = -1;
-                        m_end_array[i] = -1;
-                    }
+        if (m_bulk_bins)
+            fill_bins_bulk();
+        else {
+            for (m_eval_buf_size = 0; m_eval_buf_size < m_eval_buf_limit && !m_itr->isend(); ++m_eval_buf_size)
+                fill_slot(m_eval_buf_size);
+        }
+
+        if (m_eval_buf_size < m_eval_buf_limit) {
+            // Pad remainder with NaN/sentinel values to prevent stale data
+            // from affecting non-elementwise expressions (np.mean, np.sort, etc.)
+            if (m_use_python) {
+                if (!m_empty_chrom_str)
+                    m_empty_chrom_str = PyUnicode_FromString("");
+                for (unsigned i = m_eval_buf_size; i < m_eval_buf_limit; ++i) {
+                    Py_DECREF(m_chrom_array[i]);
+                    Py_INCREF(m_empty_chrom_str);
+                    m_chrom_array[i] = m_empty_chrom_str;
+                    m_start_array[i] = -1;
+                    m_end_array[i] = -1;
                 }
-                // NaN-fill track variable arrays for tail slots
-                m_expr_vars.pad_tail_with_nan(m_eval_buf_size, m_eval_buf_limit);
-                break;
             }
-
-            const GInterval &interval = m_itr->last_interval();
-            m_expr_itr_intervals[m_eval_buf_size] = interval;
-            m_expr_itr_interval_ids[m_eval_buf_size] = m_itr->original_interval_idx();
-
-            if (m_use_python && (m_need_chrom || m_need_start || m_need_end)) {
-                if (m_need_chrom) {
-                    Py_DECREF(m_chrom_array[m_eval_buf_size]);
-                    auto it = m_chrom_str_cache.find(interval.chromid);
-                    if (it == m_chrom_str_cache.end()) {
-                        const std::string &chrom = g_pmdb->chromkey().id2chrom(interval.chromid);
-                        PyObject *chrom_str = PyUnicode_FromString(chrom.c_str());
-                        m_chrom_str_cache[interval.chromid] = chrom_str;
-                        it = m_chrom_str_cache.find(interval.chromid);
-                    }
-                    Py_INCREF(it->second);
-                    m_chrom_array[m_eval_buf_size] = it->second;
-                }
-                if (m_need_start)
-                    m_start_array[m_eval_buf_size] = interval.start;
-                if (m_need_end)
-                    m_end_array[m_eval_buf_size] = interval.end;
-            }
-
-            // Set track variable values
-            if (m_row_subs)
-                m_expr_vars.set_substitution((*m_row_subs)[m_itr->idx()]);
-            m_expr_vars.set_vars(interval, m_eval_buf_size);
-
-            m_itr->next();
+            // NaN-fill track variable arrays for tail slots
+            m_expr_vars.pad_tail_with_nan(m_eval_buf_size, m_eval_buf_limit);
         }
 
         check_interrupt();

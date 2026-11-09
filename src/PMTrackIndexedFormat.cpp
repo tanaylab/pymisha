@@ -180,7 +180,15 @@ PyObject *pm_track_convert_to_indexed(PyObject *self, PyObject *args)
             TGLError<GenomeTrack>("Failed to create %s: %s", idx_path_tmp.c_str(), strerror(errno));
         }
 
-        write_index_header(idx_fp, track_type, chromkey.get_num_chroms(), 0);
+        // a FILE left open on an error would write its buffer at exit, into whatever file then
+        // holds its descriptor (as R misha 5.17 guards its header writers)
+        try {
+            write_index_header(idx_fp, track_type, chromkey.get_num_chroms(), 0);
+        } catch (...) {
+            fclose(dat_fp);
+            fclose(idx_fp);
+            throw;
+        }
 
         vector<TrackContigEntry> entries;
         uint64_t current_offset = 0;
@@ -337,7 +345,12 @@ PyObject *pm_track_create_empty_indexed(PyObject *self, PyObject *args)
         }
 
         uint64_t checksum = 0;
-        write_index_header(idx_fp, MishaTrackType::SPARSE, 0, checksum);
+        try {
+            write_index_header(idx_fp, MishaTrackType::SPARSE, 0, checksum);
+        } catch (...) {
+            fclose(idx_fp);
+            throw;
+        }
         fclose(idx_fp);
 
     } catch (TGLException &e) {

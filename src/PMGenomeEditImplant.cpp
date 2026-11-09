@@ -22,7 +22,7 @@ namespace {
 struct Perturbation {
     int start;         // 0-based
     int end;           // 0-based, exclusive
-    const char *donor; // pointer into Python string storage (valid for call duration)
+    const char *donor; // pointer into Python string storage (valid for call duration), one byte a base
 };
 
 struct FaiEntry {
@@ -89,8 +89,19 @@ PyObject *pm_ggenome_implant(PyObject *self, PyObject *args)
             Perturbation p;
             p.start = (int)PyLong_AsLong(PyList_GetItem(py_starts, i));
             p.end = (int)PyLong_AsLong(PyList_GetItem(py_ends, i));
-            p.donor = PyUnicode_AsUTF8(PyList_GetItem(py_donors, i));
-            if (PyErr_Occurred()) return nullptr;
+            PyObject *py_donor = PyList_GetItem(py_donors, i);
+            if (!py_donor || !PyUnicode_Check(py_donor)) {
+                PyErr_SetString(PyExc_TypeError, "donors must be strings");
+                return nullptr;
+            }
+            Py_ssize_t donor_len = 0;
+            const char *donor = py_seq_bytes(py_donor, &donor_len);
+            if (!donor) return nullptr;
+            if (donor_len != p.end - p.start) {
+                PyErr_SetString(PyExc_ValueError, "a donor sequence's length differs from its interval's");
+                return nullptr;
+            }
+            p.donor = donor;
 
             const char *chrom = PyUnicode_AsUTF8(PyList_GetItem(py_chroms, i));
             if (!chrom) return nullptr;

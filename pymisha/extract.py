@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+import functools
 import math
 import numbers
 import os
@@ -26,22 +27,25 @@ from ._shared import (
     _chunk_slices,
     _config_multitasking,
     _config_no_mt,
+    _dead_worker_message,
     _df2pymisha,
     _iterated_intervals,
     _numpy,
+    _one_random_stream,
     _pandas,
     _preprocess_intervals_iterator,
     _progress_context,
     _pymisha,
     _pymisha2df,
     _remap_interval_ids,
+    _run_forked,
     _sort_by_chrom,
     _track_names_set,
     _with_canonical_chroms,
 )
 from ._types import Iterator
 from .expr import _caller_namespace, _expr_safe_name, _parse_expr_vars, _resolve_user_vars
-from .vtracks import _compute_vtrack_values
+from .vtracks import _array_slice_spec, _compute_vtrack_values
 
 _logger = get_logger(__name__)
 
@@ -215,6 +219,37 @@ def _check_seq_vtrack_iterator(exprs, used_vtracks) -> None:
             )
 
 
+def _check_dense_bin_sizes(exprs, used_vtracks) -> None:
+    """R's error for an implicit iterator over dense tracks of different bin sizes: those in
+    the expressions and the sources of their virtual tracks (an explicit iterator reads them)."""
+    from .expr import _parse_expr_vars
+    from .tracks import gtrack_exists, gtrack_info
+
+    track_names = _shared._track_names_set()
+    sources: set[str] = set()
+    for e in exprs:
+        _, expr_tracks, _, _ = _parse_expr_vars(str(e), track_names, set(_shared._VTRACKS))
+        sources.update(expr_tracks)
+    for vt in used_vtracks or ():
+        src = (_shared._VTRACKS.get(vt) or {}).get("src")
+        if isinstance(src, str):
+            sources.add(src)
+    sizes = set()
+    for src in sources:
+        if not gtrack_exists(src):
+            continue
+        info = gtrack_info(src)
+        bs = info.get("bin_size") or info.get("bin.size")
+        if info.get("type") == "dense" and bs is not None:
+            sizes.add(int(float(bs)))
+    if len(sizes) > 1:
+        if len(exprs) == 1:
+            raise ValueError("Cannot implicitly determine iterator policy:\n"
+                             f'track expression "{exprs[0]}" contains tracks with different bin sizes.')
+        raise ValueError("Cannot implicitly determine iterator policy: track expressions contain tracks with "
+                         "different bin sizes.")
+
+
 def _default_vtrack_iterator(intervals, iterator, exprs, used_vtracks):
     """R's default iterator for an expression whose only sources are vtracks:
     a sequence vtrack is an error, a value vtrack iterates its source track's
@@ -223,6 +258,7 @@ def _default_vtrack_iterator(intervals, iterator, exprs, used_vtracks):
     if iterator is not None or not used_vtracks:
         return intervals, iterator
     _check_seq_vtrack_iterator(exprs, used_vtracks)
+    _check_dense_bin_sizes(exprs, used_vtracks)
     it = _infer_iterator_from_vtracks(used_vtracks)
     if isinstance(it, str):
         intervals, it, _ = _preprocess_intervals_iterator(intervals, it)
@@ -254,6 +290,7 @@ _CPP_VALUE_FUNCS = {
     "avg",
     "mean",
     "sum",
+    "weighted.sum",
     "min",
     "max",
     "first",
@@ -297,14 +334,12 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
         if cfg is None:
             return False
         # Array-slice vtracks evaluate in C++: the source array track is read by
-        # the scanner with the configured column slice + reduction.
+        # the scanner with the configured column slice + reduction, and the
+        # vtrack's own function as any other.
         if cfg.get("kind") == "array_slice":
-            if not isinstance(cfg.get("src"), str):
-                return False
-            sfunc = str(cfg.get("func", "avg")).lower()
+            sfunc = str((cfg.get("slice") or {}).get("func", "avg")).lower()
             if sfunc not in _CPP_ARRAY_SLICE_FUNCS:
                 return False
-            continue
         # Filter vtracks must go through Python
         filt = cfg.get("filter")
         if filt is not None and not (isinstance(filt, _pandas.DataFrame) and len(filt) == 0):
@@ -391,32 +426,11 @@ def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[st
         cfg = _shared._VTRACKS.get(name)
         if cfg is None:
             continue
-        # Array-slice vtracks: the configured column reduction is the *slice*
-        # function (applied within each bin); the inter-bin aggregation is a
-        # plain avg (the default array iterator emits one bin per interval, so
-        # avg returns that bin's sliced value). Translate to the C++ spec keys
-        # read by configure_array_slice().
-        if cfg.get("kind") == "array_slice":
-            slice_cols = cfg.get("slice_cols")
-            if slice_cols is not None:
-                # R sorts + de-duplicates the column indices (the C++ slice
-                # lookup also assumes ascending order).
-                slice_cols = sorted({int(c) for c in slice_cols})
-            sfunc = str(cfg.get("func", "avg")).lower()
-            spec = {
-                "src": cfg.get("src"),
-                "func": "avg",
-                "slice": slice_cols,
-                "slice_func": sfunc,
-            }
-            params = cfg.get("params")
-            if params is not None:
-                spec["slice_percentile"] = float(
-                    params[0] if isinstance(params, (list, tuple)) else params
-                )
-            result[name] = spec
-            continue
         spec = dict(cfg)
+        # An array-slice vtrack: the slice as the C++ spec keys
+        # (configure_array_slice); the vtrack's func, shifts and params as any other
+        if spec.pop("kind", None) == "array_slice":
+            spec.update(_array_slice_spec(cfg))
         # Ensure pssm is a numpy array
         pssm = spec.get("pssm")
         if pssm is not None and isinstance(pssm, _pandas.DataFrame):
@@ -1144,7 +1158,6 @@ def _gextract_2d_vtrack_objects_python(
 
     Kept for parity tests against the C++ fast path. Not used in production.
     """
-    import random
 
     from ._quadtree import open_2d_pair, query_2d_track_opened
     from .tracks import gtrack_info
@@ -1199,7 +1212,7 @@ def _gextract_2d_vtrack_objects_python(
                     val = objs[-1][2] if is_points else objs[-1][4]
                     values[interval_idx] = float(val)
                 elif func == "sample":
-                    chosen = random.choice(objs)
+                    chosen = objs[int(_numpy.random.randint(len(objs)))]  # numpy's global generator
                     val = chosen[2] if is_points else chosen[4]
                     values[interval_idx] = float(val)
         finally:
@@ -1278,7 +1291,8 @@ def _gextract_2d_vtrack_objects(
         "end2": intervals["end2"].to_numpy(dtype=_numpy.int64),
     }
 
-    result = _pymisha.pm_extract_2d_objects(track, intervals_dict, band, func, 60427)
+    # "sample" draws as every other random draw of the C++ layer (seeded from numpy's generator)
+    result = _pymisha.pm_extract_2d_objects(track, intervals_dict, band, func, 0)
 
     return _pandas.DataFrame(
         {
@@ -1716,9 +1730,7 @@ def _gextract_2d(
                 _is_iset = False
 
             if not _is_iset:
-                raise ValueError(
-                    f"Invalid iterator: {iterator!r} is not a known track name."
-                )
+                raise _unknown_iterator_error(iterator)
             # It's a saved interval set: fall through to the legacy 2D dispatch.
         else:
             _iter_info = gtrack_info(iterator)
@@ -1960,7 +1972,9 @@ def _gextract_2d_units(
         policy = TrackRectsPolicy(track_name=iterator)
     elif isinstance(iterator, str):
         loaded = _maybe_load_intervals_set(iterator)
-        if not (isinstance(loaded, pd.DataFrame) and _is_2d_intervals(loaded)):
+        if not isinstance(loaded, pd.DataFrame):
+            raise _unknown_iterator_error(iterator)
+        if not _is_2d_intervals(loaded):
             raise ValueError(f"Invalid iterator: {iterator!r} is not a 2D track or a 2D intervals set.")
         policy = IntervalsPolicy()
         iterator_intervals = loaded
@@ -2173,25 +2187,19 @@ def _genome_order(df: pd.DataFrame, scope: pd.DataFrame | None) -> pd.DataFrame:
 
 def _apply_extract_output(
     df: pd.DataFrame | None,
-    file: str | None,
     intervals_set_out: str | None,
     *,
     is_2d: bool = False,
     intervals_join: str = "id",
     input_intervals: pd.DataFrame | None = None,
-    value_names: list[str] | None = None,
-    int64_coords: bool = False,
 ) -> pd.DataFrame | None:
-    """Apply file-writing, intervals_set_out, and intervals_join post-processing to an extraction result.
+    """Apply intervals_set_out and intervals_join post-processing to an extraction result held in
+    memory (a file= output is written as it is computed: see _extract_to_file).
 
     Parameters
     ----------
     df : DataFrame or None
         The extraction result.
-    file : str or None
-        If given, write *df* to this path and return ``None`` instead of the
-        DataFrame: as Parquet if the name ends in ``.parquet`` (in any case),
-        as tab-separated values otherwise.
     intervals_set_out : str or None
         If given, save *df* as a named interval set via :func:`gintervals_save`
         and return ``None`` instead of the DataFrame.
@@ -2203,27 +2211,19 @@ def _apply_extract_output(
     input_intervals : DataFrame or None
         Resolved input intervals used for the ``intervals_join="intervals"``
         attach (not used here for ``"id"``/``"none"``).
-    value_names : list of str or None
-        Parquet output only: the names of the value columns.
-    int64_coords : bool
-        Parquet output only: write start and end as INT64 instead of INT32.
 
     Returns
     -------
     DataFrame or None
     """
     if df is None:
-        # A Parquet output is written even with no rows (R parity); return None
-        # either way.
-        if _is_parquet_path(file):
-            _write_parquet(None, file, value_names, int64_coords)
         return None
 
     if not is_2d:
         df = _genome_order(df, input_intervals)
 
-    # Apply intervals_join FIRST, before file/intervals_set_out which read
-    # from the post-processed result.
+    # Apply intervals_join FIRST, before intervals_set_out, which reads from the post-processed
+    # result.
     df = _apply_intervals_join(df, input_intervals, intervals_join, is_2d=is_2d)
     assert df is not None  # _apply_intervals_join preserves non-None input
 
@@ -2236,26 +2236,36 @@ def _apply_extract_output(
 
         to_save = df.drop(columns=["intervalID"], errors="ignore").reset_index(drop=True)
         gintervals_save(to_save, intervals_set_out)
-
-    # -- file: write Parquet or TSV and return None --
-    if file is not None:
-        if _is_parquet_path(file):
-            _write_parquet(df, file, value_names, int64_coords)
-            return None
-        # R parity: gextract(file=) writes only the iterator coordinate columns
-        # and the expression columns (no intervalID; see R
-        # GenomeTrackExtract.cpp), with the file mode R's C++ writer gives it.
-        with _shared._with_cpp_umask():
-            df.drop(columns=["intervalID"], errors="ignore").to_csv(
-                file, sep="\t", index=False, float_format="%.15g", na_rep="nan")  # R's "\t%.15g"
+        # R parity: with intervals.set.out R misha returns no result (an invisible 0)
         return None
+    return df
 
-    # R parity: with intervals.set.out R misha returns no result (an invisible 0)
-    return None if intervals_set_out is not None else df
+
+def _unknown_iterator_error(name: str) -> ValueError:
+    """R's error for an iterator that names no track and no intervals set (as the C++
+    parse_iterator_policy says it): a name with a character R's names cannot hold is an invalid
+    intervals set name."""
+    if not all(c.isascii() and (c.isalnum() or c in "_.") for c in name):
+        return ValueError(f"Invalid interval name {name}. Only alphanumeric characters and _ are allowed in the name.")
+    return ValueError(f"Invalid iterator: {name} is neither a name of a track nor a name of an intervals set")
 
 
 def _is_parquet_path(file: Any) -> bool:
     return file is not None and str(file).lower().endswith(".parquet")
+
+
+def _parquet_value_metadata(exprs: list[str]) -> list[list[tuple[str, str]]]:
+    """The field metadata of each Parquet value column, as R misha's gextract writes it: the
+    attributes of the track, sorted by name, for an expression that is exactly the name of a
+    track, none for any other expression."""
+    from .tracks import _load_track_attributes
+
+    tracks = _shared._track_names_set()
+    return [
+        sorted((str(k), str(v)) for k, v in _load_track_attributes(e).items() if str(v) != "")
+        if isinstance(e, str) and e in tracks else []
+        for e in exprs
+    ]
 
 
 def _parquet_int64_coords(scope: Any) -> bool:
@@ -2299,20 +2309,14 @@ def _is_decimal(s: str) -> bool:
     return 0 < len(s) <= 9 and s.isascii() and s.isdigit() and (s[0] != "0" or len(s) == 1)
 
 
-def _write_parquet(
-    df: pd.DataFrame | None, file: Any, value_names: list[str] | None, int64_coords: bool
-) -> None:
-    """Write a gextract result to a Parquet file, as R misha's gextract(file = "x.parquet") does.
-
-    The rows go to a hidden temporary file next to the target (where its symlinks lead),
-    named for this host and process, which is renamed onto the target once complete: an
-    error or an interrupt leaves an existing target as it was. A replaced target passes on
-    its permission bits. Leftovers of killed writers of the same target on this host are
-    removed first.
-    """
-    from . import __version__
-
-    assert value_names is not None
+@contextlib.contextmanager
+def _parquet_output(file: Any) -> collections.abc.Iterator[tuple[str, str]]:
+    """Where a Parquet output is written, as R misha's gextract(file = "x.parquet") writes it:
+    yields (name, tmp). name is what messages call the file; the rows go to tmp, a hidden
+    temporary file next to the target (where its symlinks lead), named for this host and
+    process, which is renamed onto the target once the block completes: an error or an
+    interrupt leaves an existing target as it was. A replaced target passes on its permission
+    bits. Leftovers of killed writers of the same target on this host are removed first."""
     name = str(file)
     target = _resolve_symlinks(name)
     directory = target[: target.rfind("/") + 1]
@@ -2340,23 +2344,8 @@ def _write_parquet(
         except OSError:
             pass  # alive, as another user's process
 
-    if df is None:
-        chroms: Any = []
-        starts = ends = _numpy.empty(0, dtype=_numpy.int64)
-        values = _numpy.empty((0, len(value_names)))
-    else:
-        # by position: chrom, start, end, then the value columns, whose names may repeat
-        # (an error the writer reports) or be one of the coordinates'
-        chroms = df.iloc[:, 0].astype(str).to_numpy(dtype=object)
-        starts = df.iloc[:, 1].to_numpy(dtype=_numpy.int64)
-        ends = df.iloc[:, 2].to_numpy(dtype=_numpy.int64)
-        values = _numpy.ascontiguousarray(df.iloc[:, 3 : 3 + len(value_names)].to_numpy(dtype=_numpy.float64))
-
     try:
-        _pymisha.pm_parquet_write(
-            tmp, name, chroms, starts, ends, values, list(value_names), int64_coords,
-            f"pymisha version {__version__}",
-        )
+        yield name, tmp
         with contextlib.suppress(OSError):  # a new target keeps the permissions tmp was created with
             os.chmod(tmp, os.stat(target).st_mode & 0o777)
         os.rename(tmp, target)
@@ -2365,6 +2354,242 @@ def _write_parquet(
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _parquet_rows(df: pd.DataFrame | None, value_names: list[str]) -> tuple[Any, Any, Any, Any]:
+    """The chroms, starts, ends and values of the rows of a gextract result that its Parquet
+    file holds."""
+    if df is None:
+        return [], _numpy.empty(0, dtype=_numpy.int64), _numpy.empty(0, dtype=_numpy.int64), \
+            _numpy.empty((0, len(value_names)))
+    # by position: chrom, start, end, then the value columns, whose names may repeat
+    # (an error the writer reports) or be one of the coordinates'
+    return (
+        df.iloc[:, 0].astype(str).to_numpy(dtype=object),
+        df.iloc[:, 1].to_numpy(dtype=_numpy.int64),
+        df.iloc[:, 2].to_numpy(dtype=_numpy.int64),
+        _numpy.ascontiguousarray(df.iloc[:, 3 : 3 + len(value_names)].to_numpy(dtype=_numpy.float64)),
+    )
+
+
+def _parquet_created_by() -> str:
+    from . import __version__
+
+    return f"pymisha version {__version__}"
+
+
+# A gextract(file=) is computed and written a part of the scope at a time (see _file_parts): about
+# this many rows a part, as estimated before the extraction
+_FILE_PART_ROWS = 1 << 21
+# The estimate for an iterator whose rows are not known in advance (other than fixed bins or the
+# intervals of a DataFrame iterator): a row for this many bases
+_FILE_GUESS_BP_PER_ROW = 64
+
+
+def _file_parts(
+    scope: pd.DataFrame, iterator: Any, binsize: int | None, base_id_map: Any, orig_scope: pd.DataFrame
+) -> list[tuple[pd.DataFrame, Any]]:
+    """The parts of *scope* (a scope after gextract's iterator preprocessing) that a
+    gextract(file=) computes and writes in turn, with the intervalIDs of their rows: each a
+    DataFrame of whole scope intervals, or of pieces of a scope interval cut at the bins of a
+    fixed-bin iterator (*binsize*), which gives the same bins. Their rows, put in R's order (by
+    the scope interval of *orig_scope*, the caller's scope, they come from) and appended in
+    turn, are the rows of the whole extraction in that order. *base_id_map* maps the rows of
+    *scope* to those of *orig_scope* (None: the same rows)."""
+    n = len(scope)
+    if not n:
+        return []
+    gid = (_numpy.arange(1, n + 1, dtype=_numpy.int64) if base_id_map is None
+           else _numpy.asarray(base_id_map, dtype=_numpy.int64))
+    whole = [(scope, gid)]
+    try:
+        from .intervals import _chrom_id_map
+
+        starts = scope["start"].to_numpy()
+        ends = scope["end"].to_numpy()
+        s = starts.astype(_numpy.int64)
+        e = ends.astype(_numpy.int64)
+        if not (_numpy.array_equal(s, starts) and _numpy.array_equal(e, ends)) or len(gid) != n:
+            return whole  # the extraction reports what is wrong with the scope
+        cmap = _chrom_id_map()
+        orig_chrom = _numpy.asarray(
+            _shared._with_canonical_chroms(orig_scope[["chrom", "start", "end"]])["chrom"].astype(str).map(cmap)
+            .fillna(len(cmap)), dtype=_numpy.int64)
+        orig_start = orig_scope["start"].to_numpy(dtype=_numpy.int64)
+        if gid.min() < 1 or gid.max() > len(orig_scope):
+            return whole
+    except (ValueError, TypeError, KeyError, OverflowError):
+        _logger.debug("gextract(file=): the scope is computed in one part", exc_info=True)
+        return whole
+
+    if isinstance(iterator, (int, _numpy.integer)) and int(iterator) == -1:
+        est = _numpy.ones(n, dtype=_numpy.int64)  # an interval a row
+    elif binsize:
+        est = _numpy.maximum(-(-e // binsize) - s // binsize, 1)
+    else:
+        est = _numpy.maximum(-(-(e - s) // _FILE_GUESS_BP_PER_ROW), 1)
+    if int(est.sum()) <= _FILE_PART_ROWS:
+        return whole
+
+    # R's order: by the caller's scope interval (chromosome, start, row), then as scanned
+    order = _numpy.lexsort((e, s, gid, orig_start[gid - 1], orig_chrom[gid - 1]))
+    pieces = _numpy.ones(n, dtype=_numpy.int64)
+    big = _numpy.flatnonzero(est[order] > _FILE_PART_ROWS) if binsize else _numpy.empty(0, dtype=_numpy.int64)
+    # an interval of more rows is cut at the multiples of a whole number of bins
+    span = _FILE_PART_ROWS * (binsize or 1)
+    cuts = [_numpy.arange((s[r] // span + 1) * span, e[r], span, dtype=_numpy.int64) for r in order[big]]
+    pieces[big] += _numpy.array([len(c) for c in cuts], dtype=_numpy.int64)
+    unit_rows = _numpy.repeat(order, pieces)
+    unit_s = _numpy.repeat(s[order], pieces)
+    unit_e = _numpy.repeat(e[order], pieces)
+    first = _numpy.cumsum(pieces) - pieces
+    for j, c in zip(big, cuts, strict=True):
+        unit_s[first[j] + 1 : first[j] + 1 + len(c)] = c
+        unit_e[first[j] : first[j] + len(c)] = c
+    unit_est = (_numpy.maximum(-(-unit_e // binsize) - unit_s // binsize, 1) if binsize else est[unit_rows])
+    unit_gid = gid[unit_rows]
+
+    # Parts of about _FILE_PART_ROWS rows. The rows of one caller's interval that start at the same
+    # place stay in one part: the scan orders them, as it does in the whole extraction.
+    cum = _numpy.cumsum(unit_est)
+    part = (cum - unit_est) // _FILE_PART_ROWS
+    split = _numpy.r_[True, (part[1:] != part[:-1])
+                      & ~((unit_gid[1:] == unit_gid[:-1]) & (unit_s[1:] == unit_s[:-1]))]
+    bounds = _numpy.r_[_numpy.flatnonzero(split), len(unit_rows)]
+    parts = []
+    for b0, b1 in zip(bounds[:-1], bounds[1:], strict=True):
+        sel = slice(int(b0), int(b1))
+        chunk = scope.iloc[unit_rows[sel]].reset_index(drop=True)
+        chunk["start"] = unit_s[sel]
+        chunk["end"] = unit_e[sel]
+        parts.append((chunk, unit_gid[sel]))
+    return parts
+
+
+@contextlib.contextmanager
+def _file_extraction(progress: Any, progress_desc: str, num_parts: int) -> collections.abc.Iterator[Any]:
+    """The setting of a gextract(file=) computed a part at a time: CONFIG['max_data_size'] does not
+    limit the parts, and their extractions report no progress of their own; yields the progress
+    callback of the parts (None if none)."""
+    cb, close = _shared._make_progress_callback(progress, total=num_parts, desc=progress_desc)
+    saved = {k: CONFIG[k] for k in ("max_data_size", "_progress_cb") if k in CONFIG}
+    CONFIG["max_data_size"] = None
+    CONFIG.pop("_progress_cb", None)
+    try:
+        yield cb
+    finally:
+        for k in ("max_data_size", "_progress_cb"):
+            if k in saved:
+                CONFIG[k] = saved[k]
+            else:
+                CONFIG.pop(k, None)
+        if close:
+            close()
+
+
+def _write_tsv_parts(file: Any, dfs: collections.abc.Iterable[pd.DataFrame], columns: list[str]) -> None:
+    """Writes the rows of gextract results to a tab-delimited file as they come, as R misha's
+    gextract(file=) writes them: a header, then the rows of each DataFrame, values as R's
+    "%.15g", no intervalID. With no rows the file holds the header, *columns*."""
+    from pandas.io.common import get_handle
+
+    handles = None
+    try:
+        for df in dfs:
+            header = handles is None
+            if handles is None:
+                # the file to_csv(file) opens, with the file mode R's C++ writer gives it
+                with _shared._with_cpp_umask():
+                    handles = get_handle(file, "w", encoding="utf-8", compression="infer")
+            df.drop(columns=["intervalID"], errors="ignore").to_csv(
+                handles.handle, sep="\t", index=False, header=header, float_format="%.15g", na_rep="nan")
+            handles.handle.flush()  # before the next part forks
+        if handles is None:
+            with _shared._with_cpp_umask():
+                handles = get_handle(file, "w", encoding="utf-8", compression="infer")
+            pd.DataFrame(columns=columns).to_csv(handles.handle, sep="\t", index=False)
+    finally:
+        if handles is not None:
+            handles.close()
+
+
+def _extract_to_file(
+    frame: Any,
+    scope: pd.DataFrame,
+    iterator: Any,
+    binsize: int | None,
+    base_id_map: Any,
+    orig_scope: pd.DataFrame,
+    file: Any,
+    value_names: list[str],
+    parquet_kw: dict[str, Any],
+    progress: Any,
+    progress_desc: str,
+) -> None:
+    """gextract(file=): computes the rows a part of the scope at a time (see _file_parts) with
+    frame(part, id_map), the extraction of gextract, and appends them to the file as they come,
+    as R misha writes them; CONFIG['max_data_size'] does not limit them. The file is a
+    tab-delimited file (see _write_tsv_parts; *value_names* name the value columns of its
+    header), or a Parquet file (see _parquet_output) of the columns of *parquet_kw*."""
+    parts = _file_parts(scope, iterator, binsize, base_id_map, orig_scope)
+    # the parts draw one random stream, as the extraction of the whole scope does
+    with (_one_random_stream() if len(parts) > 1 else contextlib.nullcontext()), \
+            _file_extraction(progress, progress_desc, len(parts)) as cb:
+        def part_rows():
+            for i, (part, id_map) in enumerate(parts):
+                df = frame(part, id_map)
+                if cb:
+                    cb(i + 1, len(parts), int((i + 1) * 100 / len(parts)))
+                if df is not None and len(df):
+                    yield _genome_order(df, orig_scope)
+
+        if parquet_kw:
+            names = parquet_kw["value_names"]
+            with _parquet_output(file) as (name, tmp):
+                writer = _pymisha.pm_parquet_writer_open(tmp, name, list(names), parquet_kw["int64_coords"],
+                                                         _parquet_created_by(), parquet_kw["value_metadata"])
+                for df in part_rows():
+                    _pymisha.pm_parquet_writer_add(writer, *_parquet_rows(df, names))
+                _pymisha.pm_parquet_writer_close(writer)
+        else:
+            _write_tsv_parts(file, part_rows(), ["chrom", "start", "end", *value_names])
+
+
+def _extract_2d_to_file(
+    extract: Any, scope: pd.DataFrame, file: Any, value_names: list[str], progress: Any, progress_desc: str
+) -> None:
+    """2D gextract(file=): computes the rows a chromosome pair of the scope at a time with
+    extract(part), the 2D extraction of gextract, and appends them to the tab-delimited file as
+    they come (see _write_tsv_parts). The pairs, and the intervals of each, are taken in the
+    order R misha's scan takes them (r_2d_sort_order), in which the extraction also takes them,
+    so that the rows are those of the whole extraction. The scope is checked as R checks it
+    before anything is written."""
+    from .intervals import _normalize_chroms, _verify_2d_intervals
+
+    _verify_2d_intervals(scope)
+    cids = []
+    for k in ("1", "2"):
+        chroms = _normalize_chroms(_chrom_names(scope[f"chrom{k}"], f"chrom{k}").tolist())
+        codes, uniques = _pandas.factorize(_numpy.asarray(chroms, dtype=object))
+        cids.append(_numpy.asarray(_pymisha.pm_chrom_ids(list(uniques)), dtype=_numpy.int64)[codes])
+    order = _numpy.asarray(_pymisha.pm_r_2d_sort_order(cids[0], cids[1]), dtype=_numpy.int64)
+    c1, c2 = cids[0][order], cids[1][order]
+    coords = {c: scope[c].to_numpy(dtype=_numpy.int64)[order] for c in ("start1", "end1", "start2", "end2")}
+    _pymisha.pm_verify_no_overlaps_2d(c1, coords["start1"], coords["end1"], c2, coords["start2"], coords["end2"])
+    bounds = _numpy.r_[0, _numpy.flatnonzero((c1[1:] != c1[:-1]) | (c2[1:] != c2[:-1])) + 1, len(order)]
+    pairs = [order[b0:b1] for b0, b1 in zip(bounds[:-1], bounds[1:], strict=True)]
+    # the pairs draw one random stream, as the extraction of the whole scope does
+    with (_one_random_stream() if len(pairs) > 1 else contextlib.nullcontext()), \
+            _file_extraction(progress, progress_desc, len(pairs)) as cb:
+        def part_rows():
+            for i, rows in enumerate(pairs):
+                df = extract(scope.iloc[rows].reset_index(drop=True))
+                if cb:
+                    cb(i + 1, len(pairs), int((i + 1) * 100 / len(pairs)))
+                if df is not None and len(df):
+                    yield df
+
+        _write_tsv_parts(file, part_rows(), ["chrom1", "start1", "end1", "chrom2", "start2", "end2", *value_names])
 
 
 def _worker_extract_chunk(args: tuple[Any, ...]) -> pd.DataFrame | None:
@@ -2532,8 +2757,6 @@ def _parallel_extract_tracks(
     Returns the merged DataFrame, or ``None`` to fall back to the legacy path
     when the inputs aren't amenable to track-parallel.
     """
-    import multiprocessing
-
     if len(exprs) < 2:
         return None
     # Repeated expressions are deduped into distinct column names ('expr',
@@ -2556,15 +2779,19 @@ def _parallel_extract_tracks(
         (chunk, iterator, worker_config, vtracks_dict) for chunk in expr_chunks
     ]
 
-    # Publish the shared scope before Pool() forks; children inherit it.
+    # Publish the shared scope before the workers fork; they inherit it.
     global _FORK_SHARED_INTERVALS
-    ctx = multiprocessing.get_context("fork")
     _FORK_SHARED_INTERVALS = intervals
     try:
-        with ctx.Pool(processes=n_workers) as pool:
-            results = pool.map(_worker_extract_tracks, worker_args)
+        results, dead = _run_forked(_worker_extract_tracks, worker_args)
     finally:
         _FORK_SHARED_INTERVALS = None
+    # A worker that died would leave its columns out of the result
+    if dead:
+        raise RuntimeError(
+            f"track-parallel gextract: {len(dead)} of {len(worker_args)} worker processes ended without returning a "
+            "result (killed, e.g. by the out-of-memory killer, or crashed)"
+        )
 
     non_empty = [(chunk, df) for chunk, df in zip(expr_chunks, results, strict=True)
                  if df is not None and len(df) > 0]
@@ -2621,8 +2848,6 @@ def _parallel_extract(
     rows (matching a serial extraction over *intervals*), or ``None`` to signal
     the caller to fall back to the serial path.
     """
-    import multiprocessing
-
     max_procs = _effective_max_procs(config)
     if max_procs < 2:
         return None
@@ -2701,9 +2926,10 @@ def _parallel_extract(
         worker_args.append((chunk_dict, exprs, iterator, worker_config, vtracks_dict))
         run_parent_maps.append(_numpy.array([x[3] for x in r], dtype=_numpy.int64))
 
-    ctx = multiprocessing.get_context("fork")
-    with ctx.Pool(processes=len(worker_args)) as pool:
-        results = pool.map(_worker_extract_chunk, worker_args)
+    results, dead = _run_forked(_worker_extract_chunk, worker_args)
+    # A worker that died would leave its rows out of the result: as the C++ scanner reports a kid
+    if dead:
+        raise RuntimeError(_dead_worker_message(dead))
 
     dfs = []
     for df, parent_map in zip(results, run_parent_maps, strict=False):
@@ -2720,6 +2946,33 @@ def _parallel_extract(
     return _pandas.concat(dfs, ignore_index=True)
 
 
+# The first suggestion of gextract's error for a result over CONFIG['max_data_size'], as R misha's
+# GEXTRACT_FILE_SUGGESTION: a file output is not limited
+_GEXTRACT_FILE_SUGGESTION = (
+    "  - Write the result to a file, which CONFIG['max_data_size'] does not limit: "
+    'gextract(..., file="x.tsv") or file="x.parquet"\n'
+)
+
+
+def _suggest_file_output(func: collections.abc.Callable[..., Any]) -> collections.abc.Callable[..., Any]:
+    """gextract's error for a result over CONFIG['max_data_size'] lists first the suggestion to
+    write the result to a file (the error comes from the C++ check shared with other functions).
+    The wrapped function finds its caller's variables two frames up."""
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except _pymisha.error as exc:
+            msg = str(exc)
+            if msg.startswith("Result size (at least ") and "\nSuggestions:\n" in msg \
+                    and _GEXTRACT_FILE_SUGGESTION not in msg:
+                msg = msg.replace("\nSuggestions:\n", "\nSuggestions:\n" + _GEXTRACT_FILE_SUGGESTION, 1)
+                raise _pymisha.error(msg) from None
+            raise
+    return wrapper
+
+
+@_suggest_file_output
 def gextract(
     expr: str | list[str],
     intervals: pd.DataFrame | str | None = None,
@@ -2777,9 +3030,13 @@ def gextract(
 
         - **file** (*str, optional*) -- Path to write extraction results
           to. When provided, the result is written to the file and ``None``
-          is returned instead of a DataFrame. A name ending in ``.parquet``
+          is returned instead of a DataFrame. The rows are computed and
+          written a part of the scope at a time (a 2D extraction a
+          chromosome pair at a time), as R misha writes them, so the whole
+          result is never held in memory, and ``CONFIG['max_data_size']``
+          does not limit it. A name ending in ``.parquet``
           (in any case) writes a GZIP-compressed Parquet file: columns
-          ``chrom``, ``start`` and ``end``, then one float32 column per
+          ``chrom``, ``start`` and ``end``, then one double column per
           expression, named as in the DataFrame, all nullable (NaN values
           are written as NaN). ``start`` and ``end`` are 32-bit integers
           unless a chromosome of the scope is 2^31 bp or longer. Only 1D
@@ -2788,7 +3045,13 @@ def gextract(
           under a temporary name in its directory (a symbolic link is
           followed, and the file it points to is replaced) and renamed when
           complete, so an error or an interrupt leaves an existing file as
-          it was. Any other name writes a tab-separated file. A new file of
+          it was. A column whose expression is exactly the name of a track
+          carries the track's attributes as its field metadata (Arrow field
+          metadata: in pyarrow, ``pq.read_schema(file).field(name).metadata``);
+          :func:`gtrack_import_parquet` restores them. Any other name writes
+          a tab-separated file, in place: an error part way through leaves
+          the rows written so far, as in R misha; with no rows it holds the
+          header. A new file of
           either kind is created with mode 0660 (umask 007), whatever the
           caller's umask; a file it replaces keeps its permission bits.
         - **intervals_set_out** (*str, optional*) -- Name of an interval set
@@ -2827,8 +3090,9 @@ def gextract(
     """
     _checkroot()
 
-    # Capture caller namespace for user variable resolution
-    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=1)
+    # Capture caller namespace for user variable resolution (the caller of _suggest_file_output's
+    # wrapper)
+    caller_ns = dict(vars) if vars is not None else _caller_namespace(depth=2)
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
     if isinstance(colnames, str):
@@ -2851,12 +3115,14 @@ def gextract(
                 "(intervals sets only carry numeric coordinate columns)"
             )
 
+    file = kwargs.get("file")
+    intervals_set_out = kwargs.get("intervals_set_out")
+    if file is not None and intervals_set_out is not None:
+        raise ValueError("Cannot use both file and intervals_set_out arguments")
+
     from .tracks import _check_computed_tracks
 
     _check_computed_tracks(exprs)
-
-    file = kwargs.get("file")
-    intervals_set_out = kwargs.get("intervals_set_out")
 
     if intervals is None:
         from .expr import _expr_is_2d
@@ -2875,6 +3141,7 @@ def gextract(
         parquet_kw = {
             "value_names": list(colnames) if colnames is not None else exprs,
             "int64_coords": _parquet_int64_coords(intervals),
+            "value_metadata": _parquet_value_metadata(exprs),
         }
 
     # Capture for intervals_join post-processing. _preprocess_intervals_iterator
@@ -2889,6 +3156,15 @@ def gextract(
     if _is_2d_intervals(intervals):
         if colnames is not None and len(colnames) != len(exprs):
             raise ValueError(f"colnames length ({len(colnames)}) must match number of expressions ({len(exprs)})")
+        if file is not None:
+            # written as the rows come, a chromosome pair of the scope at a time, as R misha writes it
+            _extract_2d_to_file(
+                lambda part: _gextract_2d(exprs, part, iterator=iterator, colnames=colnames, band=band,
+                                          caller_ns=caller_ns),
+                intervals, file, list(colnames) if colnames is not None else exprs, kwargs.get("progress"),
+                kwargs.get("progress_desc", "gextract"),
+            )
+            return None
         df = _gextract_2d(
             exprs,
             intervals,
@@ -2897,10 +3173,10 @@ def gextract(
             band=band,
             caller_ns=caller_ns,
         )
-        if df is not None and len(df) == 0 and file is None and intervals_set_out is None:
+        if df is not None and len(df) == 0 and intervals_set_out is None:
             df = None  # R returns NULL when the iterator gives no interval
         return _apply_extract_output(
-            df, file, intervals_set_out, is_2d=True,
+            df, intervals_set_out, is_2d=True,
             intervals_join=intervals_join,
             input_intervals=input_intervals_for_join,
         )
@@ -2949,6 +3225,7 @@ def gextract(
     # When no explicit iterator is given, a value-based vtrack defaults to its
     # source track's native iterator (R parity), not the whole interval.
     if iterator is None and used_vtracks and not all_user_vars:
+        _check_dense_bin_sizes(exprs, used_vtracks)
         _inferred_it = _infer_iterator_from_vtracks(used_vtracks)
         if _inferred_it is not None:
             iterator = _inferred_it
@@ -2966,227 +3243,248 @@ def gextract(
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars
 
-    if (not used_vtracks and not all_user_vars) or cpp_vtracks_extract:
-        vtracks_dict = _build_vtracks_dict(used_vtracks) if cpp_vtracks_extract else None
-        # Try parallel extraction if max_processes > 1.
-        # Skip when a custom progress callback is provided (not compatible
-        # with forked workers) or when file output is requested.
-        # Resolve the strategy before entering _config_no_mt: track-parallel is
-        # worth forking even when the iterator came in as a DataFrame, which
-        # otherwise pins the whole extraction to one process.
-        strategy = _resolve_parallel_strategy(
-            str(CONFIG.get("multitasking_strategy", "auto")),
-            n_exprs=len(exprs),
-            iterator=iterator,
-        )
-        track_parallel = strategy == "tracks" and not _tracks_workload_too_small_for_fork(
-            intervals, len(exprs), CONFIG
-        )
-        with _config_no_mt(_itr_id_map, keep=track_parallel) as _cfg:
-            df = None
-            # Mirror the C++ gate, which divides the scope by the same
-            # core-clamped worker count it would actually fork.
-            _max_procs = _effective_max_procs(_cfg)
-            use_parallel = (
-                _config_multitasking(_cfg)
-                and _max_procs > 1
-                and not callable(progress)
-                and file is None
-                and (
-                    track_parallel
-                    or not _workload_too_small_for_fork(intervals, _max_procs, _cfg)
-                )
+    def extract_frame(scope, id_map, mt_map, prog, allow_parallel):
+        """The rows of the expressions over *scope* (a scope after the iterator preprocessing
+        above), in the order of the scan, their intervalID mapped through *id_map*, or None if
+        there are none. *mt_map* is the id map of a DataFrame iterator, which keeps the scan in
+        one process; *allow_parallel*: whether the Python fork paths may be used."""
+
+        if (not used_vtracks and not all_user_vars) or cpp_vtracks_extract:
+            vtracks_dict = _build_vtracks_dict(used_vtracks) if cpp_vtracks_extract else None
+            # Try parallel extraction if max_processes > 1.
+            # Skip when a custom progress callback is provided (not compatible
+            # with forked workers) or when file output is requested.
+            # Resolve the strategy before entering _config_no_mt: track-parallel is
+            # worth forking even when the iterator came in as a DataFrame, which
+            # otherwise pins the whole extraction to one process.
+            strategy = _resolve_parallel_strategy(
+                str(CONFIG.get("multitasking_strategy", "auto")),
+                n_exprs=len(exprs),
+                iterator=iterator,
             )
-            if use_parallel:
-                if track_parallel:
-                    df = _parallel_extract_tracks(
-                        exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict,
+            track_parallel = strategy == "tracks" and not _tracks_workload_too_small_for_fork(
+                scope, len(exprs), CONFIG
+            )
+            with _config_no_mt(mt_map, keep=track_parallel) as _cfg:
+                df = None
+                # Mirror the C++ gate, which divides the scope by the same
+                # core-clamped worker count it would actually fork.
+                _max_procs = _effective_max_procs(_cfg)
+                use_parallel = (
+                    _config_multitasking(_cfg)
+                    and _max_procs > 1
+                    and not callable(prog)
+                    and allow_parallel
+                    and (
+                        track_parallel
+                        or not _workload_too_small_for_fork(scope, _max_procs, _cfg)
                     )
+                )
+                if use_parallel:
+                    if track_parallel:
+                        df = _parallel_extract_tracks(
+                            exprs, scope, iterator, _cfg, vtracks_dict=vtracks_dict,
+                        )
+                    if df is None:
+                        df = _parallel_extract(exprs, scope, iterator, _cfg, vtracks_dict=vtracks_dict)
+
                 if df is None:
-                    df = _parallel_extract(exprs, intervals, iterator, _cfg, vtracks_dict=vtracks_dict)
+                    with _progress_context(prog, desc=progress_desc):
+                        # The C++ scanner cannot fork under a DataFrame-derived
+                        # iterator: intervalIDs are sequential indices into the
+                        # intersected scope and _remap_interval_ids relies on that.
+                        _serial_cfg = _cfg
+                        if mt_map is not None and _config_multitasking(_cfg):
+                            _serial_cfg = dict(_cfg)
+                            _serial_cfg["multitasking"] = False
+                        result = _pymisha.pm_extract(
+                            exprs,
+                            _df2pymisha(scope),
+                            iterator,
+                            _serial_cfg,
+                            vtracks_dict,
+                        )
+                    df = _pymisha2df(result)
+            df = _remap_interval_ids(df, id_map)
+            if colnames is not None and df is not None and isinstance(df, _pandas.DataFrame):
+                # Build rename map: old expression columns -> new names
+                # The C++ path names columns after the expression strings
+                non_meta = [c for c in df.columns if c not in ("chrom", "start", "end", "intervalID")]
+                if len(non_meta) == len(colnames):
+                    rename_map = dict(zip(non_meta, colnames, strict=False))
+                    df = df.rename(columns=rename_map)
+            return df
 
-            if df is None:
-                with _progress_context(progress, desc=progress_desc):
-                    # The C++ scanner cannot fork under a DataFrame-derived
-                    # iterator: intervalIDs are sequential indices into the
-                    # intersected scope and _remap_interval_ids relies on that.
-                    _serial_cfg = _cfg
-                    if _itr_id_map is not None and _config_multitasking(_cfg):
-                        _serial_cfg = dict(_cfg)
-                        _serial_cfg["multitasking"] = False
-                    result = _pymisha.pm_extract(
-                        exprs,
-                        _df2pymisha(intervals),
-                        iterator,
-                        _serial_cfg,
-                        vtracks_dict,
-                    )
-                df = _pymisha2df(result)
-        df = _remap_interval_ids(df, _itr_id_map)
-        if colnames is not None and df is not None and isinstance(df, _pandas.DataFrame):
-            # Build rename map: old expression columns -> new names
-            # The C++ path names columns after the expression strings
-            non_meta = [c for c in df.columns if c not in ("chrom", "start", "end", "intervalID")]
-            if len(non_meta) == len(colnames):
-                rename_map = dict(zip(non_meta, colnames, strict=False))
-                df = df.rename(columns=rename_map)
-        return _apply_extract_output(
-            df, file, intervals_set_out, is_2d=False,
-            intervals_join=intervals_join,
-            input_intervals=input_intervals_for_join,
-            **parquet_kw,
-        )
+        track_arrays = {}
+        base_df = None
+        iter_df = None
 
-    track_arrays = {}
-    base_df = None
-    iter_df = None
+        if used_tracks:
+            if iterator is None and used_vtracks:
+                _check_dense_bin_sizes(exprs, used_vtracks)
+            track_exprs = list(used_tracks)
+            with _config_no_mt(mt_map) as _cfg:
+                base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(scope), iterator, _cfg)
+            base_df = _pymisha2df(base_result)
+            if base_df is None:
+                raise RuntimeError("Failed to extract physical track values for mixed expression")
+            base_df = _remap_interval_ids(base_df, id_map)
+            for tname in track_exprs:
+                col = tname
+                if col not in base_df.columns:
+                    raise KeyError(f"Track column not found for '{tname}'")
+                track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
 
-    if used_tracks:
-        track_exprs = list(used_tracks)
-        with _config_no_mt(_itr_id_map) as _cfg:
-            base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, _cfg)
-        base_df = _pymisha2df(base_result)
-        if base_df is None:
-            raise RuntimeError("Failed to extract physical track values for mixed expression")
-        base_df = _remap_interval_ids(base_df, _itr_id_map)
-        for tname in track_exprs:
-            col = tname
-            if col not in base_df.columns:
-                raise KeyError(f"Track column not found for '{tname}'")
-            track_arrays[tname] = base_df[col].to_numpy(dtype=float, copy=False)
-
-        iter_df = base_df[["chrom", "start", "end", "intervalID"]]
-    else:
-        if iterator is None:
-            # Array-slice vtracks can determine their own iterator from the
-            # query intervals (one output row per input interval).
-            all_array_slice = used_vtracks and all(
-                _shared._VTRACKS.get(vt, {}).get("kind") == "array_slice"
-                for vt in used_vtracks
-            )
-            if all_array_slice:
-                # Use intervals as-is, assigning intervalID 1..N
-                # By this point intervals is guaranteed to be a DataFrame
-                # (preprocessing above resolves named sets); the cast is purely
-                # to narrow the static type away from the input str alternative.
-                assert isinstance(intervals, _pandas.DataFrame)
-                iter_df = intervals.copy()
-                iter_df["intervalID"] = _numpy.arange(1, len(iter_df) + 1, dtype=int)
-            elif len(exprs) == 1:
-                raise ValueError(
-                    f"Cannot implicitly determine iterator policy:\n"
-                    f'track expression "{exprs[0]}" does not contain any tracks.'
-                )
-            else:
-                raise ValueError(
-                    "Cannot implicitly determine iterator policy: track expressions do not contain any tracks."
-                )
+            iter_df = base_df[["chrom", "start", "end", "intervalID"]]
         else:
-            # intervalID as the branch above: the caller's scope row, not the
-            # row of the intersected scope a DataFrame/track iterator made
-            iter_df = _remap_interval_ids(_iterated_intervals(intervals, iterator), _itr_id_map)
+            if iterator is None:
+                # Array-slice vtracks can determine their own iterator from the
+                # query intervals (one output row per input interval).
+                all_array_slice = used_vtracks and all(
+                    _shared._VTRACKS.get(vt, {}).get("kind") == "array_slice"
+                    for vt in used_vtracks
+                )
+                if all_array_slice:
+                    # Use intervals as-is, assigning intervalID 1..N
+                    # By this point intervals is guaranteed to be a DataFrame
+                    # (preprocessing above resolves named sets); the cast is purely
+                    # to narrow the static type away from the input str alternative.
+                    assert isinstance(scope, _pandas.DataFrame)
+                    iter_df = scope.copy()
+                    iter_df["intervalID"] = _numpy.arange(1, len(iter_df) + 1, dtype=int)
+                    iter_df = _remap_interval_ids(iter_df, id_map)
+                elif len(exprs) == 1:
+                    raise ValueError(
+                        f"Cannot implicitly determine iterator policy:\n"
+                        f'track expression "{exprs[0]}" does not contain any tracks.'
+                    )
+                else:
+                    raise ValueError(
+                        "Cannot implicitly determine iterator policy: track expressions do not contain any tracks."
+                    )
+            else:
+                # intervalID as the branch above: the caller's scope row, not the
+                # row of the intersected scope a DataFrame/track iterator made
+                iter_df = _remap_interval_ids(_iterated_intervals(scope, iterator), id_map)
 
-    if iter_df is None or len(iter_df) == 0:
-        return _apply_extract_output(
-            None, file, intervals_set_out, is_2d=False,
-            intervals_join=intervals_join,
-            input_intervals=input_intervals_for_join,
-            **parquet_kw,
-        )
+        if iter_df is None or len(iter_df) == 0:
+            return None
 
-    n_rows = len(iter_df)
-    chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
-    compiled = []
-    result_cols = []
-    # Match the C++ PMDataFrame dedup: when two expressions (or user-supplied
-    # colnames) resolve to the same name, append '_' until unique so each keeps
-    # its own column instead of silently overwriting an earlier one.
-    used_colnames = {"chrom", "start", "end"}
-    for i, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in enumerate(parsed):
-        colname = colnames[i] if colnames is not None else orig_expr
-        while colname in used_colnames:
-            colname += "_"
-        used_colnames.add(colname)
-        allowed_names = {
-            "np",
-            "numpy",
-            "CHROM",
-            "START",
-            "END",
-            *(_expr_safe_name(t) for t in expr_tracks),
-            *(_expr_safe_name(vt) for vt in expr_vtracks),
-        }
-        allowed_names |= set(all_user_vars.keys())
-        try:
-            code_obj = compile_safe_expression(expr_eval, allowed_names)
-        except UnsafeExpressionError as exc:
-            raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
-        compiled.append((colname, code_obj, expr_tracks, expr_vtracks))
-        result_cols.append(colname)
-
-    result_arrays = {col: _numpy.empty(n_rows, dtype=float) for col in result_cols}
-
-    chrom_vals = iter_df["chrom"].to_numpy()
-    start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
-    end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
-
-    # Pre-compute vtrack values once for all intervals (avoids per-chunk recomputation)
-    precomputed_vtracks = {}
-    if used_vtracks:
-        all_intervals = iter_df[["chrom", "start", "end"]]
-        for vt in used_vtracks:
-            precomputed_vtracks[vt] = _compute_vtrack_values(vt, all_intervals)
-
-    with _progress_context(progress, total=n_rows, desc=progress_desc) as progress_cb:
-        for start_idx, end_idx in _chunk_slices(n_rows, chunk_size):
-            sl = slice(start_idx, end_idx)
-
-            local_ns = {
-                "np": _numpy,
-                "numpy": _numpy,
-                "CHROM": chrom_vals[sl],
-                "START": start_vals[sl],
-                "END": end_vals[sl],
+        n_rows = len(iter_df)
+        chunk_size = int(CONFIG.get("eval_buf_size", 1000) or 1000)  # type: ignore[call-overload]
+        compiled = []
+        result_cols = []
+        # Match the C++ PMDataFrame dedup: when two expressions (or user-supplied
+        # colnames) resolve to the same name, append '_' until unique so each keeps
+        # its own column instead of silently overwriting an earlier one.
+        used_colnames = {"chrom", "start", "end"}
+        for i, (orig_expr, expr_eval, expr_tracks, expr_vtracks) in enumerate(parsed):
+            colname = colnames[i] if colnames is not None else orig_expr
+            while colname in used_colnames:
+                colname += "_"
+            used_colnames.add(colname)
+            allowed_names = {
+                "np",
+                "numpy",
+                "CHROM",
+                "START",
+                "END",
+                *(_expr_safe_name(t) for t in expr_tracks),
+                *(_expr_safe_name(vt) for vt in expr_vtracks),
             }
+            allowed_names |= set(all_user_vars.keys())
+            try:
+                code_obj = compile_safe_expression(expr_eval, allowed_names)
+            except UnsafeExpressionError as exc:
+                raise ValueError(f"Unsafe expression '{orig_expr}': {exc}") from exc
+            compiled.append((colname, code_obj, expr_tracks, expr_vtracks))
+            result_cols.append(colname)
 
-            for tname, arr in track_arrays.items():
-                local_ns[_expr_safe_name(tname)] = arr[sl]
+        result_arrays = {col: _numpy.empty(n_rows, dtype=float) for col in result_cols}
 
-            for vt, arr in precomputed_vtracks.items():
-                local_ns[_expr_safe_name(vt)] = arr[sl]
+        chrom_vals = iter_df["chrom"].to_numpy()
+        start_vals = iter_df["start"].to_numpy(dtype=int, copy=False)
+        end_vals = iter_df["end"].to_numpy(dtype=int, copy=False)
 
-            local_ns.update(all_user_vars)
+        # Pre-compute vtrack values once for all intervals (avoids per-chunk recomputation)
+        precomputed_vtracks = {}
+        if used_vtracks:
+            all_intervals = iter_df[["chrom", "start", "end"]]
+            for vt in used_vtracks:
+                precomputed_vtracks[vt] = _compute_vtrack_values(vt, all_intervals)
 
-            for colname, code_obj, _expr_tracks, _expr_vtracks in compiled:
-                result_values = eval(code_obj, {"__builtins__": {}}, local_ns)
-                if _numpy.isscalar(result_values):
-                    result_values = _numpy.full(end_idx - start_idx, result_values)
-                result_arrays[colname][sl] = _numpy.asarray(result_values, dtype=float)
+        with _progress_context(prog, total=n_rows, desc=progress_desc) as progress_cb:
+            for start_idx, end_idx in _chunk_slices(n_rows, chunk_size):
+                sl = slice(start_idx, end_idx)
+
+                local_ns = {
+                    "np": _numpy,
+                    "numpy": _numpy,
+                    "CHROM": chrom_vals[sl],
+                    "START": start_vals[sl],
+                    "END": end_vals[sl],
+                }
+
+                for tname, arr in track_arrays.items():
+                    local_ns[_expr_safe_name(tname)] = arr[sl]
+
+                for vt, arr in precomputed_vtracks.items():
+                    local_ns[_expr_safe_name(vt)] = arr[sl]
+
+                local_ns.update(all_user_vars)
+
+                for colname, code_obj, _expr_tracks, _expr_vtracks in compiled:
+                    result_values = eval(code_obj, {"__builtins__": {}}, local_ns)
+                    if _numpy.isscalar(result_values):
+                        result_values = _numpy.full(end_idx - start_idx, result_values)
+                    result_arrays[colname][sl] = _numpy.asarray(result_values, dtype=float)
+
+                if progress_cb:
+                    total = n_rows
+                    done = end_idx
+                    pct = int(done * 100.0 / total) if total else 100
+                    progress_cb(done, total, pct)
 
             if progress_cb:
-                total = n_rows
-                done = end_idx
-                pct = int(done * 100.0 / total) if total else 100
-                progress_cb(done, total, pct)
+                progress_cb(n_rows, n_rows, 100)
 
-        if progress_cb:
-            progress_cb(n_rows, n_rows, 100)
+        result_df = _pandas.DataFrame(
+            {
+                "chrom": chrom_vals,
+                "start": start_vals,
+                "end": end_vals,
+            }
+        )
+        for col in result_cols:
+            result_df[col] = result_arrays[col]
+        result_df["intervalID"] = iter_df["intervalID"].to_numpy(dtype=int, copy=False)
+        return result_df
 
-    result_df = _pandas.DataFrame(
-        {
-            "chrom": chrom_vals,
-            "start": start_vals,
-            "end": end_vals,
-        }
-    )
-    for col in result_cols:
-        result_df[col] = result_arrays[col]
-    result_df["intervalID"] = iter_df["intervalID"].to_numpy(dtype=int, copy=False)
+
+    # file= output is written as the rows come, a part of the scope at a time, as R misha writes
+    # it, and the size of the result is not limited
+    if file is not None:
+        binsize = None
+        if isinstance(iterator, (int, _numpy.integer)) and not isinstance(iterator, bool) and int(iterator) > 0:
+            binsize = int(iterator)
+        elif iterator is None:
+            from .gsynth import _implicit_binsize
+
+            binsize = _implicit_binsize(exprs)
+        _extract_to_file(
+            # as before, a part is not split between Python workers; the C++ scan may fork
+            lambda scope, id_map: extract_frame(scope, id_map, _itr_id_map, False, False),
+            intervals, iterator, binsize, _itr_id_map,
+            input_intervals_for_join if isinstance(input_intervals_for_join, pd.DataFrame) else None, file,
+            list(colnames) if colnames is not None else exprs, parquet_kw, progress, progress_desc,
+        )
+        return None
+
+    df = extract_frame(intervals, _itr_id_map, _itr_id_map, progress, True)
     return _apply_extract_output(
-        result_df, file, intervals_set_out, is_2d=False,
+        df, intervals_set_out, is_2d=False,
         intervals_join=intervals_join,
         input_intervals=input_intervals_for_join,
-        **parquet_kw,
     )
 
 
@@ -3349,6 +3647,8 @@ def gscreen(
     iter_df = None
 
     if expr_tracks:
+        if iterator is None and expr_vtracks:
+            _check_dense_bin_sizes([expr], expr_vtracks)
         track_exprs = list(expr_tracks)
         with _config_no_mt(_scr_id_map) as _cfg:
             base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, _cfg)

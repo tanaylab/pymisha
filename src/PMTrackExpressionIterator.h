@@ -58,6 +58,16 @@ public:
     virtual uint64_t original_interval_idx() const override { return m_cur_interv_idx + 1; }  // 1-based
 
     int64_t get_bin_size() const { return m_bin_size; }
+    bool is_interval_relative() const { return m_interval_relative; }
+
+    // The bin of the current interval and the end bin of the current scope interval: next() gives
+    // the bins up to get_end_bin() - 1 and then goes on to the next scope interval.
+    int64_t get_cur_bin() const { return m_cur_bin; }
+    int64_t get_end_bin() const { return m_end_bin; }
+    const GInterval &last_scope_interval() const { return m_last_scope_interval; }
+
+    // Moves k intervals forward, as k calls of next() would; 1 <= k <= get_end_bin() - get_cur_bin().
+    void advance(int64_t k);
 
 private:
     std::vector<GInterval> m_intervals;

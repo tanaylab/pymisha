@@ -21,8 +21,10 @@ from ._shared import (
     _check_spat_bounds,
     _checkroot,
     _chrom_names,
+    _coerce_pssm_matrix,
     _coerce_score_thresh,
     _df2pymisha,
+    _is_na,
     _numpy,
     _pandas,
     _potts_params,
@@ -56,6 +58,7 @@ _FILTER_MIN_POS_REL_FUNCS = {"min.pos.relative"}
 _FILTER_SAMPLE_POS_ABS_FUNCS = {"sample.pos.abs"}
 _FILTER_SAMPLE_POS_REL_FUNCS = {"sample.pos.relative"}
 _FILTER_LOGSUMEXP_FUNCS = {"pwm", "potts", "lse"}
+_FILTER_WEIGHTED_SUM_FUNCS = {"weighted.sum"}
 _FILTER_GLOBAL_PERCENTILE_FUNCS = {
     "global.percentile",
     "global.percentile.min",
@@ -140,7 +143,7 @@ def _check_params_dots_collision(func: str, params: Any, kwargs: dict[str, Any])
     )
 
 
-def _kmer_params(func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+def _kmer_params(name: str, func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Port of R misha's ``.vtrack_params_kmer``: the ``kmer``, ``extend`` and
     ``strand`` of a kmer.count / kmer.frac vtrack, given as ``params`` (a dict,
     R's list) or as keyword arguments."""
@@ -161,10 +164,16 @@ def _kmer_params(func: str, params: Any, kwargs: dict[str, Any]) -> dict[str, An
         raise ValueError("kmer functions require a 'kmer' parameter")
 
     _check_vtrack_params(func, kp)
+    # R: extend TRUE or FALSE only; strand -1, 0 or 1 (a number, not a bool)
     if kp.get("extend") is None:
         kp["extend"] = True
+    elif not isinstance(kp["extend"], (bool, _numpy.bool_)):
+        raise ValueError(f"Virtual track {name}: extend parameter must be True or False")
+    kp["extend"] = bool(kp["extend"])
     if kp.get("strand") is None:
         kp["strand"] = 0
+    elif not _is_num(kp["strand"]) or kp["strand"] not in (-1, 0, 1):
+        raise ValueError(f"Virtual track {name}: strand parameter must be -1, 0, or 1")
 
     kmer = kp.get("kmer")
     if not isinstance(kmer, str):
@@ -287,7 +296,7 @@ _R_VALUE_FUNCS = {
     "avg", "min", "max", "stddev", "sum", "lse", "quantile", "nearest", "exists", "size",
     "first", "last", "sample", "first.pos.abs", "first.pos.relative", "last.pos.abs",
     "last.pos.relative", "sample.pos.abs", "sample.pos.relative", "min.pos.abs",
-    "min.pos.relative", "max.pos.abs", "max.pos.relative", "mean", "std",
+    "min.pos.relative", "max.pos.abs", "max.pos.relative", "weighted.sum", "mean", "std",
 }
 _R_2D_TYPES = {"rectangles", "points", "computed"}
 
@@ -306,9 +315,54 @@ def _check_edit_distance_args(kw: dict, func: str) -> None:
     if (v is not None and "max_indels" in _ACCEPTED_VTRACK_PARAMS.get(func, ())
             and not (_is_num(v) and v >= 0 and v == int(v))):
         raise ValueError("max_indels must be NULL or a non-negative integer")
-    v = kw.get("extend")
-    if v is not None and not isinstance(v, (bool, _numpy.bool_)) and not (_is_num(v) and v >= 0 and v == int(v)):
-        raise ValueError("extend must be TRUE, FALSE, or a non-negative integer")
+    v = kw.get("extend")  # (an NA or a list gets R's message from _check_pwm_flags)
+    if (v is not None and not _is_na(v) and not isinstance(v, (bool, _numpy.bool_, list, tuple, _numpy.ndarray))
+            and not (_is_num(v) and v >= 0 and v == int(v))):
+        raise ValueError("extend must be True, False, or a non-negative integer")
+
+
+def _is_flag(x: Any) -> bool:
+    return isinstance(x, (bool, _numpy.bool_))
+
+
+def _is_na_or_seq(x: Any) -> bool:
+    """R's NA, or more than one value (R's C++ checks report both alike)."""
+    return _is_na(x) or isinstance(x, (list, tuple, _numpy.ndarray, _pandas.Series))
+
+
+def _check_pwm_flags(name: str, func_lc: str, config: dict) -> None:
+    """R misha's checks on bidirect, extend, prior and strand of a pwm vtrack (the
+    R handlers' and TrackExpressionParams' messages): bidirect True or False;
+    extend True or False, or for the edit-distance functions also a
+    non-negative whole number; prior a number in [0, 1]; strand 1 or -1 (a
+    number, not a bool).
+    A bool-like bidirect or extend is stored as a bool."""
+    v = config.get("bidirect")
+    if v is not None:
+        if _is_na_or_seq(v):
+            raise ValueError(f"Virtual track {name}: bidirect parameter must be True or False")
+        if not _is_flag(v):
+            raise ValueError("bidirect must be True or False")
+        config["bidirect"] = bool(v)
+    v = config.get("extend")
+    if v is not None:
+        if _is_na_or_seq(v):
+            raise ValueError(f"Virtual track {name}: extend parameter must be True, False or a non-negative integer")
+        if _is_flag(v):
+            config["extend"] = bool(v)
+        elif func_lc not in _FILTER_EDIT_DISTANCE_FUNCS:
+            raise ValueError("extend must be True or False")
+        elif not (_is_num(v) and v >= 0 and v == int(v)):
+            raise ValueError("extend must be True, False, or a non-negative integer")
+    v = config.get("prior")
+    if v is not None and (not _is_num(v) or not 0 <= v <= 1):
+        raise ValueError("prior must be a number between 0 and 1")
+    v = config.get("strand")
+    if v is not None:
+        if _is_flag(v) and v:  # R's 1/-1 check lets TRUE through to the C++ type check
+            raise ValueError(f"Virtual track {name}: strand parameter must be numeric")
+        if not _is_num(v) or v not in (1, -1):
+            raise ValueError("strand must be 1 or -1")
 
 
 def _r_vtrack_checks(name: str, src: Any, func_lc: str, params: Any) -> None:
@@ -330,7 +384,7 @@ def _r_vtrack_checks(name: str, src: Any, func_lc: str, params: Any) -> None:
             raise ValueError(f"Virtual track {name}: invalid function {func_lc} used for a virtual track")
         ttype = str(gtrack_info(src).get("type", ""))
         is_2d = ttype in _R_2D_TYPES
-        if ((not is_2d and func_lc in ("weighted.sum", "area"))
+        if ((not is_2d and func_lc == "area")
                 or (is_2d and func_lc in ("nearest", "stddev", "std", "sum", "lse", "quantile"))
                 or (ttype != "dense" and func_lc.startswith("global.percentile"))):
             raise ValueError(f"Virtual track {name}: function {func_lc} is not supported by {ttype} tracks")
@@ -385,6 +439,81 @@ def _r_vtrack_checks(name: str, src: Any, func_lc: str, params: Any) -> None:
 _NON_VALUE_COLS = {"chrom", "start", "end", "strand", "intervalID", "intervalID1", "intervalID2"}
 
 
+def _vtrack_source_rows(src: pd.DataFrame, error: Any) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """The chromosomes (the database's names) and coordinates of a vtrack's DataFrame source,
+    checked as R misha's IntervalConverter checks them, row by row: a missing, infinite or
+    out-of-range coordinate is "Invalid format of interval at index i" (from 1); then the
+    chromosome: a missing string is the name "NA", a missing category or number is an invalid
+    interval, and a name the database lacks is 'Chromosome "..." does not exist'; then the
+    interval: start below 0, start not below end, end past the chromosome. A fraction is
+    truncated, as R's as.integer. error(msg) gives the exception to raise."""
+    from .intervals import _valid_coord, gintervals_all
+
+    n = len(src)
+    start = _pandas.to_numeric(src["start"], errors="coerce").to_numpy(dtype=float)
+    end = _pandas.to_numeric(src["end"], errors="coerce").to_numpy(dtype=float)
+    coord_bad = ~(_valid_coord(start) & _valid_coord(end))
+
+    col = src["chrom"]
+    name_bad = _numpy.zeros(n, dtype=bool)
+    if isinstance(col.dtype, _pandas.CategoricalDtype):
+        name_bad = col.cat.codes.to_numpy() < 0
+        names = [str(v) if not bad else "" for v, bad in zip(col.astype(object), name_bad, strict=True)]
+    elif _pandas.api.types.is_numeric_dtype(col.dtype) and not _pandas.api.types.is_bool_dtype(col.dtype):
+        v = col.to_numpy(dtype=float, na_value=_numpy.nan)
+        with _numpy.errstate(invalid="ignore"):
+            name_bad = ~_numpy.isfinite(v) | (v != _numpy.floor(v)) | (_numpy.abs(v) > 1e15)
+        names = [str(int(x)) if not bad else "" for x, bad in zip(v, name_bad, strict=True)]
+    else:
+        names = []
+        for i, v in enumerate(col.to_numpy(dtype=object)):
+            if isinstance(v, str):
+                names.append(v)
+            elif v is None or v is _pandas.NA or (isinstance(v, float) and _numpy.isnan(v)):
+                names.append("NA")  # R's NA_character_ is read as the name "NA"
+            elif ((isinstance(v, (int, _numpy.integer)) and not isinstance(v, (bool, _numpy.bool_)))
+                  or (isinstance(v, (float, _numpy.floating)) and _numpy.isfinite(v) and v == _numpy.floor(v))):
+                names.append(str(int(v)))
+            else:
+                name_bad[i] = True
+                names.append("")
+
+    canonical: dict[str, str | None] = {}
+    for name in set(names) - {""}:
+        try:
+            canonical[name] = str(_pymisha.pm_normalize_chroms([name])[0])
+        except Exception:
+            canonical[name] = None
+    chroms = [canonical.get(name) if name else None for name in names]
+    unknown = _numpy.array([not bad and c is None for c, bad in zip(chroms, name_bad, strict=True)], dtype=bool)
+
+    sizes = dict(zip(_chrom_names(gintervals_all()["chrom"]).tolist(), gintervals_all()["end"].tolist(), strict=True))
+    with _numpy.errstate(invalid="ignore"):
+        s_int = _numpy.where(coord_bad, 0, _numpy.trunc(start)).astype(_numpy.int64)
+        e_int = _numpy.where(coord_bad, 0, _numpy.trunc(end)).astype(_numpy.int64)
+    size = _numpy.array([sizes.get(c, -1) if c is not None else -1 for c in chroms], dtype=_numpy.int64)
+    ok = ~coord_bad & ~name_bad & ~unknown
+    neg = ok & (s_int < 0)
+    inverted = ok & ~neg & (s_int >= e_int)
+    past = ok & ~neg & ~inverted & (e_int > size)
+    bad_row = coord_bad | name_bad | unknown | neg | inverted | past
+    if bad_row.any():
+        i = int(_numpy.argmax(bad_row))
+        if coord_bad[i] or name_bad[i]:
+            raise error(f"Invalid format of interval at index {i + 1}")
+        if unknown[i]:
+            raise error(f'Chromosome "{names[i]}" does not exist')
+        where = f"Interval ({chroms[i]}, {s_int[i]}, {e_int[i]}): "
+        if neg[i]:
+            raise error(where + "start coordinate must be greater or equal than zero")
+        if inverted[i]:
+            raise error(where + "start coordinate must be lesser than end coordinate. misha uses 0-based, "
+                        "half-open [start, end) coordinates; if your input is 1-based (GFF/GTF/VCF), "
+                        "subtract 1 from start.")
+        raise error(where + "end coordinate exceeds chromosome boundaries")
+    return [str(c) for c in chroms], s_int, e_int
+
+
 def _infer_default_vtrack_func(src: pd.DataFrame | str | None) -> str:
     """Infer the default ``func`` when none is given (R parity).
 
@@ -410,7 +539,7 @@ def _infer_default_vtrack_func(src: pd.DataFrame | str | None) -> str:
     return "avg"
 _VALUE_DF_PY_FUNCS = {
     "avg", "mean", "sum", "min", "max", "first", "last", "size", "exists",
-    "stddev", "std", "quantile", "nearest",
+    "stddev", "std", "quantile", "nearest", "sample", "weighted.sum",
     "first.pos.abs", "first.pos.relative",
     "last.pos.abs", "last.pos.relative",
     "min.pos.abs", "min.pos.relative",
@@ -442,6 +571,7 @@ _FILTER_SUPPORTED_FUNCS = (
     | _FILTER_SAMPLE_POS_ABS_FUNCS
     | _FILTER_SAMPLE_POS_REL_FUNCS
     | _FILTER_LOGSUMEXP_FUNCS
+    | _FILTER_WEIGHTED_SUM_FUNCS
     | _FILTER_MAX_POS_BY_SCORE_FUNCS
     | _FILTER_GLOBAL_PERCENTILE_FUNCS
     | _FILTER_EDIT_DISTANCE_FUNCS
@@ -670,242 +800,79 @@ def _compute_value_df_vtrack(
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
 ) -> np.ndarray:
-    """Python fallback evaluator for value-based virtual tracks."""
+    """A filtered value-based vtrack (a DataFrame source), as R misha's ValueVarProcessor: the
+    source is held as R's in-memory track holds it (values as floats), and C++ reads the unmasked
+    parts of each interval (pm_vtrack_compute with part_owner). "nearest" without a value in the
+    parts is the value whose unmasked stretch is nearest to them (_nearest_unmasked)."""
     func = str(payload_eval.get("func", "avg")).lower()
-    has_filter = filter_df is not None and len(filter_df) > 0
-    src_df = payload_eval.get("src_df")
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
-    if src_df is None or len(src_df) == 0:
-        if func == "exists":
-            return _numpy.zeros(len(intervals), dtype=float)
-        return out
-
+    src_df = payload_eval.get("src_df")
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
-    if seg_df is None or len(seg_df) == 0:
-        if func == "exists":
-            return _numpy.zeros(len(intervals), dtype=float)
-        return out
+    if src_df is None or len(src_df) == 0 or seg_df is None or len(seg_df) == 0:
+        return out  # every interval masked entirely (or empty after the shifts): NaN, as R
 
-    src_groups = dict(list(src_df.groupby("chrom", sort=False)))
-    src_by_chrom: dict[str, _ValueSource] = {}
+    oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
+    payload = {k: v for k, v in payload_eval.items() if k != "src_df"}
+    payload.update(sshift=0, eshift=0, part_owner=oi, part_base=seg_df["base_start"].to_numpy(dtype=_numpy.int64))
+    vals = _numpy.asarray(
+        _pymisha.pm_vtrack_compute(payload, _df2pymisha(seg_df[["chrom", "start", "end"]]), CONFIG), dtype=float)
+    first = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1]])
+    out[oi[first]] = vals[first]
 
-    def chrom_src(chrom: str) -> _ValueSource | None:
-        if chrom not in src_by_chrom and chrom in src_groups and len(src_groups[chrom]):
-            src_by_chrom[chrom] = _ValueSource(src_groups[chrom])
-        return src_by_chrom.get(chrom)
-
-    seg_oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
-    seg_chrom = seg_df["chrom"].astype(str).to_numpy()
-    seg_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
-    seg_end = seg_df["end"].to_numpy(dtype=_numpy.int64)
-    seg_base = seg_df["base_start"].to_numpy(dtype=_numpy.int64)
-    seg_len = seg_df["seg_len"].to_numpy(dtype=_numpy.int64)
-    bounds = _numpy.flatnonzero(_numpy.r_[True, seg_oi[1:] != seg_oi[:-1], True]).tolist()  # by interval
-
-    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
-        oi = int(seg_oi[a])
-        sgrp = chrom_src(str(seg_chrom[a]))
-        if sgrp is None:
-            if func == "exists":
-                out[oi] = 0.0
-            continue
-
-        segments = list(zip(seg_start[a:b].tolist(), seg_end[a:b].tolist(), strict=True))
-        base_start = int(seg_base[a])
-        unmasked_len = int(seg_len[a:b].sum())
-
-        if has_filter and func == "nearest":
-            # nearest under filter uses only the first unmasked segment.
-            segments = [segments[0]]
-
-        # the source intervals that can overlap the segments, in source order (the others
-        # overlap none), matched to the segments with numpy broadcasting
-        cand = sgrp.overlapping(segments[0][0], segments[-1][1])
-        src_starts = sgrp.start[cand]
-        src_ends = sgrp.end[cand]
-        src_vals = sgrp.value[cand]
-        n_src = len(src_starts)
-
-        total_ov = _numpy.zeros(n_src, dtype=_numpy.int64)
-        # each source interval's start clipped to the first / last unmasked part it overlaps:
-        # the *.pos functions report the position in the part they read (R misha 5.15)
-        first_part = _numpy.full(n_src, -1, dtype=_numpy.int64)
-        last_part = _numpy.full(n_src, -1, dtype=_numpy.int64)
-        overlaps_for_cov = []
-        for ss, se in segments:
-            ov_s = _numpy.maximum(src_starts, ss)
-            ov_e = _numpy.minimum(src_ends, se)
-            ov_len = _numpy.maximum(ov_e - ov_s, 0)
-            total_ov += ov_len
-            hit = ov_len > 0
-            first_part[hit & (first_part < 0)] = ss
-            last_part[hit] = ss
-            if func == "coverage":
-                for k in _numpy.flatnonzero(ov_len > 0):
-                    overlaps_for_cov.append((int(ov_s[k]), int(ov_e[k])))
-
-        has_ov = (total_ov > 0) & ~_numpy.isnan(src_vals)
-        m_idx = _numpy.flatnonzero(has_ov)
-        n_matched = len(m_idx)
-
-        if func == "exists":
-            out[oi] = 1.0 if n_matched > 0 else 0.0
-            continue
-        if func == "coverage":
-            if unmasked_len <= 0:
-                continue
-            if not overlaps_for_cov:
-                out[oi] = 0.0
-                continue
-            overlaps_for_cov.sort()
-            cov = 0
-            cs, ce = overlaps_for_cov[0]
-            for s, e in overlaps_for_cov[1:]:
-                if s < ce:
-                    ce = max(ce, e)
-                else:
-                    cov += ce - cs
-                    cs, ce = s, e
-            cov += ce - cs
-            out[oi] = float(cov) / float(unmasked_len)
-            continue
-
-        if n_matched == 0:
-            if func == "size":
-                out[oi] = 0.0
-            continue
-
-        # Extract matched arrays directly via advanced indexing (no list-of-tuples)
-        m_starts = src_starts[m_idx]
-        m_vals = src_vals[m_idx]
-        m_first_pos = _numpy.maximum(m_starts, first_part[m_idx])
-        m_last_pos = _numpy.maximum(m_starts, last_part[m_idx])
-
-        if func in {"avg", "mean"}:
-            # Unweighted, filtered or not, as R's value-based avg. (R counts an
-            # interval spanning a masked gap once per unmasked part; we count it once.)
-            out[oi] = float(m_vals.mean())
-        elif func == "nearest":
-            # If no overlap, nearest falls back to minimum distance.
-            out[oi] = float(m_vals.mean())
-        elif func == "sum":
-            out[oi] = float(m_vals.sum())
-        elif func == "min":
-            out[oi] = float(m_vals.min())
-        elif func == "max":
-            out[oi] = float(m_vals.max())
-        elif func == "size":
-            out[oi] = float(n_matched)
-        elif func in {"stddev", "std"}:
-            if n_matched >= 2:
-                out[oi] = float(_numpy.std(m_vals, ddof=1))
-        elif func == "quantile":
-            q = _quantile_param(payload_eval)
-            out[oi] = float(_numpy.quantile(m_vals, q))
-        elif func == "first":
-            # min by (start, index) — use lexsort (sorts by last key first)
-            order = _numpy.lexsort((m_idx, m_starts))
-            out[oi] = float(m_vals[order[0]])
-        elif func == "last":
-            order = _numpy.lexsort((m_idx, m_starts))
-            out[oi] = float(m_vals[order[-1]])
-        elif func == "lse":
-            mx = float(m_vals.max())
-            out[oi] = mx + float(_numpy.log(_numpy.exp(m_vals - mx).sum())) if _numpy.isfinite(mx) else mx
-        elif func in {"sample.pos.abs", "sample.pos.relative"}:
-            pos = float(m_first_pos[int(_numpy.random.randint(n_matched))])
-            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
-        elif func in {"first.pos.abs", "first.pos.relative"}:
-            order = _numpy.lexsort((m_idx, m_starts))
-            pos = float(m_first_pos[order[0]])
-            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
-        elif func in {"last.pos.abs", "last.pos.relative"}:
-            order = _numpy.lexsort((m_idx, m_starts))
-            pos = float(m_last_pos[order[-1]])
-            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
-        elif func in {"min.pos.abs", "min.pos.relative"}:
-            # min by (value, start, index)
-            order = _numpy.lexsort((m_idx, m_starts, m_vals))
-            pos = float(m_first_pos[order[0]])
-            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
-        elif func in {"max.pos.abs", "max.pos.relative"}:
-            # max by (value, -start, -index) — negate start/index for descending
-            order = _numpy.lexsort((-m_idx, -m_starts, m_vals))
-            pos = float(m_first_pos[order[-1]])
-            out[oi] = pos - float(base_start) if func.endswith(".relative") else pos
-
-    # nearest fallback for non-overlap cases: the mean of the source values (in source order)
-    # at the least distance from the first segment, max(0, ss - src_e) + max(0, src_s - se)
     if func == "nearest":
-        for a in bounds[:-1]:
-            oi = int(seg_oi[a])
-            if not _numpy.isnan(out[oi]):
-                continue
-            sgrp = chrom_src(str(seg_chrom[a]))
-            if sgrp is None:
-                continue
-            nearest = sgrp.nearest(int(seg_start[a]), int(seg_end[a]))
-            if nearest.size > 0:
-                out[oi] = float(sgrp.value[sgrp.valid][nearest].mean())
-
+        last = _numpy.r_[first[1:], len(oi)] - 1
+        need = _numpy.isnan(vals[first])
+        if need.any():
+            masks = _mask_by_chrom(filter_df)
+            chroms = seg_df["chrom"].astype(str).to_numpy()
+            p_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
+            p_end = seg_df["end"].to_numpy(dtype=_numpy.int64)
+            src_chroms = src_df["chrom"].astype(str).to_numpy()
+            items: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+            for a, b in zip(first[need].tolist(), last[need].tolist(), strict=True):
+                chrom = str(chroms[a])
+                if chrom not in items:
+                    grp = src_df[src_chroms == chrom].sort_values("start", kind="stable")
+                    # each value as a float, as R's in-memory track holds it
+                    items[chrom] = (grp["start"].to_numpy(dtype=_numpy.int64), grp["end"].to_numpy(dtype=_numpy.int64),
+                                    grp["value"].to_numpy(dtype=_numpy.float32).astype(float))
+                starts, ends, ivals = items[chrom]
+                m_start, m_end = masks.get(chrom, _NO_MASK)
+                out[oi[a]] = _nearest_unmasked(starts, ends, ivals, m_start, m_end, int(p_start[a]), int(p_end[b]))
     return out
 
 
-class _ValueSource:
-    """A value-based vtrack's source intervals on one chromosome (_compute_value_df_vtrack),
-    in source order, indexed to find those overlapping or nearest to a range."""
-
-    def __init__(self, grp: pd.DataFrame):
-        self.start = grp["start"].to_numpy(dtype=_numpy.int64)
-        self.end = grp["end"].to_numpy(dtype=_numpy.int64)
-        self.value = grp["value"].to_numpy(dtype=float)
-        self.by_start, self.sorted_start, self.end_cummax = self._index(self.start, self.end)
-        self.valid = _numpy.flatnonzero(~_numpy.isnan(self.value))
-        self.v_by_start, self.v_sorted_start, self.v_end_cummax = self._index(
-            self.start[self.valid], self.end[self.valid])
-
-    @staticmethod
-    def _index(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """The intervals by start, their starts, and the running maximum of their ends."""
-        by_start = _numpy.argsort(start, kind="stable")
-        ends = end[by_start]
-        return by_start, start[by_start], (_numpy.maximum.accumulate(ends) if len(ends) else ends)
-
-    def overlapping(self, start: int, end: int) -> np.ndarray:
-        """The intervals that start before end and end after start, in source order."""
-        lo = int(_numpy.searchsorted(self.end_cummax, start, side="right"))
-        hi = int(_numpy.searchsorted(self.sorted_start, end, side="left"))
-        cand = self.by_start[lo:max(lo, hi)]
-        return _numpy.sort(cand[self.end[cand] > start])
-
-    def nearest(self, start: int, end: int) -> np.ndarray:
-        """The intervals with a value at the least distance from [start, end), max(0, start -
-        their end) + max(0, their start - end), as positions among those with a value, in
-        source order."""
-        v_start, v_end = self.start[self.valid], self.end[self.valid]
-        n = len(v_start)
-        if n == 0:
-            return _numpy.empty(0, dtype=_numpy.int64)
-        hi = int(_numpy.searchsorted(self.v_sorted_start, end, side="right"))  # starting at or before end
-        lo = int(_numpy.searchsorted(self.v_end_cummax, start, side="left"))
-        at_zero = self.v_by_start[lo:max(lo, hi)]
-        at_zero = at_zero[v_end[at_zero] >= start]  # distance 0: touching or overlapping
-        if at_zero.size:
-            return _numpy.sort(at_zero)
-        # the others starting at or before end all end before start
-        d_left = start - int(self.v_end_cummax[hi - 1]) if hi > 0 else None
-        d_right = int(self.v_sorted_start[hi]) - end if hi < n else None
-        dmin = min(d for d in (d_left, d_right) if d is not None)
-        parts = []
-        if d_left == dmin:
-            max_end = int(self.v_end_cummax[hi - 1])
-            first = int(_numpy.searchsorted(self.v_end_cummax[:hi], max_end, side="left"))
-            left = self.v_by_start[first:hi]
-            parts.append(left[v_end[left] == max_end])
-        if d_right == dmin:
-            last = int(_numpy.searchsorted(self.v_sorted_start, self.v_sorted_start[hi], side="right"))
-            parts.append(self.v_by_start[hi:last])
-        return _numpy.sort(_numpy.concatenate(parts))
+def _filtered_item_reduce(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+    func: str,
+) -> np.ndarray:
+    """sum, size or avg of a filtered track vtrack, each bin or track interval once, however many
+    unmasked parts it overlaps (R misha 5.15)."""
+    runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+    for u in runs:
+        n = u.hi - u.lo
+        if func == "size":
+            first = _numpy.flatnonzero(_numpy.r_[True, u.oi[1:] != u.oi[:-1]])
+            out[u.oi[first]] = _numpy.add.reduceat(n, first).astype(float)
+            continue
+        read = n > 0
+        if not read.any():
+            continue
+        # as R: each part's sum or mean, which the track holds as a float, then the parts'
+        # sums, or their means weighted by their value counts, added in order
+        counts = n[read].astype(float)
+        part_sums = _seq_range_sums(u.vals, u.lo[read], u.hi[read])
+        if func == "sum":
+            terms = part_sums.astype(_numpy.float32).astype(float)
+        else:
+            terms = (part_sums / counts).astype(_numpy.float32).astype(float) * counts
+        oi = u.oi[read]
+        first = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1]])
+        totals = _seq_range_sums(terms, first, _numpy.r_[first[1:], len(oi)])
+        out[oi[first]] = totals if func == "sum" else totals / _numpy.add.reduceat(counts, first)
+    return out
 
 
 def _compute_filtered_nearest(
@@ -913,27 +880,133 @@ def _compute_filtered_nearest(
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
 ) -> np.ndarray:
-    """Nearest under filter: use only the first unmasked segment per interval."""
+    """nearest of a filtered track vtrack, as R misha 5.17: the average of the unmasked values,
+    each value once (as filtered avg); without an unmasked value in the interval, the value of
+    the sparse or array track nearest to its unmasked parts (_nearest_unmasked). A dense track
+    gives NaN there, as its unfiltered nearest does not look outside the interval either."""
+    out = _filtered_item_reduce(intervals, payload_eval, filter_df, "avg")
+    src = payload_eval.get("src")
+    if not _numpy.isnan(out).any() or not isinstance(src, str):
+        return out
+    try:
+        if _pymisha.pm_track_info(src).get("bin_size"):
+            return out  # dense
+    except _pymisha.error:
+        return out
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
-    out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     if seg_df is None or len(seg_df) == 0:
         return out
+    oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
+    first = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1]])
+    last = _numpy.r_[first[1:], len(oi)] - 1
+    need = _numpy.isnan(out[oi[first]])
+    if not need.any():
+        return out
+    chroms = seg_df["chrom"].astype(str).to_numpy()
+    p_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
+    p_end = seg_df["end"].to_numpy(dtype=_numpy.int64)
+    masks = _mask_by_chrom(filter_df)
+    items: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for a, b in zip(first[need].tolist(), last[need].tolist(), strict=True):
+        chrom = str(chroms[a])
+        if chrom not in items:
+            items[chrom] = _track_chrom_items(src, chrom, _slice_keys(payload_eval))
+        starts, ends, vals = items[chrom]
+        m_start, m_end = masks.get(chrom, _NO_MASK)
+        out[oi[a]] = _nearest_unmasked(starts, ends, vals, m_start, m_end, int(p_start[a]), int(p_end[b]))
+    return out
 
-    # Keep only the first segment per original interval
-    first_segs = seg_df.groupby("orig_idx", sort=False).first().reset_index()
-    payload_first = dict(payload_eval)
-    payload_first["sshift"] = 0
-    payload_first["eshift"] = 0
-    seg_vals = _numpy.asarray(
-        _pymisha.pm_vtrack_compute(
-            payload_first,
-            _df2pymisha(first_segs[["chrom", "start", "end"]]),
-            CONFIG,
-        ),
-        dtype=float,
-    )
-    for orig_idx, val in zip(first_segs["orig_idx"], seg_vals, strict=False):
-        out[int(orig_idx)] = val
+
+_NO_MASK = (_numpy.empty(0, dtype=_numpy.int64), _numpy.empty(0, dtype=_numpy.int64))
+
+
+def _mask_by_chrom(filter_df: pd.DataFrame | None) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """The starts and ends of a canonic mask (sorted, disjoint, touching intervals unified),
+    by chromosome."""
+    if filter_df is None or len(filter_df) == 0:
+        return {}
+    return {str(c): (g["start"].to_numpy(dtype=_numpy.int64), g["end"].to_numpy(dtype=_numpy.int64))
+            for c, g in filter_df.groupby(_chrom_names(filter_df["chrom"]), sort=False)}
+
+
+def _track_chrom_items(src: str, chrom: str,
+                       slice_keys: dict[str, Any] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The starts, ends and values of the intervals of sparse or array track src on chrom,
+    by start (NaN where an interval holds no value), after the slice of an array-slice vtrack."""
+    from .intervals import gintervals_all
+
+    all_iv = gintervals_all()
+    size = int(all_iv["end"].to_numpy()[_chrom_names(all_iv["chrom"]).to_numpy() == chrom][0])
+    res = _pymisha.pm_extract([src], _df2pymisha(_pandas.DataFrame(
+        {"chrom": [chrom], "start": [0], "end": [size]})), None, CONFIG)
+    if res is None:
+        empty = _numpy.empty(0, dtype=_numpy.int64)
+        return empty, empty, _numpy.empty(0, dtype=float)
+    starts = _numpy.asarray(res[2], dtype=_numpy.int64)
+    vals = _numpy.asarray(res[4], dtype=float)
+    if slice_keys is not None and len(vals):
+        vals = _sliced_values(src, slice_keys, _numpy.full(len(vals), chrom, dtype=object), res[2], res[3])
+    order = _numpy.argsort(starts, kind="stable")
+    return starts[order], _numpy.asarray(res[3], dtype=_numpy.int64)[order], vals[order]
+
+
+def _nearest_unmasked(
+    starts: np.ndarray, ends: np.ndarray, vals: np.ndarray,
+    m_start: np.ndarray, m_end: np.ndarray, first_start: int, last_end: int,
+) -> float:
+    """nearest of a filtered vtrack whose unmasked parts, from first_start to last_end, hold no
+    value (R misha's TrackVarProcessor::nearest_unmasked_value): the value of the interval
+    whose unmasked stretch is nearest to the parts, measured from the first part for those on
+    the left and from the last part for those on the right; a fully masked interval is never
+    chosen, the left one wins at the same distance; NaN if there is none. The intervals
+    (starts, ends, vals) do not overlap and are sorted; the mask (m_start, m_end) is canonic."""
+    left_val = right_val = _numpy.nan
+    left_dist = right_dist = -1
+    for j in range(int(_numpy.searchsorted(starts, first_start, side="right")) - 1, -1, -1):
+        if _numpy.isnan(vals[j]):
+            continue
+        a, b = int(starts[j]), min(int(ends[j]), first_start)
+        # the end of the last unmasked bp of [a, b)
+        k = int(_numpy.searchsorted(m_end, b - 1, side="right"))
+        e = b if k == len(m_end) or m_start[k] > b - 1 else int(m_start[k]) if m_start[k] > a else None
+        if e is not None:
+            left_val, left_dist = float(vals[j]), first_start - e
+            break
+    for j in range(int(_numpy.searchsorted(ends, last_end, side="right")), len(starts)):
+        if _numpy.isnan(vals[j]):
+            continue
+        a, b = max(int(starts[j]), last_end), int(ends[j])
+        # the first unmasked bp of [a, b)
+        k = int(_numpy.searchsorted(m_end, a, side="right"))
+        st = a if k == len(m_end) or m_start[k] > a else int(m_end[k]) if m_end[k] < b else None
+        if st is not None:
+            right_val, right_dist = float(vals[j]), st - last_end
+            break
+    if left_dist >= 0 and (right_dist < 0 or left_dist <= right_dist):
+        return left_val
+    return right_val
+
+
+def _compute_filtered_sample(
+    intervals: pd.DataFrame,
+    payload_eval: dict[str, Any],
+    filter_df: pd.DataFrame | None,
+    func: str,
+) -> np.ndarray:
+    """sample, sample.pos.abs or sample.pos.relative of a filtered track vtrack: one value drawn
+    with the same chance from the unmasked values, each bin or track interval once, however
+    many unmasked parts it overlaps (R misha 5.17); its position clipped to the first part it
+    overlaps."""
+    runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+    for u in runs:
+        base = dict(zip(u.oi.tolist(), u.base.tolist(), strict=True))
+        for orig_idx, ivals, ipos in _unmasked_groups(u, positions=func != "sample"):
+            k = int(_numpy.random.randint(len(ivals)))
+            if func == "sample":
+                out[orig_idx] = float(ivals[k])
+            else:
+                assert ipos is not None
+                out[orig_idx] = float(ipos[k] - base[orig_idx]) if func.endswith(".relative") else float(ipos[k])
     return out
 
 
@@ -980,10 +1053,26 @@ def _unmasked_items(
     src = payload_eval.get("src")
     if seg_df is None or len(seg_df) == 0 or src is None:
         return iter(()), out
-    return _read_unmasked_items(seg_df, src), out
+    return _read_unmasked_items(seg_df, src, _slice_keys(payload_eval)), out
 
 
-def _read_unmasked_items(seg_df: pd.DataFrame, src: str) -> Iterator[_Unmasked]:
+def _slice_keys(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The slice keys of an array-slice vtrack's payload (_array_slice_spec), None for another."""
+    if "slice_func" not in payload:
+        return None
+    return {k: payload[k] for k in ("slice", "slice_func", "slice_percentile") if k in payload}
+
+
+def _sliced_values(src: str, slice_keys: dict[str, Any], chroms: Any, starts: Any, ends: Any) -> np.ndarray:
+    """The value of each interval of array track src (one interval each, possibly clipped) after
+    the slice of an array-slice vtrack."""
+    payload = {"src": src, "func": "avg", "sshift": 0, "eshift": 0, **slice_keys}
+    df = _pandas.DataFrame({"chrom": chroms, "start": starts, "end": ends})
+    return _numpy.asarray(_pymisha.pm_vtrack_compute(payload, _df2pymisha(df), CONFIG), dtype=float)
+
+
+def _read_unmasked_items(seg_df: pd.DataFrame, src: str,
+                         slice_keys: dict[str, Any] | None = None) -> Iterator[_Unmasked]:
     """The items each unmasked part of seg_df (_build_unmasked_segments) reads from track src.
 
     The track is read with its own iterator (a row per bin or track interval) over the union
@@ -1051,6 +1140,11 @@ def _read_unmasked_items(seg_df: pd.DataFrame, src: str) -> Iterator[_Unmasked]:
         if res is None:
             res = [None, None] + [_numpy.empty(0, dtype=_numpy.int64)] * 4
         vals = _numpy.asarray(res[4], dtype=float)
+        if slice_keys is not None and len(vals):
+            # an array-slice vtrack: each array interval's columns reduced by its slice
+            span_chrom = names[m_s // key].to_numpy()
+            vals = _sliced_values(src, slice_keys, span_chrom[_numpy.asarray(res[5], dtype=_numpy.int64) - 1],
+                                  res[2], res[3])
         ok = ~_numpy.isnan(vals)
         vals = vals[ok]
         r_key = m_key[_numpy.asarray(res[5], dtype=_numpy.int64)[ok] - 1]
@@ -1288,12 +1382,50 @@ def _compute_filtered_stddev(
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
 ) -> np.ndarray:
-    """Stddev under filter: extract raw bin values and compute exact stddev."""
-    groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
-    for orig_idx, raw_vals in groups:
-        if len(raw_vals) >= 2:
-            out[orig_idx] = float(_numpy.std(raw_vals, ddof=1))
+    """stddev of a filtered track vtrack, as R misha's aggregate_stddev_with_filter: each unmasked
+    part's count, mean and standard deviation (each value once, the part's mean and deviation
+    held as floats, as the track gives them) merged pairwise (Chan et al.)."""
+    runs, out = _unmasked_items(intervals, payload_eval, filter_df)
+    for u in runs:
+        lo, hi, oi = u.lo.tolist(), u.hi.tolist(), u.oi.tolist()
+        vals = u.vals.tolist()
+        j = 0
+        while j < len(oi):
+            o = oi[j]
+            n = mean = m2 = 0.0
+            while j < len(oi) and oi[j] == o:
+                part = vals[lo[j]:hi[j]]
+                j += 1
+                if not part:
+                    continue
+                # the part's mean (summed in double, rounded to float) and its deviation (Welford)
+                part_n = float(len(part))
+                part_mean = float(_numpy.float32(_seq_sum(part) / part_n))
+                part_m2 = 0.0
+                if len(part) > 1:
+                    w_mean = w_m2 = 0.0
+                    for k, v in enumerate(part, 1):
+                        delta = v - w_mean
+                        w_mean += delta / k
+                        w_m2 += delta * (v - w_mean)
+                    part_sd = float(_numpy.float32(_math.sqrt(w_m2 / (len(part) - 1))))
+                    part_m2 = part_sd * part_sd * (part_n - 1)
+                delta = part_mean - mean
+                total = n + part_n
+                mean += delta * part_n / total
+                m2 += part_m2 + delta * delta * n * part_n / total
+                n = total
+            if n > 1:
+                out[o] = _math.sqrt(m2 / (n - 1))
     return out
+
+
+def _seq_sum(vals: list[float]) -> float:
+    """vals added one after the other, from 0, as C++ adds them in a double."""
+    total = 0.0
+    for v in vals:
+        total += v
+    return total
 
 
 def _compute_filtered_quantile(
@@ -1301,11 +1433,17 @@ def _compute_filtered_quantile(
     payload_eval: dict[str, Any],
     filter_df: pd.DataFrame | None,
 ) -> np.ndarray:
-    """Quantile under filter: extract raw bin values and compute exact quantile."""
-    percentile = _quantile_param(payload_eval)
+    """quantile of a filtered track vtrack, as R misha's aggregate_quantile_with_filter: the
+    unmasked values (each once, floats) sorted, interpolated in double and rounded to a float, as
+    StreamPercentiler<float> does while they fit max_data_size."""
+    percentile = min(max(_quantile_param(payload_eval), 0.0), 1.0)
     groups, out = _extract_raw_unmasked_values(intervals, payload_eval, filter_df)
     for orig_idx, raw_vals in groups:
-        out[orig_idx] = float(_numpy.quantile(raw_vals, percentile))
+        v = _numpy.sort(_numpy.asarray(raw_vals, dtype=_numpy.float32)).astype(float)
+        index = (len(v) - 1) * percentile
+        i1, i2 = _math.floor(index), _math.ceil(index)
+        weight = index - i1
+        out[orig_idx] = float(_numpy.float32(v[i1] * (1 - weight) + v[i2] * weight))
     return out
 
 
@@ -1687,39 +1825,20 @@ def _project_intervals_by_dim(intervals: pd.DataFrame, dim: int) -> pd.DataFrame
     raise ValueError(f"dim must be 1 or 2, got {dim}")
 
 
-def _compute_array_slice_vtrack(
-    vtrack_config: dict,
-    intervals: _pandas.DataFrame,
-) -> _numpy.ndarray:
-    """Evaluate an ``array_slice`` virtual track for *intervals*.
-
-    Returns a 1-D float64 array (one value per row of *intervals*).
-    """
-    from pathlib import Path
-
-    from ._array_track import extract_array, read_colnames, reduce_array_extract
-
-    src = vtrack_config["src"]
-    slice_cols = vtrack_config.get("slice_cols")  # None = all columns
-    func = vtrack_config.get("func", "avg")
-
-    track_path = Path(_pymisha.pm_track_path(src))
-    colnames = read_colnames(track_path)
-
-    if slice_cols is None:
-        sel_idx = None
-        val_cols = colnames
-    else:
-        sel_idx = slice_cols
-        val_cols = [colnames[i] for i in sel_idx]
-
-    n_intervals = len(intervals)
-
-    # extract_array returns one row per overlapping track interval.
-    # intervalID is 1-based, matching the row order of *intervals*.
-    extracted = extract_array(track_path, intervals, sel_idx, colnames)
-
-    return reduce_array_extract(extracted, val_cols, func, n_intervals)
+def _array_slice_spec(cfg: dict) -> dict[str, Any]:
+    """The slice of an array-slice vtrack (gvtrack_array_slice) as the C++ spec keys read by
+    PMTrackExpressionVars::configure_array_slice: the column indices sorted and de-duplicated, as
+    R; the slice function and its percentile."""
+    sl = cfg.get("slice") or {}
+    cols = sl.get("slice")
+    spec: dict[str, Any] = {
+        "slice": None if cols is None else sorted({int(c) for c in cols}),
+        "slice_func": str(sl.get("func", "avg")).lower(),
+    }
+    params = sl.get("params")
+    if params is not None:
+        spec["slice_percentile"] = float(params[0] if isinstance(params, (list, tuple)) else params)
+    return spec
 
 
 def _compute_vtrack_values(
@@ -1747,16 +1866,16 @@ def _compute_vtrack_values(
     if vtrack_config is None:
         return None
 
-    # Array-slice vtracks are handled entirely in Python.
-    if vtrack_config.get("kind") == "array_slice":
-        return _compute_array_slice_vtrack(vtrack_config, intervals)
-
     # Handle dim parameter: project 2D intervals to 1D
     dim = vtrack_config.get("dim")
     if dim is not None and dim != 0 and "chrom1" in intervals.columns:
         intervals = _project_intervals_by_dim(intervals, dim)
 
     payload = dict(vtrack_config)
+    # an array-slice vtrack: the slice as the C++ spec keys; the vtrack's func, shifts and filter
+    # apply as for any track source
+    if payload.pop("kind", None) == "array_slice":
+        payload.update(_array_slice_spec(vtrack_config))
     src = payload.get('src')
     if isinstance(src, str) and "chrom1" not in intervals.columns:
         from .tracks import gtrack_exists, gtrack_info
@@ -1777,20 +1896,8 @@ def _compute_vtrack_values(
     if subs is not None and payload.get("src") is None:
         row_subs = (_numpy.asarray(subs[0], dtype=_numpy.int64), _numpy.asarray(subs[1], dtype=_numpy.int64))
 
-    # Functions that the C++ value-based vtrack path handles efficiently
-    _VALUE_CPP_FUNCS = {
-        "avg", "mean", "sum", "min", "max", "first", "last", "size",
-        "exists", "stddev", "std", "quantile", "sample", "lse",
-    }
-
     filter_df = payload.get("filter")
     if filter_df is None or (isinstance(filter_df, _pandas.DataFrame) and len(filter_df) == 0):
-        if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS and func not in _VALUE_CPP_FUNCS:
-            return _compute_value_df_vtrack(
-                intervals,
-                payload,
-                _pandas.DataFrame(columns=["chrom", "start", "end"]),
-            )
         # C++ backend does not support global.percentile* yet.
         if func in _FILTER_GLOBAL_PERCENTILE_FUNCS:
             payload_eval = dict(payload)
@@ -1869,29 +1976,13 @@ def _compute_vtrack_values(
     # sum, size and avg of a track: each bin or track interval once, however many unmasked
     # parts it overlaps (R misha 5.15)
     if isinstance(payload_eval.get("src"), str) and func in ("sum", "size", "avg", "mean"):
-        runs, out = _unmasked_items(intervals, payload_eval, filter_df)
-        for u in runs:
-            n = u.hi - u.lo
-            if func == "size":
-                first = _numpy.flatnonzero(_numpy.r_[True, u.oi[1:] != u.oi[:-1]])
-                out[u.oi[first]] = _numpy.add.reduceat(n, first).astype(float)
-                continue
-            read = n > 0
-            if not read.any():
-                continue
-            # as R: each part's sum or mean, which the track holds as a float, then the parts'
-            # sums, or their means weighted by their value counts, added in order
-            counts = n[read].astype(float)
-            part_sums = _seq_range_sums(u.vals, u.lo[read], u.hi[read])
-            if func == "sum":
-                terms = part_sums.astype(_numpy.float32).astype(float)
-            else:
-                terms = (part_sums / counts).astype(_numpy.float32).astype(float) * counts
-            oi = u.oi[read]
-            first = _numpy.flatnonzero(_numpy.r_[True, oi[1:] != oi[:-1]])
-            totals = _seq_range_sums(terms, first, _numpy.r_[first[1:], len(oi)])
-            out[oi[first]] = totals if func == "sum" else totals / _numpy.add.reduceat(counts, first)
-        return out
+        return _filtered_item_reduce(intervals, payload_eval, filter_df, func)
+
+    # sample and sample.pos.* of a track: a uniform draw over the unmasked values, each value once
+    # (R misha 5.17)
+    if isinstance(payload_eval.get("src"), str) and func in (
+            _FILTER_SAMPLE_FUNCS | _FILTER_SAMPLE_POS_ABS_FUNCS | _FILTER_SAMPLE_POS_REL_FUNCS):
+        return _compute_filtered_sample(intervals, payload_eval, filter_df, func)
 
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
@@ -1959,6 +2050,10 @@ def _compute_vtrack_values(
             if not valid.any():
                 continue
             out[i] = float(arr[valid].sum())
+        elif func in _FILTER_WEIGHTED_SUM_FUNCS:
+            # the parts' weighted sums added in order (each unmasked bp counted once)
+            if valid.any():
+                out[i] = float(_numpy.cumsum(_numpy.r_[0.0, arr[valid]])[-1])
         elif func in _FILTER_MIN_FUNCS:
             if not valid.any():
                 continue
@@ -1971,41 +2066,15 @@ def _compute_vtrack_values(
             out[i] = 1.0 if _numpy.any(arr == 1.0) else 0.0
         elif func in _FILTER_SIZE_FUNCS:
             out[i] = float(_numpy.nansum(arr))
-        elif func in _FILTER_FIRST_FUNCS:
-            out[i] = float(arr[0])
-        elif func in _FILTER_LAST_FUNCS:
-            out[i] = float(arr[-1])
-        elif func in _FILTER_SAMPLE_FUNCS:
-            candidates = arr[valid]
-            if candidates.size == 0:
-                continue
-            idx = int(_numpy.random.randint(candidates.size))
-            out[i] = float(candidates[idx])
-        elif func in _FILTER_FIRST_POS_ABS_FUNCS:
-            out[i] = float(arr[0])
-        elif func in _FILTER_FIRST_POS_REL_FUNCS:
-            if _numpy.isnan(arr[0]):
-                continue
-            out[i] = float(arr[0] + per_starts[i][0] - (per_base_starts[i] or 0))
-        elif func in _FILTER_LAST_POS_ABS_FUNCS:
-            out[i] = float(arr[-1])
-        elif func in _FILTER_LAST_POS_REL_FUNCS:
-            if _numpy.isnan(arr[-1]):
-                continue
-            out[i] = float(arr[-1] + per_starts[i][-1] - (per_base_starts[i] or 0))
-        elif func in _FILTER_SAMPLE_POS_ABS_FUNCS:
-            candidates = arr[valid]
-            if candidates.size == 0:
-                continue
-            idx = int(_numpy.random.randint(candidates.size))
-            out[i] = float(candidates[idx])
-        elif func in _FILTER_SAMPLE_POS_REL_FUNCS:
+        elif func in (_FILTER_FIRST_FUNCS | _FILTER_FIRST_POS_ABS_FUNCS | _FILTER_FIRST_POS_REL_FUNCS
+                      | _FILTER_LAST_FUNCS | _FILTER_LAST_POS_ABS_FUNCS | _FILTER_LAST_POS_REL_FUNCS):
+            # the first (last) part that holds a value has the first (last) value (R misha 5.17)
             if not valid.any():
                 continue
-            seg_starts = _numpy.asarray(per_starts[i], dtype=float)[valid]
-            abs_candidates = arr[valid] + seg_starts
-            idx = int(_numpy.random.randint(abs_candidates.size))
-            out[i] = float(abs_candidates[idx] - (per_base_starts[i] or 0))
+            j = int(_numpy.flatnonzero(valid)[0 if func.startswith("first") else -1])
+            out[i] = float(arr[j])
+            if func.endswith(".relative"):
+                out[i] += per_starts[i][j] - (per_base_starts[i] or 0)
     return out
 
 
@@ -2051,10 +2120,17 @@ def gvtrack_create(
         for a track or value-bearing source and to ``'distance'`` for an
         intervals-set source (R parity). Supported functions include:
 
-        - **Track-based**: ``'avg'``, ``'sum'``, ``'min'``, ``'max'``,
-          ``'stddev'``, ``'nearest'``, ``'quantile'``, ``'coverage'``,
+        - **Track-based**: ``'avg'``, ``'sum'``, ``'weighted.sum'``, ``'min'``,
+          ``'max'``, ``'stddev'``, ``'nearest'``, ``'quantile'``, ``'coverage'``,
           ``'exists'``, ``'size'``, ``'first'``, ``'last'``, ``'sample'``,
-          ``'lse'``, ``'global.percentile'``
+          ``'lse'``, ``'global.percentile'``. ``'sum'`` adds the value of every
+          bin or interval the window touches, in full; ``'weighted.sum'`` adds
+          each value times the number of its bp inside the window (after
+          ``sshift``/``eshift``, clipped to the chromosome), skipping NaN, and is
+          NaN when the window holds no value. A dense track of bin size 20
+          under a 312 bp window gives ``'sum'`` of 16 or 17 bins by the
+          window's phase and ``'weighted.sum'`` of 312 bp. Also for a value-based
+          (DataFrame) source.
         - **Distance-based** (intervals source): ``'distance'``,
           ``'distance.center'``, ``'distance.edge'``, ``'neighbor.count'``
         - **Position-based**: ``'first.pos.abs'``, ``'first.pos.relative'``,
@@ -2105,7 +2181,9 @@ def gvtrack_create(
         Additional keyword arguments, depending on ``func``:
 
         - ``pssm`` (numpy.ndarray or pandas.DataFrame) -- Position-specific
-          scoring matrix with 4 columns (A, C, G, T) for PWM functions.
+          scoring matrix with 4 columns (A, C, G, T) for PWM functions. Each
+          row holds the probabilities or counts of the four bases; log-odds
+          matrices, NaN values and rows summing to 0 are rejected.
         - ``e``, ``J``, ``pairs``, ``intercept`` -- the Potts model, for the
           ``'potts'`` family. The score of one window is
           ``intercept + sum_i e[i, x_i] + sum_k J_k[x_i, x_j]``: ``e`` is a
@@ -2133,23 +2211,37 @@ def gvtrack_create(
           times a plain ``'potts.max'`` (more for wide models and with
           ``bidirect=True``), and is meant as a genome-wide bound before
           :func:`gextract_variants`. A window with a non-ACGT base is still
-          not scored. Any other potts function rejects it.
+          not scored. Any other potts function rejects it. The search of
+          ``'pwm.edit_distance.lse'`` for 3 or more edits is a heuristic
+          (beam search): its count can exceed the minimum, and its NaN can
+          mean "not found".
         - ``direction``/``score_min``/``score_max`` also apply to
           ``'pwm.n_mutations'``, which counts the single-base substitutions
           that each independently bring a window across ``score_thresh``
           (0 when the threshold is already met, NaN when no single edit
-          suffices; MAX across the windows of an iterator interval).
+          suffices; MAX across the windows of an iterator interval, so an
+          interval that already holds a match can return more than 0). With
+          ``direction='below'`` and ``bidirect=True`` it counts the
+          substitutions that bring both strands below.
         - ``max_indels`` (int) -- Maximum insertions+deletions for
           ``'pwm.edit_distance'``, ``'pwm.edit_distance.pos'``,
-          ``'pwm.max.edit_distance'``. Default 0 (substitutions only).
+          ``'pwm.max.edit_distance'``. Default 0 (substitutions only). An
+          inserted base scores the column maximum (``'above'``) or minimum
+          (``'below'``).
         - ``direction`` (str) -- Score direction for edit distance
           functions: ``'above'`` (default) finds minimum edits to raise
           score above threshold; ``'below'`` finds minimum edits to
-          lower score below threshold.
+          lower score below threshold. With ``'below'`` and
+          ``bidirect=True`` both strands must end up below, so the harder
+          strand decides; a strand that cannot be brought below within
+          ``max_edits`` makes the window NaN.
         - ``score_min`` (float or None) -- Minimum PWM score filter for
-          edit distance functions. Windows below this are skipped.
+          edit distance functions. Windows below this are skipped. The
+          score is the window's ungapped score (the PSSM-length window from
+          its start), also with ``max_indels > 0``.
         - ``score_max`` (float or None) -- Maximum PWM score filter for
-          edit distance functions. Windows above this are skipped.
+          edit distance functions. Windows above this are skipped. Same
+          score as ``score_min``.
         - ``strand`` (int) -- Strand selection: 1 (forward), -1 (reverse),
           0 (both). Used by kmer and single-strand PWM modes.
         - ``kmer`` (str) -- DNA k-mer sequence for kmer functions. The
@@ -2273,7 +2365,7 @@ def gvtrack_create(
                          "that supports only 2D iterators")
 
     if isinstance(src, _pandas.DataFrame):
-        from .intervals import _normalize_chroms
+        from .intervals import gintervals_all
 
         req = {"chrom", "start", "end"}
         if not req.issubset(src.columns):
@@ -2300,26 +2392,36 @@ def gvtrack_create(
             src_df = src[["chrom", "start", "end", value_col]].copy()
             src_df.columns = ["chrom", "start", "end", "value"]
 
-        src_df["chrom"] = _normalize_chroms(_chrom_names(src_df["chrom"]).tolist())
-        src_df["start"] = _pandas.to_numeric(src_df["start"], errors="coerce").astype("Int64")
-        src_df["end"] = _pandas.to_numeric(src_df["end"], errors="coerce").astype("Int64")
-        if not is_interval_func:
-            src_df["value"] = _pandas.to_numeric(src_df["value"], errors="coerce")
-            src_df = src_df.dropna(subset=["start", "end", "value"]).copy()
-        else:
-            src_df = src_df.dropna(subset=["start", "end"]).copy()
-        src_df["start"] = src_df["start"].astype(int)
-        src_df["end"] = src_df["end"].astype(int)
-        src_df = src_df[src_df["end"] > src_df["start"]]
-        src_df = src_df.sort_values(["chrom", "start", "end"], kind="mergesort").reset_index(drop=True)
+        def source_error(msg: str) -> Exception:
+            # R wraps the errors of an intervals source (no value column used)
+            if is_interval_func:
+                err: Exception = _pymisha.error(f"Source of virtual track {vtrack_name} was not recognized neither "
+                                                f'as a track nor as intervals. ("{msg}")')
+                return err
+            return ValueError(msg)
 
-        prev_end = src_df.groupby("chrom")["end"].shift(1)
-        has_overlaps = bool((src_df["start"] < prev_end).fillna(False).any())
-        # distance.center now accepts overlapping sources (a bin center inside
-        # several intervals resolves to the nearest center) - matching R misha
-        # 5.9.1. Value-bearing functions still reject overlaps.
-        if has_overlaps and not is_interval_func:
-            raise ValueError("overlapping intervals in DataFrame source are not allowed for this function")
+        chroms, starts, ends = _vtrack_source_rows(src_df, source_error)
+        src_df["chrom"], src_df["start"], src_df["end"] = chroms, starts, ends
+        if not is_interval_func:
+            # a missing value is kept, as R's in-memory track keeps it (no function counts it)
+            src_df["value"] = _pandas.to_numeric(src_df["value"], errors="coerce")
+        # by chromosome (in the database's order) and start, as R sorts the source
+        chrom_order = {c: k for k, c in enumerate(_chrom_names(gintervals_all()["chrom"]).tolist())}
+        src_df["_cid"] = src_df["chrom"].map(chrom_order)
+        src_df = src_df.sort_values(["_cid", "start"], kind="mergesort").drop(columns="_cid").reset_index(drop=True)
+
+        # distance.center accepts overlapping sources (a bin center inside several intervals
+        # resolves to the nearest center) - matching R misha 5.9.1. Value-bearing functions
+        # reject overlaps, with R's message (the position is in the sorted source, from 0).
+        if not is_interval_func and len(src_df) > 1:
+            c, st, en = src_df["chrom"].to_numpy(), src_df["start"].to_numpy(), src_df["end"].to_numpy()
+            ovl = _numpy.flatnonzero((c[1:] == c[:-1]) & (en[:-1] > st[1:]))
+            if ovl.size:
+                i = int(ovl[0]) + 1
+                raise ValueError(
+                    f"Virtual track {vtrack_name}: overlapping intervals detected. Interval at position {i} "
+                    f"[{c[i]}:{st[i]}-{en[i]}] overlaps with previous interval [{c[i - 1]}:{st[i - 1]}-{en[i - 1]}]. "
+                    "Value-based virtual tracks do not support overlapping intervals.")
 
         src = src_df
 
@@ -2417,7 +2519,7 @@ def gvtrack_create(
         if "filter" in kwargs:
             config["filter"] = kwargs["filter"]
     elif func_lc in ("kmer.count", "kmer.frac"):
-        config.update(_kmer_params(func, params, kwargs))
+        config.update(_kmer_params(vtrack_name, func, params, kwargs))
         # The k-mer now lives in the spec's own fields.
         config["params"] = None
         if "filter" in kwargs:
@@ -2435,6 +2537,10 @@ def gvtrack_create(
         config.update(kwargs)
 
     if str(config.get("func", "")).startswith("pwm"):
+        _check_pwm_flags(vtrack_name, func_lc, config)
+        if config.get("pssm") is not None:
+            config["pssm"] = _coerce_pssm_matrix(config["pssm"])
+
         # A missing `strand` under `bidirect=False` reached C++ as strand 0,
         # where `scan_fwd = bidirect || strand == 1` and
         # `scan_rev = bidirect || strand == -1` are BOTH false: every anchor
@@ -2823,6 +2929,16 @@ def gvtrack_filter(vtrack_name: str, mask: pd.DataFrame | str | list[Any] | None
 
     Notes
     -----
+    A bin or interval of the source that overlaps an unmasked region counts
+    once, even when the mask splits it. ``'size'`` and ``'exists'`` give 0
+    when the unmasked regions hold no value. ``'first'`` and ``'last'`` (and
+    their positions) are the first and last unmasked values; ``'sample'``
+    (and ``'sample.pos.*'``) draws one of the unmasked values, each with the
+    same chance; ``'nearest'`` is the average of the unmasked values, and
+    without any, for a sparse, array or value-based source, the value whose
+    unmasked part is nearest (never one inside the mask; the left one at the
+    same distance). ``'weighted.sum'`` counts the unmasked bp of each value.
+
     For the sequence-scoring families a masked base is a hard boundary: a
     match cannot span one. Each unmasked part of the iterator interval is
     scored on its own and the parts are combined - log-sum-exp for ``'pwm'``
@@ -2996,8 +3112,11 @@ def gvtrack_array_slice(
     """Configure an existing virtual track as an array-slice aggregator.
 
     Mirrors R ``gvtrack.array.slice``. The vtrack must already exist (created
-    via ``gvtrack_create(name, src=<array_track>)``). This function mutates
-    the vtrack in place, setting the column selection and aggregation function.
+    via ``gvtrack_create(name, src=<array_track>)``). This function sets the
+    column selection and the function that reduces the selected columns of
+    each array interval to one value; the vtrack keeps its own function,
+    shifts and filter, which then apply to these values as to a sparse
+    track's (``gvtrack_info(vtrack)["slice"]`` holds the selection).
     The vtrack can then be referenced in ``gextract``, ``gsummary``, etc.
     and returns one value per iterator interval.
 
@@ -3011,12 +3130,12 @@ def gvtrack_array_slice(
         Column subset to use. Strings are matched against track colnames;
         integers are 0-based column indices. ``None`` uses all columns.
     func : str, default ``'avg'``
-        Aggregation function applied across all non-NaN values in the
-        selected columns for each iterator interval.  Supported values:
-        ``'avg'``, ``'min'``, ``'max'``, ``'sum'``, ``'stddev'``.
-    params : None
-        Reserved for future use. Must be ``None``; raises
-        ``NotImplementedError`` if provided.
+        Function applied to the non-NaN values of the selected columns of
+        each array interval.  Supported values: ``'avg'``, ``'min'``,
+        ``'max'``, ``'sum'``, ``'stddev'``, ``'quantile'``.
+    params : float, optional
+        The percentile in [0, 1] for ``func='quantile'``; must be ``None``
+        otherwise.
 
     See Also
     --------
@@ -3129,11 +3248,10 @@ def gvtrack_array_slice(
     else:
         slice_cols = None
 
-    # Mutate the existing vtrack config in place.
-    _shared._VTRACKS[vtrack] = {
-        "kind": "array_slice",
-        "src": src,
-        "slice_cols": slice_cols,  # None = all columns
-        "func": func_lc,
-        "params": params,  # percentile for func="quantile", else None
-    }
+    # The vtrack keeps its function, shifts and filter, as R: its function reduces the sliced value
+    # of each array interval the (shifted) iterator interval holds. slice is R's var$slice, with
+    # 0-based column indices (None = all columns).
+    cfg = dict(existing)
+    cfg["kind"] = "array_slice"
+    cfg["slice"] = {"slice": slice_cols, "func": func_lc, "params": params}
+    _shared._VTRACKS[vtrack] = cfg

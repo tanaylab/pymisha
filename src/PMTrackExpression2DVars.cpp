@@ -13,10 +13,9 @@
 
 #include "PMDb.h"
 #include "TGLException.h"
+#include "pmutils.h"
 
-PMTrackExpression2DVars::PMTrackExpression2DVars()
-    : m_rng(60427)  // project-wide RNG seed
-{}
+PMTrackExpression2DVars::PMTrackExpression2DVars() {}
 
 PMTrackExpression2DVars::~PMTrackExpression2DVars() = default;
 
@@ -131,12 +130,20 @@ void PMTrackExpression2DVars::set_vars_batch(
                    static_cast<uint32_t>(k.c2);
         }
     };
-    std::unordered_map<PairKey, std::vector<unsigned>, PairKeyHash> by_pair;
-    by_pair.reserve(8);
+    // The pairs in the order their first cell comes (the iterator's, R's), not hash order: the
+    // "sample" draws follow the visit order, so that the same seed draws the same values whether
+    // the cells come in one call or a chromosome pair at a time (gextract(file=)).
+    std::unordered_map<PairKey, size_t, PairKeyHash> pair_slot;
+    std::vector<std::pair<PairKey, std::vector<unsigned>>> by_pair;
+    pair_slot.reserve(8);
 
     for (unsigned i = 0; i < count; ++i) {
         const GInterval2D &iv = intervals[start_idx + i];
-        by_pair[{iv.chromid1, iv.chromid2}].push_back(start_idx + i);
+        PairKey key{iv.chromid1, iv.chromid2};
+        auto slot = pair_slot.emplace(key, by_pair.size());
+        if (slot.second)
+            by_pair.emplace_back(key, std::vector<unsigned>());
+        by_pair[slot.first->second].second.push_back(start_idx + i);
     }
 
     // For each pair: build (optionally shifted) rects per var, run batch
@@ -281,9 +288,10 @@ void PMTrackExpression2DVars::apply_agg_objects(
             case AGG_SAMPLE:
                 if (m == 0) continue;  // leave NaN
                 {
-                    // not uniform_int_distribution, whose mapping differs
-                    // between C++ libraries (same seed, other values on macOS)
-                    result = static_cast<double>(qobj.vals[(size_t)(m_rng() % m)]);
+                    // drawn as every other random draw (pm::pm_rnd_func), so that numpy's seed
+                    // reproduces it and kids draw different numbers
+                    size_t pick = std::min((size_t)(pm::pm_rnd_func() * m), (size_t)m - 1);
+                    result = static_cast<double>(qobj.vals[pick]);
                 }
                 break;
             default:

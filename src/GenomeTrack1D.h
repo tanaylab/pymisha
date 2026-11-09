@@ -16,11 +16,37 @@
 #include "GInterval.h"
 #include "StreamPercentiler.h"
 
+// Numerically stable log-sum-exp helper: l1 = log(exp(l1) + exp(l2))
+inline void lse_accumulate(float &l1, float l2) {
+	if (l1 > l2) {
+		if (!std::isinf(l2))
+			l1 += std::log(1.0f + std::exp(l2 - l1));
+	} else {
+		if (std::isinf(l1))
+			l1 = l2;
+		else
+			l1 = l2 + std::log(1.0f + std::exp(l1 - l2));
+	}
+}
+
+inline void lse_accumulate(double &l1, double l2) {
+	if (l1 > l2) {
+		if (!std::isinf(l2))
+			l1 += std::log(1.0 + std::exp(l2 - l1));
+	} else {
+		if (std::isinf(l1))
+			l1 = l2;
+		else
+			l1 = l2 + std::log(1.0 + std::exp(l1 - l2));
+	}
+}
+
 // !!!!!!!!! IN CASE OF ERROR THIS CLASS THROWS TGLException  !!!!!!!!!!!!!!!!
 
 class GenomeTrack1D : public GenomeTrack {
 public:
-	enum Functions { AVG, MIN, MAX, NEAREST, STDDEV, SUM, LSE, MAX_POS, MIN_POS, EXISTS, SIZE, SAMPLE, SAMPLE_POS, FIRST, FIRST_POS, LAST, LAST_POS, NUM_FUNCS };
+	// WEIGHTED_SUM: sum of value x the bp of the item inside the interval (each other function counts an item in full)
+	enum Functions { AVG, MIN, MAX, NEAREST, STDDEV, SUM, LSE, MAX_POS, MIN_POS, EXISTS, SIZE, SAMPLE, SAMPLE_POS, FIRST, FIRST_POS, LAST, LAST_POS, WEIGHTED_SUM, NUM_FUNCS };
 
 	virtual ~GenomeTrack1D() {}
 
@@ -50,6 +76,7 @@ public:
 	double last_first_pos() const { return m_last_first_pos; }
 	float last_last() const { return m_last_last; }
 	double last_last_pos() const { return m_last_last_pos; }
+	double last_weighted_sum() const { return m_last_weighted_sum; }
 
 	// Access to stream percentiler for combining quantiles across intervals
 	const StreamPercentiler<float>& get_percentiler() const { return m_sp; }
@@ -85,6 +112,7 @@ protected:
 	double       m_last_first_pos;
 	float        m_last_last;
 	double       m_last_last_pos;
+	double       m_last_weighted_sum;
 	StreamPercentiler<float> m_sp;
 
 	GenomeTrack1D(Type type) : GenomeTrack(type), m_use_quantile(false) {
@@ -93,6 +121,7 @@ protected:
 		m_last_sample_pos = numeric_limits<double>::quiet_NaN();
 		m_last_first_pos = numeric_limits<double>::quiet_NaN();
 		m_last_last_pos = numeric_limits<double>::quiet_NaN();
+		m_last_weighted_sum = numeric_limits<double>::quiet_NaN();
 	}
 
 	// item_at over intervals sorted by start that do not overlap each other

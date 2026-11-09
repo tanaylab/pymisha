@@ -3,7 +3,6 @@
 import gzip
 import os
 import shutil
-import tempfile
 
 import numpy as np
 import pandas as pd
@@ -197,6 +196,55 @@ class TestBedGraphExport:
         assert len(lines) >= 2
 
 
+# ---- misha 5.17.0: the lines R misha writes (test-track-export.R) -----------------------------
+
+_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "misha_5_17_export")
+
+
+def test_bedgraph_export_writes_the_lines_r_misha_writes(tmp_path):
+    # written by R misha 5.17.0 (R 4.4.1) from this database: paste(chrom, sprintf("%.0f", start),
+    # sprintf("%.0f", end), value, sep = "\t"), values as.character() of doubles
+    outfile = str(tmp_path / "x.bedgraph")
+    pm.gtrack_export_bedgraph("dense_track * 1e5 / 3", outfile, intervals=pm.gintervals(["1", "2"], 0, 20000),
+                              iterator=50)
+    with open(os.path.join(_FIXTURES, "dense_scaled.bedgraph"), "rb") as f, open(outfile, "rb") as g:
+        assert g.read() == f.read()
+
+
+def test_doubles_are_formatted_as_r_as_character_formats_them():
+    import _pymisha
+
+    # sprintf("%a", x) and as.character(x) of R 4.4.1, from the value classes of the R test
+    with open(os.path.join(_FIXTURES, "as_character.tsv")) as f:
+        rows = [line.rstrip("\n").split("\t") for line in f if not line.startswith("#")]
+    vals = np.array([float.fromhex(h) if h not in ("Inf", "-Inf") else float(h) for h, _ in rows])
+    n = len(vals)
+    got = _pymisha.pm_bedgraph_lines(np.zeros(n, dtype=np.int32), ["c"], np.zeros(n, dtype=np.int64),
+                                     np.ones(n, dtype=np.int64), vals).decode()
+    assert got.split("\n")[:-1] == [f"c\t0\t1\t{r}" for _, r in rows]
+
+
+def test_bedgraph_lines_skip_nan_rows_and_keep_the_order_given():
+    import _pymisha
+
+    vals = np.array([1.5, np.nan, -2.0, 1e5, np.nan, 0.1 + 0.2])
+    got = _pymisha.pm_bedgraph_lines(np.array([1, 0, 0, 1, 1, 0], dtype=np.int32), ["chrA", "chrB"],
+                                     np.arange(6) * 10, np.arange(6) * 10 + 5, vals)
+    assert got == b"chrB\t0\t5\t1.5\nchrA\t20\t25\t-2\nchrB\t30\t35\t1e+05\nchrA\t50\t55\t0.3\n"
+
+
+def test_bedgraph_export_over_intervals_with_no_values_writes_the_header_only(tmp_path):
+    outfile = str(tmp_path / "x.bedgraph")
+    # sparse_track has no values there (its first two intervals are chr1:0-50 and chr1:100-150)
+    empty = pm.gintervals("1", 60, 90)
+    assert pm.gextract("sparse_track", intervals=empty) is None
+    with pytest.warns(UserWarning, match="no values in the intervals") as caught:
+        pm.gtrack_export_bedgraph("sparse_track", outfile, intervals=empty)
+    assert len(caught) == 1
+    with open(outfile) as f:
+        assert f.read().splitlines() == ['track type=bedGraph name="sparse_track"']
+
+
 class TestBigWigExport:
     """Tests for gtrack_export_bigwig."""
 
@@ -227,6 +275,21 @@ class TestBigWigExport:
 
         assert os.path.exists(outfile)
         assert os.path.getsize(outfile) > 0
+
+    def test_bigwig_export_when_the_genome_order_is_not_the_c_order_of_the_chromosome_names(self, tmp_path):
+        from test_gtrack_import_bigwig import make_db
+
+        sizes = {"1": 1000, "2": 1000, "10": 1000}
+        make_db(tmp_path / "num_db", sizes)
+        if pm.gintervals_all()["chrom"].astype(str).tolist() != list(sizes):
+            pytest.skip("the database sorts its chromosomes")
+        pm.gtrack_create_dense("t", "", pm.gintervals_all(), [1.0, 2.0, 3.0], 100)
+        # bedGraphToBigWig refuses "10" after "2"
+        f = str(tmp_path / "t.bw")
+        pm.gtrack_export_bigwig("t", f)
+        pm.gtrack_import("back", "", f, binsize=100)
+        np.testing.assert_array_equal(pm.gextract("back", pm.gintervals_all(), iterator=100)["back"],
+                                      pm.gextract("t", pm.gintervals_all(), iterator=100)["t"])
 
     def test_bigwig_nonexistent_directory_raises(self, tmp_path):
         """Writing BigWig to a nonexistent directory raises FileNotFoundError."""

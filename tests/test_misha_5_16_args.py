@@ -127,9 +127,9 @@ def test_2d_annotate_with_a_tie_method_and_maxneighbors_above_1_is_an_error():
         with pytest.raises(ValueError, match="1D intervals only"):
             pm.gintervals_annotate(q, a, annotation_columns="lab", maxneighbors=2, tie_method=tm)
     assert pm.gintervals_annotate(q, a, annotation_columns="lab", maxneighbors=2)["lab"].tolist() == ["x", "y"]
-    # one neighbor has no ties to break (R 5.16.0)
+    # one neighbor has no ties to break (R 5.16.0); both distances of a 2D neighbor (R 5.17.0)
     r = pm.gintervals_annotate(q, a, annotation_columns="lab", maxneighbors=1, tie_method="min.start")
-    assert r["lab"].tolist() == ["x"] and r["dist"].tolist() == [300]
+    assert r["lab"].tolist() == ["x"] and r["dist1"].tolist() == [300] and r["dist2"].tolist() == [300]
 
 
 def test_annotate_takes_a_single_column_name():

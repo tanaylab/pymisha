@@ -80,15 +80,16 @@ def _six_chrom_db(tmp_path, sizes=(200000,) * 6):
 
 
 def _read_pq(path, coord_type="int32"):
-    """The table, the arrow schema, per-row-group metadata and how the file compares with
-    pyarrow's own write of the same table (coord_type: its start and end)."""
+    """The table, the arrow schema (with the field metadata of the columns that have some),
+    per-row-group metadata and how the file compares with pyarrow's own write of the same table
+    (coord_type: its start and end; the values double)."""
     _pyarrow()
     f = pq.ParquetFile(path)
     md = f.metadata
     t = f.read()
     coord = pa.int64() if coord_type == "int64" else pa.int32()
     ref_schema = pa.schema(
-        [("chrom", pa.string()), ("start", coord), ("end", coord)] + [(n, pa.float32()) for n in t.column_names[3:]]
+        [("chrom", pa.string()), ("start", coord), ("end", coord)] + [(n, pa.float64()) for n in t.column_names[3:]]
     )
     buf = io.BytesIO()
     pq.write_table(pa.Table.from_pydict({n: t.column(n).to_pylist() for n in t.column_names}, schema=ref_schema), buf)
@@ -122,6 +123,8 @@ def _read_pq(path, coord_type="int32"):
         "read_table_rows": pq.read_table(path).num_rows,
         "schema_equals_reference": t.schema.equals(ref.schema),
         "concat_ok": concat_ok,
+        "field_metadata": {x.name: {k.decode(): v.decode() for k, v in x.metadata.items()}
+                           for x in f.schema_arrow if x.metadata},
     }
 
 
@@ -140,8 +143,8 @@ def _expect_same_rows(table, inmem, value_cols):
     np.testing.assert_array_equal(table.column("end").to_numpy(), inmem["end"].to_numpy())
     for k in value_cols:
         got = table.column(k).to_numpy(zero_copy_only=False)
-        assert got.dtype == np.float32, k
-        np.testing.assert_array_equal(got, inmem[k].to_numpy(dtype=np.float64).astype(np.float32), err_msg=k)
+        assert got.dtype == np.float64, k
+        np.testing.assert_array_equal(got, inmem[k].to_numpy(dtype=np.float64), err_msg=k)
 
 
 def _dir_entries(d):
@@ -163,7 +166,7 @@ def test_parquet_output_equals_in_memory_gextract(pq_track_db, tmp_path):
     p = _read_pq(f)
 
     assert p["names"] == ["chrom", "start", "end", *cols]
-    assert p["types"] == ["string", "int32", "int32", "float", "float", "float"]
+    assert p["types"] == ["string", "int32", "int32", "double", "double", "double"]
     _expect_arrow_like(p)
     assert p["table"].num_rows == 32 + 19
     _expect_same_rows(p["table"], inmem, cols)
@@ -187,8 +190,9 @@ def test_parquet_output_equals_in_memory_gextract(pq_track_db, tmp_path):
     assert pq.ParquetFile(f).metadata.created_by == f"pymisha version {pm.__version__}"
 
 
-def test_many_columns_values_rounded_to_float32(pq_track_db, tmp_path):
-    # Thrift lists of 15 elements or more; pq / 3 and the like are not float32 values
+def test_many_columns_values_kept_as_doubles(pq_track_db, tmp_path):
+    # Thrift lists of 15 elements or more; pq / 3 and the like are not float32 values, so this
+    # checks that they are not rounded to float
     f = str(tmp_path / "x.parquet")
     exprs = [f"pq / {i}" for i in range(1, 21)]
 
@@ -203,6 +207,102 @@ def test_many_columns_values_rounded_to_float32(pq_track_db, tmp_path):
     _expect_same_rows(p["table"], inmem, exprs)
 
 
+def test_coordinates_past_2_24_are_written_exactly_position_vtracks(tmp_path):
+    _big_chrom_db(tmp_path, {"chr1": 200000000})
+    pos = 190000000 + np.arange(1, 2000, 7)
+    rng = np.random.default_rng(60427)
+    pm.gtrack_create_sparse("sp", "sp", pm.gintervals("chr1", pos, pos + 1), rng.random(len(pos)))
+    pm.gvtrack_create("mp", "sp", func="max.pos.abs")
+    try:
+        f = str(tmp_path / "x.parquet")
+        scope = pm.gintervals("chr1", 190000000, 190002000)
+
+        inmem = pm.gextract("mp", scope, iterator=100)
+        pm.gextract("mp", scope, iterator=100, file=f)
+        p = _read_pq(f)
+    finally:
+        pm.gvtrack_rm("mp")
+
+    # float32 holds these only to a multiple of 16
+    v = inmem["mp"].to_numpy()
+    assert not np.array_equal(v.astype(np.float32).astype(np.float64), v)
+    _expect_same_rows(p["table"], inmem, ["mp"])
+
+
+def _track_attrs(track):
+    """The attributes of a track that have a value, sorted by name."""
+    return dict(sorted((k, v) for k, v in pm.gtrack_attr_export(track).iloc[0].items() if isinstance(v, str) and v))
+
+
+def test_track_attributes_travel_as_field_metadata_and_import_restores_them(pq_track_db, tmp_path):
+    from pymisha import tracks as _tracks
+
+    model = "mod\u00e8le \u03b1"
+    pm.gtrack_attr_set("pq", "value.scale", "log2(x+1)")
+    pm.gtrack_attr_set("pq", "model", model)
+    # a track without any attribute
+    pm.gtrack_create_dense("bare", "", pm.gintervals_all(), [1.0, 2.0], 32)
+    _tracks._save_track_attributes("bare", {})
+    assert _track_attrs("bare") == {}
+    f = str(tmp_path / "x.parquet")
+
+    pm.gextract(["pq", "bare", "pq * 2"], pm.gintervals_all(), iterator=32, colnames=["pq", "bare", "twice"], file=f)
+    p = _read_pq(f)
+
+    # only the track column has field metadata: the attributes of the track
+    assert list(p["field_metadata"]) == ["pq"]
+    assert dict(sorted(p["field_metadata"]["pq"].items())) == _track_attrs("pq")
+    assert p["field_metadata"]["pq"]["model"] == model
+    _expect_arrow_like(p)
+
+    # an empty description: the track's description comes from the file
+    pm.gtrack_import_parquet("", f, 32, track_prefix="back_")
+    back = _track_attrs("back_pq")
+    assert back["value.scale"] == "log2(x+1)"
+    assert back["model"] == model
+    assert back["description"] == "pq"
+    assert "gtrack.import_parquet" in back["created.by"]
+    # type and binsize describe how pq is stored (gtrack_create_dense sets them): not carried over
+    assert {"type", "binsize"} <= set(_track_attrs("pq"))
+    assert not {"type", "binsize"} & set(back)
+    assert sorted(back) == sorted(set(_track_attrs("pq")) - {"type", "binsize"})
+    for track in ("back_bare", "back_twice"):
+        assert sorted(_track_attrs(track)) == ["created.by", "created.date", "created.user"], track
+
+    # a description given wins
+    pm.gtrack_import_parquet("mine", f, 32, track_prefix="given_", columns="pq")
+    assert _track_attrs("given_pq")["description"] == "mine"
+    assert _track_attrs("given_pq")["value.scale"] == "log2(x+1)"
+
+
+def test_field_metadata_survives_a_multitask_extraction(tmp_path):
+    # R misha merges the parts its kids write; pymisha writes the multitasked result in one process
+    _six_chrom_db(tmp_path, (1300000,) * 6)
+    pm.gtrack_attr_set("six", "heldout.chroms", "chr3,chr5")
+    f = str(tmp_path / "x.parquet")
+    pm.gextract("six", pm.gintervals_all(), iterator=50, file=f)
+    pm.gtrack_import_parquet("", f, 50, track_prefix="back_")
+    assert pm.gtrack_attr_get("back_six", "heldout.chroms") == "chr3,chr5"
+    assert pm.gtrack_attr_get("back_six", "description") == "six"
+
+
+def test_gtrack_import_of_a_one_column_parquet_file_restores_the_attributes_its_own_attrs_first(
+        pq_track_db, tmp_path):
+    pm.gtrack_attr_set("pq", "value.scale", "linear")
+    pm.gtrack_attr_set("pq", "checkpoint", "epoch 7")
+    f = str(tmp_path / "x.parquet")
+    pm.gextract("pq", pm.gintervals_all(), iterator=32, file=f)
+
+    pm.gtrack_import("one", "", f, 64, attrs={"checkpoint": "mine"})
+    assert pm.gtrack_attr_get("one", "value.scale") == "linear"
+    assert pm.gtrack_attr_get("one", "checkpoint") == "mine"
+    assert pm.gtrack_attr_get("one", "description") == "pq"
+    assert "gtrack.import" in pm.gtrack_attr_get("one", "created.by")
+    # pq's binsize is 32; the track imported at 64 does not carry it
+    assert pm.gtrack_attr_get("pq", "binsize") == "32"
+    assert pm.gtrack_attr_get("one", "binsize") == ""
+
+
 def test_empty_result_is_one_empty_row_group(pq_track_db, tmp_path):
     # an iterator that does not meet the scope yields no rows
     f = str(tmp_path / "x.parquet")
@@ -214,7 +314,7 @@ def test_empty_result_is_one_empty_row_group(pq_track_db, tmp_path):
     p = _read_pq(f)
 
     assert p["names"] == ["chrom", "start", "end", "pq", "pq * 2"]
-    assert p["types"] == ["string", "int32", "int32", "float", "float"]
+    assert p["types"] == ["string", "int32", "int32", "double", "double"]
     _expect_arrow_like(p)
     assert p["table"].num_rows == 0
     assert p["iter_batches_rows"] == 0
@@ -280,7 +380,7 @@ def test_a_chromosome_of_2_31_bp_or_more_gets_int64_coordinates(tmp_path):
     pm.gextract("big", scope, iterator=1000000, file=f)
     p = _read_pq(f, "int64")
 
-    assert p["types"] == ["string", "int64", "int64", "float"]
+    assert p["types"] == ["string", "int64", "int64", "double"]
     _expect_arrow_like(p)
     assert max(p["table"].column("end").to_pylist()) == 2147483648
     assert p["row_groups"][0]["columns"]["end"]["max"] == 2147483648
@@ -353,7 +453,7 @@ def test_multitask_output_equals_serial_output(tmp_path):
         assert rg_chroms == [f"chr{i}" for i in range(1, 7)]
         assert _dir_entries(d) == ["x.parquet"]
 
-    # misha reads it back
+    # misha reads it back, as the float values a track holds
     pm.gtrack_import_parquet("back", f, 50, track_prefix="back_")
     for k in cols:
         got = pm.gextract(f"back_{k}", pm.gintervals_all(), iterator=50)[f"back_{k}"].to_numpy()
@@ -465,7 +565,7 @@ def test_int64_coordinates_when_one_chromosome_of_the_scope_needs_them(tmp_path)
     pm.gextract("big", scope, file=f)
     p = _read_pq(f, "int64")
 
-    assert p["types"] == ["string", "int64", "int64", "float"]
+    assert p["types"] == ["string", "int64", "int64", "double"]
     _expect_arrow_like(p)
     _expect_same_rows(p["table"], inmem, ["big"])
 
@@ -509,13 +609,13 @@ def test_temporary_files_are_named_for_this_host_and_process(tmp_path, monkeypat
     out.mkdir()
     f = out / "x.parquet"
     seen = []
-    write = _pymisha.pm_parquet_write
+    close = _pymisha.pm_parquet_writer_close
 
     def peek(*args):
-        write(*args)
+        close(*args)
         seen.extend(_dir_entries(out))  # the finished temporary file, before the rename
 
-    monkeypatch.setattr(_pymisha, "pm_parquet_write", peek)
+    monkeypatch.setattr(_pymisha, "pm_parquet_writer_close", peek)
     tmp = f".x.parquet.tmp.{_host_tag()}.{os.getpid()}"
     for multitask in (False, True):
         seen.clear()

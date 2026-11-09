@@ -343,14 +343,13 @@ PMTrackExpressionVars::TrackVar &PMTrackExpressionVars::add_track_var(const std:
                 fixed_bin->init_read(full_path.c_str(), i);
                 var.bin_size = fixed_bin->get_bin_size();
 
-                // Update global bin size and check for consistency
-                if (m_bin_size == 0) {
+                // The bin size the tracks share; dense tracks of different bin sizes are read
+                // through an explicit iterator only (the implicit one is refused, as R misha)
+                if (m_bin_size == 0 && !m_mixed_bin_sizes) {
                     m_bin_size = var.bin_size;
                 } else if (m_bin_size != var.bin_size) {
-                    TGLError("Mixed bin sizes detected: track '%s' has bin size %ld, "
-                             "but previous tracks have bin size %ld. "
-                             "Use explicit iterator policy to resolve.",
-                             track_name.c_str(), var.bin_size, m_bin_size);
+                    m_bin_size = 0;
+                    m_mixed_bin_sizes = true;
                 }
                 vdebug("Track '%s' bin size: %ld (from chrom %d)\n",
                        track_name.c_str(), var.bin_size, i);
@@ -384,6 +383,7 @@ void PMTrackExpressionVars::parse_exprs(const std::vector<std::string> &track_ex
     m_vtrack_var_map.clear();
     m_varname_to_track.clear();
     m_bin_size = 0;
+    m_mixed_bin_sizes = false;
     m_common_track_type = GenomeTrack::NUM_TYPES;
     m_common_track_type_valid = false;
     m_mixed_track_types = false;
@@ -599,33 +599,8 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
         GenomeTrackFixedBin *fixed_bin = static_cast<GenomeTrackFixedBin *>(var.track.get());
 
         // Load chromosome if needed
-        if (var.cur_chromid != interval.chromid) {
-            // Find the chromosome file in the track directory
-            std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(interval.chromid);
-
-            if (chrom_file.empty()) {
-                // Chromosome not found in track
-                var.cur_chromid = interval.chromid;
-                var.cur_chromid_valid = false;
-            } else {
-                std::string full_path = var.track_path + "/" + chrom_file;
-                fixed_bin->init_read(full_path.c_str(), interval.chromid);
-                var.cur_chromid = interval.chromid;
-                var.cur_chromid_valid = true;
-                var.bin_size = fixed_bin->get_bin_size();
-
-                // Update global bin size and check for mismatches
-                if (m_bin_size == 0) {
-                    m_bin_size = var.bin_size;
-                } else if (m_bin_size != var.bin_size) {
-                    TGLError("Mixed bin sizes detected: track '%s' has bin size %ld, "
-                             "but previous tracks have bin size %ld. "
-                             "Use explicit iterator policy to resolve.",
-                             var.name.c_str(), var.bin_size, m_bin_size);
-                }
-            }
-            var.last_bin = -1;  // Reset sequential tracking on chrom change
-        }
+        if (var.cur_chromid != interval.chromid)
+            load_dense_chrom(var, interval.chromid);
 
         if (!var.cur_chromid_valid) {
             var.values[idx] = std::nan("");
@@ -653,12 +628,15 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
                 vvar.values[idx] = std::nan("");
             } else {
                 // The pwm/potts sliding caches are keyed by position only; R
-                // clears them in TrackExpressionVars::start_chrom.
+                // clears them in TrackExpressionVars::start_chrom, and frees
+                // the potts scorers' encoded stretch of the previous chromosome.
                 if (eval.chromid != vvar.scorer_chromid) {
                     if (auto *pwm = dynamic_cast<PWMScorer *>(vvar.scorer.get()))
                         pwm->invalidate_cache();
-                    else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get()))
+                    else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get())) {
                         potts->invalidate_cache();
+                        potts->release_chunk();
+                    }
                     vvar.scorer_chromid = eval.chromid;
                 }
                 vvar.values[idx] = vvar.scorer->score_interval(eval, chromkey);
@@ -676,6 +654,66 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             vvar.values[idx] = std::nan("");
         }
     }
+}
+
+void PMTrackExpressionVars::load_dense_chrom(TrackVar &var, int chromid)
+{
+    GenomeTrackFixedBin *fixed_bin = static_cast<GenomeTrackFixedBin *>(var.track.get());
+
+    // Find the chromosome file in the track directory
+    std::string chrom_file = g_pmdb->chrom_files(var.track_path).filename(chromid);
+
+    if (chrom_file.empty()) {
+        // Chromosome not found in track
+        var.cur_chromid = chromid;
+        var.cur_chromid_valid = false;
+    } else {
+        std::string full_path = var.track_path + "/" + chrom_file;
+        fixed_bin->init_read(full_path.c_str(), chromid);
+        var.cur_chromid = chromid;
+        var.cur_chromid_valid = true;
+        var.bin_size = fixed_bin->get_bin_size();
+    }
+    var.last_bin = -1;  // Reset sequential tracking on chrom change
+}
+
+bool PMTrackExpressionVars::dense_tracks_only() const
+{
+    if (!m_vtrack_vars.empty() || m_track_vars.empty())
+        return false;
+    for (const auto &var : m_track_vars) {
+        if (var.track_type != GenomeTrack::FIXED_BIN)
+            return false;
+    }
+    return true;
+}
+
+bool PMTrackExpressionVars::set_vars_bins(const GInterval &interval, int64_t first_bin, unsigned num_bins,
+                                          int64_t bin_size, unsigned idx)
+{
+    // every track of this chromosome must hold bins of the iterator's size, each interval then
+    // lying in one bin
+    for (auto &var : m_track_vars) {
+        if (var.cur_chromid != interval.chromid)
+            load_dense_chrom(var, interval.chromid);
+        if (var.cur_chromid_valid && var.bin_size != bin_size)
+            return false;
+    }
+
+    for (auto &var : m_track_vars) {
+        double *vals = var.values + idx;
+        int64_t num_read = 0;
+        if (var.cur_chromid_valid)
+            num_read = static_cast<GenomeTrackFixedBin *>(var.track.get())->read_bins_bulk(first_bin, num_bins, m_bin_vals);
+
+        // The value read_interval() gives for one bin, (float)(0. + v): NaN for a stored NaN or
+        // inf, +0 for a stored -0, and NaN for a bin past the end of the data
+        for (int64_t i = 0; i < num_read; ++i)
+            vals[i] = std::isnan(m_bin_vals[i]) ? std::numeric_limits<double>::quiet_NaN() : 0. + m_bin_vals[i];
+        for (int64_t i = num_read; i < (int64_t)num_bins; ++i)
+            vals[i] = std::numeric_limits<double>::quiet_NaN();
+    }
+    return true;
 }
 
 const PMTrackExpressionVars::TrackVar *PMTrackExpressionVars::var(const char *name) const
@@ -1052,6 +1090,7 @@ void PMTrackExpressionVars::register_value_funcs(GenomeTrack1D *t, const std::st
     if (func == "last.pos.abs" || func == "last.pos.relative") t->register_function(GenomeTrack1D::LAST_POS);
     if (func == "max.pos.abs" || func == "max.pos.relative") t->register_function(GenomeTrack1D::MAX_POS);
     if (func == "min.pos.abs" || func == "min.pos.relative") t->register_function(GenomeTrack1D::MIN_POS);
+    if (func == "weighted.sum") t->register_function(GenomeTrack1D::WEIGHTED_SUM);
     // Register the primary reducer on dense tracks so read_interval takes the
     // incremental sliding-window fast path (overlapping sshift/eshift windows).
     // Dense-only: the sliding machinery lives in GenomeTrackFixedBin.
@@ -1061,8 +1100,8 @@ void PMTrackExpressionVars::register_value_funcs(GenomeTrack1D *t, const std::st
         if (func == "nearest") t->register_function(GenomeTrack1D::NEAREST);
         if (func == "lse") t->register_function(GenomeTrack1D::LSE);
     }
-    // An array track computes lse in calc_vals (sparse collects it in extract instead)
-    if (type == GenomeTrack::ARRAYS && func == "lse")
+    // A sparse or array track computes lse in calc_vals, in float as R misha
+    if ((type == GenomeTrack::ARRAYS || type == GenomeTrack::SPARSE) && func == "lse")
         t->register_function(GenomeTrack1D::LSE);
 }
 
@@ -1072,6 +1111,7 @@ double PMTrackExpressionVars::extract_dense_last(GenomeTrack1D *t, const std::st
 {
     if (func == "avg" || func == "mean") return t->last_avg();
     if (func == "sum") return t->last_sum();
+    if (func == "weighted.sum") return t->last_weighted_sum();
     if (func == "lse") return t->last_lse();
     if (func == "min") return t->last_min();
     if (func == "max") return t->last_max();
@@ -1205,8 +1245,6 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
     // For sparse tracks with fast-reduce functions, use the direct scan approach
     GenomeTrackSparse *sparse = (vvar.src_track_type == GenomeTrack::SPARSE)
         ? static_cast<GenomeTrackSparse *>(vvar.src_track.get()) : nullptr;
-    GenomeTrackFixedBin *fixed_bin = (vvar.src_track_type == GenomeTrack::FIXED_BIN)
-        ? static_cast<GenomeTrackFixedBin *>(vvar.src_track.get()) : nullptr;
 
     bool sparse_fast_reduce = sparse &&
         (func == "avg" || func == "mean" || func == "sum" ||
@@ -1281,10 +1319,10 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
 
     if (func == "avg" || func == "mean") return track1d->last_avg();
     if (func == "sum") return track1d->last_sum();
-    // Dense LSE uses the sliding reducer (registered above) and an array track
-    // computes it in calc_vals; sparse LSE falls through to the dedicated
-    // collect-and-reduce branch below.
-    if (func == "lse" && (fixed_bin || !sparse)) return track1d->last_lse();
+    if (func == "weighted.sum") return track1d->last_weighted_sum();
+    // Dense LSE uses the sliding reducer (registered above); a sparse or array track
+    // computes it in calc_vals
+    if (func == "lse") return track1d->last_lse();
     if (func == "min") return track1d->last_min();
     if (func == "max") return track1d->last_max();
     if (func == "stddev" || func == "std") return track1d->last_stddev();
@@ -1321,66 +1359,6 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
     if (func == "sample.pos.relative") {
         double pos = track1d->last_sample_pos();
         return std::isnan(pos) ? pos : pos - eval.start;
-    }
-
-    // LSE (log-sum-exp)
-    if (func == "lse") {
-        // Need to collect raw values for LSE
-        if (fixed_bin) {
-            unsigned bin_size = fixed_bin->get_bin_size();
-            int64_t sbin = eval.start / bin_size;
-            int64_t ebin = (int64_t)std::ceil(eval.end / (double)bin_size);
-            std::vector<float> bin_vals;
-            int64_t bins_read = fixed_bin->read_bins_bulk(sbin, ebin - sbin, bin_vals);
-            std::vector<double> vals;
-            vals.reserve(bins_read);
-            for (int64_t j = 0; j < bins_read; ++j) {
-                if (!std::isnan(bin_vals[j])) vals.push_back((double)bin_vals[j]);
-            }
-            if (vals.empty()) return std::numeric_limits<double>::quiet_NaN();
-            double m = *std::max_element(vals.begin(), vals.end());
-            if (std::isinf(m) && m < 0) return m;
-            double sum_exp = 0.0;
-            for (double v : vals) sum_exp += std::exp(v - m);
-            return m + std::log(sum_exp);
-        }
-        // Sparse LSE: collect values
-        if (sparse && vvar.sp_intervals_ptr) {
-            const auto &sp_ints = *vvar.sp_intervals_ptr;
-            const auto &sp_v = *vvar.sp_vals_ptr;
-            std::vector<double> vals;
-            // Use scan state
-            if (!vvar.sp_scan_ready || eval.start < vvar.sp_last_start) {
-                size_t lo = 0, hi = sp_ints.size();
-                while (lo < hi) {
-                    size_t mid = lo + (hi - lo) / 2;
-                    if (sp_ints[mid].end <= eval.start) lo = mid + 1;
-                    else hi = mid;
-                }
-                vvar.sp_scan_idx = lo;
-                vvar.sp_scan_ready = true;
-            } else {
-                while (vvar.sp_scan_idx < sp_ints.size() &&
-                       sp_ints[vvar.sp_scan_idx].end <= eval.start) {
-                    ++vvar.sp_scan_idx;
-                }
-            }
-            vvar.sp_last_start = eval.start;
-
-            for (size_t j = vvar.sp_scan_idx; j < sp_ints.size(); ++j) {
-                if (sp_ints[j].start >= eval.end) break;
-                if (sp_ints[j].end > eval.start && !std::isnan(sp_v[j])) {
-                    vals.push_back((double)sp_v[j]);
-                }
-            }
-            if (vals.empty()) return std::numeric_limits<double>::quiet_NaN();
-            double m = *std::max_element(vals.begin(), vals.end());
-            if (std::isinf(m) && m < 0) return m;
-            double sum_exp = 0.0;
-            for (double v : vals) sum_exp += std::exp(v - m);
-            return m + std::log(sum_exp);
-        }
-        return std::numeric_limits<double>::quiet_NaN();
     }
 
     return std::numeric_limits<double>::quiet_NaN();

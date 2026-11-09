@@ -24,11 +24,139 @@ void GenomeTrackFixedBin::classify_fast_path_mode()
 	// sliding-compatible reducers and nothing else (and no quantile). Readers
 	// that register nothing (the common compute-everything case) keep the
 	// existing recompute path untouched.
-	if (!m_use_quantile && m_func_mask != 0 &&
-	    (m_func_mask & ~SLIDING_COMPATIBLE_MASK) == 0)
+	//
+	// WEIGHTED_SUM is computed apart from the other functions (read_interval_weighted_sum) and plays no
+	// part in choosing their path.
+	const uint32_t func_mask = m_func_mask & ~(1u << WEIGHTED_SUM);
+	if (!m_use_quantile && func_mask != 0 &&
+	    (func_mask & ~SLIDING_COMPATIBLE_MASK) == 0)
 		m_fast_path_mode = 1;
 	else
 		m_fast_path_mode = -1;
+}
+
+// The sliding helpers below run once per iterator step and are used only in this file: inlined, as
+// the code they replace was (as misha 5.17.0).
+#if defined(__GNUC__) || defined(__clang__)
+#define MISHA_SLIDE_INLINE inline __attribute__((always_inline))
+#else
+#define MISHA_SLIDE_INLINE inline
+#endif
+
+// The sliding window state covers the previous window [m_lse_prev_sbin, m_lse_prev_ebin). It moves
+// to [sbin, ebin) by dropping `drop` = sbin - m_lse_prev_sbin bins at the front and adding `add` =
+// ebin - m_lse_prev_ebin at the back. The two counts may differ (a 32 bp iterator over 20 bp bins
+// alternates 16- and 17-bin windows). The window may only move forward and not past its own end.
+// (slide_window decides whether a window of another size is slid.)
+MISHA_SLIDE_INLINE bool GenomeTrackFixedBin::sliding_step(int64_t sbin, int64_t ebin, int64_t &drop, int64_t &add) const
+{
+	const int64_t prev_window = m_lse_prev_ebin - m_lse_prev_sbin;
+	drop = sbin - m_lse_prev_sbin;
+	add = ebin - m_lse_prev_ebin;
+	return drop >= 0 && add >= 0 && drop + add > 0 && drop <= prev_window &&
+		(int64_t)m_lse_window_bins.size() == prev_window;
+}
+
+// Widens [lo_exp, hi_exp] to the exponent field of v (a subnormal counts as 1; NaN and zero add
+// nothing). Returns whether it widened.
+MISHA_SLIDE_INLINE bool GenomeTrackFixedBin::add_to_exp_range(float v, int &lo_exp, int &hi_exp)
+{
+	uint32_t u;
+	memcpy(&u, &v, sizeof(u));
+	int exp = (int)((u >> 23) & 0xffu);
+	if (exp == 0xff || !(u << 1))
+		return false;
+	exp += !exp;
+	if (exp >= lo_exp && exp <= hi_exp)
+		return false;
+	lo_exp = std::min(lo_exp, exp);
+	hi_exp = std::max(hi_exp, exp);
+	return true;
+}
+
+// Whether every sum of up to num_vals floats with exponent fields in [lo_exp, hi_exp] is a double.
+// Such a float is a multiple of its unit in the last place, 2^(lo_exp - 150) at least, and below
+// 2^(hi_exp - 126), so the sum is a multiple of 2^(lo_exp - 150) below num_vals * 2^(hi_exp - 126):
+// a double when that spans at most 53 bits. Then every addition and subtraction of the sliding sum
+// is exact, whatever their order.
+MISHA_SLIDE_INLINE bool GenomeTrackFixedBin::sums_exact(int lo_exp, int hi_exp, int64_t num_vals)
+{
+	if (lo_exp > hi_exp)
+		return true;
+	const int log2n = num_vals > 1 ? 64 - __builtin_clzll((unsigned long long)(num_vals - 1)) : 0;
+	return (int64_t)hi_exp - lo_exp + 24 + log2n <= 53;
+}
+
+// Moves the sliding state (window bins, sum, count and, if need_lse, the running LSE) by `drop`
+// bins at the front and `add` bins read from m_lse_prev_ebin on. The old bins leave before the new
+// ones come in. Returns false, with the state untouched, if fewer than `add` bins can be read.
+//
+// A window of another size than the last was read afresh before, and is slid only where that
+// gives the same values to the bit (otherwise false is returned too): the count of values always;
+// the sum (need_exact_sum: sum, avg or nearest, which come from it) only while every sum of the
+// values since it was last computed afresh is exact (sums_exact), as both are then the exact sum;
+// the running LSE (need_lse) never, as it rounds differently slid than computed afresh. The exponent
+// range is kept only while a sum is asked for and still exact.
+MISHA_SLIDE_INLINE bool GenomeTrackFixedBin::slide_window(int64_t drop, int64_t add, bool need_lse, bool need_exact_sum)
+{
+	if (drop != add && (need_lse || (need_exact_sum && !m_sum_exact)))
+		return false;
+
+	// the common step of one bin is read as read_next_bin reads it, the others in bulk
+	float one_val;
+	const float *new_vals = &one_val;
+	if (add == 1) {
+		if (m_cur_coord != m_lse_prev_ebin * m_bin_size)
+			goto_bin(m_lse_prev_ebin);
+		if (!read_next_bin(one_val))
+			return false;
+	} else if (add) {
+		m_scratch_bin_vals.clear();
+		if (read_bins_bulk(m_lse_prev_ebin, add, m_scratch_bin_vals) != add)
+			return false;
+		new_vals = m_scratch_bin_vals.data();
+	}
+
+	if (need_exact_sum && m_sum_exact) {
+		int lo_exp = m_sum_lo_exp;
+		int hi_exp = m_sum_hi_exp;
+		bool widened = false;
+		for (int64_t i = 0; i < add; ++i)
+			widened |= add_to_exp_range(new_vals[i], lo_exp, hi_exp);
+		// m_sum_exact covers up to twice the window's values, all that a step between windows of
+		// its size holds: such a step needs a new check only if the range widens
+		const int64_t window = m_lse_prev_ebin - m_lse_prev_sbin;
+		if (drop != add) {
+			if (!sums_exact(lo_exp, hi_exp, std::max(window + add, 2 * (window - drop + add))))
+				return false;
+		} else if (widened)
+			m_sum_exact = sums_exact(lo_exp, hi_exp, 2 * window);
+		m_sum_lo_exp = lo_exp;
+		m_sum_hi_exp = hi_exp;
+	}
+
+	for (int64_t i = 0; i < drop; ++i) {
+		float old_val = m_lse_window_bins.front();
+		m_lse_window_bins.pop_front();
+		if (!std::isnan(old_val)) {
+			kahan_sub_from_sliding_sum(old_val);
+			--m_sliding_num_vs;
+			if (need_lse)
+				m_running_lse.pop_front();
+		}
+	}
+
+	for (int64_t i = 0; i < add; ++i) {
+		float new_val = new_vals[i];
+		m_lse_window_bins.push_back(new_val);
+		if (!std::isnan(new_val)) {
+			kahan_add_to_sliding_sum(new_val);
+			++m_sliding_num_vs;
+			if (need_lse)
+				m_running_lse.push(new_val);
+		}
+	}
+	return true;
 }
 
 // Incremental sliding-window reducer (port of R misha
@@ -42,6 +170,8 @@ void GenomeTrackFixedBin::classify_fast_path_mode()
 void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
 {
 	const bool need_lse = has_function(LSE);
+	// sum, avg and nearest are published from the sliding sum
+	const bool need_sum = has_function(SUM) || has_function(AVG) || has_function(NEAREST);
 	if (!need_lse)
 		m_running_lse_initialized = false;
 
@@ -71,7 +201,8 @@ void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
 	auto assign_single_value = [&](bool have_value, float v) {
 		bool has_num = have_value && !std::isnan(v);
 		m_last_sum = has_num ? v : numeric_limits<float>::quiet_NaN();
-		m_last_avg = m_last_nearest = has_num ? v : numeric_limits<float>::quiet_NaN();
+		// as in R misha a stored -0 averages to +0; the sum keeps it
+		m_last_avg = m_last_nearest = has_num ? 0.f + v : numeric_limits<float>::quiet_NaN();
 		m_last_exists = has_num ? 1 : 0;
 		m_last_size = has_num ? 1 : 0;
 		if (need_lse)
@@ -130,77 +261,19 @@ void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
 
 	const int64_t window_size = ebin - sbin;
 
-	// Sliding reducers update when the window shifts forward by <= its width.
-	if (m_lse_sliding_valid && window_size > 0 && (!need_lse || m_running_lse_initialized)) {
-		int64_t step = sbin - m_lse_prev_sbin;
-		int64_t prev_window = m_lse_prev_ebin - m_lse_prev_sbin;
-		if (step > 0 && step <= prev_window && window_size == prev_window &&
-			(int64_t)m_lse_window_bins.size() == prev_window) {
-			int64_t appended = 0;
-
-			if (step == 1) {
-				float new_val = numeric_limits<float>::quiet_NaN();
-				if (m_cur_coord != m_lse_prev_ebin * m_bin_size)
-					goto_bin(m_lse_prev_ebin);
-				if (read_next_bin(new_val) && !m_lse_window_bins.empty()) {
-					float old_val = m_lse_window_bins.front();
-					m_lse_window_bins.pop_front();
-					if (!std::isnan(old_val)) {
-						kahan_sub_from_sliding_sum(old_val);
-						--m_sliding_num_vs;
-						if (need_lse)
-							m_running_lse.pop_front();
-					}
-
-					m_lse_window_bins.push_back(new_val);
-					if (!std::isnan(new_val)) {
-						kahan_add_to_sliding_sum(new_val);
-						++m_sliding_num_vs;
-						if (need_lse)
-							m_running_lse.push(new_val);
-					}
-					appended = 1;
-				}
-			} else {
-				m_scratch_bin_vals.clear();
-				appended = read_bins_bulk(m_lse_prev_ebin, step, m_scratch_bin_vals);
-				auto &new_vals = m_scratch_bin_vals;
-				if (appended == step) {
-					for (int64_t i = 0; i < step && !m_lse_window_bins.empty(); ++i) {
-						float old_val = m_lse_window_bins.front();
-						m_lse_window_bins.pop_front();
-						if (!std::isnan(old_val)) {
-							kahan_sub_from_sliding_sum(old_val);
-							--m_sliding_num_vs;
-							if (need_lse)
-								m_running_lse.pop_front();
-						}
-					}
-
-					for (int64_t i = 0; i < step; ++i) {
-						float new_val = new_vals[i];
-						m_lse_window_bins.push_back(new_val);
-						if (!std::isnan(new_val)) {
-							kahan_add_to_sliding_sum(new_val);
-							++m_sliding_num_vs;
-							if (need_lse)
-								m_running_lse.push(new_val);
-						}
-					}
-				}
-			}
-
-			if (appended == step) {
-				assign_from_state();
-				m_lse_prev_sbin = sbin;
-				m_lse_prev_ebin = ebin;
-				m_lse_sliding_valid = true;
-				m_cached_bin_idx = ebin - 1;
-				m_cached_bin_val = m_lse_window_bins.back();
-				m_cache_valid = true;
-				return;
-			}
-		}
+	// Sliding reducers update when the window moves forward by no more than its width, also
+	// between windows of different sizes (see slide_window).
+	int64_t drop, add;
+	if (m_lse_sliding_valid && window_size > 0 && (!need_lse || m_running_lse_initialized) &&
+		sliding_step(sbin, ebin, drop, add) && slide_window(drop, add, need_lse, need_sum)) {
+		assign_from_state();
+		m_lse_prev_sbin = sbin;
+		m_lse_prev_ebin = ebin;
+		m_lse_sliding_valid = true;
+		m_cached_bin_idx = ebin - 1;
+		m_cached_bin_val = m_lse_window_bins.back();
+		m_cache_valid = true;
+		return;
 	}
 
 	// Fallback: full window read + reseed of the sliding state.
@@ -214,16 +287,20 @@ void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
 	m_sliding_sum_comp = 0;
 	m_sliding_num_vs = 0;
 	m_lse_window_bins.clear();
+	start_sum_range();
 	for (int64_t i = 0; i < bins_read; ++i) {
 		float v = bin_vals[i];
 		m_lse_window_bins.push_back(v);
 		if (!std::isnan(v)) {
 			kahan_add_to_sliding_sum(v);
+			if (need_sum)
+				add_to_exp_range(v, m_sum_lo_exp, m_sum_hi_exp);
 			++m_sliding_num_vs;
 			if (need_lse)
 				m_running_lse.push(v);
 		}
 	}
+	m_sum_exact = need_sum && sums_exact(m_sum_lo_exp, m_sum_hi_exp, 2 * bins_read);
 	m_running_lse_initialized = need_lse;
 
 	if (bins_read > 0) {
@@ -240,6 +317,12 @@ void GenomeTrackFixedBin::read_interval_reducers_only(const GInterval &interval)
 
 void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 {
+	if (has_function(WEIGHTED_SUM)) {
+		read_interval_weighted_sum(interval);
+		if (m_func_mask == (1u << WEIGHTED_SUM) && !m_use_quantile)
+			return;
+	}
+
 	if (m_fast_path_mode == 0)
 		classify_fast_path_mode();
 	if (m_fast_path_mode == 1) {
@@ -279,7 +362,7 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 		}
 		// A stored NaN is a bin without a value: no exists/size count, no positions (R misha 5.15.0).
 		if (have_bin && !std::isnan(m_last_avg)) {
-			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
+			m_last_min = m_last_max = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))
 				m_last_lse = m_last_avg;  // lse of a single value == the value
@@ -305,6 +388,9 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 				m_last_last_pos = interval.start;
 			if (m_use_quantile && !std::isnan(m_last_avg))
 				m_sp.add(m_last_avg, s_rnd_func);
+			// the average of one value is (float)(0. + v) as in R misha: a stored -0 reads as +0
+			// (sum, min, max, first, last and the others keep the stored value)
+			m_last_avg = m_last_nearest = 0.f + m_last_avg;
 		} else {
 			m_last_min = m_last_max = m_last_nearest = m_last_avg = m_last_stddev = m_last_sum = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))
@@ -349,7 +435,7 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 
 		// A stored NaN is a bin without a value: no exists/size count, no positions (R misha 5.15.0).
 		if (have_value && !std::isnan(m_last_avg)) {
-			m_last_min = m_last_max = m_last_nearest = m_last_sum = m_last_avg;
+			m_last_min = m_last_max = m_last_sum = m_last_avg;
 			m_last_stddev = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))
 				m_last_lse = m_last_avg;  // lse of a single value == the value
@@ -376,6 +462,9 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 				m_last_last_pos = overlap_start;
 			if (m_use_quantile && !std::isnan(m_last_avg))
 				m_sp.add(m_last_avg, s_rnd_func);
+			// the average of one value is (float)(0. + v) as in R misha: a stored -0 reads as +0
+			// (sum, min, max, first, last and the others keep the stored value)
+			m_last_avg = m_last_nearest = 0.f + m_last_avg;
 		} else {
 			m_last_min = m_last_max = m_last_nearest = m_last_avg = m_last_stddev = m_last_sum = numeric_limits<float>::quiet_NaN();
 			if (has_function(LSE))
@@ -550,6 +639,59 @@ void GenomeTrackFixedBin::read_interval(const GInterval &interval)
 			}
 		}
 	}
+}
+
+void GenomeTrackFixedBin::read_interval_weighted_sum(const GInterval &interval)
+{
+	// Each bin that the interval touches adds its value times the bp it shares with the interval: the first
+	// and the last bin may be cut, the bins between them count bin_size bp. The interval never runs past the
+	// chromosome end, so the last bin of the chromosome, shorter than bin_size or not, is cut right too.
+	// Reads the bins without moving the read cursor of the other functions when the track is mmap'd.
+	m_last_weighted_sum = numeric_limits<double>::quiet_NaN();
+	if (interval.start >= interval.end || !m_bin_size)
+		return;
+
+	const int64_t bin_size = m_bin_size;
+	const int64_t sbin = interval.start / bin_size;
+	int64_t ebin = (interval.end + bin_size - 1) / bin_size;
+	const float *vals;
+
+	if (m_mmap_data) {
+		ebin = std::min(ebin, m_mmap_num_bins);
+		vals = m_mmap_data + sbin;
+	} else {
+		m_scratch_wsum_vals.clear();
+		ebin = sbin + read_bins_bulk(sbin, ebin - sbin, m_scratch_wsum_vals);
+		vals = m_scratch_wsum_vals.data();
+	}
+	if (ebin <= sbin)
+		return;
+
+	auto overlap = [&](int64_t bin) {
+		return (double)(std::min(interval.end, (bin + 1) * bin_size) - std::max(interval.start, bin * bin_size));
+	};
+
+	// a stored inf is read as NaN, as by read_next_bin
+	double edges = 0, inner = 0;
+	bool has_value = false;
+	const int64_t num_bins = ebin - sbin;
+	if (std::isfinite(vals[0])) {
+		edges += vals[0] * overlap(sbin);
+		has_value = true;
+	}
+	if (num_bins > 1 && std::isfinite(vals[num_bins - 1])) {
+		edges += vals[num_bins - 1] * overlap(ebin - 1);
+		has_value = true;
+	}
+	for (int64_t i = 1; i < num_bins - 1; ++i) {
+		if (std::isfinite(vals[i])) {
+			inner += vals[i];
+			has_value = true;
+		}
+	}
+
+	if (has_value)
+		m_last_weighted_sum = edges + inner * bin_size;
 }
 
 double GenomeTrackFixedBin::last_max_pos() const

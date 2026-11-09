@@ -58,7 +58,7 @@ class TestGextract2dCoordValidation:
             "chrom1": ["1"], "start1": [np.nan], "end1": [200_000.0],
             "chrom2": ["1"], "start2": [0.0], "end2": [200_000.0],
         })
-        with pytest.raises(ValueError, match="missing"):
+        with pytest.raises(ValueError, match="Invalid format of interval at index 1"):  # as R misha 5.17
             pm.gextract(rects_track, intervals=iv)
 
     def test_inverted_raises_instead_of_silent_none(self, rects_track):
@@ -204,7 +204,7 @@ class TestGintervalsSave2dCoordValidation:
             "chrom1": ["1"], "start1": [np.nan], "end1": [1000.0],
             "chrom2": ["1"], "start2": [0.0], "end2": [1000.0],
         })
-        with pytest.raises(ValueError, match="missing"):
+        with pytest.raises(ValueError, match="Invalid format of interval at index 1"):  # as R misha 5.17
             pm.gintervals_save(iv, "test_save_2d_nan")
         assert not pm.gintervals_exists("test_save_2d_nan")
 
@@ -280,7 +280,7 @@ class TestSetOps2dCoordValidation:
             "chrom2": ["1"], "start2": [0.0], "end2": [1000.0],
         })
         iv2 = _2d("1", 0, 1000, "1", 0, 1000)
-        with pytest.raises(ValueError, match="missing"):
+        with pytest.raises(ValueError, match="Invalid format of interval at index 1"):  # as R misha 5.17
             pm.gintervals_2d_intersect(iv1, iv2)
 
     def test_band_intersect_rejects_negative(self):

@@ -171,8 +171,10 @@ PyObject *pm_pwm_score_strings(PyObject *self, PyObject *args)
             }
 
             Py_ssize_t seq_len = 0;
-            const char *seq = PyUnicode_AsUTF8AndSize(py_seq, &seq_len);
-            if (!seq || seq_len <= 0) {
+            const char *seq = py_seq_bytes(py_seq, &seq_len);
+            if (!seq)
+                return nullptr;
+            if (seq_len <= 0) {
                 out[i] = std::numeric_limits<double>::quiet_NaN();
                 continue;
             }

@@ -161,7 +161,8 @@ def test_gextract_track_rects_unknown_iterator_raises():
     """When iterator= is an unknown track name, gextract raises ValueError
     (R parity: R raises an error for unknown track names)."""
     intervals = _full_1x1_scope()
-    with pytest.raises(ValueError, match="not a known track"):
+    with pytest.raises(ValueError, match="no_such_track_xyz is neither a name of a track nor a name of an "
+                                         "intervals set"):
         pm.gextract("rects_track", intervals=intervals, iterator="no_such_track_xyz")
 
 

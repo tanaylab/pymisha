@@ -129,8 +129,6 @@ private:
                f == AGG_FIRST || f == AGG_LAST || f == AGG_SAMPLE;
     }
 
-    // Per-object-var RNG (seeded once in constructor, used for AGG_SAMPLE).
-    std::mt19937_64 m_rng;
 };
 
 #endif /* PMTRACKEXPRESSION2DVARS_H_ */

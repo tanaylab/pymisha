@@ -576,5 +576,5 @@ def gtrack_lookup(
     except Exception:
         if created_new and track_dir.exists():
             shutil.rmtree(track_dir, ignore_errors=True)
-            _pm_dbreload(_target_root())
+            _pm_dbreload(_target_root(), tracks=[track])
         raise

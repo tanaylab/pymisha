@@ -59,6 +59,7 @@ class TestGvtrackArraySliceCreate:
         info = pm.gvtrack_info("v1")
         assert info.get("func", "avg") == "avg"
         assert info.get("kind") == "array_slice"
+        assert info["slice"] == {"slice": None, "func": "avg", "params": None}
 
     def test_non_array_src_raises(self):
         """R: gvtrack.array.slice on fixedbin or sparse track raises."""
@@ -80,13 +81,13 @@ class TestGvtrackArraySliceCreate:
         pm.gvtrack_create("v1", src="array_track")
         pm.gvtrack_array_slice("v1", slice=["col1", "col3"])
         info = pm.gvtrack_info("v1")
-        assert info["slice_cols"] == [1, 3]
+        assert info["slice"]["slice"] == [1, 3]
 
     def test_slice_by_index(self):
         pm.gvtrack_create("v1", src="array_track")
         pm.gvtrack_array_slice("v1", slice=[0, 5])
         info = pm.gvtrack_info("v1")
-        assert info["slice_cols"] == [0, 5]
+        assert info["slice"]["slice"] == [0, 5]
 
     def test_slice_out_of_range_raises(self):
         """R: gvtrack.array.slice with index 50 (out of 10) raises."""
@@ -111,7 +112,9 @@ class TestGvtrackArraySliceCreate:
         pm.gvtrack_array_slice("v1", func="avg")
         pm.gvtrack_array_slice("v1", func="min")
         info = pm.gvtrack_info("v1")
-        assert info["func"] == "min"
+        # the slice function; the vtrack keeps its own (avg), as R
+        assert info["slice"]["func"] == "min"
+        assert info["func"] == "avg"
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +370,7 @@ class TestSliceWithDuplicateCols:
         assert "v1" in pm.gvtrack_ls()
         info = pm.gvtrack_info("v1")
         # slice_cols may contain duplicates: [1, 1, 3, 5]
-        assert info["slice_cols"] == [1, 1, 3, 5]
+        assert info["slice"]["slice"] == [1, 1, 3, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +408,8 @@ class TestGvtrackArraySliceErrors:
         pm.gvtrack_create("v1", src="array_track")
         pm.gvtrack_array_slice("v1", slice=[0, 1, 2], func="quantile", params=0.4)
         info = pm.gvtrack_info("v1")
-        assert info["func"] == "quantile"
-        assert info["params"] == 0.4
+        assert info["slice"]["func"] == "quantile"
+        assert info["slice"]["params"] == 0.4
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ from ._crc64 import (
     crc64_init as _crc64_init,
 )
 from ._log import get_logger
-from ._shared import _with_umask
+from ._shared import _map_forked, _with_umask
 
 _logger = get_logger(__name__)
 
@@ -237,6 +237,7 @@ def _parse_fasta_files(fasta_paths: list[str]) -> list[dict[str, Any]]:
                         "offset": current_offset,
                         "length": 0,
                         "_seq": b"",
+                        "file": fasta_path,
                     })
                     in_sequence = True
 
@@ -261,6 +262,26 @@ def _parse_fasta_files(fasta_paths: list[str]) -> list[dict[str, Any]]:
 
     finalize_contig()
     return entries
+
+
+def _per_chromosome_names(entries: list[dict[str, Any]], fasta_paths: list[str]) -> list[dict[str, Any]]:
+    """The contigs of a per-chromosome database, as R misha's gdb.create names them: a FASTA file
+    holding one record gives one contig named after the file (its name without the .fa, .fasta,
+    .fna or .seq extension, and .gz), a file holding several records one contig per record, named
+    after its header. A file named after a contig already read is skipped, as in R."""
+    chroms: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for path in fasta_paths:
+        file_chrom = re.sub(r"\.(fa|fasta|fna|seq)(\.gz)?$", "", Path(path).name, flags=re.IGNORECASE)
+        if file_chrom in chroms:
+            continue
+        records = [e for e in entries if e["file"] == path]
+        if len(records) == 1:
+            records[0]["name"] = file_chrom
+        for e in records:
+            chroms.add(e["name"])
+            out.append(e)
+    return out
 
 
 def _read_chrom_sizes_rows(chrom_sizes_path: str | Path) -> list[tuple[str, int]]:
@@ -597,7 +618,6 @@ def _convert_all_tracks_to_indexed(
 ) -> tuple[int, int]:
     """Converts the database's tracks; returns the number of tracks it set out to
     rewrite (a failed one may have been written) and of those that failed."""
-    import multiprocessing as mp
     import sys
 
     from .tracks import gtrack_ls
@@ -612,9 +632,7 @@ def _convert_all_tracks_to_indexed(
     if threads <= 1 or len(args_list) <= 1 or sys.platform == "win32":
         results = [_convert_one_track_worker(a) for a in args_list]
     else:
-        ctx = mp.get_context("fork")
-        with ctx.Pool(threads) as pool:
-            results = pool.map(_convert_one_track_worker, args_list)
+        results = _map_forked(_convert_one_track_worker, args_list, threads)
 
     # Whole-database layout flip: the workers converted in forked children, so the
     # parent still holds a parsed index for the per-chrom layout of every track it
@@ -693,7 +711,6 @@ def _convert_all_intervals_to_indexed(
 ) -> tuple[int, int]:
     """Converts the database's interval sets; returns the number of sets it set out to
     rewrite and of those that failed."""
-    import multiprocessing as mp
     import sys
 
     from .intervals import gintervals_ls
@@ -710,9 +727,7 @@ def _convert_all_intervals_to_indexed(
     if threads <= 1 or len(args_list) <= 1 or sys.platform == "win32":
         results = [_convert_one_intervals_worker(a) for a in args_list]
     else:
-        ctx = mp.get_context("fork")
-        with ctx.Pool(threads) as pool:
-            results = pool.map(_convert_one_intervals_worker, args_list)
+        results = _map_forked(_convert_one_intervals_worker, args_list, threads)
 
     converted = sum(1 for _, s, _ in results if s == "converted")
     failures = [(t, e) for t, s, e in results if s == "failed"]
@@ -1148,7 +1163,11 @@ def gdb_create(
     - ``"indexed"`` (default): Single ``genome.seq`` + ``genome.idx``.
       Recommended for genomes with many contigs.
     - ``"per-chromosome"``: Separate ``.seq`` file per contig in the
-      ``seq/`` directory.
+      ``seq/`` directory. A FASTA file holding one record gives one contig,
+      named after the file (without its ``.fa``, ``.fasta``, ``.fna`` or
+      ``.seq`` extension and ``.gz``); a file holding several records gives
+      one contig per record, named after its header as in the indexed
+      format. ``chrom_sizes.txt`` lists the contigs in file order.
 
     Parameters
     ----------
@@ -1244,6 +1263,9 @@ def gdb_create(
     if not entries:
         raise ValueError("No contigs found in FASTA file(s)")
 
+    if db_format == "per-chromosome":
+        entries = _per_chromosome_names(entries, fasta_paths)
+
     # Check for duplicate names
     names = [e["name"] for e in entries]
     seen: dict[str, int] = {}
@@ -1257,8 +1279,9 @@ def gdb_create(
             f"({dupes[first]} occurrences)"
         )
 
-    # Sort entries alphabetically by name (default behavior, matches C++)
-    sorted_entries = sorted(entries, key=lambda e: e["name"])
+    # The indexed format sorts the contigs by name (as R's C++ import); the per-chromosome one
+    # keeps them in file order, as R writes chrom_sizes.txt
+    sorted_entries = sorted(entries, key=lambda e: e["name"]) if db_format == "indexed" else list(entries)
     # Reassign chromids to match sorted order
     for i, entry in enumerate(sorted_entries):
         entry["chromid"] = i

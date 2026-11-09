@@ -292,6 +292,65 @@ def test_a_listed_variant_pairs_with_every_bin_whose_reach_contains_it():
     assert not res["pos"].isin([1020, 1029]).any()
 
 
+def test_listed_variants_each_bin_variant_pair_in_reach_duplicates_and_other_chromosomes_too():
+    define_variant_vtracks()
+    iv = pm.gintervals([1, 1, 2], [1000, 1003, 1000], [1010, 1006, 1012])
+    g1 = pm.gseq_extract(pm.gintervals(1, 990, 1030))[0].upper()
+    g2 = pm.gseq_extract(pm.gintervals(2, 990, 1030))[0].upper()
+
+    def alt_of(r):
+        return next(x for x in VARIANT_BASES if x != r)
+
+    pos1 = [995, 1000, 1004, 1004, 1016, 1020]
+    pos2 = [1004, 1008, 1029]
+    v = pd.DataFrame({
+        "chrom": ["chr1"] * len(pos1) + ["chr2"] * len(pos2),
+        "start": pos1 + pos2,
+        "ref": [g1[p - 990] for p in pos1] + [g2[p - 990] for p in pos2],
+    })
+    v = v[v["ref"].isin(VARIANT_BASES)].reset_index(drop=True)
+    v["alt"] = [alt_of(r) for r in v["ref"]]
+    v["end"] = v["start"] + 1
+    # the same variant twice, and one with a wrong ref at the same position
+    wrong = v.iloc[[1]].assign(ref=alt_of(v["ref"][1]), alt=v["ref"][1])
+    v = pd.concat([v, v.iloc[[1]], wrong], ignore_index=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = pm.gextract_variants("v_pwm", iv, variants=v, iterator=1)
+
+    # v_pwm reads [s - 5, s + 7) from a 1 bp bin [s, s + 1)
+    bins = pm.gextract("v_pwm", iv, iterator=1)
+    want = []
+    for _, b in bins.iterrows():
+        hit = v[(v["chrom"] == "chr" + str(b["chrom"]).removeprefix("chr"))
+                & (v["start"] >= b["start"] - 5) & (v["start"] < b["end"] + 6)]
+        want += [(str(b["chrom"]), b["start"], h["start"], h["ref"], h["alt"]) for _, h in hit.iterrows()]
+    got = list(zip(res["chrom"].astype(str), res["start"], res["pos"], res["ref"], res["alt"], strict=True))
+    assert len(got) == len(want)
+    assert sorted(got) == sorted(want)
+
+
+def test_listed_variants_join_only_the_bin_positions_that_hold_one(monkeypatch):
+    define_variant_vtracks()
+    # The join used to take every (bin, position) a bin reads: ~10^7 rows for 10^5 variants.
+    rows_joined = []
+    merge = pd.DataFrame.merge
+
+    def recording_merge(self, *args, **kwargs):
+        rows_joined.append(len(self))
+        return merge(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "merge", recording_merge)
+    g = pm.gseq_extract(pm.gintervals(1, 5000, 5001))[0].upper()
+    v = pd.DataFrame({"chrom": ["chr1"], "start": [5000], "end": [5001], "ref": [g],
+                      "alt": [next(x for x in VARIANT_BASES if x != g)]})
+    res = pm.gextract_variants("v_pwm", pm.gintervals(1, 4000, 6000), variants=v, iterator=1)
+    # bins 4994..5005 read 5000; the 2000 bins read ~24000 positions
+    assert len(res) == 12
+    assert len(rows_joined) > 0
+    assert max(rows_joined) <= len(res)
+
+
 def test_variants_are_validated():
     define_variant_vtracks()
     iv = pm.gintervals(1, 1000, 1001)

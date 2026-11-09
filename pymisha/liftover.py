@@ -37,6 +37,7 @@ from ._crc64 import (
 )
 from ._log import user_stacklevel
 from ._shared import (
+    _check_flag,
     _check_intervals_strand,
     _checkroot,
     _chrom_names,
@@ -2040,6 +2041,8 @@ def gintervals_liftover(
 
     if intervals is None or chain is None:
         raise ValueError("intervals and chain are required")
+    _check_flag(include_metadata, "include_metadata", "include_metadata must be True or False")
+    _check_flag(canonic, "canonic", "canonic must be True or False")
     _check_intervals_strand(intervals)
     intervals = _with_chrom_names(intervals)   # a numeric chrom is the chromosome of that name
 
@@ -3115,7 +3118,7 @@ def _create_empty_lifted_track(
     with _atomic_track_create(track):
         _apply_create_parallel_writers_from_config()
         _pymisha.pm_track_create_sparse(track, _df2pymisha(no_intervals))
-    _pm_dbreload(_target_root())
+    _pm_dbreload(_target_root(), tracks=[track])
     _set_created_attrs(track, description, created_by)
 
 
@@ -3597,7 +3600,7 @@ def _gtrack_liftover_2d(
         )
         has_pairs = any(not name.startswith(".") for name in os.listdir(track_dir))
 
-    _pm_dbreload(_target_root())
+    _pm_dbreload(_target_root(), tracks=[track])
     _set_created_attrs(
         track, description,
         f'gtrack.liftover("{track}", description, "{src_track_dir}", chain)',

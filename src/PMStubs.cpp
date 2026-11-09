@@ -251,12 +251,12 @@ void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end)
             PyArray_NDIM((PyArrayObject *)obj) == 1 && PyArray_ISCARRAY_RO((PyArrayObject *)obj))
             continue;
 
-        // Reject NaN *before* casting. Converting NaN to an integer is
-        // undefined behaviour and platform-dependent: x86-64 yields
-        // INT64_MIN, arm64 saturates to 0, so a missing coordinate would
-        // silently become position 0 on Apple silicon. Only float inputs can
-        // carry NaN, so the common int64 path pays nothing. (Object arrays
-        // fail the int64 cast outright and fall through to the slow path.)
+        // Reject NaN, infinite and out-of-range values *before* casting, as R misha's
+        // convert_rintervs: "Invalid format of interval at index i". Converting them to an
+        // integer is undefined behaviour and platform-dependent: x86-64 yields INT64_MIN, arm64
+        // saturates, so a missing coordinate would silently become position 0 on Apple silicon.
+        // Only float inputs can carry them, so the common int64 path pays nothing. (Object
+        // arrays fail the int64 cast outright and fall through to the slow path.)
         if (PyArray_Check(obj) &&
             PyTypeNum_ISFLOAT(PyArray_TYPE((PyArrayObject *)obj))) {
             PMPY as_double(PyArray_FROM_OTF(obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY), true);
@@ -265,9 +265,8 @@ void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end)
                 const double *d = (const double *)PyArray_DATA(arr);
                 npy_intp count = PyArray_SIZE(arr);
                 for (npy_intp k = 0; k < count; ++k) {
-                    if (d[k] != d[k])
-                        TGLError("Interval coordinates contain a missing (NaN) value at index %ld",
-                                 (long)k);
+                    if (!(std::fabs(d[k]) < 9.2e18))
+                        TGLError("Invalid format of interval at index %ld", (long)k + 1);
                 }
             } else {
                 PyErr_Clear();
@@ -478,9 +477,10 @@ void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &interv
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
 
+        // a missing (None) or non-integer coordinate, as R says of NA
         if (PyErr_Occurred()) {
             PyErr_Clear();
-            TGLError("Invalid start/end values at index %ld", (long)i);
+            TGLError("Invalid format of interval at index %ld", (long)i + 1);
         }
 
         if (start < 0 || start >= end ||
@@ -1129,7 +1129,12 @@ static void split_intervals_by_range(const std::vector<GInterval> &intervals,
                 continue;
             }
 
-            int64_t target_kid_range = (range_left + kids_left - 1) / kids_left;
+            // The kid's share of what was left when it started: range_left has
+            // already lost the kid's own segments, so dividing it alone made each
+            // kid stop at 1/(kids_left + 1) of the rest and left the last kid
+            // about twice the share of the others whenever the scope has many
+            // intervals (a genome of many contigs).
+            int64_t target_kid_range = (range_left + kid_range + kids_left - 1) / kids_left;
             int64_t need = target_kid_range - kid_range;
 
             if (need <= 0 && !out_kids.back().empty()) {
@@ -1176,6 +1181,62 @@ static void split_intervals_by_range(const std::vector<GInterval> &intervals,
     // Trim trailing empty workers
     while (!out_kids.empty() && out_kids.back().empty())
         out_kids.pop_back();
+}
+
+// Test only (R misha's C_split_by_range_shares): the bp each kid gets from
+// split_intervals_by_range() for consecutive intervals of the given lengths on one
+// chromosome. pm_split_by_range_shares(lengths, kids, align) -> list of float.
+PyObject *pm_split_by_range_shares(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(false);
+
+        PyObject *py_lengths = NULL;
+        int kids = 0;
+        long align = 0;
+        if (!PyArg_ParseTuple(args, "Oil", &py_lengths, &kids, &align))
+            verror("lengths must be a sequence of numbers, kids and align integers");
+
+        PMPY seq(PySequence_Fast(py_lengths, "lengths must be a sequence of numbers"), true);
+        if (!seq)
+            verror("lengths must be a sequence of numbers");
+
+        std::vector<GInterval> intervals;
+        int64_t pos = 0;
+        Py_ssize_t n = PySequence_Fast_GET_SIZE((PyObject *)seq);
+        PyObject **items = PySequence_Fast_ITEMS((PyObject *)seq);
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            double v = PyFloat_AsDouble(items[i]);
+            if (PyErr_Occurred()) {
+                PyErr_Clear();
+                verror("lengths must be a sequence of numbers");
+            }
+            const int64_t len = (int64_t)v;
+            if (len <= 0)
+                verror("lengths must be positive");
+            intervals.push_back(GInterval(0, pos, pos + len, 0));
+            pos += len;
+        }
+
+        std::vector<std::vector<SplitInterval>> out_kids;
+        split_intervals_by_range(intervals, kids, align, out_kids);
+
+        PMPY result(PyList_New(out_kids.size()), true);
+        for (size_t k = 0; k < out_kids.size(); ++k) {
+            double r = 0;
+            for (const SplitInterval &si : out_kids[k])
+                r += (double)(si.interval.end - si.interval.start);
+            PyList_SET_ITEM((PyObject *)result, k, PyFloat_FromDouble(r));
+        }
+        result.to_be_stolen();
+        return (PyObject *)result;
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
 }
 
 static void extract_sub_intervals(
@@ -1285,6 +1346,21 @@ long parse_iterator_policy(PyObject *py_iterator, long default_policy, const cha
         return default_policy;
     }
 
+    // A string here names no track and no intervals set (the Python side resolves those), as R
+    // says of it (TrackExpressionScanner, interv2path)
+    if (PyUnicode_Check(py_iterator)) {
+        const char *name = PyUnicode_AsUTF8(py_iterator);
+        if (!name) {
+            PyErr_Clear();
+            verror("%s: iterator must be an integer or float", context);
+        }
+        for (const char *c = name; *c; ++c) {
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '.'))
+                verror("Invalid interval name %s. Only alphanumeric characters and _ are allowed in the name.", name);
+        }
+        verror("Invalid iterator: %s is neither a name of a track nor a name of an intervals set", name);
+    }
+
     if (PyLong_Check(py_iterator)) {
         long val = PyLong_AsLong(py_iterator);
         if (PyErr_Occurred()) {
@@ -1369,7 +1445,7 @@ static ExtractResult run_extract(const std::vector<std::string> &exprs,
             result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
         }
 
-        g_pymisha->verify_max_data_size(result.intervals.size(), "Result");
+        g_pymisha->verify_max_data_size(result.intervals.size(), "Result", "rows");
         check_interrupt();
     }
 
@@ -1427,7 +1503,7 @@ static void run_extract_direct(PMDirectAccumulator &acc,
         acc.write_row(interval.chromid, interval.start, interval.end,
                       row_values.data(), interval_id);
 
-        g_pymisha->verify_max_data_size(acc.size(), "Result");
+        g_pymisha->verify_max_data_size(acc.size(), "Result", "rows");
         check_interrupt();
     }
 }
@@ -1768,7 +1844,7 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             struct ExtractHeader {
                 uint64_t nrows;
@@ -1890,7 +1966,7 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
             return Py_None;
         }
 
-        g_pymisha->verify_max_data_size(acc.size(), "Result");
+        g_pymisha->verify_max_data_size(acc.size(), "Result", "rows");
 
         vdebug("pm_extract: collected %lu results\n", acc.size());
 
@@ -2048,7 +2124,7 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             struct ScreenHeader {
                 uint64_t nrows;
@@ -2425,7 +2501,7 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
             progress_cb = NULL;
         }
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -2800,7 +2876,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             progress_cb = NULL;
         }
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             uint64_t kid_sampling_buf_size = (uint64_t)std::ceil(g_pymisha->max_data_size() / (double)num_kids);
 
@@ -2985,7 +3061,7 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -3183,7 +3259,7 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -3396,6 +3472,43 @@ PyObject *pm_interv_unregister(PyObject *self, PyObject *args)
     }
 }
 
+// List or drop the given track names as a rescan would, without rescanning the others
+// (PMDb::refresh_track). pm_tracks_refresh(names) -> list of bool, whether each name is listed.
+PyObject *pm_tracks_refresh(PyObject *self, PyObject *args)
+{
+    try {
+        PyObject *py_names = nullptr;
+        if (!PyArg_ParseTuple(args, "O", &py_names)) {
+            verror("Invalid arguments to pm_tracks_refresh");
+        }
+        if (!g_pmdb || !g_pmdb->is_initialized()) {
+            verror("Database not initialized. Call gdb_init() first.");
+        }
+        PMPY seq(PySequence_Fast(py_names, "names must be a sequence of strings"), true);
+        if (!seq) {
+            verror("names must be a sequence of strings");
+        }
+        Py_ssize_t n = PySequence_Fast_GET_SIZE((PyObject *)seq);
+        PyObject **items = PySequence_Fast_ITEMS((PyObject *)seq);
+        PMPY result(PyList_New(n), true);
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            if (!PyUnicode_Check(items[i])) {
+                verror("names must be a sequence of strings");
+            }
+            bool listed = g_pmdb->refresh_track(PyUnicode_AsUTF8(items[i]));
+            PyList_SET_ITEM((PyObject *)result, i, PyBool_FromLong(listed));
+        }
+        result.to_be_stolen();
+        return (PyObject *)result;
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return NULL;
+    }
+}
+
 // Get track information
 PyObject *pm_track_info(PyObject *self, PyObject *args)
 {
@@ -3591,6 +3704,19 @@ PyObject *pm_intervals_all(PyObject *self, PyObject *args)
     }
 }
 
+// pm_rng_stream(on): with on, the following calls continue one random stream (the first draw seeds
+// it from numpy's generator, as a call does) until pm_rng_stream(False), which also leaves the next
+// call to seed afresh.
+PyObject *pm_rng_stream(PyObject *self, PyObject *args)
+{
+    int on = 0;
+    if (!PyArg_ParseTuple(args, "p", &on))
+        return NULL;
+    pm::g_rng_stream = on != 0;
+    pm::g_rng_loaded = false;
+    Py_RETURN_NONE;
+}
+
 // Set random seed
 PyObject *pm_seed(PyObject *self, PyObject *args)
 {
@@ -3601,6 +3727,13 @@ PyObject *pm_seed(PyObject *self, PyObject *args)
         if (!PyArg_ParseTuple(args, "l", &seed))
             verror("Invalid seed value");
 
+        // The draws follow numpy's global generator (pm::rng_load): seed it
+        PMPY random(PyImport_ImportModule("numpy.random"), true);
+        PMPY res(random ? PyObject_CallMethod(random, "seed", "k", (unsigned long)((unsigned long long)seed & 0xFFFFFFFFULL)) : NULL, true);
+        if (!res) {
+            PyErr_Clear();
+            verror("Failed to seed numpy's random generator");
+        }
         srand48(seed);
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());
@@ -3613,6 +3746,7 @@ PyObject *pm_seed(PyObject *self, PyObject *args)
     Py_INCREF(Py_None);
     return Py_None;
 }
+
 
 // Test DataFrame conversion
 PyObject *pm_test_df(PyObject *self, PyObject *args)
@@ -3760,9 +3894,10 @@ static void convert_py_intervals_with_strand(PyObject *py_intervals,
         int64_t start = PyLong_AsLongLong(start_val);
         int64_t end = PyLong_AsLongLong(end_val);
 
+        // a missing (None) or non-integer coordinate, as R says of NA
         if (PyErr_Occurred()) {
             PyErr_Clear();
-            TGLError("Invalid start/end values at index %ld", (long)i);
+            TGLError("Invalid format of interval at index %ld", (long)i + 1);
         }
 
         // Get strand if available
@@ -3841,10 +3976,10 @@ PyObject *pm_seq_extract(PyObject *self, PyObject *args)
         for (size_t i = 0; i < intervals.size(); ++i) {
             seqfetch.read_interval(intervals[i], chromkey, seq_buf);
 
-            // PyUnicode_FromStringAndSize copies the bytes once; the
-            // intermediate std::string was a redundant copy of seq_buf.
-            PyObject *py_seq = PyUnicode_FromStringAndSize(seq_buf.data(),
-                                                          seq_buf.size());
+            // One character per byte (Latin-1): a byte above 127 in a .seq file
+            // comes back as it is, as R returns it, and the length stays end - start.
+            PyObject *py_seq = PyUnicode_DecodeLatin1(seq_buf.data(),
+                                                      seq_buf.size(), NULL);
             if (!py_seq) {
                 verror("Failed to create sequence string");
             }
@@ -4079,7 +4214,7 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -4942,7 +5077,7 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -5320,7 +5455,7 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         }
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             struct LookupHeader {
                 uint64_t nrows;
@@ -5515,7 +5650,7 @@ PyObject *pm_sample(PyObject *self, PyObject *args)
         for (; !scanner.isend(); scanner.next()) {
             double val = scanner.vdouble(0);
             if (!std::isnan(val)) {
-                sampler.add(val, drand48);
+                sampler.add(val, pm::pm_rnd_func);
             }
             check_interrupt();
         }
@@ -5526,7 +5661,7 @@ PyObject *pm_sample(PyObject *self, PyObject *args)
         }
 
         // Shuffle the samples (reservoir sampler doesn't guarantee random order)
-        tgs_random_shuffle(sampler.samples().begin(), sampler.samples().end(), drand48);
+        tgs_random_shuffle(sampler.samples().begin(), sampler.samples().end(), pm::pm_rnd_func);
 
         // Build NumPy result array
         npy_intp dims[1] = {(npy_intp)sampler.samples().size()};
@@ -6043,9 +6178,9 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
         if (std::isnan(x) || std::isnan(y))
             return;
         ++non_nan;
-        pair_sampler.add({x, y}, drand48);
-        x_sampler.add(x, drand48);
-        y_sampler.add(y, drand48);
+        pair_sampler.add({x, y}, pm::pm_rnd_func);
+        x_sampler.add(x, pm::pm_rnd_func);
+        y_sampler.add(y, pm::pm_rnd_func);
     };
 
     // Try combined scanner first.
@@ -6209,7 +6344,7 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
             sample_size = 1;
 
         if (num_kids > 0) {
-            PyMisha::prepare4multitasking();
+            PyMisha::prepare4multitasking(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
                 pid_t pid = PyMisha::launch_process();
@@ -7834,7 +7969,8 @@ PyObject *pm_extract_2d(PyObject *self, PyObject *args)
 //                                arrays (chromids as int32, coords as int64)
 //   band       : tuple|None    - (d1, d2) diagonal-band filter, or None
 //   func       : str           - "exists" | "size" | "first" | "last" | "sample"
-//   seed       : int           - RNG seed for "sample" (ignored otherwise)
+//   seed       : int           - unused: "sample" draws as every other random draw
+//                                (pm::pm_rnd_func, seeded from numpy's generator)
 //
 // Returns:
 //   dict {"value": np.ndarray[n] of float64}
@@ -7967,8 +8103,8 @@ PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
         band_ptr = &band_real;
     }
 
-    // Seeded RNG for sample.
-    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    // "sample" draws through pm::pm_rnd_func
+    (void)seed;
 
     try {
         PMGenomeTrack2D track;
@@ -8020,9 +8156,9 @@ PyObject *pm_extract_2d_objects(PyObject *self, PyObject *args)
                     break;
                 case F_SAMPLE:
                     if (m > 0) {
-                        // not uniform_int_distribution, whose mapping differs
-                        // between C++ libraries (same seed, other values on macOS)
-                        size_t pick = (size_t)(rng() % m);
+                        // drawn as every other random draw, so that numpy's seed reproduces
+                        // it and a gextract(file=) of several parts draws one stream
+                        size_t pick = std::min((size_t)(pm::pm_rnd_func() * m), (size_t)m - 1);
                         out[orig_idx] = static_cast<double>(qresult.vals[pick]);
                     }
                     break;
@@ -8453,6 +8589,76 @@ static PyObject *_emit_neighbors_2d_result(
     return result;
 }
 
+// The rectangles of one chromosome pair at dist1 = dist2 = 0 from a query (overlapping or touching
+// it on both axes), in the order neighbors are kept: (start1, end1, start2, end2, row). The tree
+// holds, for each run of the sorted rectangles, the largest end1, the smallest start2 and the
+// largest end2, and a run that cannot hold a match is skipped whole. A query that overlaps K of
+// them would otherwise walk all K in the nearest-neighbor iterator; here each one kept costs
+// about O(log n). (R misha's ZeroDistNeighbors2D.)
+class ZeroDistNeighbors2D {
+public:
+    struct Item {
+        int64_t start1, end1, start2, end2;
+        int64_t row;
+        bool operator<(const Item &o) const {
+            if (start1 != o.start1) return start1 < o.start1;
+            if (end1 != o.end1) return end1 < o.end1;
+            if (start2 != o.start2) return start2 < o.start2;
+            if (end2 != o.end2) return end2 < o.end2;
+            return row < o.row;
+        }
+    };
+
+    bool empty() const { return m_items.empty() && !m_cap; }
+
+    void build(std::vector<Item> &&items) {
+        m_items = std::move(items);
+        std::sort(m_items.begin(), m_items.end());
+        m_cap = 1;
+        while (m_cap < m_items.size())
+            m_cap *= 2;
+        m_nodes.assign(2 * m_cap, Node());
+        for (size_t i = 0; i < m_items.size(); ++i)
+            m_nodes[m_cap + i] = Node{m_items[i].end1, m_items[i].start2, m_items[i].end2};
+        for (size_t i = m_cap - 1; i > 0; --i) {
+            const Node &l = m_nodes[2 * i], &r = m_nodes[2 * i + 1];
+            m_nodes[i] = Node{std::max(l.max_end1, r.max_end1), std::min(l.min_start2, r.min_start2),
+                              std::max(l.max_end2, r.max_end2)};
+        }
+    }
+
+    // Calls take(item) for the first n rectangles at distance 0 from the query [x1, x2) x [y1, y2),
+    // in order
+    template <class F> void first(int64_t x1, int64_t y1, int64_t x2, int64_t y2, int64_t n, F take) const {
+        for (size_t i = find(1, 0, m_cap, 0, x1, y1, x2, y2); n > 0 && i < m_items.size();
+             i = find(1, 0, m_cap, i + 1, x1, y1, x2, y2), --n)
+            take(m_items[i]);
+    }
+
+private:
+    struct Node {
+        int64_t max_end1 = std::numeric_limits<int64_t>::min();
+        int64_t min_start2 = std::numeric_limits<int64_t>::max();
+        int64_t max_end2 = std::numeric_limits<int64_t>::min();
+    };
+
+    std::vector<Item> m_items;
+    std::vector<Node> m_nodes;
+    size_t            m_cap = 0;
+
+    // the first index >= from of a rectangle at distance 0 from the query, or the number of items
+    size_t find(size_t node, size_t lo, size_t hi, size_t from, int64_t x1, int64_t y1, int64_t x2, int64_t y2) const {
+        const Node &nd = m_nodes[node];
+        if (hi <= from || lo >= m_items.size() || m_items[lo].start1 > x2 || nd.max_end1 < x1 || nd.min_start2 > y2 || nd.max_end2 < y1)
+            return m_items.size();
+        if (hi - lo == 1)
+            return lo;
+        size_t mid = lo + (hi - lo) / 2;
+        size_t res = find(2 * node, lo, mid, from, x1, y1, x2, y2);
+        return res < m_items.size() ? res : find(2 * node + 1, mid, hi, from, x1, y1, x2, y2);
+    }
+};
+
 PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
     PyArrayObject *qx1_a, *qy1_a, *qx2_a, *qy2_a;
     PyArrayObject *tx1_a, *ty1_a, *tx2_a, *ty2_a;
@@ -8546,15 +8752,36 @@ PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
     // stop once dist1 + dist2 exceeds the sum.  We treat "unbounded" as
     // any maxdist >= 1e9 (the Python `_BIG` sentinel).
     constexpr int64_t BIG = 1000000000LL;
-    int64_t cutoff = INT64_MAX;
+    int64_t max_manhattan = INT64_MAX;
     if (maxdist1 < BIG && maxdist2 < BIG)
-        cutoff = maxdist1 + maxdist2;
+        max_manhattan = maxdist1 + maxdist2;
+
+    // Neighbors are chosen by dist1 + dist2, then by their coordinates (start1, end1, start2,
+    // end2), then by row, whatever the input order (as R misha 5.17): after maxneighbors are found,
+    // the iterator goes on through the ties at the cutoff, and the nearest are kept. The iterator
+    // yields the rectangles by their exact dist1 + dist2.
+    struct Cand {
+        int64_t dist, x1, x2, y1, y2, t, d1, d2;
+        bool operator<(const Cand &o) const {
+            if (dist != o.dist) return dist < o.dist;
+            if (x1 != o.x1) return x1 < o.x1;
+            if (x2 != o.x2) return x2 < o.x2;
+            if (y1 != o.y1) return y1 < o.y1;
+            if (y2 != o.y2) return y2 < o.y2;
+            return t < o.t;
+        }
+    };
+    std::vector<Cand> cands;
+    ZeroDistNeighbors2D zero_dist;  // built when a query first needs it
 
     for (npy_intp j = 0; j < nq; ++j) {
         memqt::MemQuadTree::NNIterator it(&tree);
         memqt::Rectangle qr(qx1[j], qy1[j], qx2[j], qy2[j]);
         if (!it.begin(qr)) continue;
-        int kept = 0;
+        cands.clear();
+        int64_t num_neighbors = 0;
+        int64_t cutoff = 0;  // the largest dist1 + dist2 of the first maxneighbors neighbors found
+        bool zero_dist_ties = false;
         do {
             const memqt::RectObj &t = *it;
             int64_t d1 = 0;
@@ -8564,19 +8791,73 @@ PyObject *pm_neighbors_2d(PyObject *self, PyObject *args) {
             if (t.rect.y1 >= qr.y2)      d2 = t.rect.y1 - qr.y2;
             else if (qr.y1 >= t.rect.y2) d2 = qr.y1 - t.rect.y2;
             int64_t M = d1 + d2;
-            if (M > cutoff) break;
+            if (M > max_manhattan) break;
+            if (num_neighbors >= maxneighbors && M > cutoff) break;
             if (d1 >= mindist1 && d1 <= maxdist1 &&
                 d2 >= mindist2 && d2 <= maxdist2) {
-                out_q.push_back(static_cast<int64_t>(j));
-                out_t.push_back(t.id);
-                out_d1.push_back(d1);
-                out_d2.push_back(d2);
-                if (++kept >= static_cast<int>(maxneighbors)) break;
+                cands.push_back(Cand{M, t.rect.x1, t.rect.x2, t.rect.y1, t.rect.y2, t.id, d1, d2});
+                if (num_neighbors < maxneighbors)
+                    cutoff = std::max(cutoff, M);
+                ++num_neighbors;
+                // maxneighbors at distance 0: the ties can be all the rectangles the query
+                // overlaps, taken below in their order instead of walked here
+                if (num_neighbors == maxneighbors && cutoff == 0) {
+                    zero_dist_ties = true;
+                    break;
+                }
             }
         } while (it.next());
+
+        // Distance 0 on both axes is in range here (it was reached), so every rectangle at it is
+        // a candidate, and the ones kept are the first maxneighbors in their order
+        if (zero_dist_ties) {
+            if (zero_dist.empty()) {
+                std::vector<ZeroDistNeighbors2D::Item> items;
+                items.reserve(nt);
+                for (npy_intp i = 0; i < nt; ++i)
+                    items.push_back({tx1[i], tx2[i], ty1[i], ty2[i], (int64_t)i});
+                zero_dist.build(std::move(items));
+            }
+            cands.clear();
+            zero_dist.first(qx1[j], qy1[j], qx2[j], qy2[j], maxneighbors, [&](const ZeroDistNeighbors2D::Item &item) {
+                cands.push_back(Cand{0, item.start1, item.end1, item.start2, item.end2, item.row, 0, 0});
+            });
+        }
+
+        // keep the maxneighbors nearest by dist1 + dist2, ties by the smallest coordinates
+        if ((int64_t)cands.size() > maxneighbors) {
+            std::sort(cands.begin(), cands.end());
+            cands.resize(maxneighbors);
+        }
+        for (const Cand &c : cands) {
+            out_q.push_back(static_cast<int64_t>(j));
+            out_t.push_back(c.t);
+            out_d1.push_back(c.d1);
+            out_d2.push_back(c.d2);
+        }
     }
 
     return _emit_neighbors_2d_result(out_q, out_t, out_d1, out_d2);
+}
+
+// pm_verify_max_data_size(size[, name[, unit]]): the error of a result of size records over
+// CONFIG['max_data_size'] (PyMisha::verify_max_data_size), for the checks made on the Python side
+PyObject *pm_verify_max_data_size(PyObject *self, PyObject *args)
+{
+    try {
+        PyMisha pymisha(true);
+
+        unsigned long long size;
+        const char *name = "Result";
+        const char *unit = "records";
+        if (!PyArg_ParseTuple(args, "K|ss", &size, &name, &unit))
+            verror("Invalid arguments to pm_verify_max_data_size");
+        pymisha.verify_max_data_size(size, name, unit);
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return NULL;
+    }
+    Py_RETURN_NONE;
 }
 
 // The order in which R sorts 2D intervals by chromosome pair (r_2d_sort_order, which

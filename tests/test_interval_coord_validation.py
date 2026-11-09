@@ -31,8 +31,9 @@ BAD_COORDS = {
     "inverted": (_iv(300, 100), "start coordinate must be"),
     "zero_width": (_iv(100, 100), "start coordinate must be"),
     "past_chrom_end": (_iv(499900, 500100), "exceeds chromosome boundaries"),
-    "nan_start": (_iv(np.nan, 100.0), "missing .NaN. value"),
-    "nan_end": (_iv(0.0, np.nan), "missing .NaN. value"),
+    # as R misha 5.17
+    "nan_start": (_iv(np.nan, 100.0), "Invalid format of interval at index 1"),
+    "nan_end": (_iv(0.0, np.nan), "Invalid format of interval at index 1"),
 }
 
 READERS = {

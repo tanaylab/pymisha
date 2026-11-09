@@ -202,7 +202,8 @@ def test_copy_per_pair_2d_between_prefixed_and_unprefixed_names(tmp_path):
     for src, dest in ((prefixed, unprefixed), (unprefixed, prefixed)):
         pm.gdb_init(src)
         pairs = pm.gintervals_2d(["chr1", "chr10"], 10, 15, ["chr2", "chrX"], 30, 35)
-        pm.gtrack_2d_create("r2", "x", pairs, [12, 1023])
+        # (gintervals_2d orders the pairs by the database's chromosome ids, as R)
+        pm.gtrack_2d_create("r2", "x", pairs, [12 if c == "chr1" else 1023 for c in pairs["chrom1"]])
         pm.gtrack_copy("r2", "r2c", db=dest)
         pm.gtrack_rm("r2", force=True)
         pm.gdb_init(dest)

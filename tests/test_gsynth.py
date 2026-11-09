@@ -1950,12 +1950,12 @@ class TestGsynthReplaceKmerAdvanced:
         assert "CG" not in r_upper[0].upper()
         assert "CG" not in r_lower[0].upper()
 
-    def test_replace_kmer_identical_is_noop(self):
-        """Identical target and replacement returns original sequence unchanged."""
+    def test_replace_kmer_identical_is_an_error(self):
+        """Identical target and replacement (ignoring case) is an error, as in R."""
         ivs = pm.gintervals("1", 0, 100)
-        result = pm.gsynth_replace_kmer("CG", "CG", intervals=ivs)
-        orig = pm.gseq_extract(ivs)[0]
-        assert result[0].upper() == orig.upper()
+        for target in ("CG", "cg"):
+            with pytest.raises(ValueError, match="cannot be identical"):
+                pm.gsynth_replace_kmer(target, "CG", intervals=ivs)
 
 
 # ============================================================================

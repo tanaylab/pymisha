@@ -15,12 +15,14 @@
 #include "StratifiedMarkovModel.h"
 #include "MaskUtils.h"
 #include "BufferedFile.h"
+#include "pmutils.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <tuple>
 #include <vector>
 #include <string>
 
@@ -316,8 +318,11 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
                 for (int64_t pos = interval_start; pos + k < interval_end; ++pos) {
                     int64_t rel = pos - interval_start;
 
-                    // Check mask
-                    if (is_position_masked(pos, mask_ivs, mask_cursor)) {
+                    // Skip (k+1)-mers that overlap the mask, as gseq_kmer_dist does. When pos
+                    // itself is not masked, the cursor is at the first mask interval that
+                    // starts after it, and no later one starts earlier.
+                    if (is_position_masked(pos, mask_ivs, mask_cursor) ||
+                        (mask_cursor < mask_ivs.size() && mask_ivs[mask_cursor].start < pos + window_size)) {
                         total_masked++;
                         continue;
                     }
@@ -527,7 +532,12 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
  *   breaks         - list of float, bin boundaries
  *   bin_indices    - numpy int32 array, flat bin index per iterator position
  *   iter_starts    - numpy int64 array, start of each iter position
- *   iter_chroms    - numpy int32 array, chromid of each iter position
+ *   iter_ends      - numpy int64 array, end of each iter position
+ *   iter_ivids     - numpy int32 array, the row of `intervals` (0-based) each
+ *                    iter position belongs to (gextract's intervalID - 1). A
+ *                    position takes its bin from the iter positions of the
+ *                    interval being sampled only, so that overlapping
+ *                    intervals do not see each other's.
  *   intervals      - DataFrame, intervals to synthesize
  *   mask_copy      - DataFrame or None, intervals where original seq is copied
  *   output_path    - str, output file path (ignored if format="vector")
@@ -535,6 +545,10 @@ PyObject *pm_gsynth_train(PyObject *self, PyObject *args)
  *   n_samples      - int, number of samples per interval
  *   seed           - int or None, random seed
  *   k              - int, Markov order (1..10, default 5)
+ *   preserve_n     - bool, keep the N (or n) of the reference
+ *   fallback_cdf   - None or 4 floats, the CDF of A, C, G, T for the bases
+ *                    that have no valid context or bin (the first k bases of
+ *                    an interval, bases after an N); None = uniform
  *
  * Returns: list of strings (format=2) or None (format=0,1)
  */
@@ -547,7 +561,8 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         PyObject *py_breaks = NULL;
         PyObject *py_bin_indices = NULL;
         PyObject *py_iter_starts = NULL;
-        PyObject *py_iter_chroms = NULL;
+        PyObject *py_iter_ends = NULL;
+        PyObject *py_iter_ivids = NULL;
         PyObject *py_intervals = NULL;
         PyObject *py_mask_copy = NULL;
         const char *output_path = "";
@@ -555,15 +570,15 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         int n_samples = 1;
         PyObject *py_seed = NULL;
         int k = 5;
-        long long iter_size_arg = 0;
         int preserve_n_arg = 1;
+        PyObject *py_fallback_cdf = NULL;
 
-        if (!PyArg_ParseTuple(args, "OOOOOOOsiiOiLp",
+        if (!PyArg_ParseTuple(args, "OOOOOOOOsiiOipO",
                               &py_cdf_list, &py_breaks,
-                              &py_bin_indices, &py_iter_starts, &py_iter_chroms,
+                              &py_bin_indices, &py_iter_starts, &py_iter_ends, &py_iter_ivids,
                               &py_intervals, &py_mask_copy,
                               &output_path, &output_format, &n_samples,
-                              &py_seed, &k, &iter_size_arg, &preserve_n_arg)) {
+                              &py_seed, &k, &preserve_n_arg, &py_fallback_cdf)) {
             verror("Invalid arguments to pm_gsynth_sample");
         }
         bool preserve_n = (preserve_n_arg != 0);
@@ -574,12 +589,29 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                    StratifiedMarkovModel::MAX_K, k);
         }
 
-        // Validate iterator: caller must pass the iterator value used during
-        // bin extraction (see pm_gsynth_train for rationale).
-        if (iter_size_arg <= 0) {
-            verror("iterator must be a positive integer, got %lld", iter_size_arg);
+        // Bases with no valid context or bin are drawn from this CDF (uniform if none)
+        bool has_fallback = py_fallback_cdf && py_fallback_cdf != Py_None;
+        float fallback_cdf[NUM_BASES];
+        if (has_fallback) {
+            PMPY arr_fb(PyArray_FROM_OTF(py_fallback_cdf, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY), true);
+            if (!arr_fb || PyArray_SIZE((PyArrayObject *)(PyObject *)arr_fb) != NUM_BASES) {
+                PyErr_Clear();
+                verror("fallback_cdf must be a numeric vector of length %d", NUM_BASES);
+            }
+            const double *fb = (const double *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_fb);
+            for (int b = 0; b < NUM_BASES; ++b)
+                fallback_cdf[b] = static_cast<float>(fb[b]);
         }
-        int64_t iter_size = (int64_t)iter_size_arg;
+        auto draw_fallback_base = [&]() -> int {
+            if (!has_fallback)
+                return static_cast<int>(pm::pm_rnd_func() * NUM_BASES);
+            float r = static_cast<float>(pm::pm_rnd_func());
+            for (int b = 0; b < NUM_BASES - 1; ++b) {
+                if (r < fallback_cdf[b])
+                    return b;
+            }
+            return NUM_BASES - 1;
+        };
 
         int num_kmers = 1 << (2 * k);  // 4^k
 
@@ -587,7 +619,7 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         if (py_seed && py_seed != Py_None) {
             long seed = PyLong_AsLong(py_seed);
             if (!PyErr_Occurred()) {
-                srand48(seed);
+                pm::rng_seed(seed);
             }
             PyErr_Clear();
         }
@@ -601,15 +633,6 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         if (num_bins <= 0) {
             verror("breaks must have at least 2 elements");
         }
-
-        // 0D models have a single bin spanning the whole genome. The Python
-        // side then passes iter_size = INT64_MAX as a "no constraint"
-        // sentinel; the per-position bin-bounds check below would overflow
-        // (bins[c].first + INT64_MAX wraps to a negative number) and
-        // misroute unaligned-interval samples through the uniform-random
-        // fallback. Treat num_bins == 1 as a fast path that skips the
-        // bounds check entirely (R 5.6.x parity follow-up, roadmap #1).
-        const bool one_bin = (num_bins == 1);
 
         // --- Build CDF data from Python list ---
         // Use flat vector layout: cdf_data[bin][kmer_idx * NUM_BASES + base_idx]
@@ -656,14 +679,22 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         }
         int64_t *iter_starts = (int64_t *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_starts);
 
-        // --- Parse iter_chroms ---
-        PMPY arr_chroms(PyArray_FROM_OTF(py_iter_chroms, NPY_INT32,
-                                          NPY_ARRAY_IN_ARRAY), true);
-        if (!arr_chroms) {
+        // --- Parse iter_ends and iter_ivids ---
+        PMPY arr_ends(PyArray_FROM_OTF(py_iter_ends, NPY_INT64,
+                                        NPY_ARRAY_IN_ARRAY), true);
+        PMPY arr_ivids(PyArray_FROM_OTF(py_iter_ivids, NPY_INT32,
+                                         NPY_ARRAY_IN_ARRAY), true);
+        if (!arr_ends || !arr_ivids) {
             PyErr_Clear();
-            verror("iter_chroms must be convertible to int32 array");
+            verror("iter_ends and iter_ivids must be convertible to int64 and int32 arrays");
         }
-        int32_t *iter_chroms = (int32_t *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_chroms);
+        if (PyArray_SIZE((PyArrayObject *)(PyObject *)arr_starts) != num_iter_positions ||
+            PyArray_SIZE((PyArrayObject *)(PyObject *)arr_ends) != num_iter_positions ||
+            PyArray_SIZE((PyArrayObject *)(PyObject *)arr_ivids) != num_iter_positions) {
+            verror("iterator starts, ends and interval ids must match the bin indices in length");
+        }
+        int64_t *iter_ends = (int64_t *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_ends);
+        int32_t *iter_ivids = (int32_t *)PyArray_DATA((PyArrayObject *)(PyObject *)arr_ivids);
 
         // --- Parse intervals ---
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
@@ -673,11 +704,18 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         {
             std::vector<GInterval> all_intervals;
             convert_py_intervals(py_intervals, all_intervals);
+            // udata: the row of the interval, which iter_ivids refer to
+            for (size_t i = 0; i < all_intervals.size(); ++i)
+                all_intervals[i].udata = (void *)(intptr_t)i;
             for (auto &iv : all_intervals) {
                 if (iv.chromid >= 0 && iv.chromid < num_chroms) {
                     sample_per_chrom[iv.chromid].push_back(iv);
                 }
             }
+            // the intervals of a chromosome in order of start, as R sorts them
+            for (auto &ivs : sample_per_chrom)
+                std::stable_sort(ivs.begin(), ivs.end(),
+                                 [](const GInterval &x, const GInterval &y) { return x.start < y.start; });
         }
 
         // --- Parse mask_copy intervals ---
@@ -699,17 +737,21 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
 
         if (n_samples < 1) n_samples = 1;
 
-        // --- Build per-chromosome bin lookup ---
-        std::vector<std::vector<std::pair<int64_t, int>>> chrom_bins(num_chroms);
+        // --- Bin lookup per interval: (start, end, bin index) of the iter
+        // positions of each row of `intervals`, sorted by start ---
+        typedef std::tuple<int64_t, int64_t, int> IterBin;
+        int max_ivid = -1;
+        for (int i = 0; i < num_iter_positions; ++i)
+            max_ivid = std::max(max_ivid, (int)iter_ivids[i]);
+        std::vector<std::vector<IterBin>> interval_bins(max_ivid + 1);
         for (int i = 0; i < num_iter_positions; ++i) {
-            int chromid = iter_chroms[i];
-            if (chromid >= 0 && chromid < num_chroms) {
-                chrom_bins[chromid].push_back({iter_starts[i], bin_indices[i]});
-            }
+            if (iter_ivids[i] >= 0)
+                interval_bins[iter_ivids[i]].push_back(
+                    std::make_tuple(iter_starts[i], iter_ends[i], (int)bin_indices[i]));
         }
-        for (int c = 0; c < num_chroms; ++c) {
-            std::sort(chrom_bins[c].begin(), chrom_bins[c].end());
-        }
+        for (auto &ib : interval_bins)
+            std::sort(ib.begin(), ib.end());
+        const std::vector<IterBin> no_bins;
 
         // --- Set up sequence fetcher (for mask_copy) ---
         GenomeSeqFetch seqfetch;
@@ -739,10 +781,12 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
 
             const std::string &chrom_name = chromkey.id2chrom(chromid);
             const auto &mask_copy_ivs = mask_copy_per_chrom[chromid];
-            const auto &bins = chrom_bins[chromid];
 
             for (size_t iv_idx = 0; iv_idx < sample_ivs.size(); ++iv_idx) {
                 const GInterval &iv = sample_ivs[iv_idx];
+                intptr_t ivid = (intptr_t)iv.udata;
+                const std::vector<IterBin> &bins =
+                    ivid >= 0 && ivid < (intptr_t)interval_bins.size() ? interval_bins[ivid] : no_bins;
                 int64_t interval_start = std::max<int64_t>(0, iv.start);
                 int64_t interval_end = std::min<int64_t>(chrom_size, iv.end);
                 if (interval_end <= interval_start) continue;
@@ -768,7 +812,7 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                     int64_t first_query = interval_start;
                     if (!bins.empty()) {
                         while (bin_cursor + 1 < bins.size() &&
-                               first_query >= bins[bin_cursor + 1].first) {
+                               first_query >= std::get<0>(bins[bin_cursor + 1])) {
                             ++bin_cursor;
                         }
                     }
@@ -799,8 +843,7 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                                 continue;
                             }
                         }
-                        synth_seq[i] = StratifiedMarkovModel::decode_base(
-                            static_cast<int>(drand48() * NUM_BASES));
+                        synth_seq[i] = StratifiedMarkovModel::decode_base(draw_fallback_base());
                     }
 
                     // Sample remaining using Markov chain
@@ -812,8 +855,7 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                             if (rel_pos < (int64_t)original_seq.size()) {
                                 synth_seq[rel_pos] = original_seq[rel_pos];
                             } else {
-                                synth_seq[rel_pos] = StratifiedMarkovModel::decode_base(
-                                    static_cast<int>(drand48() * NUM_BASES));
+                                synth_seq[rel_pos] = StratifiedMarkovModel::decode_base(draw_fallback_base());
                             }
                             continue;
                         }
@@ -833,27 +875,14 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
                         // attributes each (k+1)-mer event to bin_at(pos - k).
                         int64_t bin_query_pos = pos - k;
                         int bin_idx = -1;
-                        if (one_bin) {
-                            // 0D model: single bin spans everything. Skip
-                            // the bounds check that would overflow when
-                            // iter_size == INT64_MAX.
-                            if (!bins.empty()) bin_idx = bins[0].second;
-                        } else if (!bins.empty()) {
+                        if (!bins.empty()) {
                             while (bin_cursor + 1 < bins.size() &&
-                                   bin_query_pos >= bins[bin_cursor + 1].first) {
+                                   bin_query_pos >= std::get<0>(bins[bin_cursor + 1])) {
                                 ++bin_cursor;
                             }
-                            int64_t bin_first = bins[bin_cursor].first;
-                            // Saturate: bin_first + iter_size can overflow
-                            // when callers pass the INT64_MAX no-constraint
-                            // sentinel on a > 0 bin start.
-                            int64_t bin_end_excl =
-                                (iter_size > std::numeric_limits<int64_t>::max() - bin_first)
-                                    ? std::numeric_limits<int64_t>::max()
-                                    : bin_first + iter_size;
-                            if (bin_query_pos >= bin_first &&
-                                bin_query_pos < bin_end_excl) {
-                                bin_idx = bins[bin_cursor].second;
+                            if (bin_query_pos >= std::get<0>(bins[bin_cursor]) &&
+                                bin_query_pos < std::get<1>(bins[bin_cursor])) {
+                                bin_idx = std::get<2>(bins[bin_cursor]);
                             }
                         }
 
@@ -863,9 +892,9 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
 
                         int next_base;
                         if (context_idx < 0 || bin_idx < 0 || bin_idx >= num_bins) {
-                            next_base = static_cast<int>(drand48() * NUM_BASES);
+                            next_base = draw_fallback_base();
                         } else {
-                            float r = static_cast<float>(drand48());
+                            float r = static_cast<float>(pm::pm_rnd_func());
                             int base_offset = context_idx * NUM_BASES;
                             next_base = NUM_BASES - 1;
                             for (int b = 0; b < NUM_BASES; ++b) {
@@ -921,8 +950,9 @@ PyObject *pm_gsynth_sample(PyObject *self, PyObject *args)
         if (output_format == 2) {
             PMPY result(PyList_New(collected_seqs.size()), true);
             for (size_t i = 0; i < collected_seqs.size(); ++i) {
-                PyObject *py_str = PyUnicode_FromStringAndSize(
-                    collected_seqs[i].c_str(), collected_seqs[i].size());
+                // one character per byte (Latin-1), as gseq_extract
+                PyObject *py_str = PyUnicode_DecodeLatin1(
+                    collected_seqs[i].c_str(), collected_seqs[i].size(), NULL);
                 PyList_SET_ITEM((PyObject *)result, i, py_str);
             }
             result.to_be_stolen();
@@ -1003,6 +1033,10 @@ PyObject *pm_gsynth_replace_kmer(PyObject *self, PyObject *args)
                     intervals_per_chrom[iv.chromid].push_back(iv);
                 }
             }
+            // the intervals of a chromosome in order of start, as R sorts them
+            for (auto &ivs : intervals_per_chrom)
+                std::stable_sort(ivs.begin(), ivs.end(),
+                                 [](const GInterval &x, const GInterval &y) { return x.start < y.start; });
         }
 
         // --- Set up sequence fetcher ---
@@ -1097,8 +1131,9 @@ PyObject *pm_gsynth_replace_kmer(PyObject *self, PyObject *args)
         if (output_format == 2) {
             PMPY result(PyList_New(collected_seqs.size()), true);
             for (size_t i = 0; i < collected_seqs.size(); ++i) {
-                PyObject *py_str = PyUnicode_FromStringAndSize(
-                    collected_seqs[i].c_str(), collected_seqs[i].size());
+                // one character per byte (Latin-1), as gseq_extract
+                PyObject *py_str = PyUnicode_DecodeLatin1(
+                    collected_seqs[i].c_str(), collected_seqs[i].size(), NULL);
                 PyList_SET_ITEM((PyObject *)result, i, py_str);
             }
             result.to_be_stolen();

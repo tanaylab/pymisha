@@ -7,10 +7,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
-from ._log import get_logger
+from ._log import get_logger, user_stacklevel
 from ._shared import _checkroot, _pymisha
 from .extract import gextract
 from .intervals import (
@@ -36,7 +39,9 @@ def gtrack_export_bedgraph(
 
     Evaluates a track expression over the specified genomic intervals and
     writes the result in standard bedGraph format (4-column, tab-separated:
-    chrom, start, end, value). NaN values are omitted from the output.
+    chrom, start, end, value). NaN values are omitted from the output. The
+    lines are those R misha writes: values as R's ``as.character()`` writes
+    them (15 significant digits), coordinates as integers.
 
     If the output file path ends in ``.gz``, the output is gzip-compressed.
 
@@ -79,6 +84,24 @@ def gtrack_export_bedgraph(
     >>> _ = pm.gdb_init_examples()
     >>> pm.gtrack_export_bedgraph("dense_track", "/tmp/dense.bedgraph")  # doctest: +SKIP
     """
+    _export_bedgraph(track, file, intervals, iterator, name, header)
+
+
+# Rows formatted in one call to the C++ formatter
+_BEDGRAPH_CHUNK_ROWS = 1 << 20
+
+
+def _export_bedgraph(
+    track: str,
+    file: str,
+    intervals: pd.DataFrame | str | None,
+    iterator: int | None,
+    name: str | None,
+    header: bool,
+    chroms: list[str] | None = None,
+) -> None:
+    """gtrack_export_bedgraph with the chromosomes written in the order of *chroms* (names), genome
+    order if None (R misha's .gtrack_export_bedgraph)."""
     _checkroot()
 
     if not isinstance(track, str):
@@ -134,68 +157,54 @@ def gtrack_export_bedgraph(
     else:
         data = extract_canonic(intervals)
 
-    if data is None or len(data) == 0:
-        import warnings
-
-        warnings.warn(
-            "All values are NaN; output file will contain only the header",
-            stacklevel=2,
-        )
-        data = pd.DataFrame(columns=["chrom", "start", "end", track])
-
-    # Determine value column name (gextract uses the track expression as column name)
+    # gextract returns None when the intervals hold no values (e.g. a sparse track)
     value_col = track
-    if value_col not in data.columns:
-        # gextract may use a sanitized column name; find the data column
-        data_cols = [
-            c for c in data.columns if c not in {"chrom", "start", "end", "intervalID"}
-        ]
-        if data_cols:
-            value_col = data_cols[0]
-        else:
-            # No data columns -- empty result
-            import warnings
-
+    if data is None or len(data) == 0:
+        warnings.warn(
+            "The track has no values in the intervals; output file will contain only the header",
+            stacklevel=user_stacklevel(),
+        )
+        data = None
+    else:
+        # the value column is named after the track expression
+        if value_col not in data.columns:
+            value_col = next(c for c in data.columns if c not in {"chrom", "start", "end", "intervalID"})
+        if data[value_col].isna().all():
             warnings.warn(
                 "All values are NaN; output file will contain only the header",
-                stacklevel=2,
+                stacklevel=user_stacklevel(),
             )
-            data = pd.DataFrame(columns=["chrom", "start", "end", track])
-            value_col = track
-
-    # Remove rows with NaN values
-    data = data.dropna(subset=[value_col])
-
-    if len(data) == 0:
-        import warnings
-
-        warnings.warn(
-            "All values are NaN; output file will contain only the header",
-            stacklevel=2,
-        )
-
-    # Sort by chromosome (genome order) then by start
-    genome_intervals = gintervals_all()
-    chrom_order = {
-        chrom: i for i, chrom in enumerate(genome_intervals["chrom"].values)
-    }
-    data = data.copy()
-    data["_chrom_order"] = data["chrom"].map(chrom_order)
-    data = data.sort_values(["_chrom_order", "start"]).drop(columns=["_chrom_order"])
 
     # Write output
     use_gz = file.endswith(".gz")
-
     opener = gzip.open if use_gz else open
-    with opener(file, "wt") as f:
+    with opener(file, "wb") as f:
         if header:
-            f.write(f'track type=bedGraph name="{name}"\n')
+            f.write(f'track type=bedGraph name="{name}"\n'.encode())
+        if data is not None:
+            _write_bedgraph_lines(f, data, value_col, chroms)
 
-        if len(data) > 0:
-            out = data[["chrom", "start", "end", value_col]].astype(
-                {"start": "int64", "end": "int64"}
-            )
-            out.to_csv(f, sep="\t", header=False, index=False)
+
+def _write_bedgraph_lines(f: Any, data: pd.DataFrame, value_col: str, chroms: list[str] | None) -> None:
+    """Writes the bedGraph lines of the rows of *data* whose value is not NaN to the binary stream
+    *f*, rows in genome order (chromosome as in the genome database, or as in *chroms*), then
+    start. The lines are R misha's: paste(chrom, sprintf("%.0f", start), sprintf("%.0f", end),
+    value, sep = "\t")."""
+    genome_chroms = [str(c) for c in gintervals_all()["chrom"]] if chroms is None else chroms
+    rank = {c: i for i, c in enumerate(genome_chroms)}
+    chrom = pd.Categorical(data["chrom"].astype(str))
+    # a chromosome the order does not name sorts last, as NA in R's order()
+    chrom_rank = np.array([rank.get(c, len(rank)) for c in chrom.categories], dtype=np.int64)[chrom.codes]
+    start = data["start"].to_numpy(dtype=np.int64)
+    ord_ = np.lexsort((start, chrom_rank))
+    codes = chrom.codes.astype(np.int32)[ord_]
+    names = [str(c) for c in chrom.categories]
+    start = start[ord_]
+    end = data["end"].to_numpy(dtype=np.int64)[ord_]
+    value = data[value_col].to_numpy(dtype=np.float64)[ord_]
+    for b in range(0, len(value), _BEDGRAPH_CHUNK_ROWS):
+        e = b + _BEDGRAPH_CHUNK_ROWS
+        f.write(_pymisha.pm_bedgraph_lines(codes[b:e], names, start[b:e], end[b:e], value[b:e]))
 
 
 def gtrack_export_bigwig(
@@ -280,11 +289,11 @@ def gtrack_export_bigwig(
         ) as tmp_bg:
             tmp_bedgraph = tmp_bg.name
 
-        # bedGraphToBigWig rejects the track header, so never write it
-        gtrack_export_bedgraph(
-            track, tmp_bedgraph, intervals=intervals, iterator=iterator,
-            header=False,
-        )
+        # bedGraphToBigWig rejects the track header, so never write it. It wants the chromosomes
+        # sorted by name in the C locale ("10" before "9"), which is not the genome order of a
+        # database whose chromosomes are 1, 2, ..., 10.
+        c_order = sorted((str(c) for c in gintervals_all()["chrom"]), key=lambda c: c.encode())
+        _export_bedgraph(track, tmp_bedgraph, intervals, iterator, None, False, chroms=c_order)
 
         # Write chrom.sizes
         with tempfile.NamedTemporaryFile(

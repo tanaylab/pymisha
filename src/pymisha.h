@@ -28,6 +28,19 @@ using namespace std;
 // Throws exception if the command is interrupted.
 inline void check_interrupt();
 
+// The bytes of a Python str holding a sequence, as R's C code reads a string's
+// bytes: one byte per character (Latin-1) when every character is at most
+// U+00FF, as gseq_extract returns a .seq byte above 127; otherwise the UTF-8
+// bytes, as R reads a UTF-8 string. nullptr (with a Python error) on failure.
+inline const char *py_seq_bytes(PyObject *str, Py_ssize_t *len)
+{
+    if (PyUnicode_KIND(str) == PyUnicode_1BYTE_KIND) {
+        *len = PyUnicode_GET_LENGTH(str);
+        return (const char *)PyUnicode_1BYTE_DATA(str);
+    }
+    return PyUnicode_AsUTF8AndSize(str, len);
+}
+
 // adds timeout to the time that is already in req
 void set_abs_timeout(int64_t delay_msec, struct timespec &req);
 
@@ -137,8 +150,9 @@ public:
     const PMPY &c_module_dict() const { return m_c_module_dict; }
     const PMPY &py_module_dict() const { return m_py_module_dict; }
 
-    // Verifies that the data size does not exceed the maximum allowed.
-    void verify_max_data_size(uint64_t data_size, const char *data_name = "Result");
+    // Verifies that the data size, a number of records, does not exceed the maximum allowed.
+    // unit: what the error message calls the records ("rows" for a result frame).
+    void verify_max_data_size(uint64_t data_size, const char *data_name = "Result", const char *unit = "records");
 
     // true if debug prints are allowed
     bool debug() const { return m_debug; }
@@ -172,7 +186,9 @@ public:
     static void reset_alarm();
     static int alarm_fired() { return s_sigalrm_fired; }
 
-    static void prepare4multitasking();
+    // Called by the parent before it forks num_kids processes for a call; warns once per
+    // session when the forks will be slow (warn_if_forks_are_slow).
+    static void prepare4multitasking(unsigned num_kids);
     static pid_t launch_process();
 
     // returns false if all the child processes have ended or true if the timeout has elapsed
@@ -269,6 +285,7 @@ protected:
     static void    sigalrm_handler(int);
     static void    sigchld_handler(int);
     static void    check_kids_state(bool ignore_errors);
+    static void    forget_reaped_kids();
 
     friend void check_interrupt();
     // No [[noreturn]] here: clang rejects an attribute list on a friend

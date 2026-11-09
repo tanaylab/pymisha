@@ -158,32 +158,25 @@ class TestGextractIntervalsSetOut1D:
             pm.gintervals_rm(iset_name, force=True)
 
 
-# ── 1D both file + intervals_set_out ─────────────────────────────────
+# ── file + intervals_set_out: an error, as R misha ───────────────────
 
-class TestGextractBothParams1D:
-    """Test combining file and intervals_set_out for 1D extraction."""
+class TestGextractBothParams:
+    """R misha refuses file and intervals.set.out together, before any work."""
 
-    def test_file_and_intervals_set_out_together(self, tmp_path):
-        """Both file and intervals_set_out work simultaneously."""
+    @pytest.mark.parametrize("dim", [1, 2])
+    def test_file_and_intervals_set_out_together_is_an_error(self, tmp_path, dim):
         out = tmp_path / "both.tsv"
-        iset_name = "test.gextract_both_1d"
-        try:
-            intervals = pm.gintervals("1", 0, 1000)
-            result = pm.gextract(
-                "dense_track", intervals, iterator=200,
-                file=str(out), intervals_set_out=iset_name, progress=False
-            )
-            assert result is None
-            # file was written
-            assert out.exists()
-            df_file = pd.read_csv(out, sep="\t")
-            assert len(df_file) == 5
-            # interval set was saved
-            loaded = pm.gintervals_load(iset_name)
-            assert loaded is not None
-            assert len(loaded) > 0
-        finally:
-            pm.gintervals_rm(iset_name, force=True)
+        iset_name = "test.gextract_both"
+        if dim == 1:
+            args = ("dense_track", pm.gintervals("1", 0, 1000))
+            kw = {"iterator": 200}
+        else:
+            args = ("rects_track", pm.gintervals_2d("1", 0, 500000, "1", 0, 500000))
+            kw = {}
+        with pytest.raises(ValueError, match="Cannot use both file and intervals_set_out arguments"):
+            pm.gextract(*args, file=str(out), intervals_set_out=iset_name, progress=False, **kw)
+        assert not out.exists()
+        assert not pm.gintervals_exists(iset_name)
 
 
 # ── 2D file output ───────────────────────────────────────────────────

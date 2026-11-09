@@ -668,7 +668,10 @@ class TestGseqKmerDistRParity:
 
     def test_handles_overlapping_intervals_correctly(self):
         iv = self._iv(["chr1", "chr1"], [0, 500], [1000, 1500])
-        assert pm.gseq_kmer_dist(iv, k=2)["count"].sum() == 1998
+        # the overlap is counted once: the k-mers of chr1:0-1500, 1500 - 1 = 1499 dinucleotides
+        result = pm.gseq_kmer_dist(iv, k=2)
+        assert result["count"].sum() == 1499
+        pd.testing.assert_frame_equal(result, pm.gseq_kmer_dist(self._one(0, 1500), k=2))
 
     def test_handles_multiple_mask_intervals(self):
         iv = self._one(0, 1000)
