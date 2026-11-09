@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.19.1 (2026-11-09)
+
+### Fixes
+
+* Multitasked `gextract` of 8 or more expressions (or with `multitasking_strategy="tracks"`) over a numeric or data-frame iterator could return the rows of an interval out of order, depending on the platform and numpy version (seen with numpy 2.2 on Linux and on macOS).
+
 ## v0.19.0 (2026-11-09)
 
 Follows R misha 5.17.0. Several results change; recompute anything that depends on them.

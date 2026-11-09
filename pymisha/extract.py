@@ -2799,14 +2799,13 @@ def _parallel_extract_tracks(
         return _pandas.DataFrame()
 
     # Workers ran on identical (intervals, iterator) so the coordinate /
-    # intervalID rows match. Sort each by intervalID to be defensive, then
-    # take coords from the first chunk, column-bind expression values from
-    # all chunks, and append intervalID last to match serial output column
-    # order (coords -> exprs -> intervalID).
+    # intervalID rows match, in scan order (no sort: rows of one interval tie
+    # on intervalID, and numpy's default sort may reorder ties). Take coords
+    # from the first chunk, column-bind expression values from all chunks,
+    # and append intervalID last to match serial output column order
+    # (coords -> exprs -> intervalID).
     sort_key = "intervalID"
     first_chunk_exprs, first_df = non_empty[0]
-    if sort_key in first_df.columns:
-        first_df = first_df.sort_values(sort_key).reset_index(drop=True)
 
     coord_cols = [c for c in ("chrom", "start", "end", "chrom1", "start1", "end1",
                                "chrom2", "start2", "end2")
@@ -2818,8 +2817,6 @@ def _parallel_extract_tracks(
 
     parts = [first_df[coord_cols].copy(), _value_columns(first_df)]
     for _chunk, df in non_empty[1:]:
-        if sort_key in df.columns:
-            df = df.sort_values(sort_key).reset_index(drop=True)
         parts.append(_value_columns(df))
     if sort_key in first_df.columns:
         parts.append(first_df[[sort_key]].copy())
