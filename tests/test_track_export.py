@@ -211,6 +211,9 @@ def test_bedgraph_export_writes_the_lines_r_misha_writes(tmp_path):
         assert g.read() == f.read()
 
 
+@pytest.mark.skipif(np.finfo(np.longdouble).nmant <= np.finfo(np.float64).nmant,
+                    reason="the fixture is from R on x86_64, which formats with an 80-bit long double; "
+                           "where long double is double (arm64 macOS) the last digit can differ")
 def test_doubles_are_formatted_as_r_as_character_formats_them():
     import _pymisha
 

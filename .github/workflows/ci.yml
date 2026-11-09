@@ -150,4 +150,4 @@ jobs:
         run: ruff check pymisha/
 
       - name: Run tests
-        run: pytest tests/ -x -q --override-ini="addopts=" -n auto --dist loadscope
+        run: pytest tests/ -q --override-ini="addopts=" -n auto --dist loadscope
