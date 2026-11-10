@@ -4,10 +4,9 @@ R's `gtrack.lookup` with `force.binning=FALSE` and equivalent pymisha paths
 build 2D RECTS tracks containing both finite and NaN values; the NaN rects
 must round-trip through `gtrack_2d_create` + `gextract`, and 2D virtual-track
 stat aggregations (avg / min / max / weighted.sum / area) must count them as
-R misha 5.12.1 does: a NaN rect's area counts and makes the weighted sum and
-avg NaN, and min / max take the values after the last NaN met. The expected
-values are R's, on the very file gtrack_2d_create writes here (R writes the
-same bytes for these rects).
+R misha (a3a27ed3) does: a NaN rect's area counts, and avg, min, max and the
+weighted sum skip it. The expected values are R's, on the very file
+gtrack_2d_create writes here (R writes the same bytes for these rects).
 """
 from __future__ import annotations
 
@@ -83,8 +82,8 @@ def test_2d_track_with_nan_rects_round_trips_all_rows():
         _cleanup_track(name)
 
 
-def test_2d_vtrack_avg_is_nan_over_a_nan_rect():
-    """avg over a window covering 3 finite + 2 NaN rects is NaN, as in R."""
+def test_2d_vtrack_avg_skips_a_nan_rect():
+    """avg over a window covering 3 finite + 2 NaN rects is the mean of the finite ones, as in R."""
     name = "test.test_2d_nan_avg"
     _cleanup_track(name)
     try:
@@ -93,7 +92,7 @@ def test_2d_vtrack_avg_is_nan_over_a_nan_rect():
         scope = pm.gintervals_2d([1], 0, 1000, [1], 0, 1000)
         result = pm.gextract("v_avg", scope, iterator=scope)
         assert result is not None
-        assert np.isnan(result["v_avg"].iloc[0])
+        assert result["v_avg"].iloc[0] == 30.0
     finally:
         _cleanup_track(name)
 
@@ -101,18 +100,17 @@ def test_2d_vtrack_avg_is_nan_over_a_nan_rect():
 def test_2d_vtrack_min_max_sum_area_with_nan():
     """min / max / weighted.sum / area over a NaN-bearing window, as R gives them.
 
-    The rects are 10, NaN, 30, NaN, 50, each 50x50 and read in that order: the
-    area counts all five, the weighted sum is NaN, and min and max are both
-    50, the only value after the last NaN.
+    The rects are 10, NaN, 30, NaN, 50, each 50x50: the area counts all five,
+    and the weighted sum, min and max skip the NaN ones.
     """
     name = "test.test_2d_nan_minmaxsum"
     _cleanup_track(name)
     try:
         _build_mixed_track(name)
         for func, expected in [
-            ("min", 50.0),
+            ("min", 10.0),
             ("max", 50.0),
-            ("weighted.sum", np.nan),
+            ("weighted.sum", 90 * 2500.0),
             ("area", 5 * 2500.0),
         ]:
             pm.gvtrack_clear()

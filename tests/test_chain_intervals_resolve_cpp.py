@@ -85,8 +85,8 @@ class TestEmptyInput:
             assert len(v) == 0
 
     def test_empty_with_any_policy(self):
-        for sp in ("keep", "error", "discard"):
-            for tp in ("keep", "error", "discard", "auto",
+        for sp in ("keep", "error", "discard", "discard_intervals"):
+            for tp in ("keep", "error", "discard", "discard_intervals", "auto",
                        "auto_first", "auto_longer", "auto_score", "agg"):
                 out = _pymisha.pm_chain_intervals_resolve(_empty_chain_dict(), sp, tp)
                 assert len(out["chrom"]) == 0, f"policies sp={sp} tp={tp}"
@@ -181,17 +181,17 @@ class TestHandleSrcOverlaps:
         assert "[500, 600)" in str(exc.value)
         assert "[550, 650)" in str(exc.value)
 
-    def test_discard_drops_overlap_pair(self):
+    def test_discard_intervals_drops_overlap_pair(self):
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
             ("chr1", 300, 400, 0, "chrA", 550, 650, 0, 2, 2000.0),  # overlaps row 1
             ("chr1", 500, 600, 0, "chrA", 800, 900, 0, 3, 3000.0),  # alone
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "discard", "keep")
+        out = _pymisha.pm_chain_intervals_resolve(d, "discard_intervals", "keep")
         chain_ids = sorted(out["chain_id"].tolist())
         assert chain_ids == [3]
 
-    def test_discard_drops_full_cluster_of_three(self):
+    def test_discard_intervals_drops_full_cluster_of_three(self):
         # Three intervals all in one overlapping cluster - all dropped.
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
@@ -199,10 +199,10 @@ class TestHandleSrcOverlaps:
             ("chr1", 700, 800, 0, "chrA", 700, 800, 0, 3, 3000.0),  # overlaps row 2
             ("chr1", 900,1000, 0, "chrA", 900,1000, 0, 4, 4000.0),  # standalone
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "discard", "keep")
+        out = _pymisha.pm_chain_intervals_resolve(d, "discard_intervals", "keep")
         assert sorted(out["chain_id"].tolist()) == [4]
 
-    def test_discard_per_chromsrc(self):
+    def test_discard_intervals_per_chromsrc(self):
         # Overlaps on chrA but chrB is clean.
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
@@ -210,7 +210,7 @@ class TestHandleSrcOverlaps:
             ("chr1", 700, 800, 0, "chrB", 100, 200, 0, 3, 3000.0),  # clean
             ("chr1", 800, 900, 0, "chrB", 300, 400, 0, 4, 4000.0),  # clean
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "discard", "keep")
+        out = _pymisha.pm_chain_intervals_resolve(d, "discard_intervals", "keep")
         assert sorted(out["chain_id"].tolist()) == [3, 4]
 
 
@@ -251,33 +251,33 @@ class TestHandleTgtOverlapsSimple:
         assert "[100, 200)" in str(exc.value)
         assert "[150, 250)" in str(exc.value)
 
-    def test_discard_drops_simple_pair(self):
+    def test_discard_intervals_drops_simple_pair(self):
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
             ("chr1", 150, 250, 0, "chrA", 700, 800, 0, 2, 2000.0),
             ("chr1", 500, 600, 0, "chrA", 900,1000, 0, 3, 3000.0),  # standalone
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard")
+        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard_intervals")
         assert sorted(out["chain_id"].tolist()) == [3]
 
-    def test_discard_drops_all_overlap_cluster(self):
+    def test_discard_intervals_drops_all_overlap_cluster(self):
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
             ("chr1", 150, 300, 0, "chrA", 700, 850, 0, 2, 2000.0),
             ("chr1", 250, 350, 0, "chrA", 850, 950, 0, 3, 3000.0),
             ("chr1", 500, 600, 0, "chrA", 1100,1200, 0, 4, 4000.0),  # alone
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard")
+        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard_intervals")
         assert sorted(out["chain_id"].tolist()) == [4]
 
-    def test_discard_per_chrom_independent(self):
+    def test_discard_intervals_per_chrom_independent(self):
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
             ("chr1", 150, 250, 0, "chrA", 700, 800, 0, 2, 2000.0),
             ("chr2", 100, 200, 0, "chrA", 900,1000, 0, 3, 3000.0),
             ("chr2", 300, 400, 0, "chrA", 1100,1200, 0, 4, 4000.0),
         ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard")
+        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "discard_intervals")
         # chr1 had an overlap pair (rows 1+2), chr2 clean.
         assert sorted(out["chain_id"].tolist()) == [3, 4]
 
@@ -521,6 +521,9 @@ class TestCrossValidatePython:
         ("discard", "keep"),
         ("keep", "discard"),
         ("discard", "discard"),
+        ("discard_intervals", "keep"),
+        ("keep", "discard_intervals"),
+        ("discard_intervals", "discard_intervals"),
         ("keep", "auto_score"),
         ("keep", "auto_longer"),
         ("keep", "auto_first"),
@@ -556,12 +559,28 @@ class TestCrossValidatePython:
                          end_src, strand_src, cid, score))
         d = _make_chain_dict(rows)
 
-        for src_p in ("keep", "discard"):
-            for tgt_p in ("keep", "discard", "auto_score", "auto_longer",
+        for src_p in ("keep", "discard", "discard_intervals"):
+            for tgt_p in ("keep", "discard", "discard_intervals", "auto_score", "auto_longer",
                           "auto_first", "agg"):
                 cpp_out = self._cpp_resolve(d, src_p, tgt_p)
                 py_out = self._python_resolve(d, src_p, tgt_p)
                 self._assert_same(cpp_out, py_out)
+
+    @pytest.mark.parametrize("src_p,tgt_p", [
+        ("keep", "discard"), ("discard", "keep"), ("keep", "auto_score"),
+    ])
+    def test_xval_large_group_sweep_path(self, src_p, tgt_p):
+        # 800 overlapping rows on one chrom and one chromsrc: over the Python
+        # path's 500k segment x row limit, so it takes the sweep-line fallback
+        rng = np.random.RandomState(3)
+        rows = []
+        for cid in range(1, 801):
+            start, start_src, length = (int(v) for v in (rng.randint(0, 20000), rng.randint(0, 20000),
+                                                         rng.randint(20, 200)))
+            rows.append(("chr1", start, start + length, int(rng.randint(0, 2)), "chrA",
+                         start_src, start_src + length, 0, cid, float(rng.randint(1, 4))))
+        d = _make_chain_dict(rows)
+        self._assert_same(self._cpp_resolve(d, src_p, tgt_p), self._python_resolve(d, src_p, tgt_p))
 
     def test_xval_three_way_overlap(self):
         d = _make_chain_dict([
@@ -581,7 +600,7 @@ class TestCrossValidatePython:
             ("chr1", 100, 300, 1, "chrA", 500, 700, 0, 1, 1000.0),
             ("chr1", 200, 400, 1, "chrA", 800,1000, 0, 2, 2000.0),
         ])
-        for tp in ("auto_score", "auto_longer", "auto_first", "agg"):
+        for tp in ("auto_score", "auto_longer", "auto_first", "agg", "discard", "discard_intervals"):
             self._assert_same(
                 self._cpp_resolve(d, "keep", tp),
                 self._python_resolve(d, "keep", tp),
@@ -593,8 +612,8 @@ class TestEdgeCases:
         d = _make_chain_dict([
             ("chr1", 100, 200, 0, "chrA", 500, 600, 0, 1, 1000.0),
         ])
-        for sp in ("keep", "error", "discard"):
-            for tp in ("keep", "error", "discard", "auto_score",
+        for sp in ("keep", "error", "discard", "discard_intervals"):
+            for tp in ("keep", "error", "discard", "discard_intervals", "auto_score",
                        "auto_first", "auto_longer", "agg"):
                 out = _pymisha.pm_chain_intervals_resolve(d, sp, tp)
                 assert len(out["chrom"]) == 1
@@ -632,8 +651,8 @@ class TestEdgeCases:
     def test_empty_chain_through_dispatcher(self):
         from pymisha.liftover import _resolve_chain_overlaps
         empty = _empty_chain_dict()
-        for sp in ("keep", "error", "discard"):
-            for tp in ("keep", "error", "discard", "auto_score", "agg"):
+        for sp in ("keep", "error", "discard", "discard_intervals"):
+            for tp in ("keep", "error", "discard", "discard_intervals", "auto_score", "agg"):
                 out = _resolve_chain_overlaps(empty, sp, tp)
                 assert len(out["chrom"]) == 0
 
@@ -678,98 +697,62 @@ class TestEdgeCases:
 
 
 class TestRParity:
-    """R-parity tests added in v0.1.91 to verify the corrections from v0.1.90.
+    """R misha 5.18.0 behaviour of the overlap policies, checked in C++ and Python.
 
-    Two divergences from R were fixed:
-    1. src=discard switched from whole-cluster (Python's prefix-max-end) to
-       R's pair-only scan (rdbinterval.cpp:820-841).
-    2. auto_*/agg merge predicate gained back the src-adjacency requirement
-       (rdbinterval.cpp:889-902): a slice can no longer be merged back if its
-       start_src does not equal prev.end_src - which matters for negative-strand
-       chains whose split slices have reversed src coords.
+    - "discard_intervals" drops every interval that overlaps another, on the source
+      side also one that is not next to it in source order (R's "discard" before
+      5.18.0 compared neighbours only, and pymisha followed it from v0.1.91).
+    - "discard" drops only the bases several intervals cover.
+    - auto_*: a minus-strand interval that wins every segment comes back in one piece.
+    """
 
-    Both Python and C++ implement the R behavior; cross-validation continues
-    to pass."""
+    # [0,200) holds [10,50) and [60,80), which do not overlap each other
+    NESTED_GAP = [
+        ("chr1", 100, 300, 0, "chrA",  0, 200, 0, 1, 1000.0),
+        ("chr1", 300, 340, 0, "chrA", 10,  50, 0, 2, 2000.0),
+        ("chr1", 400, 420, 0, "chrA", 60,  80, 0, 3, 3000.0),
+    ]
+    # minus-strand chain 1 [100,400) holds chain 2 [200,300), which has the lower score
+    MINUS_WINNER = [
+        ("chr1", 100, 400, 1, "chrA", 200, 500, 0, 1, 1000.0),
+        ("chr1", 200, 300, 0, "chrA", 800, 900, 0, 2,  500.0),
+    ]
 
-    def test_src_discard_pair_only_nested_with_gap(self):
-        # src rows [0,200), [10,50), [60,80) - row3 is INSIDE row1 but does
-        # NOT overlap row2 (50 < 60). R pair-only keeps row3; whole-cluster
-        # would drop it. Confirm we now keep row3.
-        d = _make_chain_dict([
-            ("chr1", 100, 200, 0, "chrA",   0, 200, 0, 1, 1000.0),
-            ("chr1", 200, 300, 0, "chrA",  10,  50, 0, 2, 2000.0),
-            ("chr1", 300, 400, 0, "chrA",  60,  80, 0, 3, 3000.0),
-        ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "discard", "keep")
-        assert sorted(out["chain_id"].tolist()) == [3]
-
-    def test_src_discard_python_matches_cpp_on_nested_gap(self):
-        # Same fixture, cross-validation.
+    @staticmethod
+    def _both(rows, src_p, tgt_p):
         from pymisha.liftover import _resolve_chain_overlaps
-        d = _make_chain_dict([
-            ("chr1", 100, 200, 0, "chrA",   0, 200, 0, 1, 1000.0),
-            ("chr1", 200, 300, 0, "chrA",  10,  50, 0, 2, 2000.0),
-            ("chr1", 300, 400, 0, "chrA",  60,  80, 0, 3, 3000.0),
-        ])
-        cpp = _resolve_chain_overlaps(d, "discard", "keep")
-        py = _resolve_chain_overlaps(d, "discard", "keep", _force_pure_python=True)
-        assert list(cpp["chain_id"]) == list(py["chain_id"])
-        assert sorted(cpp["chain_id"].tolist()) == [3]
+        d = _make_chain_dict(rows)
+        return [_to_df(_resolve_chain_overlaps(d, src_p, tgt_p, _force_pure_python=py))
+                .sort_values(["startsrc", "start"]).reset_index(drop=True) for py in (False, True)]
 
-    def test_negative_strand_auto_score_no_collapse(self):
-        # Fixture M from the audit: a negative-strand chain split by an
-        # overlapping higher-score chain in the middle. R refuses to merge
-        # the two outer slices because their src coords are reversed
-        # (prev.end_src != slice.start_src). Result: 3 rows instead of the
-        # 1-row collapse that v0.1.90 produced.
-        d = _make_chain_dict([
-            ("chr1", 100, 400, 1, "chrA", 200, 500, 1, 1, 1000.0),
-            ("chr1", 200, 300, 0, "chrA", 800, 900, 0, 2,  500.0),
-        ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "auto_score")
-        # Three rows: chain1 sliced [100,200) src=[400,500), chain1 [200,300)
-        # wins over chain2 because higher score, then chain1 [300,400)
-        # src=[200,300). The two chain1 outer slices do NOT merge under R.
-        df = _to_df(out).sort_values("start").reset_index(drop=True)
-        assert len(df) == 3
-        assert list(df["chain_id"]) == [1, 1, 1]
-        # First slice: tgt [100,200), neg strand, len=100. src=500-(200-100)=400 to 500-(100-100)=500.
-        assert df.iloc[0]["startsrc"] == 400 and df.iloc[0]["endsrc"] == 500
-        # Middle slice: tgt [200,300). src=500-(300-100)=300 to 500-(200-100)=400.
-        assert df.iloc[1]["startsrc"] == 300 and df.iloc[1]["endsrc"] == 400
-        # Last slice: tgt [300,400). src=500-(400-100)=200 to 500-(300-100)=300.
-        assert df.iloc[2]["startsrc"] == 200 and df.iloc[2]["endsrc"] == 300
+    def test_src_discard_intervals_finds_non_adjacent_overlap(self):
+        for df in self._both(self.NESTED_GAP, "discard_intervals", "keep"):
+            assert len(df) == 0
 
-    def test_negative_strand_auto_score_xval(self):
-        # Cross-validate the same fixture: Python and C++ both produce 3 rows.
-        from pymisha.liftover import _resolve_chain_overlaps
-        d = _make_chain_dict([
-            ("chr1", 100, 400, 1, "chrA", 200, 500, 1, 1, 1000.0),
-            ("chr1", 200, 300, 0, "chrA", 800, 900, 0, 2,  500.0),
-        ])
-        cpp = _resolve_chain_overlaps(d, "keep", "auto_score")
-        py = _resolve_chain_overlaps(d, "keep", "auto_score", _force_pure_python=True)
-        assert len(cpp["chrom"]) == 3
-        assert len(py["chrom"]) == 3
-        # Cell-by-cell match via the existing harness pattern.
-        df_cpp = _to_df(cpp).sort_values(["start", "end", "chain_id"]).reset_index(drop=True)
-        df_py = _to_df(py).sort_values(["start", "end", "chain_id"]).reset_index(drop=True)
-        for k in _EMPTY_CHAIN_COLS:
-            assert list(df_cpp[k]) == list(df_py[k]), f"col={k}"
+    def test_src_discard_keeps_single_covered_bases(self):
+        for df in self._both(self.NESTED_GAP, "discard", "keep"):
+            assert df["chain_id"].tolist() == [1, 1, 1]
+            assert list(zip(df["startsrc"], df["endsrc"], strict=True)) == [(0, 10), (50, 60), (80, 200)]
+            assert list(zip(df["start"], df["end"], strict=True)) == [(100, 110), (150, 160), (180, 300)]
+
+    def test_src_discard_minus_strand(self):
+        # chain 1 src [1000,1100) -> tgt [5000,5100) reversed; chain 2 src [1010,1020)
+        rows = [("chr1", 5000, 5100, 1, "chrA", 1000, 1100, 0, 1, 1000.0),
+                ("chr1", 8000, 8010, 0, "chrA", 1010, 1020, 0, 2, 1000.0)]
+        for df in self._both(rows, "discard", "keep"):
+            assert list(zip(df["startsrc"], df["endsrc"], df["start"], df["end"], strict=True)) == [
+                (1000, 1010, 5090, 5100), (1020, 1100, 5000, 5080)]
+
+    def test_auto_score_minus_strand_winner_in_one_piece(self):
+        for df in self._both(self.MINUS_WINNER, "keep", "auto_score"):
+            assert len(df) == 1
+            assert df.iloc[0][["start", "end", "startsrc", "endsrc"]].tolist() == [100, 400, 200, 500]
 
     def test_positive_strand_merge_still_works(self):
-        # Sanity: positive-strand slices still merge under R-parity because
-        # their src coords are monotonic (prev.end_src == slice.start_src).
-        # Same as the basic auto_score test elsewhere - just an explicit
-        # belt-and-suspenders against breaking the common case.
-        d = _make_chain_dict([
-            ("chr1", 100, 300, 0, "chrA",   0, 200, 0, 1, 1000.0),
-            ("chr1", 200, 400, 0, "chrA", 500, 700, 0, 2, 2000.0),
-        ])
-        out = _pymisha.pm_chain_intervals_resolve(d, "keep", "auto_score")
-        df = _to_df(out).sort_values("start").reset_index(drop=True)
-        # chain1 [100,200), chain2 [200,400) - the chain2 slice [200,300) and
-        # [300,400) ARE merged because they share chain_id + positive strand.
-        assert len(df) == 2
-        assert list(df["chain_id"]) == [1, 2]
-        assert df.iloc[1]["start"] == 200 and df.iloc[1]["end"] == 400
+        # chain 2 wins [200,400) whole: its two segments merge
+        rows = [("chr1", 100, 300, 0, "chrA",   0, 200, 0, 1, 1000.0),
+                ("chr1", 200, 400, 0, "chrA", 500, 700, 0, 2, 2000.0)]
+        for df in self._both(rows, "keep", "auto_score"):
+            df = df.sort_values("start")
+            assert df["chain_id"].tolist() == [1, 2]
+            assert df.iloc[1][["start", "end"]].tolist() == [200, 400]

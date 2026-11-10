@@ -920,7 +920,7 @@ bool parse_pssm_local(PyObject *obj, DnaPSSM &pssm, double prior) {
  * roi_start:    sequence of int (1-based, one per sequence) or None (1)
  * roi_end:      sequence of int (1-based, one per sequence) or None (the sequence length)
  *
- * A window may start from roi_start - extend to roi_end - w + extend (1-based),
+ * A window may start from roi_start to roi_end - w + extend (1-based),
  * and no later than where fewer bases remain than the shortest window
  * (w - max_indels; w without indels), as in R misha's C_gseq_pwm_edits.
  *
@@ -1140,7 +1140,8 @@ PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args)
             const int64_t roi_start_1 = roi_start.empty() ? 1 : roi_start[si];
             const int64_t roi_end_1 = roi_end.empty() ? seqlen : roi_end[si];
             int min_window = std::max(1, w - max_indels);
-            int start_min0 = (int)std::max<int64_t>(0, roi_start_1 - 1 - extend_val);
+            // a window never starts before the ROI (extend reaches past its end only)
+            int start_min0 = (int)std::max<int64_t>(0, roi_start_1 - 1);
             int start_max0 = (int)std::min<int64_t>(seqlen - min_window, roi_end_1 - w + extend_val);
             // For the non-indel path, still need at least w bases
             if (max_indels == 0) {

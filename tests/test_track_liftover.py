@@ -954,11 +954,12 @@ class TestGtrackLiftoverBin:
 
 
 class TestGtrackLiftoverSparseOverlapMerge:
-    """Tests for sparse track liftover overlapping interval merging.
+    """Sparse track liftover where lifted pieces overlap in the target.
 
-    Ported from R test-gtrack.liftover-sparse-overlap-merge.R.
-    These tests verify that gtrack_liftover correctly handles the case
-    where different source intervals map to overlapping target regions.
+    Ported from R test-gtrack.liftover-sparse-overlap-merge.R. A sparse track
+    cannot hold overlapping intervals, so the pieces are cut at their boundaries
+    and each segment gets the aggregate of the pieces that cover it, as
+    gintervals_liftover(value_col=) does (R misha 44ecd8d5).
     """
 
     def test_overlapping_target_intervals_merged(self, tmp_path):
@@ -1002,6 +1003,11 @@ class TestGtrackLiftoverSparseOverlapMerge:
 
             out = pm.gextract("lifted_overlap_merge", pm.gintervals_all())
             assert len(out) >= 1
+
+            # Both pieces have value 10: every covered position is 10, nothing outside [10,27)
+            per_bp = pm.gextract("lifted_overlap_merge", pm.gintervals("chr1", 0, 40), iterator=1)
+            np.testing.assert_array_equal(per_bp["lifted_overlap_merge"].to_numpy(),
+                                          [np.nan] * 10 + [10.0] * 17 + [np.nan] * 13)
 
             # Verify no overlapping intervals
             if len(out) > 1:
@@ -1306,6 +1312,57 @@ class TestGtrackLiftoverSparseOverlapMerge:
                 out = out.sort_values("start").reset_index(drop=True)
                 for i in range(len(out) - 1):
                     assert out.iloc[i]["end"] <= out.iloc[i + 1]["start"]
+
+            # Summed per segment: only [13,20) is covered by both pieces
+            assert list(zip(out["start"], out["end"], out["lifted_sum_overlap"], strict=True)) == [
+                (10, 13, 100.0), (13, 20, 200.0), (20, 23, 100.0)]
+        finally:
+            pm.gdb_init(str(TEST_DB))
+
+    @pytest.mark.parametrize("force_python", [False, True])
+    def test_per_segment_as_gintervals_liftover(self, tmp_path, force_python):
+        """R: 'gtrack.liftover aggregates overlapping sparse pieces per segment, as
+        gintervals.liftover does'. The three pieces land on chr1 [0,10), [9,20),
+        [19,30): neighbours overlap by 1bp."""
+        root = _copy_db(tmp_path)
+        try:
+            pm.gdb_init(str(root))
+            src = [(0, 10, 1.0), (100, 111, 100.0), (200, 211, 1.0)]
+            src_track_dir = tmp_path / "src_seg.track"
+            _create_sparse_track_dir(src_track_dir, {"srcA": src})
+            chain_path = _write_chain(tmp_path, [
+                ({"score": 1000, "src_chrom": "srcA", "src_size": 300, "src_strand": "+",
+                  "src_start": s, "src_end": e, "tgt_chrom": "chr1", "tgt_size": 500000,
+                  "tgt_strand": "+", "tgt_start": t, "tgt_end": t + e - s, "chain_id": cid},
+                 [(e - s,)])
+                for cid, (s, e, t) in enumerate([(0, 10, 0), (100, 111, 9), (200, 211, 19)], start=1)
+            ])
+
+            def lift(agg):
+                if pm.gtrack_exists("lifted_seg"):
+                    pm.gtrack_rm("lifted_seg", force=True)
+                pm.gtrack_liftover("lifted_seg", "x", str(src_track_dir), chain_path,
+                                   tgt_overlap_policy="keep", multi_target_agg=agg,
+                                   _force_pure_python=force_python)
+
+            lift("mean")
+            out = pm.gextract("lifted_seg", pm.gintervals_all())
+            assert list(zip(out["start"], out["end"], out["lifted_seg"], strict=True)) == [
+                (0, 9, 1.0), (9, 10, 50.5), (10, 19, 100.0), (19, 20, 50.5), (20, 30, 1.0)]
+
+            # Per position, the lifted track equals gintervals_liftover(value_col=)
+            src_iv = pd.DataFrame({"chrom": "srcA", "start": [r[0] for r in src],
+                                   "end": [r[1] for r in src], "v": [r[2] for r in src]})
+            for agg in ("mean", "sum", "count", "max", "first", "last",
+                        "max.coverage_len", "min.coverage_frac"):
+                lift(agg)
+                got = pm.gextract("lifted_seg", pm.gintervals("chr1", 0, 40), iterator=1)["lifted_seg"]
+                ref = pm.gintervals_liftover(src_iv, chain_path, tgt_overlap_policy="keep",
+                                             value_col="v", multi_target_agg=agg)
+                exp = np.full(40, np.nan)
+                for st, en, v in zip(ref["start"], ref["end"], ref["v"], strict=True):
+                    exp[st:en] = v
+                np.testing.assert_array_equal(got.to_numpy(), exp, err_msg=agg)
         finally:
             pm.gdb_init(str(TEST_DB))
 
@@ -1322,7 +1379,7 @@ class TestGtrackLiftoverRefusesClusterPolicies:
     def _r_message(policy):
         # R's text, verbatim
         return (f"tgt_overlap_policy = '{policy}' is only supported by gintervals.liftover(), "
-                "not gtrack.liftover(). Use 'auto', 'agg', 'keep', or 'discard'.")
+                "not gtrack.liftover(). Use 'auto', 'agg', 'keep', 'discard', or 'discard_intervals'.")
 
     @pytest.fixture()
     def setup(self, tmp_path):
@@ -1376,3 +1433,132 @@ class TestGtrackLiftoverRefusesClusterPolicies:
         src = pd.DataFrame({"chrom": ["srcA"], "start": [100], "end": [200]})
         out = pm.gintervals_liftover(src, chain, tgt_overlap_policy=policy)
         assert out[["chrom", "start", "end"]].values.tolist() == [["chr1", 2100, 2200]]
+
+
+class TestGtrackLiftoverPreloadedChainPolicies:
+    """As R misha, gtrack_liftover resolves a pre-loaded chain's overlaps by the
+    policies it carries (target first, then source)."""
+
+    # A: minus strand, tgt [0,100), score 2000; B: tgt [40,60) inside A, score 10
+    TGT_OVERLAP = pd.DataFrame({
+        "chrom": "chr2", "start": [0, 40], "end": [100, 60], "strand": [-1, 1],
+        "chromsrc": "chr1", "startsrc": [1000, 5000], "endsrc": [1100, 5020], "strandsrc": 1,
+        "chain_id": [1, 2], "score": [2000.0, 10.0],
+    })
+
+    @pytest.fixture()
+    def src_dir(self, tmp_path):
+        root = _copy_db(tmp_path)
+        pm.gdb_init(str(root))
+        pm.gtrack_create_sparse("srct", "x", pm.gintervals("chr1", [1000, 5000], [1100, 5020]), [1.0, 2.0])
+        yield str(root / "tracks" / "srct.track")
+        pm.gdb_init(str(TEST_DB))
+
+    # values from R misha 5.18.0
+    @pytest.mark.parametrize("policy, expected", [
+        ("auto_score", [(0, 100, 1.0)]),
+        ("agg", [(0, 40, 1.0), (40, 60, 1.5), (60, 100, 1.0)]),
+        ("discard", [(0, 40, 1.0), (60, 100, 1.0)]),
+    ])
+    @pytest.mark.parametrize("force_python", [False, True])
+    def test_tgt_policy(self, src_dir, policy, expected, force_python):
+        ch = pm.gintervals_as_chain(self.TGT_OVERLAP, tgt_overlap_policy=policy)
+        pm.gtrack_liftover("lifted", "x", src_dir, ch, _force_pure_python=force_python)
+        out = pm.gextract("lifted", pm.gintervals("chr2", 0, 100))
+        assert list(zip(out["start"], out["end"], out["lifted"], strict=True)) == expected
+
+    @pytest.mark.parametrize("force_python", [False, True])
+    def test_src_policy(self, src_dir, force_python):
+        ov = self.TGT_OVERLAP.assign(start=[0, 500], end=[100, 600], strand=1,
+                                     startsrc=[1000, 1050], endsrc=[1100, 1150])
+        with pytest.raises(Exception, match="overlap"):
+            pm.gtrack_liftover("lifted", "x", src_dir, pm.gintervals_as_chain(ov),
+                               _force_pure_python=force_python)
+        assert not pm.gtrack_exists("lifted")
+
+
+@pytest.mark.parametrize("force_python", [False, True])
+def test_count_is_zero_in_every_empty_dense_bin(tmp_path, force_python):
+    """R: 'gtrack.liftover count: a dense bin nothing lands in is 0 on every chromosome'.
+    A dense target bin nothing lands in counts 0, on a chromosome something lands on
+    and on one nothing lands on (which was NaN); below min_n it is NaN, and the other
+    aggregators give NaN."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        src_dir = tmp_path / "cnt_src.track"
+        _create_dense_track_dir(src_dir, 10, {"srcA": np.array([5.0] + [np.nan] * 9, dtype=np.float32)})
+        chain = _write_chain(tmp_path, [
+            ({"score": 1000, "src_chrom": "srcA", "src_size": 100, "src_strand": "+",
+              "src_start": 0, "src_end": 10, "tgt_chrom": "chr1", "tgt_size": 500000,
+              "tgt_strand": "+", "tgt_start": 0, "tgt_end": 10, "chain_id": 1}, [(10,)]),
+        ])
+        iv = pm.gintervals(["chr1", "chr1", "chr2"], [0, 100, 100], [10, 110, 110])
+
+        def lift(agg, min_n=None):
+            if pm.gtrack_exists("cnt_lifted"):
+                pm.gtrack_rm("cnt_lifted", force=True)
+            pm.gtrack_liftover("cnt_lifted", "x", str(src_dir), chain, multi_target_agg=agg, min_n=min_n,
+                               _force_pure_python=force_python)
+            return pm.gextract("cnt_lifted", iv, iterator=iv)["cnt_lifted"].to_numpy()
+
+        np.testing.assert_array_equal(lift("count"), [1, 0, 0])
+        np.testing.assert_array_equal(lift("count", min_n=0), [1, 0, 0])
+        np.testing.assert_array_equal(lift("count", min_n=1), [1, np.nan, np.nan])
+        np.testing.assert_array_equal(lift("sum"), [5, np.nan, np.nan])
+    finally:
+        pm.gdb_init(str(TEST_DB))
+
+
+@pytest.mark.parametrize("policy", ["keep", "agg"])
+@pytest.mark.parametrize("ids", [(1, 2), (2, 1)])
+def test_first_last_nth_by_position_then_chain(tmp_path, policy, ids):
+    """As R misha 5.18.0: first, last and nth order the lifted pieces by where they lie,
+    then by chain id, not by value. srcA -> chr1 [0,100) and srcB -> chr1 [50,150): with
+    "keep" the piece from srcA starts first; "agg" cuts both chains at 50 and 100, so on
+    [50,100) the two pieces coincide and the lower chain id comes first. Dense liftover lands
+    one 10 bp source bin of each on every target bin there, so it goes by chain either way."""
+    root = _copy_db(tmp_path)
+    try:
+        pm.gdb_init(str(root))
+        hdr = {"score": 1000, "src_size": 100, "src_strand": "+", "src_start": 0, "src_end": 100,
+               "tgt_chrom": "chr1", "tgt_size": 500000, "tgt_strand": "+"}
+        chain_path = _write_chain(tmp_path, [
+            (hdr | {"src_chrom": "srcA", "tgt_start": 0, "tgt_end": 100, "chain_id": ids[0]}, [(100,)]),
+            (hdr | {"src_chrom": "srcB", "tgt_start": 50, "tgt_end": 150, "chain_id": ids[1]}, [(100,)]),
+        ])
+        chain = pm.gintervals_load_chain(chain_path, tgt_overlap_policy=policy)
+        by_chain = 0 if ids[0] < ids[1] else 1
+        first_src = 0 if policy == "keep" else by_chain
+        src = pd.DataFrame({"chrom": ["srcA", "srcB"], "start": [0, 0], "end": [100, 100]})
+
+        for vals in ([1.0, 2.0], [2.0, 1.0]):
+            def lift(agg, params=None, vals=vals):
+                res = pm.gintervals_liftover(src.assign(val=vals), chain, value_col="val",
+                                             multi_target_agg=agg, params=params)
+                return res.loc[(res["start"] >= 50) & (res["end"] <= 100), "val"].tolist()
+            assert lift("first") == [vals[first_src]]
+            assert lift("last") == [vals[1 - first_src]]
+            assert lift("nth", 1) == [vals[first_src]]
+            assert lift("nth", 2) == [vals[1 - first_src]]
+
+        tracks = {
+            "sp12": (_create_sparse_track_dir, {"srcA": [(0, 100, 1.0)], "srcB": [(0, 100, 2.0)]}, [1.0, 2.0], first_src),
+            "sp21": (_create_sparse_track_dir, {"srcA": [(0, 100, 2.0)], "srcB": [(0, 100, 1.0)]}, [2.0, 1.0], first_src),
+            "de12": (_create_dense_track_dir, {"srcA": np.full(10, 1.0), "srcB": np.full(10, 2.0)}, [1.0, 2.0], by_chain),
+        }
+        for name, (make, data, vals, first) in tracks.items():
+            src_dir = tmp_path / f"{name}.track"
+            if make is _create_dense_track_dir:
+                make(src_dir, 10, data)
+            else:
+                make(src_dir, data)
+            for agg in ("first", "last"):
+                out = f"lifted_{name}_{agg}"
+                pm.gtrack_liftover(out, "", str(src_dir), chain_path,
+                                   tgt_overlap_policy=policy, multi_target_agg=agg)
+                got = pm.gextract(out, pm.gintervals("chr1", 50, 100), iterator=10 if name == "de12" else None)[out]
+                want = vals[first] if agg == "first" else vals[1 - first]
+                assert (got == want).all(), (name, agg, got.tolist())
+    finally:
+        pm.gdb_init(str(TEST_DB))

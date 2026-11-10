@@ -59,13 +59,14 @@ PyObject *get_array(PyObject *df_dict, const char *key, int dtype)
 
 bool valid_src_policy(const char *p)
 {
-    return !strcmp(p, "error") || !strcmp(p, "keep") || !strcmp(p, "discard");
+    return !strcmp(p, "error") || !strcmp(p, "keep") || !strcmp(p, "discard") ||
+           !strcmp(p, "discard_intervals");
 }
 
 bool valid_tgt_policy(const char *p)
 {
     return !strcmp(p, "error") || !strcmp(p, "keep") || !strcmp(p, "discard") ||
-           !strcmp(p, "auto") || !strcmp(p, "auto_first") ||
+           !strcmp(p, "discard_intervals") || !strcmp(p, "auto") || !strcmp(p, "auto_first") ||
            !strcmp(p, "auto_longer") || !strcmp(p, "auto_score") ||
            !strcmp(p, "agg");
 }
@@ -289,8 +290,11 @@ void sort_by_tgt(std::vector<ChainRow> &rows)
         });
 }
 
+void handle_tgt_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
+                         const ChromInterner &tgt_chrom, const ChromInterner &src_chrom);
+
 void handle_src_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
-                         const ChromInterner &/*tgt_chrom*/, const ChromInterner &src_chrom)
+                         const ChromInterner &tgt_chrom, const ChromInterner &src_chrom)
 {
     if (rows.empty() || policy == "keep") return;
 
@@ -311,22 +315,42 @@ void handle_src_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
         return;
     }
 
-    // policy == "discard": R uses a PAIR-ONLY scan after sort_by_src (rdbinterval.cpp:820-841).
-    // For each consecutive pair on the same chromsrc, if they overlap mark BOTH.
-    // This is strictly weaker than whole-cluster discard: a row nested inside
-    // a larger row with a GAP between it and the previous row stays kept.
-    // Example: src rows [0,200), [10,50), [60,80) -> R keeps [60,80) because
-    // pair (row2, row3) doesn't overlap (50 < 60). **R parity per user direction
-    // 2026-05-20.**
     if (policy == "discard") {
+        // Keep only the source bases a single chain interval covers (R misha 5.18.0).
+        // A chain interval maps the same way read from either side (minus strand
+        // too), so run the target-side trim on the rows with the two sides swapped.
+        auto swap_sides = [&rows]() {
+            for (ChainRow &r : rows) {
+                std::swap(r.chromid, r.chromid_src);
+                std::swap(r.start, r.start_src);
+                std::swap(r.end, r.end_src);
+            }
+        };
+        swap_sides();
+        handle_tgt_overlaps(rows, "discard", src_chrom, tgt_chrom);
+        swap_sides();
+        sort_by_src(rows);
+        return;
+    }
+
+    if (policy == "discard_intervals") {
+        // Drop every row with a source overlap. Sorted by source start, row i
+        // overlaps an earlier one iff the largest end_src before it on its chrom
+        // exceeds its start; and row i-1 overlaps a later one iff it overlaps i,
+        // the later one with the smallest start (R misha 5.18.0).
         const size_t n = rows.size();
         std::vector<char> discard(n, 0);
+        int64_t max_end_src = 0;
         for (size_t i = 1; i < n; ++i) {
-            if (rows[i].chromid_src == rows[i-1].chromid_src &&
-                rows[i-1].end_src > rows[i].start_src) {
-                discard[i-1] = 1;
-                discard[i]   = 1;
+            if (rows[i].chromid_src != rows[i-1].chromid_src) {
+                max_end_src = 0;
+                continue;
             }
+            max_end_src = std::max(max_end_src, rows[i-1].end_src);
+            if (max_end_src > rows[i].start_src)
+                discard[i] = 1;
+            if (rows[i-1].end_src > rows[i].start_src)
+                discard[i-1] = 1;
         }
 
         // Compact in place: keep only rows where discard[k] == 0.
@@ -396,15 +420,10 @@ ChainRow slice_row(const ChainRow &orig, int64_t seg_start, int64_t seg_end)
 }
 
 // Try to merge `slice` into the back of `out`. Returns true on merge.
-// Mirrors R's append_slice merge predicate (rdbinterval.cpp:889-902): same
-// (chromid, chain_id, strand, chromid_src, strand_src), tgt-adjacent
-// (prev.end == slice.start), AND src-adjacent (prev.end_src == slice.start_src).
-// The src-adjacency requirement is what differentiates this from Python's
-// merge step (liftover.py:686-711) which only checks tgt-adjacency + same
-// chain_id. For positive-strand splits R and Python agree; for negative-strand
-// splits the slices have reversed src coords (prev.end_src != slice.start_src)
-// so R refuses to merge - leaving N rows. Python's loose merge collapses them
-// back to 1 row via min/max. **R parity wins per user direction 2026-05-20.**
+// R's append_slice merge predicate: same (chromid, chain_id, strand,
+// chromid_src, strand_src), tgt-adjacent (prev.end == slice.start) and
+// src-adjacent. On a reversed interval the next target slice lies just before
+// the previous one in source coordinates (prev.start_src == slice.end_src).
 bool try_merge_back(std::vector<ChainRow> &out, const ChainRow &slice)
 {
     if (out.empty()) return false;
@@ -415,9 +434,13 @@ bool try_merge_back(std::vector<ChainRow> &out, const ChainRow &slice)
     if (prev.chromid_src != slice.chromid_src) return false;
     if (prev.strand_src  != slice.strand_src)  return false;
     if (prev.end         != slice.start)       return false;
-    if (prev.end_src     != slice.start_src)   return false;
-    prev.end     = slice.end;
-    prev.end_src = slice.end_src;
+    if (slice.strand == 0 ? prev.end_src != slice.start_src
+                          : prev.start_src != slice.end_src) return false;
+    prev.end = slice.end;
+    if (slice.strand == 0)
+        prev.end_src = slice.end_src;
+    else
+        prev.start_src = slice.start_src;
     return true;
 }
 
@@ -493,7 +516,7 @@ void handle_tgt_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
         return;
     }
 
-    if (policy == "discard") {
+    if (policy == "discard_intervals") {
         const size_t n = rows.size();
         std::vector<char> discard(n, 0);
         size_t i = 0;
@@ -550,7 +573,8 @@ void handle_tgt_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
     const bool is_auto = (policy == "auto_first" || policy == "auto_longer" ||
                           policy == "auto_score");
     const bool is_agg  = (policy == "agg");
-    if (!is_auto && !is_agg) {
+    const bool is_discard = (policy == "discard");
+    if (!is_auto && !is_agg && !is_discard) {
         PyErr_Format(PyExc_ValueError, "Unknown tgt_overlap_policy: %s", policy.c_str());
         TGLError("propagating PyErr from handle_tgt_overlaps");
     }
@@ -558,7 +582,7 @@ void handle_tgt_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
     // Per-chrom event sweep: emit one row per non-empty inter-event segment.
     // auto_* picks a single winner per multi-active segment + merges adjacent
     // contiguous slices. agg emits every active interval per multi-active
-    // segment + never merges.
+    // segment + never merges. discard emits nothing for a multi-active segment.
     std::vector<ChainRow> resolved;
     resolved.reserve(rows.size() * 2);
 
@@ -597,11 +621,15 @@ void handle_tgt_overlaps(std::vector<ChainRow> &rows, const std::string &policy,
             if (next_pos <= pos || active.empty()) continue;
 
             if (active.size() == 1) {
-                // Single-active segment. agg never merges; auto merges.
-                const bool allow_merge = !is_agg;
-                append_slice(resolved, rows[*active.begin()], pos, next_pos, allow_merge);
+                // Only the auto policies join a winner's slices back together, as R misha.
+                // agg keeps its pieces apart, and discard keeps the pieces it is given: as
+                // the source-side pass it must not merge the agg pieces of the target pass.
+                append_slice(resolved, rows[*active.begin()], pos, next_pos, is_auto);
                 continue;
             }
+
+            // "discard": a segment covered by several intervals maps nowhere
+            if (is_discard) continue;
 
             if (is_agg) {
                 // Emit one slice per active interval. No merging.

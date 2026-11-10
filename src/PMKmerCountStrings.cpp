@@ -29,20 +29,36 @@ std::string revcomp(const std::string &s)
     return rc;
 }
 
-// The window starts (0-based, inclusive) a k-mer of width w may take, for the
-// 1-based ROI [roi_start, roi_end] extended by extend_val on each side.
-void compute_bounds(int L, int w, int roi_start, int roi_end, int extend_val,
-                    int &start_min0, int &start_max0)
+// The window starts (0-based, inclusive) for the 1-based ROI [roi_start,
+// roi_end], as R misha 5.18.0's compute_bounds, by the rule of the kmer
+// virtual tracks: a window is anchored at its first base, which must not lie
+// before the ROI, and it may run at most extend_val bases past the ROI end
+// (non-gap bases when is_gap is given), never past the end of the sequence.
+// start_max0 is as if the sequence held no gaps: the gap path reads
+// start_max0 + w - 1 as the last base a window may cover.
+void compute_bounds(const std::string &seq, int w, int roi_start, int roi_end, int extend_val,
+                    const bool *is_gap, int &start_min0, int &start_max0)
 {
-    start_min0 = std::max(0, roi_start - 1 - extend_val);
-    start_max0 = std::min(L - w, roi_end - 1 - w + 1 + extend_val);
+    const int last0 = (int)seq.size() - 1;
+    int end_lim0 = roi_end - 1;
+    if (!is_gap) {
+        end_lim0 = (int)std::min<int64_t>(last0, (int64_t)end_lim0 + extend_val);
+    } else {
+        for (int left = extend_val; left > 0 && end_lim0 < last0;) {
+            if (!is_gap[(unsigned char)seq[++end_lim0]])
+                --left;
+        }
+    }
+    start_min0 = roi_start - 1;
+    start_max0 = end_lim0 - w + 1;
 }
 
-// count positions in [start_min0, start_max0] where the k-mer matches on the
-// forward strand (strand >= 0) or its reverse complement does (strand <= 0):
-// a position counts once, even when both match. With skip_gaps the windows
-// are taken over the sequence with the gap characters removed. frac divides
-// by the number of window starts scanned.
+// count the matches at the positions in [start_min0, start_max0] of the k-mer
+// on the forward strand (strand >= 0) and of its reverse complement (strand <=
+// 0): strand 0 sums the two, so a palindrome counts twice per site, as the
+// kmer virtual tracks count (R misha 5.18.0). With skip_gaps the windows are
+// taken over the sequence with the gap characters removed. frac divides by
+// the number of window starts scanned, of both strands under strand 0.
 double score_kmer_over_range(const std::string &seq, int start_min0, int start_max0,
                              const std::string &kmer, const std::string &kmer_rc,
                              int strand, bool frac, const bool *is_gap)
@@ -67,14 +83,13 @@ double score_kmer_over_range(const std::string &seq, int start_min0, int start_m
     if (hi < lo)
         return 0.0;
 
-    int count = 0;
+    int64_t count = 0;
     for (int p = lo; p <= hi; ++p) {
-        const bool fwd = strand >= 0 && s->compare(p, w, kmer) == 0;
-        const bool rev = strand <= 0 && s->compare(p, w, kmer_rc) == 0;
-        if (fwd || rev)
-            ++count;
+        count += strand >= 0 && s->compare(p, w, kmer) == 0;
+        count += strand <= 0 && s->compare(p, w, kmer_rc) == 0;
     }
-    return frac ? (double)count / (double)(hi - lo + 1) : (double)count;
+    const int64_t nstarts = (int64_t)(hi - lo + 1) * (strand == 0 ? 2 : 1);
+    return frac ? (double)count / (double)nstarts : (double)count;
 }
 
 const int64_t *int64_data(PyObject *obj, Py_ssize_t n, PMPY &holder, const char *what)
@@ -97,9 +112,9 @@ const int64_t *int64_data(PyObject *obj, Py_ssize_t n, PMPY &holder, const char 
  * seqs:      list of str (None gives NaN)
  * kmer:      str, A/C/G/T only (validated by gseq_kmer)
  * mode:      "count" or "frac"
- * strand:    0 = either strand, 1 = forward, -1 = reverse complement
+ * strand:    0 = both strands, summed, 1 = forward, -1 = reverse complement
  * roi_start, roi_end: int arrays, 1-based inclusive ROI per sequence
- * extend:    bases the window starts may extend past the ROI (>= 0)
+ * extend:    bases a window may run past the ROI end (>= 0)
  * skip_gaps: bool
  * gap_chars: str, one gap character per byte
  *
@@ -170,7 +185,7 @@ PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args)
                 continue;
             }
             int start_min0, start_max0;
-            compute_bounds(L, w, rs, re, extend_val, start_min0, start_max0);
+            compute_bounds(seq, w, rs, re, extend_val, skip_gaps ? is_gap : nullptr, start_min0, start_max0);
             out[i] = score_kmer_over_range(seq, start_min0, start_max0, kmer, kmer_rc, strand,
                                            frac, skip_gaps ? is_gap : nullptr);
         }

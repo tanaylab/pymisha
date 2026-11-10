@@ -53,14 +53,14 @@ from .intervals import gintervals_all
 # Overlap policy constants
 # ---------------------------------------------------------------------------
 
-_SRC_POLICIES = {"error", "keep", "discard"}
+_SRC_POLICIES = {"error", "keep", "discard", "discard_intervals"}
 _CLUSTER_TGT_POLICIES = (
     "best_source_cluster", "best_cluster_union",
     "best_cluster_sum", "best_cluster_max",
 )
 _TGT_POLICIES = {
     "error", "auto", "auto_first", "auto_longer", "auto_score",
-    "discard", "keep", "agg", *_CLUSTER_TGT_POLICIES,
+    "discard", "discard_intervals", "keep", "agg", *_CLUSTER_TGT_POLICIES,
 }
 
 _EMPTY_CHAIN_COLS = [
@@ -430,26 +430,17 @@ def _handle_src_overlaps_python(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         return df
 
     if policy == "discard":
-        # R parity (rdbinterval.cpp:820-841): mark each consecutive pair that
-        # overlaps on the same chromsrc. Strictly weaker than whole-cluster
-        # discard - a row nested inside a larger row with a gap to its prev
-        # neighbor stays kept. Replaces the prior _discard_overlapping_intervals
-        # whole-cluster call which over-discarded on nested-with-gap inputs.
-        n = len(df)
-        if n < 2:
-            return df
-        chroms = df["chromsrc"].to_numpy()
-        starts = df["startsrc"].to_numpy(dtype=np.int64, copy=False)
-        ends = df["endsrc"].to_numpy(dtype=np.int64, copy=False)
-        pair_overlap = (chroms[1:] == chroms[:-1]) & (ends[:-1] > starts[1:])
-        discard_mask = np.zeros(n, dtype=bool)
-        if pair_overlap.any():
-            idx = np.flatnonzero(pair_overlap)
-            discard_mask[idx] = True
-            discard_mask[idx + 1] = True
-        if discard_mask.any():
-            return df.loc[~discard_mask].reset_index(drop=True)
-        return df
+        # Keep only the source bases a single chain interval covers (R misha
+        # 5.18.0): a chain interval maps the same way read from either side, so
+        # trim the target side of the rows with the two sides swapped.
+        swap = {"chrom": "chromsrc", "chromsrc": "chrom", "start": "startsrc",
+                "startsrc": "start", "end": "endsrc", "endsrc": "end"}
+        out = _handle_tgt_overlaps_auto(df.rename(columns=swap), "discard").rename(columns=swap)
+        return out[_EMPTY_CHAIN_COLS].sort_values(
+            ["chromsrc", "startsrc", "endsrc"], kind="stable").reset_index(drop=True)
+
+    if policy == "discard_intervals":
+        return _discard_overlapping_intervals(df, "chromsrc", "startsrc", "endsrc")
 
     raise ValueError(f"Unknown src_overlap_policy: {policy}")
 
@@ -480,10 +471,10 @@ def _handle_tgt_overlaps_python(df: pd.DataFrame, policy: str) -> pd.DataFrame:
                 )
         return df
 
-    if policy == "discard":
+    if policy == "discard_intervals":
         return _discard_overlapping_intervals(df, "chrom", "start", "end")
 
-    if policy in ("auto_score", "auto_first", "auto_longer"):
+    if policy in ("auto_score", "auto_first", "auto_longer", "discard"):
         return _handle_tgt_overlaps_auto(df, policy)
 
     if policy == "agg":
@@ -629,6 +620,7 @@ def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
     auto_score: highest score wins (tiebreak: longer span, lower chain_id)
     auto_first: lowest chain_id wins
     auto_longer: longest span wins (tiebreak: higher score, lower chain_id)
+    discard: a segment several intervals cover maps nowhere
 
     Uses vectorized numpy operations for breakpoint segmentation, winner
     selection, and adjacent merging.
@@ -687,7 +679,7 @@ def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
                     -scores, -spans.astype(np.float64), chain_ids.astype(np.float64),
                     idx_arr.astype(np.float64),
                 ))
-            elif policy == "auto_first":
+            elif policy in ("auto_first", "discard"):
                 prio_keys = np.column_stack((
                     chain_ids.astype(np.float64), idx_arr.astype(np.float64),
                 ))
@@ -719,8 +711,8 @@ def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
             # Map back to original indices
             winner_orig = sort_order[first_true]  # (n_segs,)
 
-            # Filter segments with no covering interval
-            valid = has_any
+            # Filter segments with no covering interval ("discard": or several)
+            valid = has_any if policy != "discard" else covers.sum(axis=1) == 1
             if not valid.any():
                 continue
 
@@ -785,17 +777,25 @@ def _handle_tgt_overlaps_auto(df: pd.DataFrame, policy: str) -> pd.DataFrame:
         if ns == 0:
             continue
 
-        # A new group starts where chain_id changes, tgt is not adjacent,
-        # OR src is not adjacent (R-parity: rdbinterval.cpp:889-902 requires
-        # `prev.end_src == slice.start_src` for the merge to fire). The src
-        # check matters only for negative-strand chains, whose slices have
-        # reversed src coords across consecutive tgt segments.
+        # A new group starts where the interval changes or tgt or src is not
+        # adjacent, as R's append_slice merges: on a reversed interval the next
+        # tgt segment lies just before the previous one in src coordinates.
+        # "discard" merges nothing: it keeps the pieces it is given, so as the
+        # source-side pass it leaves the "agg" pieces of the target pass apart.
         new_group = np.ones(ns, dtype=bool)
-        if ns > 1:
+        if ns > 1 and policy != "discard":
+            src_adjacent = np.where(
+                seg_strands[1:] == 0,
+                seg_src_starts[1:] == seg_src_ends[:-1],
+                seg_src_ends[1:] == seg_src_starts[:-1],
+            )
             new_group[1:] = (
                 (seg_chain_ids[1:] != seg_chain_ids[:-1])
+                | (seg_strands[1:] != seg_strands[:-1])
+                | (seg_chromsrc[1:] != seg_chromsrc[:-1])
+                | (seg_strandsrc[1:] != seg_strandsrc[:-1])
                 | (seg_starts_v[1:] != seg_ends_v[:-1])
-                | (seg_src_starts[1:] != seg_src_ends[:-1])
+                | ~src_adjacent
             )
 
         group_ids = np.cumsum(new_group) - 1
@@ -869,7 +869,7 @@ def _sweep_line_winners(
     if policy == "auto_score":
         def prio(idx: int) -> Any:
             return (-float(scores[idx]), -int(spans[idx]), int(chain_ids[idx]), int(idx))
-    elif policy == "auto_first":
+    elif policy in ("auto_first", "discard"):
         def prio(idx: int) -> Any:
             return (int(chain_ids[idx]), int(idx))
     else:  # auto_longer
@@ -892,7 +892,7 @@ def _sweep_line_winners(
             active.add(idx)
             heapq.heappush(heap, (prio(idx), idx))
 
-        if next_coord <= coord or not active:
+        if next_coord <= coord or not active or (policy == "discard" and len(active) > 1):
             continue
 
         while heap and heap[0][1] not in active:
@@ -1235,6 +1235,26 @@ def _chain_from_r(chain: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _apply_chain_policies(chain: pd.DataFrame, src_overlap_policy: str,
+                          tgt_overlap_policy: str) -> pd.DataFrame:
+    """Resolve the overlaps of a chain (internal strands) as R's liftover does before
+    it maps: source overlaps first, then target overlaps, as gintervals_load_chain,
+    by the policies the chain carries or, for a chain that carries none, the
+    arguments. A chain from gintervals_load_chain is resolved already and does not
+    change."""
+    attrs = dict(chain.attrs)
+    if "src_overlap_policy" in attrs and "tgt_overlap_policy" in attrs:
+        src_overlap_policy = attrs["src_overlap_policy"]
+        tgt_overlap_policy = attrs["tgt_overlap_policy"]
+    dtypes = {"chrom": object, "chromsrc": object, "score": np.float64}
+    d = {c: chain[c].to_numpy(dtype=dtypes.get(c, np.int64)) for c in _EMPTY_CHAIN_COLS}
+    d = _resolve_chain_overlaps(d, src_overlap_policy, tgt_overlap_policy)
+    out = pd.DataFrame(d)[_EMPTY_CHAIN_COLS]
+    out.attrs = attrs | {"src_overlap_policy": src_overlap_policy,
+                         "tgt_overlap_policy": tgt_overlap_policy}
+    return out
+
+
 def _check_chain_src(chain: pd.DataFrame, path: str, src_groot: str) -> None:
     """R's src_groot check: the chains' source chromosomes exist in that
     database and their source ends fit (the session's database is restored)."""
@@ -1302,8 +1322,10 @@ def gintervals_load_chain(
           detected.
         - ``"keep"`` -- allow one source interval to map to multiple target
           intervals.
-        - ``"discard"`` -- remove all chain intervals involved in source
-          overlaps.
+        - ``"discard"`` -- remove the source bases covered by more than one
+          chain interval, keeping the rest of each chain interval.
+        - ``"discard_intervals"`` -- remove all chain intervals involved in
+          source overlaps.
     tgt_overlap_policy : str, optional
         Policy for handling target-side overlaps. One of:
 
@@ -1318,8 +1340,10 @@ def gintervals_load_chain(
         - ``"auto_first"`` -- segment and select the chain with the lowest
           chain_id per segment.
         - ``"keep"`` -- preserve all overlapping intervals.
-        - ``"discard"`` -- remove all chain intervals involved in target
-          overlaps.
+        - ``"discard"`` -- remove the target bases covered by more than one
+          chain interval, keeping the rest of each chain interval.
+        - ``"discard_intervals"`` -- remove all chain intervals involved in
+          target overlaps.
         - ``"agg"`` -- segment overlaps into disjoint sub-regions, retaining
           all contributing chains per region for downstream aggregation.
         - ``"best_source_cluster"`` -- cluster chains by source overlap and
@@ -1458,15 +1482,18 @@ def gintervals_as_chain(
         ``startsrc``, ``endsrc``, ``strandsrc``, ``chain_id``, ``score``.
     src_overlap_policy : str, optional
         Policy for handling source-side overlaps. One of ``"error"``
-        (default), ``"keep"``, or ``"discard"``. This value is stored as a
-        DataFrame attribute but does not trigger overlap resolution.
+        (default), ``"keep"``, ``"discard"`` or ``"discard_intervals"`` (see
+        ``gintervals_load_chain``). It is stored as a DataFrame attribute;
+        ``gintervals_liftover`` and ``gtrack_liftover`` resolve the chain's
+        overlaps by it.
     tgt_overlap_policy : str, optional
         Policy for handling target-side overlaps. One of ``"error"``,
         ``"auto"`` (default, alias for ``"auto_score"``), ``"auto_score"``,
         ``"auto_longer"``, ``"auto_first"``, ``"keep"``, ``"discard"``,
-        ``"agg"``, ``"best_source_cluster"``, ``"best_cluster_union"``,
-        ``"best_cluster_sum"``, ``"best_cluster_max"``. Stored as a
-        DataFrame attribute.
+        ``"discard_intervals"``, ``"agg"``, ``"best_source_cluster"``,
+        ``"best_cluster_union"``, ``"best_cluster_sum"``,
+        ``"best_cluster_max"``. Stored as a DataFrame attribute, and used as
+        *src_overlap_policy* is.
     min_score : float, optional
         Minimum alignment score threshold to record as a DataFrame attribute.
         Does not filter the data; the value is stored for informational use
@@ -1934,7 +1961,9 @@ def gintervals_liftover(
     When *chain* is a file path, it is loaded with the specified overlap
     policies. When it is a pre-loaded DataFrame (from ``gintervals_load_chain``
     or ``gintervals_as_chain``), the policies stored in its attributes are
-    used and the policy arguments here are ignored.
+    used and the policy arguments here are ignored; a DataFrame without them
+    takes the arguments. As in R misha, the chain's target overlaps and then
+    its source overlaps are resolved by these policies before mapping.
 
     Parameters
     ----------
@@ -1946,13 +1975,14 @@ def gintervals_liftover(
         Either a path to a UCSC chain file (loaded via
         ``gintervals_load_chain``) or a pre-loaded chain DataFrame.
     src_overlap_policy : str, optional
-        Source overlap policy, used only when *chain* is a file path.
-        One of ``"error"`` (default), ``"keep"``, or ``"discard"``.
+        Source overlap policy, used when *chain* is a file path or a
+        DataFrame that carries no policies. One of ``"error"`` (default),
+        ``"keep"``, ``"discard"`` or ``"discard_intervals"``.
     tgt_overlap_policy : str, optional
-        Target overlap policy, used only when *chain* is a file path.
+        Target overlap policy, used as *src_overlap_policy* is.
         One of ``"error"``, ``"auto"`` (default), ``"auto_score"``,
         ``"auto_longer"``, ``"auto_first"``, ``"keep"``, ``"discard"``,
-        ``"agg"``, ``"best_source_cluster"``, ``"best_cluster_union"``,
+        ``"discard_intervals"``, ``"agg"``, ``"best_source_cluster"``, ``"best_cluster_union"``,
         ``"best_cluster_sum"``, ``"best_cluster_max"``.
     min_score : float, optional
         Minimum chain alignment score, used only when *chain* is a file
@@ -2073,17 +2103,19 @@ def gintervals_liftover(
         # a target chromosome named by an alias (such as "1" for chr1) is the
         # database's chromosome, as in misha
         chain_df = _preloaded_chain(chain, min_score)
-    chain_df = _chain_from_r(chain_df)
+    given = _chain_from_r(chain_df)
+    chain_df = _apply_chain_policies(given, src_overlap_policy, tgt_overlap_policy)
 
     if "chrom1" in intervals.columns:
         return _liftover_2d(intervals, chain_df)
 
     # intervals on chromosomes the chain does not have map nowhere; none at all
-    # on one is more likely a naming mismatch, which R warns about
+    # on one is more likely a naming mismatch, which R warns about (for the chain
+    # as given, before its overlaps are resolved)
     no_src_chrom = bool(len(intervals)) and not set(intervals["chrom"].astype(str)) & set(
-        chain_df["chromsrc"].astype(str))
+        given["chromsrc"].astype(str))
     if no_src_chrom:
-        _warn_no_source_chrom(chain_df)
+        _warn_no_source_chrom(given)
 
     if chain_df.empty or no_src_chrom:
         cols = ["chrom", "start", "end", "intervalID", "chain_id"]
@@ -2131,7 +2163,7 @@ def gintervals_liftover(
     if value_col is not None:
         result = _aggregate_lifted(
             result, value_col, multi_target_agg, na_rm, min_n, nth, include_metadata,
-            drop_ids=tgt_overlap_policy == "agg",
+            drop_ids=effective_tgt_policy == "agg",
         )
 
     # Canonic merging: merge adjacent target blocks from same intervalID + chain_id
@@ -2310,7 +2342,8 @@ def _aggregate_lifted(
                 continue
             s, e = int(breaks[k]), int(breaks[k + 1])
             contribs = [
-                {"value": vals[i], "overlap_len": float(e - s), "coverage_frac": 1.0, "start": s, "end": e,
+                {"value": vals[i], "overlap_len": float(e - s), "coverage_frac": 1.0,
+                 "start": int(starts[i]), "end": int(ends[i]),
                  "is_na": bool(np.isnan(vals[i])), "chain_id": (int(cids[i]) << 32) ^ int(iids[i])}
                 for i in idx
             ]
@@ -2412,7 +2445,7 @@ def _refuse_cluster_policy(chain: pd.DataFrame, tgt_overlap_policy: str) -> None
     if policy in _CLUSTER_TGT_POLICIES:
         raise ValueError(
             f"tgt_overlap_policy = '{policy}' is only supported by gintervals.liftover(), "
-            "not gtrack.liftover(). Use 'auto', 'agg', 'keep', or 'discard'."
+            "not gtrack.liftover(). Use 'auto', 'agg', 'keep', 'discard', or 'discard_intervals'."
         )
 
 
@@ -2797,8 +2830,10 @@ def _aggregate_value_for_bin(
         mid = n // 2
         return float((vs[mid - 1] + vs[mid]) / 2.0 if n % 2 == 0 else vs[mid])
     if agg_name in ("first", "last", "nth"):
-        # Sort by (start asc, end asc, value desc) matching R ordering.
-        sorted_v = sorted(valid, key=lambda c: (c["start"], c["end"], -c["value"]))
+        # R's contribution_order: where the lifted piece lies (start, end), then chain_id
+        # (pieces that coincide, as on an overlap "agg" cut out of both chains, or two source
+        # bins landing on one target bin), then value, larger first
+        sorted_v = sorted(valid, key=lambda c: (c["start"], c["end"], c["chain_id"], -c["value"]))
         if agg_name == "first":
             return float(sorted_v[0]["value"])
         if agg_name == "last":
@@ -2836,9 +2871,9 @@ def _aggregate_per_bin_python(
     collect (value, overlap_len, chain_id) contributions from every interval
     overlapping [bin_start, bin_end), in R's order (start, end, chain_id,
     value). Merge contributions sharing the same chain_id (sum overlap_len).
-    Apply the agg function. Emit one row per bin: a bin with no contributions
-    gets what R's aggregate_values gives it (NaN, or 0 for "count" without
-    min_n), and a chrom with none at all is NaN throughout, as R writes it.
+    Apply the agg function. Emit one row per bin: a bin with no contributions,
+    also on a chrom with none at all, gets what R's aggregate_values gives it
+    (NaN, or 0 for "count" without min_n), as R 5.18.0 writes it.
 
     intervals_df must have columns chrom, start, end, value, chain_id.
     """
@@ -2898,16 +2933,14 @@ def _aggregate_per_bin_python(
                         "value": v,
                         "overlap_len": float(ovl_e - ovl_s),
                         "coverage_frac": float(ovl_e - ovl_s) / float(be - bs),
-                        "start": ovl_s,
-                        "end": ovl_e,
+                        "start": s_k,
+                        "end": e_k,
                         "is_na": bool(np.isnan(v)),
                         "chain_id": int(cids[k]),
                     })
                 k += 1
 
-            v_out = (_aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)
-                     if n_iv else float("nan"))
-            out_rows.append((chrom, bs, be, v_out))
+            out_rows.append((chrom, bs, be, _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)))
 
     return pd.DataFrame(out_rows, columns=["chrom", "start", "end", "value"])
 
@@ -3034,12 +3067,13 @@ def _aggregate_overlapping(
     """The intervals of a sparse lifted track, as R's gtrack.liftover writes them.
 
     *intervals_df* holds the lifted pieces: chrom, start, end, value and key
-    (``_agg_key``). Per chromosome, in (start, end, key, value) order, every
-    run of overlapping pieces becomes one interval, valued by R's
-    aggregate_values over the run (``_aggregate_value_for_bin``): a piece
-    counts its whole length, pieces sharing a key count once, and a NaN value
-    is kept, so a run of NaN source values gives a NaN interval. Touching
-    pieces are not merged.
+    (``_agg_key``). Per chromosome, in (start, end, key, value) order, the
+    pieces are cut at their boundaries and each segment some piece covers
+    becomes one interval, valued by R's aggregate_values over the pieces
+    covering it (``_aggregate_value_for_bin``), as gintervals_liftover
+    (value_col=) gives: pieces sharing a key count once, and a NaN value is
+    kept, so a segment of NaN source values gives a NaN interval. Gaps give no
+    interval, and equal neighbours are not merged (R misha 44ecd8d5).
 
     Runs through the C++ ``pm_liftover_aggregate``; ``_force_pure_python``
     runs the same steps in Python.
@@ -3067,20 +3101,22 @@ def _aggregate_overlapping(
         ends = group["end"].to_numpy(dtype=np.int64)
         vals = group["value"].to_numpy(dtype=np.float64)
         keys = group["key"].to_numpy(dtype=np.int64)
-        i, n = 0, len(group)
-        while i < n:
-            run_start, run_end = int(starts[i]), int(ends[i])
-            contribs = []
-            while i < n and starts[i] < run_end:
-                run_end = max(run_end, int(ends[i]))
-                v = float(vals[i])
-                contribs.append({
-                    "value": v, "overlap_len": float(ends[i] - starts[i]), "coverage_frac": 1.0,
-                    "start": int(starts[i]), "end": int(ends[i]), "is_na": math.isnan(v),
-                    "chain_id": int(keys[i]),
-                })
-                i += 1
-            rows.append((str(chrom), run_start, run_end,
+        # sweep the segments between consecutive boundaries, keeping the pieces that
+        # overlap the current one; a piece overlapping a segment covers all of it
+        breaks = np.unique(np.concatenate((starts, ends))).tolist()
+        nxt, active, n = 0, [], len(group)
+        for seg_start, seg_end in zip(breaks[:-1], breaks[1:], strict=True):
+            while nxt < n and starts[nxt] < seg_end:
+                active.append(nxt)
+                nxt += 1
+            active = [i for i in active if ends[i] > seg_start]
+            if not active:
+                continue
+            contribs = [{
+                "value": float(vals[i]), "overlap_len": float(seg_end - seg_start), "coverage_frac": 1.0,
+                "start": int(starts[i]), "end": int(ends[i]), "is_na": math.isnan(vals[i]), "chain_id": int(keys[i]),
+            } for i in active]
+            rows.append((str(chrom), seg_start, seg_end,
                          _aggregate_value_for_bin(contribs, agg_name, na_rm, min_n, nth_index)))
     return pd.DataFrame(rows, columns=["chrom", "start", "end", "value"])
 
@@ -3200,6 +3236,7 @@ def gtrack_liftover(
         chain = _preloaded_chain(chain, min_score)   # an alias names the database's chromosome
     chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
+    chain = _apply_chain_policies(chain, src_overlap_policy, tgt_overlap_policy)
 
     chain_dict = {
         "chrom":     chain["chrom"].to_numpy(dtype=object),
@@ -3287,7 +3324,10 @@ def _gtrack_liftover_python(
 
     When *chain* is a file path it is loaded with the specified overlap
     policies. When it is a pre-loaded DataFrame the policies stored in its
-    attributes are used and the policy arguments here are ignored.
+    attributes are used and the policy arguments here are ignored; a
+    DataFrame without them takes the arguments. As in R misha, the chain's
+    target overlaps and then its source overlaps are resolved by these
+    policies before mapping.
 
     Parameters
     ----------
@@ -3304,13 +3344,14 @@ def _gtrack_liftover_python(
         Either a path to a UCSC chain file or a pre-loaded chain DataFrame
         as returned by ``gintervals_load_chain``.
     src_overlap_policy : str, optional
-        Source overlap policy, used only when *chain* is a file path.
-        One of ``"error"`` (default), ``"keep"``, or ``"discard"``.
+        Source overlap policy, used when *chain* is a file path or a
+        DataFrame that carries no policies. One of ``"error"`` (default),
+        ``"keep"``, ``"discard"`` or ``"discard_intervals"``.
     tgt_overlap_policy : str, optional
-        Target overlap policy, used only when *chain* is a file path.
+        Target overlap policy, used as *src_overlap_policy* is.
         One of ``"error"``, ``"auto"`` (default), ``"auto_score"``,
         ``"auto_longer"``, ``"auto_first"``, ``"keep"``, ``"discard"``,
-        ``"agg"``. The cluster policies (``"best_source_cluster"``,
+        ``"discard_intervals"``, ``"agg"``. The cluster policies (``"best_source_cluster"``,
         ``"best_cluster_union"``, ``"best_cluster_sum"``,
         ``"best_cluster_max"``) are refused, here or in a pre-loaded chain,
         as in R misha: they are for ``gintervals_liftover`` only.
@@ -3323,6 +3364,8 @@ def _gtrack_liftover_python(
         ``"min.coverage_frac"``. The coverage aggregations take the value
         of the contributor that covers the most (least) of the locus, by
         length or by fraction of the locus; a tie goes to the higher value.
+        On a dense track ``"count"`` gives 0 in a bin that nothing lands in
+        (NaN if *min_n* is above 0), where the other aggregations give NaN.
     params : int or dict, optional
         The ``n`` of ``"nth"`` aggregation (1-based), given as is or as
         ``{"n": n}``. Required for ``"nth"`` and not allowed otherwise.
@@ -3403,13 +3446,13 @@ def _gtrack_liftover_python(
             min_score=min_score,
         )
     elif isinstance(chain, pd.DataFrame):
-        # Pre-loaded chain — policies are already baked in. An alias names the
-        # database's chromosome.
+        # Pre-loaded chain: an alias names the database's chromosome.
         chain = _preloaded_chain(chain, min_score)
     else:
         raise TypeError("chain must be a file path string or a chain DataFrame")
     chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
+    chain = _apply_chain_policies(chain, src_overlap_policy, tgt_overlap_policy)
 
     # Read source track
     src_type, src_data = _read_source_track(src_track_dir)
@@ -3572,6 +3615,7 @@ def _gtrack_liftover_2d(
         chain = _preloaded_chain(chain, min_score)   # an alias names the database's chromosome
     chain = _chain_from_r(chain)
     _refuse_cluster_policy(chain, tgt_overlap_policy)
+    chain = _apply_chain_policies(chain, src_overlap_policy, tgt_overlap_policy)
 
     effective_tgt_policy = chain.attrs.get("tgt_overlap_policy", tgt_overlap_policy)
     chain_dict = {

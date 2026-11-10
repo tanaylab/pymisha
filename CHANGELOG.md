@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.20.0 (2026-11-10)
+
+Follows R misha 5.18.0. Several results change; recompute anything that depends on them.
+
+### Breaking
+
+* `src_overlap_policy="discard"` and `tgt_overlap_policy="discard"` (`gintervals_load_chain`, `gintervals_liftover`, `gtrack_liftover`) drop only the bases that more than one chain interval covers and keep the rest of each interval. They dropped whole intervals, and since 0.1.91 the source side missed overlaps between intervals that are not adjacent in source order, so some bases aligned twice were lifted to one place.
+* `gintervals_liftover` and `gtrack_liftover` resolve the overlaps of a pre-loaded chain (source, then target, as `gintervals_load_chain`) by the policies it carries, or by the arguments for a chain that carries none, as R. A chain from `gintervals_as_chain` or a plain DataFrame was used as given, so all of its overlapping intervals mapped; with the default `src_overlap_policy="error"`, a plain DataFrame with source overlaps is now an error.
+* `gtrack_liftover` of a sparse track: where lifted pieces overlap in the target, they are cut at their boundaries and each segment gets the `multi_target_agg` of the pieces that cover it, as `gintervals_liftover(value_col=)` gives and as R misha now does. The whole run of overlapping pieces was one interval with one value, so a position one piece covers got the values of the others too.
+* `gintervals_liftover(value_col=)` and `gtrack_liftover` with `multi_target_agg="first"`, `"last"` or `"nth"` order the lifted pieces by where they lie, then by chain id (pieces that coincide, as on an overlap `"agg"` cut out or two source bins landing on one target bin, go by the lower chain id), as R misha 5.18.0. Pieces that both cover a segment or a bin were ordered by value, so `"first"` gave the larger value and `"last"` the smaller.
+* 2D virtual tracks `avg`, `min`, `max` and `weighted.sum`, and a 2D track expression, skip NaN cells, as the 1D summarizers do and as R misha now does, and are NaN only when no cell with a value overlaps the interval; `avg` is the mean over the area that has a value, and `area` still counts NaN cells. `min` and `max` depended on where a NaN cell sat (and on the node statistics stored in the file), and `avg` and `weighted.sum` were NaN. Tracks already on disk are read right without rewriting them.
+* `gtrack_liftover` of a dense track with `multi_target_agg="count"`: a bin nothing lands in is 0 on every chromosome, as on the chromosomes something lands on, and as R misha 5.18.0; it was NaN on a chromosome nothing lands on. With `min_n` above 0 it is NaN.
+* `gseq_kmer` counts as the `kmer.count` and `kmer.frac` virtual tracks and R misha 5.18.0 do. With `strand=0` the two strands are summed (a palindromic k-mer counts twice per site, with the vtracks' warning) and `frac` divides by the starts of both; a start used to count once. `extend` lets a match run past `end_pos` only (`True` is k - 1 bases, an integer that many) and never moves the first start before `start_pos`; it widened the starts on both sides. With `skip_gaps`, `extend` counts non-gap bases.
+* `gseq_pwm`: `extend` lets a window run past `end_pos` only (`True` is w - 1 bases, an integer that many; non-gap bases with `skip_gaps`), as the pwm virtual tracks and R misha 5.18.0 do, in every mode; it widened the starts on both sides, so a motif starting before `start_pos` was scored. `start_pos` and `end_pos` take one value per sequence, as R's.
+* `pwm.count` and `gseq_pwm(mode="count")` give NaN where there is nothing to count, as the other pwm functions and R misha 5.18.0 do: a `pwm.count` interval at a chromosome end that leaves no room for the motif, and a sequence or ROI with no window (shorter than the motif, `start_pos` past `end_pos`, `spat_min` past the last start, fewer non-gap bases than the motif). They gave 0; an all-N sequence still counts 0. A None sequence gives NaN in every mode of `gseq_pwm`.
+
+### Features
+
+* New overlap policy `"discard_intervals"`, on both sides, drops every chain interval involved in an overlap.
+
+### Fixes
+
+* `tgt_overlap_policy="auto*"`: a minus-strand chain interval that wins an overlap comes back as one interval instead of several.
+
 ## v0.19.1 (2026-11-09)
 
 ### Fixes

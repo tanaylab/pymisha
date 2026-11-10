@@ -1,9 +1,10 @@
 """pm_liftover_aggregate: the sparse target of gtrack_liftover, as R's GTrackLiftover.cpp.
 
-Per chromosome every run of overlapping intervals becomes one interval, valued
-by R's aggregate_values over the run: an interval counts its whole length,
-intervals sharing a key count once, and a NaN result is kept. Touching
-intervals are not merged. The end-to-end comparison with R is in
+Per chromosome the intervals are cut at their boundaries, and each segment some
+interval covers gets R's aggregate_values over the intervals covering it, as
+gintervals_liftover(value_col=) does (R misha 44ecd8d5): intervals sharing a
+key count once, and a NaN result is kept. Gaps give no segment, and equal
+neighbouring segments are not merged. The end-to-end comparison with R is in
 test_liftover_1d_r_parity.py.
 """
 
@@ -41,68 +42,71 @@ def test_single_interval_passthrough():
 
 @pytest.mark.parametrize("agg, value", [
     ("mean", 3.0), ("sum", 6.0), ("min", 2.0), ("max", 4.0), ("count", 2.0), ("median", 3.0),
-    ("first", 2.0), ("last", 4.0),
 ])
-def test_overlapping_run_is_one_interval(agg, value):
-    # [100,200)=2 and [150,250)=4 overlap: R writes [100,250)
+def test_overlap_is_cut_into_segments(agg, value):
+    # [100,200)=2 and [150,250)=4 overlap on [150,200) only
+    one = 1.0 if agg == "count" else None
     _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [2.0, 4.0], agg_type=agg),
-          [("chr1", 100, 250, value)])
+          [("chr1", 100, 150, one or 2.0), ("chr1", 150, 200, value), ("chr1", 200, 250, one or 4.0)])
 
 
 def test_contained_interval():
-    _same(_call(["chr1", "chr1"], [100, 200], [500, 300], [2.0, 10.0]), [("chr1", 100, 500, 6.0)])
+    _same(_call(["chr1", "chr1"], [100, 200], [500, 300], [2.0, 10.0]),
+          [("chr1", 100, 200, 2.0), ("chr1", 200, 300, 6.0), ("chr1", 300, 500, 2.0)])
 
 
-def test_touching_intervals_are_not_merged():
-    # [100,200) and [200,300) touch, so they are two runs; the second averages 2 and 3
-    _same(_call(["chr1"] * 3, [100, 200, 200], [200, 300, 300], [1.0, 2.0, 3.0], agg_type="median"),
-          [("chr1", 100, 200, 1.0), ("chr1", 200, 300, 2.5)])
+def test_touching_intervals_and_gaps():
+    # [100,200) and [200,300) touch, so they are two segments; the second averages 2 and 3.
+    # Nothing covers [300,400), and the equal segments around it stay apart.
+    _same(_call(["chr1"] * 5, [100, 200, 200, 250, 400], [200, 300, 300, 300, 500], [1.0, 2.0, 3.0, 2.5, 2.5],
+                agg_type="median"),
+          [("chr1", 100, 200, 1.0), ("chr1", 200, 250, 2.5), ("chr1", 250, 300, 2.5), ("chr1", 400, 500, 2.5)])
 
 
 def test_nth():
-    # in (start, end) order: 10, 20
+    # within a segment the pieces are in R's order: the one that starts first first
     _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="nth", nth_index=2),
-          [("chr1", 100, 250, 20.0)])
-    _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [10.0, 20.0], agg_type="nth", nth_index=3),
-          [("chr1", 100, 250, np.nan)])
+          [("chr1", 100, 150, np.nan), ("chr1", 150, 200, 20.0), ("chr1", 200, 250, np.nan)])
+    _same(_call(["chr1", "chr1"], [100, 150], [200, 250], [20.0, 10.0], agg_type="nth", nth_index=2),
+          [("chr1", 100, 150, np.nan), ("chr1", 150, 200, 10.0), ("chr1", 200, 250, np.nan)])
 
 
 def test_nan_is_kept():
-    # a NaN interval stretches the run, and a run of NaN alone is a NaN interval
+    # a segment of NaN values alone is a NaN interval
     nan = float("nan")
-    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan]),
-          [("chr1", 100, 250, 2.0), ("chr1", 400, 500, np.nan)])
-    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan], agg_type="count"),
-          [("chr1", 100, 250, 1.0), ("chr1", 400, 500, 0.0)])
-    _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan], na_rm=False),
-          [("chr1", 100, 250, np.nan), ("chr1", 400, 500, np.nan)])
+    args = (["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, nan, nan])
+    _same(_call(*args),
+          [("chr1", 100, 150, 2.0), ("chr1", 150, 200, 2.0), ("chr1", 200, 250, np.nan), ("chr1", 400, 500, np.nan)])
+    _same(_call(*args, agg_type="count"),
+          [("chr1", 100, 150, 1.0), ("chr1", 150, 200, 1.0), ("chr1", 200, 250, 0.0), ("chr1", 400, 500, 0.0)])
+    _same(_call(*args, na_rm=False),
+          [("chr1", 100, 150, 2.0), ("chr1", 150, 200, np.nan), ("chr1", 200, 250, np.nan), ("chr1", 400, 500, np.nan)])
 
 
 def test_min_n():
     _same(_call(["chr1"] * 3, [100, 150, 400], [200, 250, 500], [2.0, 4.0, 1.0], min_n=2),
-          [("chr1", 100, 250, 3.0), ("chr1", 400, 500, np.nan)])
+          [("chr1", 100, 150, np.nan), ("chr1", 150, 200, 3.0), ("chr1", 200, 250, np.nan),
+           ("chr1", 400, 500, np.nan)])
 
 
 def test_key_counts_once():
-    # [0,50) and [50,100) are one source interval (key 1) and [20,80) another
-    args = (["chr1"] * 3, [0, 20, 50], [50, 80, 100], [4.0, 10.0, 4.0])
-    _same(_call(*args, agg_type="count", key=[1, 2, 1]), [("chr1", 0, 100, 2.0)])
-    _same(_call(*args, agg_type="mean", key=[1, 2, 1]), [("chr1", 0, 100, 7.0)])
-    _same(_call(*args, agg_type="count"), [("chr1", 0, 100, 3.0)])
+    # two pieces of key 1 and one of key 2 on [0,50)
+    args = (["chr1"] * 3, [0, 0, 0], [50, 50, 50], [4.0, 4.0, 10.0])
+    _same(_call(*args, agg_type="count", key=[1, 1, 2]), [("chr1", 0, 50, 2.0)])
+    _same(_call(*args, agg_type="mean", key=[1, 1, 2]), [("chr1", 0, 50, 7.0)])
+    _same(_call(*args, agg_type="count"), [("chr1", 0, 50, 3.0)])
 
 
-@pytest.mark.parametrize("agg, value", [
-    ("max.coverage_len", 1.0), ("min.coverage_len", 5.0),
-    # every interval covers all of itself, so the fractions tie and the higher value wins
-    ("max.coverage_frac", 5.0), ("min.coverage_frac", 5.0),
-])
-def test_coverage(agg, value):
-    _same(_call(["chr1", "chr1"], [0, 50], [100, 120], [1.0, 5.0], agg_type=agg), [("chr1", 0, 120, value)])
+@pytest.mark.parametrize("agg", ["max.coverage_len", "min.coverage_len", "max.coverage_frac", "min.coverage_frac"])
+def test_coverage(agg):
+    # in [50,100) both intervals cover the whole segment, so the higher value wins
+    _same(_call(["chr1", "chr1"], [0, 50], [100, 120], [1.0, 5.0], agg_type=agg),
+          [("chr1", 0, 50, 1.0), ("chr1", 50, 100, 5.0), ("chr1", 100, 120, 5.0)])
 
 
 def test_multi_chrom():
     _same(_call(["chr2", "chr1", "chr1"], [100, 100, 150], [200, 200, 250], [5.0, 2.0, 4.0]),
-          [("chr1", 100, 250, 3.0), ("chr2", 100, 200, 5.0)])
+          [("chr1", 100, 150, 2.0), ("chr1", 150, 200, 3.0), ("chr1", 200, 250, 4.0), ("chr2", 100, 200, 5.0)])
 
 
 def test_empty_input():

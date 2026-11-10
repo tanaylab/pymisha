@@ -1119,21 +1119,25 @@ def _gextract_2d_vtrack_agg(
                 band=band,
             )
 
+            # area counts every cell, NaN ones too; the rest skip NaN cells and are
+            # NaN when no cell with a value is met (R misha a3a27ed3)
             occ = batch["occupied_area"]
+            valued = occ - batch["nan_area"]
             for j in range(m):
-                if occ[j] == 0:
-                    continue
                 idx = indices[j]
                 if func == "area":
                     values[idx] = float(occ[j])
-                elif func == "weighted.sum":
+                    continue
+                if valued[j] == 0:
+                    continue
+                if func == "weighted.sum":
                     values[idx] = float(batch["weighted_sum"][j])
                 elif func == "min":
                     values[idx] = float(batch["min_val"][j])
                 elif func == "max":
                     values[idx] = float(batch["max_val"][j])
                 elif func == "avg":
-                    values[idx] = float(batch["weighted_sum"][j]) / float(occ[j])
+                    values[idx] = float(batch["weighted_sum"][j]) / float(valued[j])
         finally:
             close_fn()
 

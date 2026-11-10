@@ -346,8 +346,8 @@ class TestPwmSpatialRangeEdges:
         for g in (True, False):
             for m in ("lse", "max", "pos"):
                 assert np.isnan(pm.gseq_pwm(seq, pssm, mode=m, spat_min=25, skip_gaps=g)).all(), (m, g)
-            np.testing.assert_array_equal(
-                pm.gseq_pwm(seq, pssm, mode="count", score_thresh=-1, spat_min=25, skip_gaps=g), [0])
+            # count too, as pwm.count: nothing to count (R misha 5.18.0)
+            assert np.isnan(pm.gseq_pwm(seq, pssm, mode="count", score_thresh=-1, spat_min=25, skip_gaps=g)).all(), g
             assert np.isnan(pm.gseq_pwm(seq, pssm, start_pos=5, spat_min=18, skip_gaps=g)).all(), g
         # the window [spat_min, spat_max] counts from start_pos
         s = seqs[0]

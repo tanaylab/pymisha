@@ -299,6 +299,23 @@ def test_gseq_pwm_edits_gives_no_row_for_a_non_acgt_sequence():  # R test-gseq-p
     assert len(pm.gseq_pwm_edits(["NC"], pssm, score_thresh=-1, prior=0)) == 0  # its one window holds N
 
 
+def test_gseq_pwm_edits_integer_extend_on_a_sequence():  # R test-gseq-pwm-edits.R, misha 5.18.0
+    """An integer extend on a sequence is how many bases a window may run past its end."""
+    pssm = np.array([[.97, .01, .01, .01], [.01, .97, .01, .01], [.01, .01, .97, .01], [.01, .01, .01, .97]])
+    thr = 4 * np.log(0.97) - 0.01
+
+    def ed(extend):
+        r = pm.gseq_pwm_edits("TTTTTTAC", pssm, score_thresh=thr, max_indels=2, extend=extend, prior=0,
+                              bidirect=False)
+        return r[["window_start", "n_edits"]].drop_duplicates().values.tolist()
+
+    # the AC at 7-8 needs G and T inserted past the end: 2 bases
+    assert ed(True) == [[7, 2]]
+    assert ed(2) == ed(True)
+    assert 7 not in [w for w, _ in ed(1)]
+    assert 7 not in [w for w, _ in ed(False)]
+
+
 def test_lse_edit_distance_leaves_out_n_windows(n_db):  # R :572
     s = n_db
     length, st = 8, 89  # windows 89..96: the N run at 100..105 cuts the last two

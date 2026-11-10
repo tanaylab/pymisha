@@ -294,9 +294,9 @@ def test_pwm_na_at_chrom_end():
     for fn in ("pwm", "pwm.max", "pwm.max.pos"):
         for kw in ({}, {"bidirect": False}, {"bidirect": False, "strand": -1}, {"spat_factor": [1, 2], "spat_bin": 2}):
             assert np.isnan(ext(fn, **kw)[0]), (fn, kw)
-    # documented: pwm.count reports 0 there
-    assert ext("pwm.count", score_thresh=-100) == [0]
-    assert ext("pwm.count", score_thresh=-100, bidirect=False) == [0]
+    # pwm.count too: nothing to count (R misha 5.18.0)
+    assert np.isnan(ext("pwm.count", score_thresh=-100)[0])
+    assert np.isnan(ext("pwm.count", score_thresh=-100, bidirect=False)[0])
 
     # 2 bp bins: the motif still fits from the first three
     pm.gvtrack_create("pwm_end", None, "pwm.max", pssm=pssm)

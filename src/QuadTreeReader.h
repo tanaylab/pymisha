@@ -195,14 +195,15 @@ struct DiagonalBand {
 // -------------------------------------------------------------------
 
 struct QueryStat {
-    int64_t occupied_area;
+    int64_t occupied_area;   // NaN-valued objects included
     double  weighted_sum;
     double  min_val;
     double  max_val;
+    int64_t nan_area;        // the part of occupied_area whose value is NaN
 
     QueryStat() : occupied_area(0), weighted_sum(0.0),
                   min_val(std::numeric_limits<double>::max()),
-                  max_val(-std::numeric_limits<double>::max()) {}
+                  max_val(-std::numeric_limits<double>::max()), nan_area(0) {}
 };
 
 struct QueryObjects {
@@ -314,12 +315,14 @@ struct BatchQueryStats {
     std::vector<double>  weighted_sum;
     std::vector<double>  min_val;
     std::vector<double>  max_val;
+    std::vector<int64_t> nan_area;
 
     void resize(size_t n) {
         occupied_area.resize(n, 0);
         weighted_sum.resize(n, 0.0);
         min_val.resize(n, std::numeric_limits<double>::quiet_NaN());
         max_val.resize(n, std::numeric_limits<double>::quiet_NaN());
+        nan_area.resize(n, 0);
     }
 };
 

@@ -120,11 +120,11 @@ class TestAggregateHelperRoundtrip:
             "value": np.array([1.0, 3.0], dtype=np.float64),
         }
         result = _pymisha.pm_liftover_aggregate(df, "mean", True, -1, 0)
-        # R merges the overlapping run into one interval: [100,250) -> mean(1,3)
-        assert list(result["chrom"]) == ["chr1"]
-        assert list(result["start"]) == [100]
-        assert list(result["end"])   == [250]
-        assert list(result["value"]) == [2.0]
+        # cut at the boundaries, as R: only [150,200) averages 1 and 3
+        assert list(result["chrom"]) == ["chr1"] * 3
+        assert list(result["start"]) == [100, 150, 200]
+        assert list(result["end"])   == [150, 200, 250]
+        assert list(result["value"]) == [1.0, 2.0, 3.0]
 
 
 class TestPmLiftoverTrackEndToEnd:

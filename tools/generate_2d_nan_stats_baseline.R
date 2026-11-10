@@ -1,11 +1,11 @@
-# Regenerate tests/test_data/stats_2d_nan from R misha (5.12.1 or later).
+# Regenerate tests/test_data/stats_2d_nan from R misha (5.18.0 or later).
 #
 # tests/test_2d_nan_stats_r_parity.py checks that pymisha reads 2D tracks with
-# NaN cells as R does: R adds a NaN cell to the statistics of any query that
-# covers it (area counted, weighted sum and avg NaN), and min / max follow the
-# order of R's tree walk. The tracks are R's own files (gzipped into the
-# fixture), since that order follows the quad tree, and the values R reads from
-# them are frozen in baseline.json, so the test needs no R. It also checks that
+# NaN cells as R does: avg, min, max and weighted.sum skip a NaN cell, area
+# counts it, and a node whose stored statistics hold a NaN is read object by
+# object. The tracks are R's own files (gzipped into the fixture), since the
+# nodes follow the quad tree, and the values R reads from them are frozen in
+# baseline.json, so the test needs no R. It also checks that
 # gtrack_2d_create writes R's bytes for rects with NaN values (rct_input.tsv,
 # whose SHA-256 per file R wrote is in baseline.json). Re-run only when the
 # cases change:

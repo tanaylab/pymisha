@@ -1,8 +1,9 @@
 // The aggregation of gtrack_liftover, as R's GTrackLiftover.cpp: a sparse
-// target merges every run of overlapping lifted intervals into one interval
-// (aggregate_overlapping_cpp), a dense target aggregates what lands in each bin
-// (aggregate_per_bin_cpp), both through R's aggregate_values
-// (aggregate_value_for_bin). pm_liftover_aggregate exposes the sparse one.
+// target cuts the lifted intervals at their boundaries and aggregates each
+// segment over the intervals covering it (aggregate_overlapping_cpp), a dense
+// target aggregates what lands in each bin (aggregate_per_bin_cpp), both through
+// R's aggregate_values (aggregate_value_for_bin). pm_liftover_aggregate exposes
+// the sparse one.
 
 #include "PMLiftoverAggregate.h"
 #include "pymisha.h"
@@ -67,6 +68,17 @@ PyObject *get_array(PyObject *df_dict, const char *key, int dtype)
 // ---------------------------------------------------------------------------
 // Per-bin aggregation
 // ---------------------------------------------------------------------------
+
+// R's contribution_order, the order of first, last and nth: where the lifted
+// piece lies (start, end), then chain_id (pieces that coincide, as on an overlap
+// "agg" cut out of both chains, or two source bins landing on one target bin),
+// then value, larger first.
+static bool contribution_order(const BinContribution *a, const BinContribution *b) {
+    if (a->start != b->start) return a->start < b->start;
+    if (a->end != b->end) return a->end < b->end;
+    if (a->chain_id != b->chain_id) return a->chain_id < b->chain_id;
+    return a->value > b->value;
+}
 
 // Mirrors AggregationHelpers.h::aggregate_values. Contributions sharing the same
 // chain_id are merged before the reduce step.
@@ -152,31 +164,19 @@ double aggregate_value_for_bin(
         case AggType::FIRST: {
             const BinContribution *first = *std::min_element(
                 valid.begin(), valid.end(),
-                [](const BinContribution *a, const BinContribution *b) {
-                    if (a->start != b->start) return a->start < b->start;
-                    if (a->end   != b->end)   return a->end   < b->end;
-                    return a->value > b->value;
-                });
+                contribution_order);
             return first->value;
         }
         case AggType::LAST: {
             const BinContribution *last = *std::max_element(
                 valid.begin(), valid.end(),
-                [](const BinContribution *a, const BinContribution *b) {
-                    if (a->start != b->start) return a->start < b->start;
-                    if (a->end   != b->end)   return a->end   < b->end;
-                    return a->value > b->value;
-                });
+                contribution_order);
             return last->value;
         }
         case AggType::NTH: {
             std::vector<const BinContribution *> sorted_v = valid;
             std::sort(sorted_v.begin(), sorted_v.end(),
-                [](const BinContribution *a, const BinContribution *b) {
-                    if (a->start != b->start) return a->start < b->start;
-                    if (a->end   != b->end)   return a->end   < b->end;
-                    return a->value > b->value;
-                });
+                contribution_order);
             if (nth_index <= 0)
                 return std::numeric_limits<double>::quiet_NaN();
             const size_t idx = (size_t)(nth_index - 1);
@@ -245,6 +245,44 @@ struct LiftedOrder {
     }
 };
 
+// R's LiftedPiecesSweep: finds the lifted pieces (rows, sorted in R's order) that
+// overlap each target locus, for loci visited left to right. active holds the
+// pieces that overlap the current locus, in the order of rows, and next the
+// first piece not yet reached, so each piece is looked at only while it
+// overlaps a locus.
+struct LiftedPiecesSweep {
+    const std::vector<size_t> &rows;
+    const std::vector<std::int64_t> &start, &end, &key;
+    const std::vector<double> &value;
+    size_t next = 0;
+    std::vector<size_t> active;
+
+    // Appends to state each piece that overlaps [s, e), weighed by its overlap,
+    // with coverage_frac = overlap / locus_len. s and e must not decrease from
+    // call to call.
+    void add_overlapping(std::int64_t s, std::int64_t e, double locus_len, std::vector<BinContribution> &state) {
+        while (next < rows.size() && start[rows[next]] < e)
+            active.push_back(rows[next++]);
+        active.erase(std::remove_if(active.begin(), active.end(), [&](size_t r) { return end[r] <= s; }),
+                     active.end());
+        for (size_t r : active) {
+            const std::int64_t ovl_s = std::max(s, start[r]);
+            const std::int64_t ovl_e = std::min(e, end[r]);
+            if (ovl_s >= ovl_e)
+                continue;
+            BinContribution c;
+            c.value = value[r];
+            c.overlap_len = (double)(ovl_e - ovl_s);
+            c.coverage_frac = locus_len > 0 ? c.overlap_len / locus_len : 0;
+            c.start = start[r];  // the piece's own place, by which first/last/nth order
+            c.end = end[r];
+            c.is_na = std::isnan(value[r]);
+            c.chain_id = key[r];
+            state.push_back(c);
+        }
+    }
+};
+
 }  // namespace
 
 void aggregate_overlapping_cpp(
@@ -278,31 +316,27 @@ void aggregate_overlapping_cpp(
         std::vector<size_t> &rows = kv.second;
         std::sort(rows.begin(), rows.end(), order);
 
-        // GTrackLiftover.cpp, SPARSE: a run of intervals each starting before the
-        // run's end so far becomes one interval. An interval counts its whole
-        // length (coverage fraction 1), and the pieces sharing a key count once.
-        size_t i = 0;
-        while (i < rows.size()) {
-            const int64_t run_start = in_start[rows[i]];
-            int64_t run_end = in_end[rows[i]];
+        // GTrackLiftover.cpp, SPARSE: cut the intervals at their boundaries and give
+        // each segment the aggregate of the intervals that cover it, as
+        // gintervals.liftover(value_col =) does; a gap between intervals is skipped.
+        std::vector<std::int64_t> breaks;
+        breaks.reserve(2 * rows.size());
+        for (size_t r : rows) {
+            breaks.push_back(in_start[r]);
+            breaks.push_back(in_end[r]);
+        }
+        std::sort(breaks.begin(), breaks.end());
+        breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+
+        LiftedPiecesSweep sweep{rows, in_start, in_end, in_key, in_value};
+        for (size_t b = 0; b + 1 < breaks.size(); ++b) {
             state.clear();
-            while (i < rows.size() && in_start[rows[i]] < run_end) {
-                const size_t r = rows[i];
-                run_end = std::max(run_end, in_end[r]);
-                BinContribution c;
-                c.value = in_value[r];
-                c.overlap_len = (double)(in_end[r] - in_start[r]);
-                c.coverage_frac = 1.0;
-                c.start = in_start[r];
-                c.end = in_end[r];
-                c.is_na = std::isnan(in_value[r]);
-                c.chain_id = in_key[r];
-                state.push_back(c);
-                ++i;
-            }
+            sweep.add_overlapping(breaks[b], breaks[b + 1], (double)(breaks[b + 1] - breaks[b]), state);
+            if (state.empty())
+                continue;
             out_chrom.push_back(kv.first);
-            out_start.push_back(run_start);
-            out_end.push_back(run_end);
+            out_start.push_back(breaks[b]);
+            out_end.push_back(breaks[b + 1]);
             out_value.push_back(aggregate_value_for_bin(state, agg, na_rm, min_n_or_negative, nth_index));
         }
     }
@@ -358,47 +392,21 @@ void aggregate_per_bin_cpp(
         }
 
         const int64_t end_bin = (chrom_size + bin_size - 1) / bin_size;  // ceil
-        // Cursor advances monotonically: past intervals ending at or before the
-        // current bin start (sorted by start, those cannot overlap this or any
-        // later bin). Intervals ending after bin start may still overlap a later
-        // bin, so they are re-scanned each bin. R 5.11.3: the old `iinterv = iter`
-        // over-advanced past a boundary-spanning contribution whenever an
-        // overlapping sibling shared its interval, dropping it from the next bin.
-        size_t iinterv = 0;
+        LiftedPiecesSweep sweep{idxs, in_start, in_end, in_chain_id, in_value};
+        std::vector<BinContribution> state;
 
         for (int64_t bin = 0; bin < end_bin; ++bin) {
             const int64_t bs = bin * bin_size;
             const int64_t be = std::min<int64_t>((bin + 1) * bin_size, chrom_size);
 
-            // Advance the cursor past intervals that end at or before this bin start.
-            while (iinterv < idxs.size() && in_end[idxs[iinterv]] <= bs) ++iinterv;
+            // every contribution overlapping [bs, be); the bin is clamped to the
+            // chromosome end, as R's locus_len
+            state.clear();
+            sweep.add_overlapping(bs, be, (double)(be - bs), state);
 
-            // Collect every contribution overlapping [bs, be). Sorted by start, so
-            // stop as soon as an interval starts at or after the bin end.
-            std::vector<BinContribution> state;
-            for (size_t iter = iinterv; iter < idxs.size(); ++iter) {
-                const size_t i = idxs[iter];
-                if (in_start[i] >= be) break;
-                const int64_t ovl_s = std::max<int64_t>(bs, in_start[i]);
-                const int64_t ovl_e = std::min<int64_t>(be, in_end[i]);
-                if (ovl_s < ovl_e) {
-                    BinContribution c;
-                    c.value      = in_value[i];
-                    c.overlap_len = (double)(ovl_e - ovl_s);
-                    // the bin is clamped to the chromosome end, as R's locus_len
-                    c.coverage_frac = c.overlap_len / (double)(be - bs);
-                    c.start      = ovl_s;
-                    c.end        = ovl_e;
-                    c.is_na      = std::isnan(in_value[i]);
-                    c.chain_id   = in_chain_id[i];
-                    state.push_back(c);
-                }
-            }
-
-            // A chrom no interval lands on is all NaN, as R writes it, even for
-            // "count", which gives 0 for an empty bin of a chrom that has some.
-            const double v = idxs.empty() ? std::numeric_limits<double>::quiet_NaN()
-                : aggregate_value_for_bin(state, agg, na_rm, min_n_or_negative, nth_index);
+            // a bin nothing lands in, on any chrom, gets what aggregate_values gives no
+            // contributions: NaN, or 0 under "count" (NaN below min_n), as R 5.18.0
+            const double v = aggregate_value_for_bin(state, agg, na_rm, min_n_or_negative, nth_index);
 
             out_chrom.push_back(chrom);
             out_start.push_back(bs);
@@ -426,7 +434,7 @@ void aggregate_per_bin_cpp(
  * nth_index:  int. 1-based index for "nth" aggregation; ignored otherwise.
  *
  * Returns: dict with "chrom" (object/str), "start" (int64), "end" (int64),
- *          "value" (float64): one row per run of overlapping intervals, as
+ *          "value" (float64): one row per segment some interval covers, as
  *          aggregate_overlapping_cpp (NaN values included).
  *
  * Raises ValueError on malformed input.

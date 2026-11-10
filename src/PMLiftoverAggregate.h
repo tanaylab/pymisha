@@ -39,11 +39,12 @@ double aggregate_value_for_bin(
 
 // SPARSE-path aggregator, as R's gtrack_liftover writes a sparse track
 // (GTrackLiftover.cpp): per chrom (in name order), the intervals sorted by
-// (start, end, key, value), every run of overlapping intervals becomes one
-// interval whose value is R's aggregate_values over the run - an interval
-// counting its whole length, intervals sharing a key (the pieces of one source
-// interval through one chain) counting once. A NaN value is kept, so a run of
-// NaN source values gives a NaN interval. Touching intervals are not merged.
+// (start, end, key, value) are cut at their boundaries, and each segment some
+// interval covers becomes one interval whose value is R's aggregate_values over
+// the intervals covering it, as gintervals.liftover(value_col =) gives -
+// intervals sharing a key (the pieces of one source interval through one chain)
+// counting once. A NaN value is kept, so a segment of NaN source values gives a
+// NaN interval. Gaps give no interval, and equal neighbours are not merged.
 // Inputs need not be sorted.
 //
 // APPENDS to output vectors (caller should pre-clear).
@@ -70,9 +71,8 @@ void aggregate_overlapping_cpp(
 // contributions (interval, value, overlap_len, chain_id), merge entries
 // sharing the same chain_id (sum overlap_len), apply agg function. Emits
 // ceil(chrom_size / bin_size) rows per target chrom. A bin with no
-// contributions gets what R's aggregate_values gives it (NaN, or 0 for
-// "count" without min_n); a chrom with none at all is NaN throughout, as R
-// writes it.
+// contributions, also on a chrom with none at all, gets what R's
+// aggregate_values gives it (NaN, or 0 for "count" without min_n).
 //
 // Matches R GTrackLiftover.cpp:702-768 + AggregationHelpers.h::aggregate_values.
 //

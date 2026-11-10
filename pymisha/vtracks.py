@@ -2140,7 +2140,11 @@ def gvtrack_create(
           ``'sample.pos.abs'``, ``'sample.pos.relative'``
         - **2D track**: ``'area'``, ``'weighted.sum'``, ``'exists'``,
           ``'size'``, ``'first'``, ``'last'``, ``'sample'``,
-          ``'global.percentile'``
+          ``'global.percentile'``. ``'avg'``, ``'min'``, ``'max'`` and
+          ``'weighted.sum'`` skip NaN values, as the 1D summarizers do, and
+          give NaN when no value overlaps the interval; ``'avg'`` is the mean
+          over the area that has a value. ``'area'`` counts every rectangle,
+          NaN ones included.
         - **Motif/PWM** (src=None): ``'pwm'``, ``'pwm.max'``,
           ``'pwm.max.pos'``, ``'pwm.count'``
         - **Potts / pairwise energy** (src=None): ``'potts'``,

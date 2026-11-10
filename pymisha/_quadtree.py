@@ -14,6 +14,7 @@ Struct Stat (pack(8)): [int64 occupied_area] [double weighted_sum] [double min_v
 
 from __future__ import annotations
 
+import math
 import mmap
 import os
 import struct
@@ -145,7 +146,7 @@ class QuadTree:
 
         The value is kept as the float the file stores, and every node on the
         object's path adds it to its stat as R's StatQuadTree::insert does,
-        NaN included (see ``_stat_add_obj``).
+        NaN included (a reader then reads such a node object by object).
         """
         if self.is_points:
             x, y, v = obj
@@ -180,8 +181,8 @@ class QuadTree:
         obj_idx: int,
         obj_rect: tuple[Any, ...],
     ) -> None:
-        # R's update_stat: min(val, min_val) / max(val, max_val) resolve a NaN
-        # as std::min / std::max do (see _stat_add_obj)
+        # R's StatQuadTree::update_stat, NaN included: min(val, min_val) /
+        # max(val, max_val) resolve a NaN as std::min / std::max do
         area = _rect_area(intersection)
         val = self._get_value(obj_idx)
         node.stat["weighted_sum"] += val * area
@@ -953,23 +954,32 @@ def query_2d_track_opened(
 
 
 def _new_stat() -> list[Any]:
-    """A fresh ``[occupied_area, weighted_sum, min_val, max_val]``, as R's Stat::reset()."""
-    return [0, 0.0, _DBL_MAX, -_DBL_MAX]
+    """A fresh ``[occupied_area, weighted_sum, min_val, max_val, nan_area]``, as R's
+    Stat::reset() and the nan_area of StatQuadTreeCached::get_stat."""
+    return [0, 0.0, _DBL_MAX, -_DBL_MAX, 0]
 
 
 def _stat_add_obj(stat: list[Any], val: float, area: int) -> None:
     """Add an object's intersection to *stat*, as R's StatQuadTreeCached::update_stat.
 
-    A NaN value is added like any other: its area counts, the weighted sum
-    becomes NaN, and min / max are R's ``std::min(val, min_val)`` /
-    ``std::max(val, max_val)``. Python's ``min`` / ``max`` with the same
-    argument order resolve a NaN the same way: a NaN takes over until a later
-    value replaces it.
+    A NaN value adds its area to the occupied area and to nan_area, and nothing
+    else: the weighted sum, min and max skip it, as the 1D summarizers skip a
+    NaN bin (R misha a3a27ed3).
     """
+    stat[0] += area
+    if math.isnan(val):
+        stat[4] += area
+        return
     stat[1] += val * area
     stat[2] = min(val, stat[2])
     stat[3] = max(val, stat[3])
-    stat[0] += area
+
+
+def _node_stat_usable(node_stat: tuple[int, float, float, float]) -> bool:
+    """Whether a node's stored stat can stand for its objects: the writer adds a
+    NaN value to it (making the weighted sum NaN), so such a node is read object
+    by object, as R's get_stat does."""
+    return not math.isnan(node_stat[1])
 
 
 def _stat_add_node(stat: list[Any], node_stat: tuple[int, float, float, float]) -> None:
@@ -984,15 +994,16 @@ def _stat_add_node(stat: list[Any], node_stat: tuple[int, float, float, float]) 
 def _finish_stat(stat: list[Any]) -> dict[str, Any]:
     """The stat dict R reports for *stat*.
 
-    A query no object touches gives NaN. R reads min and max into float
-    members (GenomeTrack2D::m_last_min / m_last_max), so a DBL_MAX left from
-    Stat::reset() reads as Inf.
+    A query no value touches (no object, or only NaN ones) gives NaN; the
+    occupied area stays. R reads min and max into float members
+    (GenomeTrack2D::m_last_min / m_last_max).
     """
-    if stat[0] == 0:
-        return {"occupied_area": 0, "weighted_sum": float("nan"),
-                "min_val": float("nan"), "max_val": float("nan")}
+    if stat[0] == stat[4]:
+        return {"occupied_area": stat[0], "weighted_sum": float("nan"),
+                "min_val": float("nan"), "max_val": float("nan"), "nan_area": stat[4]}
     return {"occupied_area": stat[0], "weighted_sum": stat[1],
-            "min_val": float(np.float32(stat[2])), "max_val": float(np.float32(stat[3]))}
+            "min_val": float(np.float32(stat[2])), "max_val": float(np.float32(stat[3])),
+            "nan_area": stat[4]}
 
 
 def _kid_nodes(data: bytes | mmap.mmap, chunk_data_offset: int, abs_offset: int) -> list[tuple[int, int]]:
@@ -1018,9 +1029,10 @@ def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offs
 
     A port of R's ``StatQuadTreeCached::get_stat`` (no band): a kid that lies
     inside the query contributes its stored stat, unless its occupied area is
-    0; a leaf adds each object's intersection with the query and its own arena,
-    so an object stored in several leaves is counted once. *stat* is
-    ``[occupied_area, weighted_sum, min_val, max_val]`` (see ``_new_stat``),
+    0, or it is searched when the stat holds a NaN; a leaf adds each object's
+    intersection with the query and its own arena, so an object stored in
+    several leaves is counted once. *stat* is
+    ``[occupied_area, weighted_sum, min_val, max_val, nan_area]`` (see ``_new_stat``),
     updated in place. *computer*, for a COMPUTED track, gives the value of an
     intersection that is not the whole object, as R's ``Computed_val::val``.
     """
@@ -1053,11 +1065,12 @@ def _query_node_stats(data: bytes | mmap.mmap, chunk_data_offset: int, node_offs
             continue
         if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
             kid_stat = _unpack_stat(data, kid_abs)
-            if kid_stat[0]:
-                _stat_add_node(stat, kid_stat)
-        else:
-            _query_node_stats(data, kid_chunk, kid_node, is_points, qx1, qy1, qx2, qy2,
-                              stat, _depth + 1, computer)
+            if _node_stat_usable(kid_stat):
+                if kid_stat[0]:
+                    _stat_add_node(stat, kid_stat)
+                continue
+        _query_node_stats(data, kid_chunk, kid_node, is_points, qx1, qy1, qx2, qy2,
+                          stat, _depth + 1, computer)
 
 
 def _computed_val(obj_rect: tuple[int, ...], cached: float, rect: tuple[int, ...], computer: Any,
@@ -1111,7 +1124,8 @@ def _query_node_stats_band(data: bytes | mmap.mmap, chunk_data_offset: int, node
 
     A port of R's ``StatQuadTreeCached::get_stat`` with a band: a kid inside
     both the query and the band contributes its stored stat (even an empty
-    one, as in R), a kid the band cuts is searched with the query shrunk to
+    one, as in R; one that holds a NaN is searched without the band instead),
+    a kid the band cuts is searched with the query shrunk to
     the band, and a leaf object the band cuts counts the area of its
     intersection inside the band.
     """
@@ -1151,7 +1165,12 @@ def _query_node_stats_band(data: bytes | mmap.mmap, chunk_data_offset: int, node
             continue
         if cx1 >= qx1 and cy1 >= qy1 and cx2 <= qx2 and cy2 <= qy2:
             if _band_do_contain(kid_arena, d1, d2):
-                _stat_add_node(stat, _unpack_stat(data, kid_abs))
+                kid_stat = _unpack_stat(data, kid_abs)
+                if _node_stat_usable(kid_stat):
+                    _stat_add_node(stat, kid_stat)
+                else:
+                    _query_node_stats(data, kid_chunk, kid_node, is_points, qx1, qy1, qx2, qy2,
+                                      stat, _depth + 1, computer)
             elif _band_do_intersect(kid_arena, d1, d2):
                 _query_node_stats_band(data, kid_chunk, kid_node, is_points,
                                        _band_shrink(kid_arena, d1, d2), d1, d2, stat, _depth + 1, computer)
@@ -1172,7 +1191,7 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
 
     Follows R misha's ``get_stat``: for subtrees fully contained by the query,
     pre-computed node statistics are used directly (O(1) per subtree), avoiding
-    object enumeration. NaN values count as R counts them (see ``_stat_add_obj``).
+    object enumeration. A NaN value counts in the area only (see ``_stat_add_obj``).
 
     Parameters
     ----------
@@ -1193,8 +1212,9 @@ def query_2d_track_stats(data: bytes | mmap.mmap, is_points: bool, num_objs: int
     -------
     dict
         ``{"occupied_area": int, "weighted_sum": float,
-        "min_val": float, "max_val": float}``.
-        When no objects contribute, *weighted_sum*, *min_val* and *max_val*
+        "min_val": float, "max_val": float, "nan_area": int}``: the occupied
+        area includes the NaN-valued objects, *nan_area* is their part of it.
+        When no value contributes, *weighted_sum*, *min_val* and *max_val*
         are ``float("nan")``.
     """
     if num_objs == 0:
@@ -1262,7 +1282,8 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
     -------
     dict
         ``{"occupied_area": ndarray(N, int64), "weighted_sum": ndarray(N, float64),
-        "min_val": ndarray(N, float64), "max_val": ndarray(N, float64)}``.
+        "min_val": ndarray(N, float64), "max_val": ndarray(N, float64),
+        "nan_area": ndarray(N, int64)}`` (see ``query_2d_track_stats``).
     """
     n = len(rects) if rects is not None else 0
     if n == 0 or num_objs == 0:
@@ -1271,6 +1292,7 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
             "weighted_sum": np.full(n, np.nan),
             "min_val": np.full(n, np.nan),
             "max_val": np.full(n, np.nan),
+            "nan_area": np.zeros(n, dtype=np.int64),
         }
 
     rects_arr = np.ascontiguousarray(rects, dtype=np.int64).reshape(-1, 4)
@@ -1302,6 +1324,7 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
     ws = np.full(n, np.nan)
     mn = np.full(n, np.nan)
     mx = np.full(n, np.nan)
+    nan_area = np.zeros(n, dtype=np.int64)
     for i in range(n):
         qx1, qy1, qx2, qy2 = int(rects_arr[i, 0]), int(rects_arr[i, 1]), int(rects_arr[i, 2]), int(rects_arr[i, 3])
         s = query_2d_track_stats(data, is_points, num_objs, root_chunk_fpos,
@@ -1310,7 +1333,8 @@ def query_2d_track_stats_batch(data: bytes | mmap.mmap, is_points: bool, num_obj
         ws[i] = s["weighted_sum"]
         mn[i] = s["min_val"]
         mx[i] = s["max_val"]
-    return {"occupied_area": occ, "weighted_sum": ws, "min_val": mn, "max_val": mx}
+        nan_area[i] = s["nan_area"]
+    return {"occupied_area": occ, "weighted_sum": ws, "min_val": mn, "max_val": mx, "nan_area": nan_area}
 
 
 def _query_2d_track_stats_with_band(data: bytes | mmap.mmap, is_points: bool, num_objs: int, root_chunk_fpos: int,

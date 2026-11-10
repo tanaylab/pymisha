@@ -6561,6 +6561,10 @@ PyObject *pm_quadtree_query_stats(PyObject *self, PyObject *args)
             v = PyFloat_FromDouble(stat.max_val);
             PyDict_SetItemString(result, "max_val", v);
             Py_DECREF(v);
+
+            v = PyLong_FromLongLong(stat.nan_area);
+            PyDict_SetItemString(result, "nan_area", v);
+            Py_DECREF(v);
         }
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -6749,6 +6753,12 @@ PyObject *pm_quadtree_query_stats_batch(PyObject *self, PyObject *args)
                               batch.max_val.data(), n * sizeof(double));
             PyDict_SetItemString(result, "max_val", arr_max);
             Py_DECREF(arr_max);
+
+            PyObject *arr_nan = PyArray_SimpleNew(1, dims, NPY_INT64);
+            if (n > 0) memcpy(PyArray_DATA((PyArrayObject *)arr_nan),
+                              batch.nan_area.data(), n * sizeof(int64_t));
+            PyDict_SetItemString(result, "nan_area", arr_nan);
+            Py_DECREF(arr_nan);
         }
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());

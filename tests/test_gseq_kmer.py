@@ -1,5 +1,7 @@
 """Tests for gseq_kmer and gseq_kmer_dist."""
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -39,10 +41,11 @@ class TestGseqKmer:
 
     def test_both_strands(self):
         """Count on both strands."""
-        # As in R misha, a position counts once when the k-mer matches on
-        # either strand, so the palindrome CG counts once.
-        result = pm.gseq_kmer(["AACGTT"], "CG", mode="count", strand=0)
-        assert result[0] == 1
+        # As in R misha 5.18.0 and the kmer vtracks, strand 0 sums the two
+        # strands, so the palindrome CG counts twice.
+        with pytest.warns(UserWarning, match="palindromic"):
+            result = pm.gseq_kmer(["AACGTT"], "CG", mode="count", strand=0)
+        assert result[0] == 2
 
     def test_non_palindrome_both_strands(self):
         """Non-palindromic k-mer counted on both strands."""
@@ -131,9 +134,10 @@ class TestGseqKmer:
     def test_many_sequences_both_strands(self):
         """Batch fast path with both-strand counting."""
         seqs = ["ACGTACGTACGTACGT"] * 50
-        # CG appears 4 times; a palindrome counts once per position
-        result = pm.gseq_kmer(seqs, "CG", mode="count", strand=0)
-        assert all(r == 4 for r in result)
+        # CG appears 4 times; a palindrome counts twice per position
+        with pytest.warns(UserWarning, match="palindromic"):
+            result = pm.gseq_kmer(seqs, "CG", mode="count", strand=0)
+        assert all(r == 8 for r in result)
 
     def test_many_sequences_fraction(self):
         """Batch fast path fraction mode."""
@@ -182,9 +186,10 @@ class TestGseqKmer:
         assert result[2] == 0   # too short
 
     def test_palindromic_kmer_both_strands(self):
-        """A palindromic k-mer (AATT) counts once per position on both strands."""
-        result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
-        assert result[0] == 1
+        """A palindromic k-mer (AATT) counts twice per position on both strands."""
+        with pytest.warns(UserWarning, match="palindromic"):
+            result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
+        assert result[0] == 2
 
     def test_empty_list(self):
         """Empty input list returns empty array."""
@@ -314,18 +319,18 @@ class TestGseqKmerDist:
 
 
 def _ref_gseq_kmer(seq, kmer, mode, strand):
-    """R misha's gseq.kmer over a whole gap-free sequence, written out."""
+    """R misha's gseq.kmer over a whole gap-free sequence, written out: strand 0
+    sums the two strands and frac divides by the starts of both."""
     seq, kmer = seq.upper(), kmer.upper()
     rc = pm.grevcomp(kmer)
     starts = len(seq) - len(kmer) + 1
     if starts <= 0:
         return 0.0
     count = sum(
-        1 for p in range(starts)
-        if (strand >= 0 and seq[p:p + len(kmer)] == kmer)
-        or (strand <= 0 and seq[p:p + len(kmer)] == rc)
+        (strand >= 0 and seq[p:p + len(kmer)] == kmer) + (strand <= 0 and seq[p:p + len(kmer)] == rc)
+        for p in range(starts)
     )
-    return count / starts if mode == "frac" else float(count)
+    return count / (starts * (2 if strand == 0 else 1)) if mode == "frac" else float(count)
 
 
 class TestGseqKmerCpp:
@@ -347,7 +352,9 @@ class TestGseqKmerCpp:
         for kmer in ["CG", "ACG", "ACGT", "A", "AATT"]:
             for strand in (-1, 0, 1):
                 for mode in ("count", "frac"):
-                    got = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        got = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand)
                     want = [_ref_gseq_kmer(x, kmer, mode, strand) for x in seqs]
                     np.testing.assert_allclose(
                         got, want, rtol=1e-12, atol=0,
@@ -366,12 +373,14 @@ class TestGseqKmerCpp:
         np.testing.assert_array_equal(result, [0.0, 0.0, 0.0])
 
     def test_cpp_palindromic_kmer(self):
-        """A palindromic k-mer counts once per position on both strands."""
-        result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
-        assert result[0] == 1
+        """A palindromic k-mer counts twice per position on both strands."""
+        with pytest.warns(UserWarning, match="palindromic"):
+            result = pm.gseq_kmer(["AATTCC"], "AATT", mode="count", strand=0)
+        assert result[0] == 2
         # "CGCGCG": CG at positions 0, 2, 4
-        result2 = pm.gseq_kmer(["CGCGCG"], "CG", mode="count", strand=0)
-        assert result2[0] == 3
+        with pytest.warns(UserWarning, match="palindromic"):
+            result2 = pm.gseq_kmer(["CGCGCG"], "CG", mode="count", strand=0)
+        assert result2[0] == 6
 
     def test_cpp_n_characters(self):
         """N characters in sequences do not match any kmer."""
@@ -426,9 +435,11 @@ class TestGseqKmerRParity:
 
     def test_mode_count_counts_exact_matches(self):
         seq = "CGCGCGCG"
-        assert pm.gseq_kmer(seq, "CG", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 4
-        assert pm.gseq_kmer(seq, "GC", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 3
-        assert pm.gseq_kmer(seq, "AA", mode="count", start_pos=1, end_pos=8, extend=False)[0] == 0
+        # CG and GC are palindromes, so strand = 1 counts each site once
+        kw = {"mode": "count", "strand": 1, "start_pos": 1, "end_pos": 8, "extend": False}
+        assert pm.gseq_kmer(seq, "CG", **kw)[0] == 4
+        assert pm.gseq_kmer(seq, "GC", **kw)[0] == 3
+        assert pm.gseq_kmer(seq, "AA", **kw)[0] == 0
 
     def test_mode_frac_computes_correct_fractions(self):
         seq = "AAACCCGGG"
@@ -443,12 +454,32 @@ class TestGseqKmerRParity:
         assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=1, end_pos=4, extend=False)[0] == 0
         assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=7, end_pos=10, extend=False)[0] == 0
 
-    def test_extend_parameter_works_correctly(self):
+    def test_extend_lets_a_match_run_past_the_roi_end_never_before_its_start(self):
         seq = "GGGGACGGGG"
-        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=False)[0] == 0
-        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=True)[0] == 1
-        # extend=1 (explicit k - 1): same as extend=True
-        assert pm.gseq_kmer(seq, "AC", mode="count", start_pos=6, end_pos=6, extend=1)[0] == 1
+
+        def k(s, kmer, **kw):
+            return pm.gseq_kmer(s, kmer, **kw)[0]
+
+        # ROI at 5-5 (just "A"): the AC at 5-6 starts in the ROI and ends past it
+        assert k(seq, "AC", strand=1, start_pos=5, end_pos=5, extend=False) == 0
+        assert k(seq, "AC", strand=1, start_pos=5, end_pos=5, extend=True) == 1
+        assert k(seq, "AC", strand=1, start_pos=5, end_pos=5, extend=1) == 1
+        # ROI at 6-6 (just "C"): the AC starts before the ROI, so no extend counts it
+        assert k(seq, "AC", strand=1, start_pos=6, end_pos=6, extend=True) == 0
+        assert k(seq, "AC", strand=1, start_pos=6, end_pos=6, extend=5) == 0
+        # a minus-strand match is anchored at its first base too: GT at 5-6 is AC's reverse complement
+        assert k("GGGGGTGGGG", "AC", strand=-1, start_pos=6, end_pos=6, extend=True) == 0
+        assert k("GGGGGTGGGG", "AC", strand=-1, start_pos=5, end_pos=5, extend=True) == 1
+        # An integer extend is how many bases a match may run past end_pos
+        assert k(seq, "AC", strand=1, start_pos=1, end_pos=4, extend=1) == 0
+        assert k(seq, "AC", strand=1, start_pos=1, end_pos=4, extend=2) == 1
+        # frac with extend = TRUE divides by every start in the ROI whose k-mer fits
+        # in the sequence: 9 when the ROI reaches the sequence end, 10 when a base follows it
+        assert k(seq, "AC", mode="frac", strand=1, start_pos=1, end_pos=10, extend=True) == pytest.approx(1 / 9)
+        assert k(seq + "G", "AC", mode="frac", strand=1, start_pos=1, end_pos=10, extend=True) == pytest.approx(1 / 10)
+        # With skip_gaps the run past the end counts non-gap bases: A at 3 then C at 5
+        assert k("GGA-CG", "AC", strand=1, start_pos=3, end_pos=3, extend=True) == 1
+        assert k("GGA-CG", "AC", strand=1, start_pos=3, end_pos=4, extend=False) == 0
 
     def test_strand_parameter_works(self):
         seq = "ACGTACGT"
@@ -527,6 +558,61 @@ class TestGseqKmerRParity:
         assert pm.gseq_kmer(seq, "AC", strand=0, **kw)[0] == res["count_both"].iloc[0]
         assert pm.gseq_kmer(seq, "AC", strand=1, **kw)[0] == res["count_fwd"].iloc[0]
         assert pm.gseq_kmer(seq, "AC", strand=-1, **kw)[0] == res["count_rev"].iloc[0]
+
+    def test_matches_the_kmer_vtracks_on_random_intervals(self):
+        """R: 'gseq.kmer matches the kmer vtracks on random intervals'. Short and long
+        intervals on chr1 and both ends of chrX (R takes chr20, which this database
+        lacks); gseq_kmer gets each interval padded by k - 1 on each side (clipped
+        to the chromosome), with start_pos / end_pos marking it."""
+        rng = np.random.default_rng(17)
+        sizes = dict(zip(pm.gintervals_all()["chrom"], pm.gintervals_all()["end"], strict=True))
+        starts = np.sort(rng.choice(200, 15, replace=False)) * 1000 + 10000
+        iv = pd.DataFrame({
+            "chrom": ["chr1"] * 15 + ["chrX"] * 2,
+            "start": list(starts) + [0, sizes["chrX"] - 41],
+            "end": list(starts + np.r_[1:6, rng.integers(20, 301, 10)]) + [37, sizes["chrX"]],
+        })
+        size = iv["chrom"].map(sizes).to_numpy()
+        try:
+            # palindromic: CG, GATC; not: A, C, AC, TTA, CAGG
+            for kmer in ["A", "C", "CG", "AC", "TTA", "GATC", "CAGG"]:
+                w = len(kmer) - 1
+                pad = iv.assign(start=np.maximum(0, iv["start"] - w), end=np.minimum(size, iv["end"] + w))
+                seqs = pm.gseq_extract(pad)
+                roi_start = (iv["start"] - pad["start"] + 1).tolist()
+                roi_end = (iv["end"] - pad["start"]).tolist()
+                for ext in (False, True):
+                    for strand in (-1, 0, 1):
+                        for mode in ("count", "frac"):
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                pm.gvtrack_create("v", None, f"kmer.{mode}", kmer=kmer, strand=strand, extend=ext)
+                            vt = pm.gextract("v", iv, iterator=iv).sort_values("intervalID")["v"].to_numpy()
+                            for skip in (True, False):
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore")
+                                    gs = pm.gseq_kmer(seqs, kmer, mode=mode, strand=strand, start_pos=roi_start,
+                                                      end_pos=roi_end, extend=ext, skip_gaps=skip)
+                                np.testing.assert_allclose(gs, vt, rtol=1e-6,
+                                                           err_msg=f"{kmer} {ext} {strand} {mode} {skip}")
+        finally:
+            pm.gvtrack_clear()
+
+        # Both strands are summed: a palindrome counts twice per site
+        with pytest.warns(UserWarning, match="palindromic"):
+            assert pm.gseq_kmer("CGCGCGCGCG", "CG", strand=0)[0] == 10
+
+    def test_warns_for_a_palindromic_kmer_on_strand_0_as_the_vtracks_do(self):
+        with pytest.warns(UserWarning) as rec:
+            pm.gseq_kmer("ACGT", "CG")
+        assert str(rec[0].message) == ("kmer sequence 'CG' is palindromic, please set strand to 1 or -1 "
+                                       "to avoid double counting")
+        with pytest.warns(UserWarning, match="palindromic"):
+            pm.gseq_kmer("ACGT", "cg", strand=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            pm.gseq_kmer("ACGT", "CG", strand=1)
+            pm.gseq_kmer("ACGT", "AC", strand=0)
 
     # -- gaps ------------------------------------------------------------------
 

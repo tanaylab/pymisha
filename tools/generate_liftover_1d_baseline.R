@@ -1,4 +1,4 @@
-# Regenerate tests/test_data/liftover_1d from R misha (5.12.1 or later).
+# Regenerate tests/test_data/liftover_1d from R misha (5.18.0 or later).
 #
 # tests/test_liftover_1d_r_parity.py checks that gtrack_liftover of a sparse or a
 # dense track gives the track R's gtrack.liftover gives: the intervals and values

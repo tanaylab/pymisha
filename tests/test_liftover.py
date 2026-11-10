@@ -205,21 +205,17 @@ class TestLoadChain:
              [(600,)]),
         ]
         path = _write_chain(str(tmp_path), entries)
-        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard",
+        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard_intervals",
                                          tgt_overlap_policy="keep")
         # Both chains discarded because they overlap in source space
         assert len(chain) == 0
 
     def test_load_chain_src_overlap_discard_wide_interval(self, tmp_path):
-        """src=discard uses R's pair-only scan (rdbinterval.cpp:820-841).
+        """discard_intervals drops a row that overlaps a non-adjacent one.
 
-        A wide row encloses two non-adjacent narrow rows. R only inspects
-        consecutive pairs after sort_by_src, so the wide+first-narrow pair
-        is dropped but the second-narrow row (separated by a gap from the
-        first narrow) survives because its only neighbor in src-sorted
-        order is the prior narrow row and they don't pair-overlap. Pymisha
-        switched from whole-cluster discard (v0.1.90 and earlier) to R-parity
-        pair-only in v0.1.91.
+        A wide row encloses two narrow rows that do not overlap each other. R
+        misha before 5.18.0 compared only neighbours in source order and kept
+        the second narrow row; it overlaps the wide one, so it is dropped too.
         """
         entries = [
             ({"score": 1000, "src_chrom": "srcA", "src_size": 10000,
@@ -242,12 +238,9 @@ class TestLoadChain:
              [(100,)]),
         ]
         path = _write_chain(str(tmp_path), entries)
-        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard",
+        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard_intervals",
                                          tgt_overlap_policy="keep")
-        # R-parity: pair (chain1, chain2) overlap at src -> drop both.
-        # Pair (chain2, chain3) doesn't overlap (200 < 300) -> chain3 kept.
-        assert len(chain) == 1
-        assert chain["chain_id"].tolist() == [3]
+        assert len(chain) == 0
 
     def test_load_chain_src_overlap_error(self, tmp_path):
         """Source overlap with error policy raises."""
@@ -288,7 +281,7 @@ class TestLoadChain:
         ]
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
-                                         tgt_overlap_policy="discard")
+                                         tgt_overlap_policy="discard_intervals")
         assert len(chain) == 0
 
     def test_load_chain_tgt_overlap_discard_wide_interval(self, tmp_path):
@@ -315,7 +308,7 @@ class TestLoadChain:
         ]
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
-                                         tgt_overlap_policy="discard")
+                                         tgt_overlap_policy="discard_intervals")
         assert len(chain) == 0
 
     def test_load_chain_negative_strand(self, tmp_path):
@@ -727,7 +720,7 @@ class TestLiftoverOverlapPoliciesParity:
         ]
         path = _write_chain(str(tmp_path), entries)
         chain = pm.gintervals_load_chain(path, src_overlap_policy="keep",
-                                         tgt_overlap_policy="discard")
+                                         tgt_overlap_policy="discard_intervals")
         assert len(chain) == 1
         assert chain.iloc[0]["chrom"] == "chrX"
 
@@ -840,6 +833,167 @@ class TestLiftoverOverlapPoliciesParity:
         # Verify startsrc shifts for chain 3 segments
         chain3_segs = chr1[chr1["chain_id"] == 3].reset_index(drop=True)
         assert list(chain3_segs["startsrc"]) == [0, 10, 15]
+
+
+def _block(src_chrom, src_start, src_end, tgt_chrom, tgt_start, tgt_end, chain_id,
+           score=1000, tgt_strand="+"):
+    """One single-block chain entry for _write_chain (target sizes of the test DB)."""
+    tgt_size = {"chr1": 500000, "chr2": 300000, "chrX": 200000}[tgt_chrom]
+    return ({"score": score, "src_chrom": src_chrom, "src_size": 10000,
+             "src_strand": "+", "src_start": src_start, "src_end": src_end,
+             "tgt_chrom": tgt_chrom, "tgt_size": tgt_size, "tgt_strand": tgt_strand,
+             "tgt_start": tgt_start, "tgt_end": tgt_end, "chain_id": chain_id},
+            [(src_end - src_start,)])
+
+
+@pytest.mark.parametrize("force_python", [False, True])
+class TestDiscardPolicies:
+    """R misha 5.18.0: "discard" drops only the bases several chain intervals cover;
+    "discard_intervals" drops every interval in an overlap. Ported from test-liftover.R."""
+
+    @pytest.fixture(autouse=True)
+    def _python_path(self, monkeypatch, force_python):
+        if force_python:
+            monkeypatch.setenv("PYMISHA_FORCE_PY_CHAIN_INTERVALS_RESOLVE", "1")
+
+    def test_src_discard_keeps_single_covered_bases(self, tmp_path):
+        # A [0,100) overlaps B [10,20) and C [50,150); B and C do not overlap.
+        # D [200,210) overlaps nothing.
+        path = _write_chain(str(tmp_path), [
+            _block("srcA", 0, 100, "chr1", 0, 100, 1),
+            _block("srcA", 10, 20, "chr1", 100, 110, 2),
+            _block("srcA", 50, 150, "chr1", 200, 300, 3),
+            _block("srcA", 200, 210, "chr1", 300, 310, 4),
+        ])
+        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard")
+        chain = chain.sort_values("startsrc")
+        assert chain["chain_id"].tolist() == [1, 1, 3, 4]
+        assert chain["startsrc"].tolist() == [0, 20, 100, 200]
+        assert chain["endsrc"].tolist() == [10, 50, 150, 210]
+        assert chain["start"].tolist() == [0, 20, 250, 300]
+        assert chain["end"].tolist() == [10, 50, 300, 310]
+
+        # In source order C is next to B only; a neighbour-only check kept C
+        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard_intervals")
+        assert chain["chain_id"].tolist() == [4]
+
+    def test_src_discard_minus_strand(self):
+        # A: chr2 [1000,1100) -> chr1 [5000,5100) reversed; B [1010,1020) lies inside A.
+        # A keeps source [1000,1010) and [1020,1100): target [5090,5100) and [5000,5080).
+        ch = pm.gintervals_as_chain(pd.DataFrame({
+            "chrom": "chr1", "start": [5000, 8000], "end": [5100, 8010], "strand": [-1, 1],
+            "chromsrc": "chr2", "startsrc": [1000, 1010], "endsrc": [1100, 1020], "strandsrc": 1,
+            "chain_id": [1, 2], "score": 1000.0,
+        }), src_overlap_policy="discard")
+        res = pm.gintervals_liftover(pm.gintervals("chr2", 1000, 1100), ch).sort_values("start")
+        assert res["start"].tolist() == [5000, 5090]
+        assert res["end"].tolist() == [5080, 5100]
+        res = pm.gintervals_liftover(pm.gintervals("chr2", 1005, 1006), ch)
+        assert (res["start"].tolist(), res["end"].tolist()) == ([5094], [5095])
+
+    def test_tgt_discard_keeps_single_covered_bases(self, tmp_path):
+        # X -> [0,100), Y -> [50,150), Z -> [20,40) inside X, W -> [500,510) alone
+        path = _write_chain(str(tmp_path), [
+            _block("srcX", 0, 100, "chr1", 0, 100, 1),
+            _block("srcY", 0, 100, "chr1", 50, 150, 2),
+            _block("srcZ", 0, 20, "chr1", 20, 40, 3),
+            _block("srcW", 0, 10, "chr1", 500, 510, 4),
+        ])
+        chain = pm.gintervals_load_chain(path, tgt_overlap_policy="discard")
+        assert chain["chain_id"].tolist() == [1, 1, 2, 4]
+        assert chain["start"].tolist() == [0, 40, 100, 500]
+        assert chain["end"].tolist() == [20, 50, 150, 510]
+        assert chain["startsrc"].tolist() == [0, 40, 50, 0]
+
+        chain = pm.gintervals_load_chain(path, tgt_overlap_policy="discard_intervals")
+        assert chain["chain_id"].tolist() == [4]
+
+    def test_src_discard_leaves_agg_pieces_without_source_overlap(self, tmp_path):
+        # X -> [0,100) and Y -> [50,150) overlap in the target only. Liftover applies the
+        # target policy, then the source policy; "discard" finds nothing to drop, so it must
+        # not merge the two "agg" pieces of X back into one.
+        path = _write_chain(str(tmp_path), [
+            _block("srcX", 0, 100, "chr1", 0, 100, 1),
+            _block("srcY", 0, 100, "chr1", 50, 150, 2),
+        ])
+        intervs = pd.DataFrame({"chrom": ["srcX", "srcY"], "start": [10, 20], "end": [90, 80]})
+
+        def lift(src_policy):
+            chain = pm.gintervals_load_chain(path, src_overlap_policy=src_policy, tgt_overlap_policy="agg")
+            res = pm.gintervals_liftover(intervs, chain).sort_values("start").reset_index(drop=True)
+            return res[["chrom", "start", "end", "intervalID"]]
+
+        pd.testing.assert_frame_equal(lift("discard"), lift("keep"))
+        assert lift("discard")["start"].tolist() == [10, 50, 70, 100]
+
+    def test_auto_score_minus_strand_winner_in_one_piece(self, tmp_path):
+        # A: srcA [1000,1100) -> chr2 [0,100) reversed, score 2000; B -> chr2 [40,60), score 10.
+        # A wins all of [0,100); its three segments merge back into one interval.
+        path = _write_chain(str(tmp_path), [
+            _block("srcA", 1000, 1100, "chr2", 299900, 300000, 1, score=2000, tgt_strand="-"),
+            _block("srcB", 0, 20, "chr2", 40, 60, 2, score=10),
+        ])
+        chain = pm.gintervals_load_chain(path, tgt_overlap_policy="auto_score")
+        assert len(chain) == 1
+        assert chain.iloc[0][["start", "end", "startsrc", "endsrc"]].tolist() == [0, 100, 1000, 1100]
+
+
+class TestPreloadedChainPolicies:
+    """As R misha, liftover resolves a pre-loaded chain's overlaps (source, then target,
+    as gintervals_load_chain) by the policies it carries, or by the arguments for a
+    chain that carries none."""
+
+    # A: minus strand, tgt [0,100), score 2000; B: tgt [40,60) inside A, score 10
+    TGT_OVERLAP = pd.DataFrame({
+        "chrom": "chr2", "start": [0, 40], "end": [100, 60], "strand": [-1, 1],
+        "chromsrc": "chr1", "startsrc": [1000, 5000], "endsrc": [1100, 5020], "strandsrc": 1,
+        "chain_id": [1, 2], "score": [2000.0, 10.0],
+    })
+    # sources [1000,1100) and [1050,1150) overlap
+    SRC_OVERLAP = pd.DataFrame({
+        "chrom": "chr2", "start": [0, 500], "end": [100, 600], "strand": 1,
+        "chromsrc": "chr1", "startsrc": [1000, 1050], "endsrc": [1100, 1150], "strandsrc": 1,
+        "chain_id": [1, 2], "score": 1.0,
+    })
+
+    def _rows(self, res):
+        return list(zip(res["start"], res["end"], res["intervalID"], res["chain_id"], strict=True))
+
+    def test_tgt_policy_of_as_chain(self):
+        ch = pm.gintervals_as_chain(self.TGT_OVERLAP, tgt_overlap_policy="auto_score")
+        assert len(pm.gintervals_liftover(pm.gintervals("chr1", 5000, 5020), ch)) == 0
+
+    def test_tgt_policy_argument_for_plain_chain(self):
+        iv = pm.gintervals("chr1", 5000, 5020)
+        assert len(pm.gintervals_liftover(iv, self.TGT_OVERLAP)) == 0
+        res = pm.gintervals_liftover(iv, self.TGT_OVERLAP, tgt_overlap_policy="keep")
+        assert self._rows(res) == [(40, 60, 1, 2)]
+
+    def test_agg_of_as_chain(self):
+        ch = pm.gintervals_as_chain(self.TGT_OVERLAP, tgt_overlap_policy="agg")
+        res = pm.gintervals_liftover(pm.gintervals("chr1", [1000, 5000], [1100, 5020]), ch)
+        assert self._rows(res) == [(60, 100, 1, 1), (40, 60, 1, 1), (0, 40, 1, 1), (40, 60, 2, 2)]
+
+    def test_source_overlaps_resolved_first(self):
+        # A src [0,100) -> [0,100) and B src [50,150) -> [50,150) overlap on both sides. Source
+        # first, "discard" drops src [50,100) from both, so "auto" has nothing left to resolve.
+        both = pd.DataFrame({
+            "chrom": "chr2", "start": [0, 50], "end": [100, 150], "strand": 1,
+            "chromsrc": "chr1", "startsrc": [0, 50], "endsrc": [100, 150], "strandsrc": 1,
+            "chain_id": [1, 2], "score": 1000.0,
+        })
+        ch = pm.gintervals_as_chain(both, src_overlap_policy="discard", tgt_overlap_policy="auto")
+        res = pm.gintervals_liftover(pm.gintervals("chr1", 0, 150), ch).sort_values("start")
+        assert list(zip(res["start"], res["end"], strict=True)) == [(0, 50), (100, 150)]
+
+    def test_src_policy_of_as_chain(self):
+        iv = pm.gintervals("chr1", 1000, 1200)
+        with pytest.raises(Exception, match="overlap"):
+            pm.gintervals_liftover(iv, pm.gintervals_as_chain(self.SRC_OVERLAP))
+        ch = pm.gintervals_as_chain(self.SRC_OVERLAP, src_overlap_policy="discard_intervals")
+        assert len(pm.gintervals_liftover(iv, ch)) == 0
+        ch = pm.gintervals_as_chain(self.SRC_OVERLAP, src_overlap_policy="discard")
+        assert self._rows(pm.gintervals_liftover(iv, ch)) == [(0, 50, 1, 1), (550, 600, 1, 2)]
 
 
 class TestLiftoverValueColParity:
@@ -1380,7 +1534,7 @@ class TestLiftoverMappingParity:
              [(500,)]),
         ]
         path = _write_chain(str(tmp_path), entries)
-        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard",
+        chain = pm.gintervals_load_chain(path, src_overlap_policy="discard_intervals",
                                          tgt_overlap_policy="keep")
         assert len(chain) == 0
 

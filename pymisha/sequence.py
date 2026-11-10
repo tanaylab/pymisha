@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections.abc
 import math as _math
+import warnings as _warnings
 
 import numpy as _numpy
 import pandas as _pandas
@@ -426,11 +427,16 @@ def gseq_kmer(
     """
     Count k-mer occurrences in DNA sequences.
 
-    Scans every window start of the region of interest (ROI) and counts the
-    starts where the k-mer matches. With ``strand=0`` a start counts once when
-    the k-mer matches on either strand, so a palindromic k-mer is not counted
-    twice. ``mode="frac"`` divides the count by the number of window starts
-    scanned, whatever the strand.
+    Counts the k-mer as the ``kmer.count`` and ``kmer.frac`` virtual tracks do,
+    with the region of interest (ROI) in the interval's place: a match on
+    either strand is anchored at its first (leftmost) base, which must not lie
+    before ``start_pos``, and ``extend`` sets how many bases past ``end_pos``
+    it may run, never past the end of the sequence. With ``strand=0`` the
+    matches on the two strands are summed, so a palindromic k-mer (its own
+    reverse complement) counts twice per site, and a warning is given; use
+    ``strand=1`` or ``-1`` to count it once. ``mode="frac"`` divides by the
+    number of allowed anchors, doubled with ``strand=0``, so the fraction stays
+    in [0, 1].
 
     Parameters
     ----------
@@ -439,45 +445,55 @@ def gseq_kmer(
     kmer : str
         K-mer pattern to search for (only A, C, G, T characters).
     mode : str, default "count"
-        "count" returns raw counts, "frac" returns the fraction of window
-        starts that match.
+        "count" returns raw counts, "frac" returns the fraction of the
+        allowed anchors that match.
     strand : int, default 0
-        0 = either strand, 1 = forward only, -1 = reverse complement only.
+        0 = both strands, summed, 1 = forward only, -1 = reverse complement
+        only.
     start_pos : int or list of int, optional
         1-based start of the ROI, per sequence (recycled); 1 by default.
     end_pos : int or list of int, optional
         1-based end of the ROI (inclusive), per sequence (recycled); the
         sequence end by default.
     extend : bool or int, default False
-        How far window starts may reach past the ROI on each side: False for
-        none, True for ``len(kmer) - 1``, or a non-negative number of bases.
+        How many bases a match may run past ``end_pos``: False for none (only
+        k-mers inside the ROI), True for ``len(kmer) - 1`` (every anchor in
+        the ROI), or a non-negative number of bases. It never moves the first
+        anchor before ``start_pos``; a number above ``len(kmer) - 1`` also
+        counts k-mers that start after ``end_pos`` (and ``frac`` counts their
+        starts).
     skip_gaps : bool, default True
-        If True, gap characters are removed before scanning.
+        If True, gap characters are removed before scanning; windows are k
+        consecutive non-gap bases, and ``extend`` and the ``frac`` denominator
+        count non-gap bases and windows.
     gap_chars : list of str, optional
         Characters to treat as gaps. Default: ["-", "."].
 
     Returns
     -------
     numpy.ndarray
-        Array of counts or fractions, one per input sequence.
+        Array of counts or fractions, one per input sequence: 0 for a
+        sequence shorter than the k-mer or an empty ROI, NaN for a None
+        sequence.
 
     Examples
     --------
     >>> import pymisha as pm
 
-    Count CG dinucleotides (a palindrome counts once per position):
+    Count CG dinucleotides on the forward strand (CG is its own reverse
+    complement, so ``strand=0`` would count each site twice, with a warning):
 
-    >>> pm.gseq_kmer(["CGCGCGCGCG", "ATATATATAT"], "CG")
+    >>> pm.gseq_kmer(["CGCGCGCGCG", "ATATATATAT"], "CG", strand=1)
     array([5., 0.])
 
     Get fraction instead of count:
 
-    >>> pm.gseq_kmer(["CGCGCGCGCG"], "CG", mode="frac")  # doctest: +ELLIPSIS
+    >>> pm.gseq_kmer(["CGCGCGCGCG"], "CG", mode="frac", strand=1)  # doctest: +ELLIPSIS
     array([0.555...])
 
     Count in a specific region:
 
-    >>> pm.gseq_kmer("ATCGATCG", "AT", start_pos=1, end_pos=4)
+    >>> pm.gseq_kmer("ATCGATCG", "AT", strand=1, start_pos=1, end_pos=4)
     array([1.])
 
     See Also
@@ -493,6 +509,10 @@ def gseq_kmer(
         raise ValueError("kmer must contain only A, C, G, T characters")
     strand = _seq_strand_arg(strand)
     skip_gaps = _skip_gaps_arg(skip_gaps)
+    # the warning of the kmer vtracks
+    if strand == 0 and kmer == gseq_revcomp(kmer):
+        _warnings.warn(f"kmer sequence '{kmer}' is palindromic, please set strand to 1 or -1 to avoid "
+                       "double counting", stacklevel=2)
     if gap_chars is None:
         gap_chars = ["-", "."]
     if skip_gaps:
@@ -785,9 +805,7 @@ def _pwm_score_batch_vectorized(
     for i, seq in enumerate(seqs):
         seq_upper = _seq_upper(seq)
         L = len(seq_upper)
-        if w > L:
-            if mode == "count":
-                results[i] = 0
+        if w > L:   # no window: NaN in every mode, count included
             continue
 
         # Encode sequence to base codes
@@ -1098,9 +1116,9 @@ def _pwm_score_sequence(
     spat_min, spat_max : int or None
         1-based window counted from the ROI start; as R's C_gseq_pwm.
     """
-    # ROI (1-based inclusive)
-    roi_start = start_pos if start_pos is not None else 1
-    roi_end = end_pos if end_pos is not None else L
+    # ROI (1-based inclusive), clipped to the sequence as R's C_gseq_pwm does
+    roi_start = max(1, start_pos if start_pos is not None else 1)
+    roi_end = min(L, end_pos if end_pos is not None else L)
 
     # Extension
     if extend is True:
@@ -1110,9 +1128,22 @@ def _pwm_score_sequence(
     else:
         E = int(extend)
 
-    # 0-based allowed window start range
-    start_min = max(0, roi_start - 1 - E)
-    start_max = min(L - w, roi_end - w + E)
+    # 0-based allowed window starts, as R misha 5.18.0's compute_bounds, by the rule
+    # of the pwm virtual tracks: a window is anchored at its first base, which must
+    # not lie before the ROI, and it may run at most E bases past the ROI end (non-gap
+    # bases with skip_gaps), never past the end of the sequence. The gap path reads
+    # start_max + w - 1 as the last base a window may cover.
+    end_lim = roi_end - 1
+    if skip_gaps and gap_set:
+        left = E
+        while left > 0 and end_lim < L - 1:
+            end_lim += 1
+            if seq_upper[end_lim] not in gap_set:
+                left -= 1
+    else:
+        end_lim = min(L - 1, end_lim + E)
+    start_min = roi_start - 1
+    start_max = end_lim - w + 1
     bin_origin = roi_start
     if spat_min is not None:
         start_min = max(start_min, roi_start + spat_min - 2)
@@ -1120,9 +1151,10 @@ def _pwm_score_sequence(
     if spat_max is not None:
         start_max = min(start_max, roi_start + spat_max - 1 - w)
 
-    if start_max < start_min or w > L:
-        if mode == "count":
-            return 0
+    # No window at all (an ROI shorter than the motif, start_pos past end_pos,
+    # spat_min past the last start): NaN in every mode, count included, as the pwm
+    # virtual tracks give for an interval without an anchor (R misha 5.18.0).
+    if roi_start > roi_end or start_max < start_min or w > L:
         if return_strand and mode == "pos":
             return (float("nan"), 0)
         return float("nan")
@@ -1240,8 +1272,9 @@ def _pwm_score_sequence(
         if return_strand:
             return (float(best_pos), best_strand)
         return float(best_pos)
-    # count
-    return count
+    # count: windows that exist but none scorable count 0; no window at all (fewer
+    # non-gap bases than the motif) is NaN, nothing to count
+    return count if has_valid else float("nan")
 
 
 def gseq_pwm(
@@ -1251,8 +1284,8 @@ def gseq_pwm(
     bidirect: bool = True,
     strand: int = 1,
     score_thresh: float | None = None,
-    start_pos: int | None = None,
-    end_pos: int | None = None,
+    start_pos: int | list[int] | None = None,
+    end_pos: int | list[int] | None = None,
     extend: bool | int = False,
     spat_factor: _numpy.ndarray | list[float] | None = None,
     spat_bin: int = 1,
@@ -1298,13 +1331,20 @@ def gseq_pwm(
     score_thresh : float, optional
         Threshold for ``"count"`` mode, where it is required: PWM scores are
         log-likelihoods, so no default suits every PSSM. Ignored otherwise.
-    start_pos : int or None
-        1-based inclusive start of region of interest.
-    end_pos : int or None
-        1-based inclusive end of region of interest.
+    start_pos : int, list of int or None
+        1-based inclusive start of the region of interest (ROI), per
+        sequence (recycled); 1 by default.
+    end_pos : int, list of int or None
+        1-based inclusive end of the ROI, per sequence (recycled); the
+        sequence end by default.
     extend : bool or int, default False
-        Allow motif window to start before ROI.  ``True`` = ``w-1``,
-        ``False`` = 0, or an explicit integer extension.
+        How many bases a window may run past ``end_pos``: False for none
+        (only windows inside the ROI), True for ``w - 1`` (every anchor in
+        the ROI), or a non-negative number of bases; never past the end of
+        the sequence. As in the pwm virtual tracks, a window on either strand
+        is anchored at its first base, which never lies before
+        ``start_pos``; a number above ``w - 1`` also scores windows that start
+        after ``end_pos``. With ``skip_gaps``, ``extend`` counts non-gap bases.
     spat_factor : array-like or None
         Spatial weighting factors, one per spatial bin.  When provided,
         the score at each window position is shifted in log-space by
@@ -1349,7 +1389,12 @@ def gseq_pwm(
     numpy.ndarray or pandas.DataFrame
         Array of scores (one per input sequence). For ``mode="pos"`` with
         ``return_strand=True``, returns a DataFrame with columns ``pos``
-        and ``strand``.
+        and ``strand``. A sequence whose windows are all unscorable (for
+        example all ``N``) gives 0 for ``"count"``, as ``pwm.count`` does. A
+        sequence or ROI with no window at all (shorter than the motif,
+        ``start_pos`` past ``end_pos``, fewer non-gap bases than the motif),
+        or a None sequence, gives NaN in every mode, ``"count"`` included, as
+        the pwm virtual tracks give for an interval without an anchor.
 
     Examples
     --------
@@ -1418,8 +1463,13 @@ def gseq_pwm(
     # --- Single-string convenience ---
     if isinstance(seqs, str):
         seqs = [seqs]
-    # one character per byte, as R reads a string (Latin-1)
-    seqs = [_seq_bytes(x) if isinstance(x, str) else x for x in seqs]
+    # one character per byte, as R reads a string (Latin-1); a None, NaN or pd.NA
+    # (R's NA) has no window: NaN in every mode, as an empty string. Anything else
+    # that is not a str is left for the scan to refuse.
+    seqs = [_seq_bytes(x) if isinstance(x, str) else ("" if x is None or _is_na(x) else x) for x in seqs]
+    # the ROI of each sequence, recycled, as R's .normalize_bounds
+    starts = None if start_pos is None else _numpy.resize(_numpy.asarray(start_pos, dtype=_numpy.int64), len(seqs))
+    ends = None if end_pos is None else _numpy.resize(_numpy.asarray(end_pos, dtype=_numpy.int64), len(seqs))
 
     # spat_min / spat_max: 1-based positions counted from start_pos, as in the
     # pwm virtual tracks with the ROI in the interval's place. Windows must lie
@@ -1487,22 +1537,23 @@ def gseq_pwm(
 
         # Apply ROI slicing in Python before passing to C++.
         cpp_seqs = list(seqs)
-        _roi_offset = 0
-        if start_pos is not None or end_pos is not None or spat_min is not None or spat_max is not None:
-            s = (start_pos - 1) if start_pos is not None else 0
-            e = end_pos if end_pos is not None else None
-            # The spat window, counted from the ROI start, narrows the slice;
-            # its start is also where the spatial bins begin.
-            if spat_max is not None:
-                e = s + spat_max if e is None else min(e, s + spat_max)
-            if spat_min is not None:
-                s += spat_min - 1
-            cpp_seqs = [seq[s:e] for seq in cpp_seqs]
-            # The slice is invisible to C++, so a position it reports counts
-            # from the slice. Positions are documented - in both packages - as
-            # being on the FULL input sequence, so the offset goes back on
-            # below. max/lse/count are unaffected: the window set is the same.
-            _roi_offset = s
+        _roi_offset = _numpy.zeros(len(seqs), dtype=_numpy.int64)
+        if starts is not None or ends is not None or spat_min is not None or spat_max is not None:
+            for i, seq in enumerate(seqs):
+                s = int(max(starts[i], 1)) - 1 if starts is not None else 0
+                e = int(ends[i]) if ends is not None else None
+                # The spat window, counted from the ROI start, narrows the slice;
+                # its start is also where the spatial bins begin.
+                if spat_max is not None:
+                    e = s + spat_max if e is None else min(e, s + spat_max)
+                if spat_min is not None:
+                    s += spat_min - 1
+                cpp_seqs[i] = seq[s:e]
+                # The slice is invisible to C++, so a position it reports counts
+                # from the slice. Positions are documented - in both packages - as
+                # being on the FULL input sequence, so the offset goes back on
+                # below. max/lse/count are unaffected: the window set is the same.
+                _roi_offset[i] = s
 
         # Map strand for C++: in Python, strand=0 with bidirect=False
         # means "forward only"; the C++ scorer treats strand=0 as
@@ -1524,11 +1575,9 @@ def gseq_pwm(
                 cpp_spat,
                 int(spat_bin),
             )
-            if mode == "count":
-                # score_string() answers NaN for a string shorter than the
-                # motif; R counts no window there as 0, as the Python paths do.
-                _res = _numpy.nan_to_num(_numpy.asarray(_res, dtype=float), nan=0.0)
-            if mode == "pos" and _roi_offset:
+            # score_string() answers NaN for a string shorter than the motif: no
+            # window, NaN in every mode, count included, as R misha 5.18.0
+            if mode == "pos" and _roi_offset.any():
                 # Back onto the full sequence's coordinates; a NaN (nothing
                 # scorable) stays NaN rather than becoming the offset.
                 _res = _numpy.asarray(_res, dtype=float)
@@ -1658,7 +1707,7 @@ def gseq_pwm(
     results: list[float | int | tuple[float, int]] = []
     strand_results: list[int] = []
 
-    for seq in seqs:
+    for i, seq in enumerate(seqs):
         seq_upper = _seq_upper(seq)
         sr = _pwm_score_sequence(
             seq_upper,
@@ -1670,8 +1719,8 @@ def gseq_pwm(
             scan_fwd,
             scan_rev,
             score_thresh,
-            start_pos,
-            end_pos,
+            None if starts is None else int(starts[i]),
+            None if ends is None else int(ends[i]),
             extend,
             skip_gaps,
             gap_set,
@@ -1918,7 +1967,12 @@ def gseq_pwm_edits(
         what it means for the ``pwm.edit_distance`` virtual track: ``True``
         or a positive integer lets a window start at every position of the
         interval and read bases past its end; ``False`` or 0 keeps every
-        window (deletions included) inside the interval.
+        window (deletions included) inside the interval. For a sequence, its
+        end acts as a chromosome end: with ``max_indels > 0``, ``True`` lets a
+        window start wherever at least ``max(1, w - max_indels)`` bases remain
+        (insertions supply the rest), as the virtual track does at a
+        chromosome end, and an integer lets a window run at most that many
+        bases past the end.
     strand : int, default 1
         When ``bidirect=False``: ``1`` = forward, ``-1`` = reverse.
     direction : str, default "above"

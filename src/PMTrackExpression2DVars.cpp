@@ -231,20 +231,23 @@ void PMTrackExpression2DVars::apply_agg(AggFunc func,
     const size_t n = indices.size();
     for (size_t j = 0; j < n; ++j) {
         int64_t occ = batch.occupied_area[j];
+        int64_t valued = occ - batch.nan_area[j];
         unsigned idx = indices[j];
-        // A rect that meets no cell has area 0 and NaN for the rest, as in R
-        // (StatQuadTreeCached::get_stat).
-        if (occ == 0) {
-            if (func == AGG_AREA)
-                values[idx] = 0.0;
+        // area counts every cell the rect meets, NaN ones too; the rest skip NaN
+        // cells and are NaN when no cell with a value is met, as in R
+        // (StatQuadTreeCached::get_stat, R misha a3a27ed3)
+        if (func == AGG_AREA) {
+            values[idx] = static_cast<double>(occ);
             continue;
         }
+        if (valued == 0)
+            continue;
         switch (func) {
-            case AGG_AREA:         values[idx] = static_cast<double>(occ);             break;
             case AGG_WEIGHTED_SUM: values[idx] = batch.weighted_sum[j];                 break;
             case AGG_MIN:          values[idx] = batch.min_val[j];                      break;
             case AGG_MAX:          values[idx] = batch.max_val[j];                      break;
-            case AGG_AVG:          values[idx] = batch.weighted_sum[j] / static_cast<double>(occ); break;
+            // the mean over the area that has a value
+            case AGG_AVG:          values[idx] = batch.weighted_sum[j] / static_cast<double>(valued); break;
             // Object funcs handled separately in apply_agg_objects; cannot reach here.
             default: break;
         }

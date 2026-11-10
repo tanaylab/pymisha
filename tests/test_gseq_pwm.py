@@ -306,23 +306,147 @@ class TestGseqPwmROI:
         )
         assert result[0] == 0
 
-    def test_extend_true(self):
-        """extend=True allows motif to start before ROI."""
+    def test_extend_never_moves_the_first_anchor(self):
+        """extend lets a window run past end_pos only, as the pwm vtracks (R misha 5.18.0)."""
         pssm = _create_test_pssm()
         seq = "XACXXXXXXXXX"
-        # ROI starts at 3, "AC" starts at position 2
-        # Without extend: not counted (starts outside ROI)
-        # With extend: counted (overlaps ROI)
-        result_no_ext = pm.gseq_pwm(
-            [seq], pssm, mode="count", bidirect=False, prior=0,
-            score_thresh=0, start_pos=3, end_pos=12, extend=False
-        )
-        result_ext = pm.gseq_pwm(
-            [seq], pssm, mode="count", bidirect=False, prior=0,
-            score_thresh=0, start_pos=3, end_pos=12, extend=True
-        )
-        assert result_no_ext[0] == 0
-        assert result_ext[0] == 1
+        # ROI starts at 3, "AC" starts at position 2: not counted, with or without extend
+        for ext in (False, True):
+            assert pm.gseq_pwm([seq], pssm, mode="count", bidirect=False, prior=0, score_thresh=0,
+                               start_pos=3, end_pos=12, extend=ext)[0] == 0
+        # ROI ends at 2, where "AC" starts: counted only when it may run past the end
+        for ext, n in ((False, 0), (True, 1)):
+            assert pm.gseq_pwm([seq], pssm, mode="count", bidirect=False, prior=0, score_thresh=0,
+                               start_pos=1, end_pos=2, extend=ext)[0] == n
+
+    # R's "gseq.pwm extend parameter works correctly". R's matrix has 1e-10 for 0: R
+    # keeps the probabilities in float, where 1 / (1 + 3e-10) is 1 and a match scores
+    # exactly 0, while pymisha computes in double (-6e-10), below score_thresh = 0.
+    # Exact zeros give 0 in both.
+    def test_extend_parameter_works_correctly(self):
+        pssm = np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0]])
+        seq = "GGGGACGGGG"
+
+        def count(s=seq, **kw):
+            return pm.gseq_pwm(s, pssm, mode="count", score_thresh=0, prior=0, **kw)[0]
+
+        # ROI at 5-5 (just "A"): the AC at 5-6 starts in the ROI and ends past it. Without
+        # extend the ROI holds no window at all: NaN, nothing to count, as the pwm vtracks
+        assert np.isnan(count(start_pos=5, end_pos=5, extend=False))
+        assert count(start_pos=5, end_pos=5, extend=True) == 1
+        assert count(start_pos=5, end_pos=5, extend=1) == 1
+        # ROI at 6-6 (just "C"): the AC starts before the ROI, so no extend scores it,
+        # as the pwm vtracks never score an anchor before the interval
+        assert np.isnan(count(start_pos=6, end_pos=6, extend=False))
+        assert count(start_pos=6, end_pos=6, extend=True) == 0
+        assert count(start_pos=6, end_pos=6, extend=5) == 0
+        assert pm.gseq_pwm(seq, pssm, mode="max", prior=0, start_pos=6, end_pos=6, extend=True)[0] < -1
+        # An integer extend is how many bases a match may run past end_pos
+        assert count(start_pos=1, end_pos=4, extend=1) == 0
+        assert count(start_pos=1, end_pos=4, extend=2) == 1
+        # A minus-strand match is anchored at its first base too: GT at 5-6 is AC's reverse complement
+        assert count("GGGGGTGGGG", bidirect=False, strand=-1, start_pos=6, end_pos=6, extend=True) == 0
+        assert count("GGGGGTGGGG", bidirect=False, strand=-1, start_pos=5, end_pos=5, extend=True) == 1
+        # The motif at 1-2 lies before the ROI and the one at 9-10 ends 2 bases past it
+        ac = pd.DataFrame({"A": [1, 0], "C": [0, 1], "G": 0, "T": 0})
+        assert pm.gseq_pwm("ACGGGGGGAC", ac, mode="count", bidirect=False, strand=1, start_pos=2, end_pos=8,
+                           extend=True, score_thresh=-0.01, prior=0)[0] == 0
+
+    # R's "gseq.pwm with gaps: ROI and extend" (exact zeros, as above)
+    def test_with_gaps_roi_and_extend(self):
+        pssm = np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0]])
+
+        def count(s="GGGG-A--GGAC-GGGG", **kw):
+            return pm.gseq_pwm(s, pssm, mode="count", score_thresh=0, bidirect=False, strand=1,
+                               skip_gaps=True, prior=0, **kw)[0]
+
+        # ROI at 11-11 (the A) with extend=TRUE finds the AC at 11-12, which runs past it
+        assert count(start_pos=11, end_pos=11, extend=True) == 1
+        assert np.isnan(count(start_pos=11, end_pos=11, extend=False))
+        # ROI at 12-12 (the C): the AC starts before the ROI
+        assert count(start_pos=12, end_pos=12, extend=True) == 0
+        # The run past the end counts non-gap bases: A at 3 and C at 5 across a gap
+        assert count("GGA-CG", start_pos=3, end_pos=3, extend=True) == 1
+
+    # R misha 5.18.0 (89b68fa7): a sequence or ROI with no window is NaN for count too,
+    # as the pwm vtracks give for an interval without an anchor; windows that exist but
+    # none scorable still count 0. On every path: the C++ scorer ("log_quarter"), the
+    # vectorized one (no ROI) and the per-sequence one.
+    @pytest.mark.parametrize("policy", ["average", "log_quarter"])
+    def test_count_is_nan_where_there_is_nothing_to_count(self, policy):
+        pssm = np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0]])
+
+        def g(s, mode="count", **kw):
+            if mode == "count":
+                kw["score_thresh"] = 0
+            return pm.gseq_pwm(s, pssm, mode=mode, prior=0, neutral_chars_policy=policy, **kw)
+
+        for mode in ("count", "lse", "max", "pos"):
+            # shorter than the motif, with and without an ROI
+            assert np.isnan(g(["A", "ACAC"], mode)[0]), mode
+            assert np.isnan(g("A", mode, start_pos=1, end_pos=1)[0]), mode
+            # start_pos past end_pos
+            assert np.isnan(g("ACGTACGT", mode, start_pos=5, end_pos=3)[0]), mode
+            # all gaps, or fewer non-gap bases than the motif
+            assert np.isnan(g("-----", mode, skip_gaps=True)[0]), mode
+            assert np.isnan(g("---A---", mode, skip_gaps=True)[0]), mode
+            # a None sequence (R's NA)
+            assert np.isnan(g([None, "ACAC"], mode)[0]), mode
+        assert g(["A", "ACAC", "ACAC"], start_pos=[1, 1, 2])[1:].tolist() == [2, 1]
+
+    # R's "gseq.pwm count separates 'counted nothing' from 'nothing to count', and an
+    # NA sequence is NA"
+    def test_count_separates_counted_nothing_from_nothing_to_count(self):
+        pssm = pd.DataFrame({"A": [0.97], "C": [0.01], "G": [0.01], "T": [0.01]})
+        # windows, none scorable: counted, found none
+        assert pm.gseq_pwm("NNNN", pssm, mode="count", score_thresh=-1, prior=0)[0] == 0
+        # a None sequence: R's NA, whose "A" R used to score as CHAR() of NA is "NA"
+        for m in ("lse", "max", "count", "pos"):
+            assert np.isnan(pm.gseq_pwm([None], pssm, mode=m, score_thresh=-1, prior=0)[0]), m
+        np.testing.assert_array_equal(pm.gseq_kmer([None, "AA"], "A", strand=1), [np.nan, 2])
+
+    # R's "gseq.pwm matches the pwm vtracks on random intervals"
+    def test_matches_the_pwm_vtracks_on_random_intervals(self):
+        rng = np.random.default_rng(29)
+        pssm = pd.DataFrame([[0.7, 0.1, 0.1, 0.1], [0.1, 0.1, 0.7, 0.1], [0.1, 0.6, 0.2, 0.1]],
+                            columns=["A", "C", "G", "T"])
+        w = len(pssm) - 1
+        sizes = dict(zip(pm.gintervals_all()["chrom"], pm.gintervals_all()["end"], strict=True))
+        starts = np.sort(rng.choice(200, 12, replace=False)) * 1000 + 10000
+        # short and long intervals on chr1, plus the end of chrX (R takes chr20)
+        iv = pd.DataFrame({
+            "chrom": ["chr1"] * 12 + ["chrX"],
+            "start": list(starts) + [sizes["chrX"] - 41],
+            "end": list(starts + np.r_[3:6, rng.integers(20, 301, 9)]) + [sizes["chrX"]],
+        })
+        size = iv["chrom"].map(sizes).to_numpy()
+        # gseq_pwm gets the interval padded by w - 1 on each side (clipped to the
+        # chromosome), with start_pos / end_pos marking the interval
+        pad = iv.assign(start=np.maximum(0, iv["start"] - w), end=np.minimum(size, iv["end"] + w))
+        seqs = pm.gseq_extract(pad)
+        roi_start = (iv["start"] - pad["start"] + 1).tolist()
+        roi_end = (iv["end"] - pad["start"]).tolist()
+        funcs = {"lse": "pwm", "max": "pwm.max", "count": "pwm.count"}
+        try:
+            for ext in (False, True):
+                # strand 0 stands for bidirect = True
+                for strand0 in (0, 1, -1):
+                    bidirect = strand0 == 0
+                    strand = 1 if bidirect else strand0
+                    for mode, func in funcs.items():
+                        thresh = -4.5 if mode == "count" else None
+                        kw = {} if thresh is None else {"score_thresh": thresh}
+                        pm.gvtrack_create("v", None, func, pssm=pssm, bidirect=bidirect, strand=strand,
+                                          extend=ext, prior=0.01, **kw)
+                        vt = pm.gextract("v", iv, iterator=iv).sort_values("intervalID")["v"].to_numpy()
+                        for skip in (True, False):
+                            gs = pm.gseq_pwm(seqs, pssm, mode=mode, bidirect=bidirect, strand=strand,
+                                             start_pos=roi_start, end_pos=roi_end, extend=ext, prior=0.01,
+                                             skip_gaps=skip, **kw)
+                            np.testing.assert_allclose(gs, vt, rtol=1e-5,
+                                                       err_msg=f"{mode} {ext} {bidirect} {strand} {skip}")
+        finally:
+            pm.gvtrack_clear()
 
 
 class TestGseqPwmGaps:
