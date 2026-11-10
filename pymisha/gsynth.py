@@ -84,6 +84,14 @@ class GsynthModel:
         Total k-mers counted during training.
     per_bin_kmers : numpy.ndarray
         K-mers per flat bin.
+    min_obs : int
+        Bins with fewer k-mers than this are sparse: their CDF is NaN.
+    sparse_bins : numpy.ndarray
+        1-based flat bins with fewer than ``min_obs`` k-mers (read-only).
+    sparse_coords : pandas.DataFrame or None
+        The 1-based bin of each sparse bin in every dimension, one column per
+        ``expr``; only for models with 2+ dimensions and 1 to 50 sparse bins,
+        else None (read-only).
     total_masked : int
         Positions skipped due to mask.
     total_n : int
@@ -144,6 +152,23 @@ class GsynthModel:
         """Number of k-mer contexts (4^k)."""
         return int(4 ** self.k)
 
+    @property
+    def sparse_bins(self) -> _numpy.ndarray:
+        """1-based flat bins with fewer than ``min_obs`` k-mers."""
+        if self.per_bin_kmers is None:
+            return _numpy.array([], dtype=_numpy.int64)
+        return _numpy.flatnonzero(_numpy.asarray(self.per_bin_kmers) < self.min_obs) + 1
+
+    @property
+    def sparse_coords(self) -> _pd.DataFrame | None:
+        """The 1-based per-dimension bins of ``sparse_bins`` (2+ dimensions, 1-50 sparse bins)."""
+        sb = self.sparse_bins
+        if self.n_dims < 2 or not 0 < len(sb) <= 50:
+            return None
+        coords = _numpy.unravel_index(sb - 1, self.dim_sizes, order="F")  # first dim fastest
+        return _pd.DataFrame(_numpy.column_stack(coords) + 1,
+                             columns=[s["expr"] for s in self.dim_specs])
+
     def __repr__(self) -> str:
         lines = [
             f"Synthetic Genome Markov-{self.k} Model",
@@ -158,6 +183,11 @@ class GsynthModel:
         ]
         if self.min_obs > 0:
             lines.append(f"  Min observations: {self.min_obs}")
+        sparse = self.sparse_bins
+        if len(sparse) > 0:
+            lines.append(f"  Sparse bins (< {self.min_obs} obs): {len(sparse)} bins marked as NA")
+            if len(sparse) <= 10:
+                lines.append(f"    Bin indices: {', '.join(str(b) for b in sparse)}")
         prior_line = f"  Prior: {self.prior_mode}"
         if self.prior_matrix is not None:
             mean_pi = _numpy.asarray(self.prior_matrix).mean(axis=0)
@@ -174,6 +204,19 @@ class GsynthModel:
             lines.append(f"  Dim {i + 1}: expr='{spec.get('expr', '')}', "
                          f"bins={spec.get('num_bins', '?')}")
         return "\n".join(lines)
+
+
+def _find_bins(values: _numpy.ndarray, breaks: _numpy.ndarray) -> _numpy.ndarray:
+    """0-based bins of *values* as R's ``findInterval(rightmost.closed = TRUE)``.
+
+    Bins are ``[breaks[i], breaks[i+1])`` and the last one is closed on both ends, so a value
+    equal to ``breaks[0]`` is in bin 0 (unlike gdist's ``(b_i, b_{i+1}]``). Values outside
+    the breaks and NaN get -1.
+    """
+    idx = _numpy.searchsorted(breaks, values, side="right") - 1
+    idx[values == breaks[-1]] = len(breaks) - 2
+    idx[idx >= len(breaks) - 1] = -1  # above the last break, or NaN (sorted last)
+    return idx.astype(_numpy.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -586,12 +629,9 @@ def gsynth_cell_merge(
         from_vals = _numpy.array([e["from"][d] for e in entries], dtype=float)
         to_vals = _numpy.array([e["to"][d] for e in entries], dtype=float)
 
-        # findInterval(rightmost.closed=TRUE) -> 1-based bin via searchsorted.
-        from_bins = _numpy.searchsorted(breaks, from_vals, side="right")
-        to_bins = _numpy.searchsorted(breaks, to_vals, side="right")
-        # Clamp upper edge: values equal to breaks[-1] land in last bin.
-        from_bins = _numpy.where(from_vals == breaks[-1], num_bins, from_bins)
-        to_bins = _numpy.where(to_vals == breaks[-1], num_bins, to_bins)
+        # 1-based bins; 0 = outside the breaks
+        from_bins = _find_bins(from_vals, breaks).astype(_numpy.int64) + 1
+        to_bins = _find_bins(to_vals, breaks).astype(_numpy.int64) + 1
 
         bad_from = (from_bins < 1) | (from_bins > num_bins)
         bad_to = (to_bins < 1) | (to_bins > num_bins)
@@ -626,23 +666,38 @@ def gsynth_cell_merge(
     return _pd.DataFrame(out, columns=cols)
 
 
+def _nan_cdf_bins(cdf_list: list[_numpy.ndarray]) -> _numpy.ndarray:
+    """1-based flat bins whose CDF is NaN: the sparse bins, for gsynth_sample as for gsynth_score."""
+    return _numpy.array([b + 1 for b, c in enumerate(cdf_list) if _numpy.isnan(c[0, 0])],
+                        dtype=_numpy.int64)
+
+
 def _apply_cell_merge_to_cdf_list(
     model: GsynthModel,
     cell_merge: list[dict[str, _Any]] | _pd.DataFrame | None,
     bin_merge: list[_Any] | None,
+    sparse: _numpy.ndarray,
 ) -> list[_numpy.ndarray]:
-    """Return a (possibly modified) cdf_list with cell_merge redirects applied.
+    """Return the cdf_list to sample from: *sparse* bins uniform, then cell_merge redirects applied.
 
     Always returns a shallow copy of ``model.model_data["cdf"]`` so the model
-    is never mutated. When ``cell_merge`` is None or empty, returns the copy
-    unchanged.
+    is never mutated.
 
     Emits warnings for:
 
     - self-redirects (``source_flat == target_flat``) -- dropped
     - duplicate source cells across entries -- last entry wins
+    - a target cell that is a sparse bin
     """
     cdf_list = list(model.model_data["cdf"])
+    # Sparse bins (NaN CDF) are sampled uniformly: from a NaN row the C++ sampler would draw only T.
+    # All of them, not only those hit as R does, so a sparse cell_merge target is uniform too.
+    # Unlike R, a bin of fewer than min_obs k-mers whose CDF gsynth_forbid_kmer rebuilt is not
+    # uniform, so the forbidden k-mer stays out of it.
+    if len(sparse) > 0:
+        uniform = _numpy.tile([0.25, 0.5, 0.75, 1.0], (model.num_kmers, 1))
+        for b in sparse:
+            cdf_list[b - 1] = uniform
     if cell_merge is None:
         return cdf_list
 
@@ -660,6 +715,13 @@ def _apply_cell_merge_to_cdf_list(
         )
         resolved = resolved[~self_mask]
 
+    if resolved["target_flat"].isin(sparse).any():
+        _warnings.warn(
+            "cell_merge: at least one target cell is itself a sparse bin (uniform fallback).",
+            UserWarning,
+            stacklevel=3,
+        )
+
     # Duplicate source -> last entry wins.
     dup_mask = resolved["source_flat"].duplicated(keep="last")
     if dup_mask.any():
@@ -672,10 +734,6 @@ def _apply_cell_merge_to_cdf_list(
         resolved = resolved[~dup_mask]
 
     # Apply redirects: source/target are 1-based.
-    # KNOWN GAP vs R: R also warns when the target_flat bin's CDF is itself
-    # sparse-fallback (uniform 0.25 per base). PyMisha does not detect this
-    # yet; redirecting to a sparse target produces silent uniform sampling.
-    # See R synth.R:2017 for reference.
     for _, row in resolved.iterrows():
         src = int(row["source_flat"]) - 1
         tgt = int(row["target_flat"]) - 1
@@ -753,8 +811,6 @@ def _extract_bin_data(
         return bin_indices, iter_starts, iter_chroms, [0.0, 1.0], None, [1], iter_ends, iter_ivids
 
     # Extract track values for each dimension
-    from .summary import _bin_values
-
     dim_data = []
     dim_sizes = []
 
@@ -775,17 +831,16 @@ def _extract_bin_data(
             raise ValueError(f"No value column in extraction for '{expr}'")
         values = df[val_cols[0]].to_numpy(dtype=float)
 
-        # Keep binning semantics consistent with gdist/gbins.
-        bin_idx = _bin_values(values, breaks, include_lowest=False)
+        bin_idx = _find_bins(values, breaks)
 
-        # Determine effective bin_merge for this dimension:
-        # sample_bin_merge overrides training-time bin_merge when provided.
+        # A sample-time bin_merge replaces the training-time bin_map (0-based; None = no
+        # merging), which a loaded model keeps without its bin_merge.
         if sample_bin_merge is not None and d_idx < len(sample_bin_merge) and sample_bin_merge[d_idx] is not None:
-            bm_spec = sample_bin_merge[d_idx]
+            bm = gsynth_bin_map(breaks, sample_bin_merge[d_idx]) if sample_bin_merge[d_idx] else None
         else:
-            bm_spec = spec.get("bin_merge")
-        if bm_spec:
-            bm = gsynth_bin_map(breaks, bm_spec)
+            bm = spec.get("bin_map")
+        if bm is not None:
+            bm = _numpy.asarray(bm, dtype=_numpy.int64)
             valid = bin_idx >= 0
             bin_idx[valid] = bm[bin_idx[valid]]
 
@@ -1100,7 +1155,22 @@ def _merge_train_results(
     }
 
 
-def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
+def _warn_sparse_used(sparse: _numpy.ndarray, min_obs: int, bin_indices: _numpy.ndarray) -> None:
+    """R's warning when sampling reaches *sparse* (1-based) bins; *bin_indices* are 0-based."""
+    if len(sparse) == 0:
+        return
+    used = _numpy.intersect1d(_numpy.asarray(bin_indices) + 1, sparse)
+    if len(used) > 0:
+        _warnings.warn(
+            f"{len(used)} sparse bins (with < {min_obs} observations) will be used during "
+            "sampling.\nThese bins will use uniform base distribution. Consider using bin_merge "
+            "to merge them.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _worker_sample_chunk(args: tuple[_Any, ...]) -> tuple[list[str], _numpy.ndarray]:
     """Worker function for parallel gsynth_sample.
 
     Runs in a forked subprocess. The child inherits the parent's
@@ -1115,8 +1185,8 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
 
     Returns
     -------
-    list of str
-        Sampled sequences for this chunk.
+    tuple
+        Sampled sequences for this chunk, and the flat bins (0-based) it used.
     """
     (chunk_intervals_dict, dim_specs_list, cdf_list_data,
      iterator, mask_copy_dict, n_samples, chunk_seed,
@@ -1149,7 +1219,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
 
     # Call C++ backend (vector mode)
-    return list(_pymisha.pm_gsynth_sample(
+    seqs = list(_pymisha.pm_gsynth_sample(
         cdf_list,
         flat_breaks,
         bin_indices,
@@ -1166,6 +1236,7 @@ def _worker_sample_chunk(args: tuple[_Any, ...]) -> list[str]:
         bool(preserve_n),
         None,  # bases without a valid context or bin are drawn uniformly
     ))
+    return seqs, _numpy.unique(bin_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1274,23 @@ def _resolve_prior_arg(
             f"shape {arr.shape}"
         )
     return "explicit", arr
+
+
+def _mark_sparse_bins(model: GsynthModel) -> GsynthModel:
+    """Set the CDF of every bin with fewer than ``min_obs`` k-mers to NaN, with R's warning."""
+    sparse = model.sparse_bins
+    if len(sparse) > 0:
+        cdf = model.model_data["cdf"]
+        for b in sparse:
+            cdf[b - 1] = _numpy.full_like(cdf[b - 1], _numpy.nan)
+        _warnings.warn(
+            f"{len(sparse)} out of {model.total_bins} bins have fewer than {model.min_obs} "
+            "observations and are marked as NA.\nUse bin_merge to merge sparse bins before "
+            "sampling, or they will use uniform sampling.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return model
 
 
 def gsynth_train(
@@ -1272,8 +1360,13 @@ def gsynth_train(
         Pseudocount added to all k-mer counts to avoid zero probabilities
         in the CDF.
     min_obs : int, default 0
-        Minimum number of (k+1)-mer observations required per bin.  Reserved
-        for future use.
+        Minimum number of (k+1)-mer observations required per bin. Bins with
+        fewer are marked sparse (``model.sparse_bins``): their CDF is set to
+        NaN, with a warning. Where a bin's CDF is NaN, :func:`gsynth_sample`
+        draws bases uniformly unless ``bin_merge`` redirects the bin, and
+        :func:`gsynth_score` follows its ``sparse_policy``.
+        :func:`gsynth_forbid_kmer` rebuilds the CDF of every bin, sparse ones
+        included.
     k : int, default 5
         Markov order (context length).  Must be in ``[1, 10]``.  The model
         stores ``4^k`` context states; higher values capture longer-range
@@ -1346,6 +1439,7 @@ def gsynth_train(
     if not isinstance(k, int) and isinstance(k, float) and k != int(k):
         raise ValueError(f"k must be an integer, got {k}")
     k = int(k)
+    min_obs = int(min_obs)
     if k < 1 or k > 10:
         raise ValueError(f"Markov order k must be in [1, 10], got {k}")
 
@@ -1441,7 +1535,7 @@ def gsynth_train(
             prior_mode=prior_mode, prior_matrix=prior_matrix_arg,
         )
 
-        return GsynthModel(
+        return _mark_sparse_bins(GsynthModel(
             k=k,
             n_dims=len(parsed_specs),
             dim_sizes=dim_sizes,
@@ -1461,7 +1555,7 @@ def gsynth_train(
             prior_mode=prior_mode,
             prior_matrix=result["prior"],
             marginal_fallbacks=int(result["marginal_fallbacks"]),
-        )
+        ))
 
     # --- Single-process path (original logic) ---
 
@@ -1505,7 +1599,7 @@ def gsynth_train(
     for dim_size in dim_sizes:
         total_bins *= int(dim_size)
 
-    return GsynthModel(
+    return _mark_sparse_bins(GsynthModel(
         k=k,
         n_dims=len(parsed_specs),
         dim_sizes=dim_sizes,
@@ -1525,7 +1619,7 @@ def gsynth_train(
         prior_mode=prior_mode,
         prior_matrix=result.get("prior"),
         marginal_fallbacks=int(result.get("marginal_fallbacks", 0)),
-    )
+    ))
 
 
 
@@ -1702,10 +1796,11 @@ def gsynth_sample(
 
     intervals = _maybe_load_intervals_set(intervals)
 
-    # Apply per-joint-cell CDF redirects (cell_merge) on top of bin_merge.
-    # Returns a (possibly modified) shallow copy of model.model_data["cdf"];
+    # Sparse bins sampled uniformly, then per-joint-cell CDF redirects (cell_merge) on top of
+    # bin_merge. Returns a (possibly modified) shallow copy of model.model_data["cdf"];
     # both the parallel and serial paths below consume this same list.
-    cdf_list = _apply_cell_merge_to_cdf_list(model, cell_merge, bin_merge)
+    sparse = _nan_cdf_bins(model.model_data["cdf"])
+    cdf_list = _apply_cell_merge_to_cdf_list(model, cell_merge, bin_merge, sparse)
 
     # Check whether to parallelize
     do_parallel, effective_cores = _should_parallelize(
@@ -1744,10 +1839,9 @@ def gsynth_sample(
         chunk_results = _map_forked(_worker_sample_chunk, worker_args, effective_cores)
 
         # Concatenate all sequence lists
-        all_seqs = []
-        for cr in chunk_results:
-            if cr is not None:
-                all_seqs.extend(cr)
+        all_seqs = [s for seqs, _ in chunk_results for s in seqs]
+        _warn_sparse_used(sparse, model.min_obs,
+                          _numpy.concatenate([used for _, used in chunk_results]))
 
         # Handle output mode
         if output is None:
@@ -1786,10 +1880,10 @@ def gsynth_sample(
     bin_indices, iter_starts, _, flat_breaks, _, _, iter_ends, iter_ivids = \
         _extract_bin_data(model.dim_specs, intervals, iterator,
                           sample_bin_merge=bin_merge)
+    _warn_sparse_used(sparse, model.min_obs, bin_indices)
 
-    # cdf_list was computed once near the top (with cell_merge redirects
-    # applied, if any); reuse it here so the serial path stays consistent
-    # with the parallel path.
+    # cdf_list was computed once near the top (sparse bins uniform, cell_merge redirects
+    # applied); reuse it here so the serial path stays consistent with the parallel path.
 
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None
@@ -1994,7 +2088,6 @@ def gsynth_score(
         unknown).
     """
     from .sequence import gseq_extract
-    from .summary import _bin_values
     from .tracks import gtrack_create_dense_direct, gtrack_rm
 
     if not isinstance(model, GsynthModel):
@@ -2075,18 +2168,19 @@ def gsynth_score(
         iter_ends = track_data["end"].to_numpy(dtype=_numpy.int64)
         iter_ivids = track_data["intervalID"].to_numpy(dtype=_numpy.int64) - 1
 
-        # Compute per-dimension bin indices and combine to a flat index.
+        # Compute per-dimension bin indices and combine to a flat index, the first dimension
+        # varying fastest, as in training.
         bin_indices = _numpy.zeros(len(track_data), dtype=_numpy.int64)
         valid = _numpy.ones(len(track_data), dtype=bool)
         stride = 1
-        for d_idx in reversed(range(len(model.dim_specs))):
+        for d_idx in range(len(model.dim_specs)):
             spec = model.dim_specs[d_idx]
             breaks = _numpy.asarray(spec["breaks"], dtype=float)
             n_bins = spec["num_bins"]
             val_col = [c for c in track_data.columns
                        if c not in {"chrom", "start", "end", "intervalID"}][d_idx]
             values = track_data[val_col].to_numpy(dtype=float)
-            bidx = _bin_values(values, breaks, include_lowest=False)
+            bidx = _find_bins(values, breaks)
             bin_map = spec.get("bin_map")
             if bin_map is not None:
                 bm = _numpy.asarray(bin_map, dtype=_numpy.int64)
@@ -2870,15 +2964,15 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
 
     dim_specs_out = []
     for spec in model.dim_specs:
+        # bin_map is 1-based in the file, as R writes it, and null when it merges nothing
+        bm = spec.get("bin_map")
+        if bm is not None and list(bm) == list(range(len(bm))):
+            bm = None
         ds = {
             "expr": str(spec.get("expr", "")),
             "breaks": [float(b) for b in spec.get("breaks", [])],
             "num_bins": int(spec.get("num_bins", 0)),
-            "bin_map": (
-                [int(x) for x in spec["bin_map"]]
-                if spec.get("bin_map") is not None
-                else None
-            ),
+            "bin_map": [int(x) + 1 for x in bm] if bm is not None else None,
         }
         dim_specs_out.append(ds)
 
@@ -2900,6 +2994,8 @@ def gsynth_save(model: GsynthModel, path: str, *, compress: bool = False) -> Non
         "total_n": int(model.total_n),
         "per_bin_kmers": per_bin_kmers_list,
         "dim_specs": dim_specs_out,
+        # older pymisha wrote bin_map 0-based; this key marks the files that hold it 1-based
+        "bin_map_base": 1,
         "prior_mode": str(getattr(model, "prior_mode", "uniform")),
         "marginal_fallbacks": int(getattr(model, "marginal_fallbacks", 0)),
         "data": {
@@ -3050,14 +3146,29 @@ def _load_gsm_from_meta_and_files(metadata: dict[str, _Any], read_file: _Any) ->
     counts_list = [counts_raw[i].astype(_numpy.uint64) for i in range(total_bins)]
     cdf_list = [cdf_raw[i].copy() for i in range(total_bins)]
 
-    # Reconstruct dim_specs
+    # Reconstruct dim_specs. bin_map is 1-based in the file (R, and pymisha with bin_map_base: 1)
+    # except in older pymisha files: those written since marginal_fallbacks was added, and
+    # earlier ones whose map has a 0. In memory it is 0-based.
     dim_specs = []
     for ds in metadata.get("dim_specs", []):
+        num_bins = int(ds["num_bins"])
+        bm = ds.get("bin_map")
+        if bm is not None:
+            bm = [int(x) for x in (bm if isinstance(bm, list) else [bm])]
+            if "bin_map_base" in metadata:
+                base = int(metadata["bin_map_base"])
+            elif "marginal_fallbacks" in metadata:
+                base = 0
+            else:
+                base = 0 if 0 in bm else 1
+            bm = [x - base for x in bm]
+            if len(bm) != num_bins or not all(0 <= x < num_bins for x in bm):
+                raise ValueError(f"Invalid bin_map for dimension '{ds['expr']}': {ds['bin_map']}")
         spec = {
             "expr": ds["expr"],
             "breaks": ds["breaks"],
             "num_bins": ds["num_bins"],
-            "bin_map": ds.get("bin_map"),
+            "bin_map": bm,
         }
         dim_specs.append(spec)
 

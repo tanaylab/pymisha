@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.20.1 (2026-11-10)
+
+### Fixes
+
+* `gsynth_train`, `gsynth_sample` and `gsynth_score` bin values as R (`findInterval`): bins are `[b_i, b_{i+1})`, the last one closed. A value equal to the first break was dropped from training (e.g. every window with no CpG when the breaks start at 0), and a value on an interior break went to the bin below. Retrain models built on such data.
+* `gsynth_score` on a model with 2 or more dimensions looked up the wrong bin for most positions.
+* `gsynth_train(min_obs=)` now works as in R: bins with fewer k-mers are marked sparse (`model.sparse_bins`, `model.sparse_coords`) with a NaN CDF and a warning; `gsynth_sample` draws their bases uniformly and warns when it uses them, and warns when a `cell_merge` target is sparse. Unlike R, after `gsynth_forbid_kmer` they are sampled from their rebuilt CDF, so the forbidden k-mer stays out of them.
+* A model trained with `bin_merge` lost the merge when saved and loaded, so `gsynth_sample` on the loaded model gave different sequences. `.gsm` files now hold `bin_map` 1-based, as R writes them, so such models load the same in R and pymisha; files written by older pymisha still load.
+
 ## v0.20.0 (2026-11-10)
 
 Follows R misha 5.18.0. Several results change; recompute anything that depends on them.
