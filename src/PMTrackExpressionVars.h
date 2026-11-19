@@ -21,6 +21,7 @@
 #include "GenomeTrackSparse.h"
 #include "GenomeTrackArray.h"
 #include "GenomeSeqScorer.h"
+#include "PMIntervalsVtrack.h"
 
 class PMTrackExpressionVars {
 public:
@@ -89,9 +90,8 @@ public:
         int64_t sp_last_start{0};
         bool sp_scan_ready{false};
 
-        // For value-based vtracks with interval/DataFrame source
-        // (These are computed by pm_vtrack_compute via Python, so we keep the spec)
-        bool use_pm_vtrack_compute{false};
+        // A DataFrame source (interval or value-based functions), read once
+        std::unique_ptr<PMIntervalsVtrack> intervals_src;
     };
 
     PMTrackExpressionVars();

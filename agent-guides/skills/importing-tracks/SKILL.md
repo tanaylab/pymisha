@@ -12,7 +12,7 @@ A "track import" is any operation that materializes a persistent on-disk track f
 Two failure modes worth pre-empting:
 
 1. **Picking the wrong variant** for the source shape.
-2. **Silent partial imports.** WIG / bigWig importers run with `ignore_unknown_chroms = True` - chroms not in `pm.gintervals_all()["chrom"]` are dropped without error. Mismatched naming (`1` vs `chr1`) yields an "all NaN" track, not a failure.
+2. **Partial imports.** WIG / bedGraph / bigWig chromosome names are matched through the alias chain (`chr1` <-> `1`, `M` <-> `MT`, plus `chrom_aliases.tsv`). Names that still do not match are skipped and the import succeeds: a log message for scaffolds, a warning for primary chromosomes. Only a file that matches no chromosome at all is an error.
 
 ## Precondition: chrom-name compatibility (mandatory)
 
@@ -37,16 +37,19 @@ Non-empty diff → wrong gdb, naming-convention mismatch, or a gdb missing scaff
 
 ## Format chooser
 
+Convention used throughout: `binsize > 0` produces a dense fixed-bin track (one value per `binsize`-wide genomic window); `binsize=0` produces a sparse track (one value per source interval, no inter-record bookkeeping). Picking the wrong shape for the source is the second-most-common ingestion mistake after chrom-name mismatch.
+
 | Source | Function | Key args / caveats |
 |---|---|---|
 | In-memory intervals + values (DataFrame) | `gtrack_create_dense(name, desc, intervals, values, binsize, defval, func)` (`func` ∈ `"weighted.mean"` / `"weighted.sum"` / `"coverage"` / `"max"` / `"min"` / `"median"` / `"count"`) or `gtrack_create_sparse(name, desc, intervals, values)` | preferred whenever data is already in Python - no TSV round-trip needed |
 | Single WIG / bigWig file | `gtrack_import(name, desc, file, binsize, defval=float("nan"))` | auto-dispatch on `.wig` / `.bw` / `.bigWig`; pass `defval=float("nan")` (not `0`) for continuous signal so uncovered bins read as NaN |
 | Single BED file (or 4-col TSV) | same `gtrack_import` - pass `binsize` for a dense track, omit it for a sparse track | path goes through the same C++ importer as R misha |
 | Python-computed values via TSV (chrom/start/end/value) | `gtrack_import(name, desc, file, binsize)` | pandas writes ints in decimal by default, no `scipen` equivalent needed; verify with `head` before launching the import on a large file |
+| Parquet file(s): chrom/start/end + value columns | `gtrack_import_parquet(description, path, binsize, track_prefix=None, columns=None, defval=float("nan"))`; one value column: `gtrack_import(name, desc, file, binsize)` | one dense track per column; see "Deep-learning bridge" below |
 | Directory or URL-with-wildcards of WIG / bigWig files | `gtrack_import_set(description, path, binsize, track_prefix=None, defval=float("nan"))` | bulk import; `path` may be a glob (`/data/*.bw`) or an `ftp://` URL; continues on per-file errors and returns a dict of successes / failures |
 | ChIP / ATAC pileup from read intervals (DataFrame in Python) | `gtrack_create_dense(name, desc, intervals=reads, values=np.ones(len(reads)), binsize=20, defval=0, func="coverage")` | one-call replacement for the `gtrack_import_mappedseq` route when reads are already in Python |
 | Mapped reads (BAM, SAM, gzipped SAM, or tab-delimited text) | `gtrack_import_mappedseq(name, desc, file, pileup=N, binsize=B, cols_order=(9, 11, 13, 14), remove_dups=True)` | **BAM is now auto-detected** (bgzip magic bytes) and piped through `samtools view` automatically - `samtools` must be on PATH. SAM, gzipped SAM, and TSV inputs work as before. The default `remove_dups=True` is correct for ChIP / ATAC / CUT&RUN. **C++ fast-path since v0.1.95** (3-5x over the legacy Python loop) with **R-parity semantics**: chromosome names in the input are matched through the alias chain (`chr1` ↔ `1`, `M` ↔ `MT`, `chrom_aliases.tsv`), as in R misha 5.16, and only tabs split fields. SAM / BAM reads are placed at their 0-based 5' base. For paired-end ATAC / CUT&RUN pass `paired=True, binsize=B` (fragments from proper pairs, or a 10x `fragments.tsv.gz`); `min_mapq` filters SAM / BAM records |
-| 2D Hi-C / capture-C contacts (per-contact adj + fends) | `gtrack_2d_import_contacts(name, desc, contacts, fends="<redb>/<RE>.fends", allow_duplicates=False)` | `contacts=` accepts a list (shaman per-rect scores, scHi-C per-core stagings - see "scHi-C pooling" below); `allow_duplicates=True` for adj files that already count duplicates. **pymisha defaults `allow_duplicates=True` - the safe default for pooled / non-bulk inputs is `False`; pass it explicitly.** |
+| 2D Hi-C / capture-C contacts (per-contact adj + fends) | `gtrack_2d_import_contacts(name, desc, contacts, fends="<redb>/<RE>.fends", allow_duplicates=True)` | `contacts=` accepts a list (shaman per-rect scores, scHi-C per-core stagings - see "scHi-C pooling" below). `allow_duplicates=True` (the default) sums repeated fend pairs; use `allow_duplicates=False` only for pre-scored shaman per-rectangle outputs where any duplicate is an upstream bug |
 | Restriction-enzyme fragment + fend prerequisites (any new 4C / Hi-C bootstrap) | `gtrack_import("redb.<RE>_flen", flen_file, 0)` + `gtrack_import("redb.<RE>_gc", gc_file, 0)` + `gtrack_create("redb.<RE>_map", mapab_track, iterator="redb.<RE>_flen")` | per-fragment iterator promotes a per-base mapability track to per-fragment mean. See "RE fragment-track bootstrap" below |
 | Pooled multi-cell scHi-C track | `gtrack_2d_import_contacts(pool_name, desc, contacts=[stage_1, ..., stage_N], fends="<redb>/<RE>.fends")` | parallel-stage per-cell `gextract`s to N TSVs, then a single pool call (the N files are read in parallel). See "scHi-C pooling" below |
 | Per-coordinate 2D matrix (already binned, no fends) | `gtrack_2d_import(name, desc, file)` | lower-level than `_contacts`; takes a coord-resolution TSV directly. Used for 4DN-style 1kb contacts. Skip when you have adj + fends |
@@ -60,9 +63,11 @@ Non-empty diff → wrong gdb, naming-convention mismatch, or a gdb missing scaff
 | Track from another assembly (liftover via chain) | `gtrack_liftover(track, desc, src_track_dir, chain, multi_target_agg="mean")` | requires a chain (`gintervals_load_chain`); aggregation policy controls how multiple source bins folded into one target bin combine - pick deliberately. Much less used in the lab than the intervals-side liftover above |
 | Intervals (BED / GFF / GTF / VCF) as an interval set, not a track | `gintervals_import_bed` / `gintervals_import_genes` / `gintervals_import_gff` / `gintervals_import_vcf` | for a sparse-track route instead, build the DataFrame and pass to `gtrack_create_sparse` |
 
-## Pileup tracks: prefer the in-Python path
+## Pileup tracks: which route
 
-For ChIP / ATAC / CUT&Tag pileup tracks, `gtrack_create_dense(..., func="coverage")` remains the simplest path when reads are already in a Python DataFrame: with `values=np.ones(len(reads))`, bin value = `sum(overlap_i) / binsize` = average per-base read count - exactly the ChIP-seq pileup definition, in one C++ pass over the DataFrame. Use `gtrack_import_mappedseq` when you start from a SAM / TSV file (now also C++; see the import table) or when you specifically want the `pileup=` read-extension feature.
+- **Paired-end BAM / SAM, or a fragment file:** `gtrack_import_mappedseq(..., binsize=20, paired=True)`. Each fragment from a proper pair covers its real span, and the file is streamed, so it never has to fit in memory. This is what nf-core, MACS3 `-f BAMPE` and deepTools do for paired-end data.
+- **Single-end reads:** `gtrack_import_mappedseq(..., pileup=<fragment length>, binsize=20)`. A `pileup` shorter than the fragments leaves the + and - strand reads in two humps with a dip at the binding site; use the cross-correlation estimate, or 200 when unknown.
+- **Reads or fragments already in Python:** `gtrack_create_dense(..., func="coverage")` with `values=np.ones(len(reads))`. Bin value = `sum(overlap_i) / binsize` = average per-base coverage, the ChIP-seq pileup definition, in one C++ pass over the DataFrame.
 
 `gtrack_create_dense` `func` choices: `"weighted.mean"` (default), `"weighted.sum"`, `"coverage"`, `"max"`, `"min"`, `"median"`, `"count"`.
 
@@ -210,11 +215,13 @@ with Pool(num_cores) as p:
 pm.gtrack_2d_import_contacts(pool_track,
                              description="Pooled scHi-C contacts",
                              contacts=stage_files,
-                             fends=os.path.join(redb_dir, "GATC.fends"),
-                             allow_duplicates=False)
+                             fends=os.path.join(redb_dir, "GATC.fends"))
+                             # allow_duplicates defaults to True - the right
+                             # value for pooling; False here would raise on
+                             # the first cross-cell repeat.
 ```
 
-Key points: `value=1` per-contact (counts get aggregated by the importer); pandas writes ints in decimal by default - no equivalent of R's `format(..., scientific=FALSE)` needed, but verify on the first chunk if you ever override the float format. `allow_duplicates=True` (pymisha default) is appropriate only when the *same fend pair* should be counted more than once (e.g. raw bulk Hi-C); for pooled scHi-C, pass `allow_duplicates=False` explicitly. (R defaults the other way; pymisha agreed with the older convention. Always be explicit.)
+Key points: `value=1` per-contact (counts get aggregated by the importer); pandas writes ints in decimal by default - no equivalent of R's `format(..., scientific=FALSE)` needed, but verify on the first chunk if you ever override the float format. `allow_duplicates=True` is correct (and is the default, as in R): when two cells contribute the same fend pair, the importer sums their counts, which is what pooling means. `False` makes the importer raise `ValueError` on the first repeated fend pair, which kills any non-trivial pool; it is appropriate only for pre-scored shaman per-rectangle imports, where each rectangle should be unique.
 
 ## Deep-learning bridge: model predictions → pymisha tracks
 
@@ -239,6 +246,8 @@ borzoi_data[borzoi_vt] = (borzoi_data
 borzoi_data.to_csv("output/data-for-borzoi/borzoi_data.tsv",
                    sep="\t", index=False)
 ```
+
+**Parquet.** For a genome-wide matrix, `pm.gextract(exprs, intervals=pm.gintervals_all(), iterator=32, colnames=cols, file="x.parquet")` writes Parquet directly, without holding the result in memory: `chrom`, `start`, `end`, then one double column per expression. Since nothing passes through pandas, put per-column transforms in the expressions (e.g. `np.where(np.isnan(v1), 0, v1) / 6.1 * (blacklisted == 0)`). The other way, `pm.gtrack_import_parquet(description, path, binsize, track_prefix=None, columns=None, defval=float("nan"))` creates one dense track per value column, named `<track_prefix><column>`; `path` may be a glob over per-chromosome files, and columns are matched by name. A Parquet file with a single value column also goes through `gtrack_import(name, desc, file, binsize)`.
 
 Prediction-side import (after the external model run produces per-bin TSVs):
 
@@ -270,7 +279,7 @@ lifted = pm.gintervals_force_range(lifted)        # clamp to chrom bounds
 # lifted = pm.gintervals_canonic(lifted)
 ```
 
-Two non-negotiable post-liftover steps: `gintervals_force_range` (lifted intervals can extend past chrom ends - `gintervals()` then rejects them with `end coordinate exceeds chromosome boundaries`) and, if disjoint output is required, `gintervals_canonic` (lifted intervals may overlap).
+Two non-negotiable post-liftover steps: `gintervals_force_range` (lifted intervals can extend past chrom ends - `gintervals()` then rejects them with `end coordinate exceeds chromosome boundaries`) and, if disjoint output is required, `gintervals_canonic` (lifted intervals may overlap). `gintervals_canonic` defaults to `unify_touching_intervals=True`, which merges intervals that share an endpoint as well as overlapping ones - pass `unify_touching_intervals=False` if you need to preserve adjacency as separate rows.
 
 Output always carries `intervalID` (index into the input) and `chain_id` (which chain produced the mapping). The `chain_id` is essential when a source interval lifted via multiple chains (duplications): two rows with the same `intervalID` but different `chain_id` are distinct mappings.
 
@@ -289,6 +298,7 @@ Output always carries `intervalID` (index into the input) and `chain_id` (which 
 
 | Value | When to use |
 |---|---|
+| `"error"` | Strict: fail if any target overlap is detected. Use to catch unexpected chain-file structure before downstream work assumes there are none |
 | `"auto"` / `"auto_score"` (default) | Segment target overlaps and pick the highest-scoring chain per segment. Right default for almost everything |
 | `"auto_longer"` | Prefer the longer chain per segment. Useful when alignment scores are noisy or uniform across the chain file |
 | `"auto_first"` | Prefer the lowest `chain_id` per segment (= original chain-file order). Use when the chain file encodes ranked preference |
@@ -391,6 +401,24 @@ for i in range(min(5, len(all_chr))):
 
 All-zero across every chrom you expect signal on → chrom-name mismatch (revisit the precondition). Non-zero with a sane range → import succeeded.
 
+## Post-import metadata (provenance)
+
+Every imported track should carry enough metadata for someone (you, in six months; a collaborator; a paper companion repo) to figure out *what it is* without rereading the import script. The lab convention is `gtrack_attr_set` with a small, consistent attribute vocabulary:
+
+```python
+pm.gtrack_attr_set(track, "source",     "ENCODE")               # or GEO, in-house, ...
+pm.gtrack_attr_set(track, "experiment", "chip-seq")             # chip-seq, atac, wgbs, hic, ...
+pm.gtrack_attr_set(track, "protein",    "Oct4")                 # for chip-seq / cut&run
+pm.gtrack_attr_set(track, "PMID",       "28212747")
+pm.gtrack_attr_set(track, "data_link",  "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM1910646")
+pm.gtrack_attr_set(track, "liftover",   "mm9")                  # source assembly if lifted
+pm.gtrack_attr_set(track, "pileup",     "200")                  # single-end mappedseq imports
+```
+
+`created.by` and `created.date` are populated automatically. List everything attached to a track with `pm.gtrack_attr_export(track)`; query one with `pm.gtrack_attr_get`.
+
+Use `pm.gtrack_var_set(track, var, value)` (not `attr_set`) when you need to attach a structured object - a donors DataFrame for an array track, a per-sample metadata table, an arbitrary dict. `attr` is for short string labels; `var` is for Python objects.
+
 ## Failure modes
 
 | Symptom / error | Cause | Fix |
@@ -400,20 +428,22 @@ All-zero across every chrom you expect signal on → chrom-name mismatch (revisi
 | `overlapping intervals` (at `gextract`, not import) | Same-chrom chunks overlap | Validation §4 |
 | Import succeeds, `gextract` returns all 0 or all NaN | Chrom names didn't match gdb (silent skip); or `defval=0` with uncovered bases on a continuous-signal source | Precondition; use `defval=float("nan")` for continuous signal |
 | `gtrack_import_mappedseq` track gives 5-20× expected counts at peaks | Legacy call site explicitly passed `remove_dups=False` (current default is `True`) | Drop the explicit `False`; rely on the safe default |
+| Paired-end ChIP peaks have a dip at the summit, with humps on either side | Paired-end BAM imported as single-end with a `pileup` shorter than the fragments | Re-import with `paired=True` |
+| `paired=True` track has far fewer fragments than the BAM has pairs | Pairs longer than the aligner's insert-size limit (bowtie2 default `-X 500`) are flagged improper and skipped | Compare TLEN of proper and improper pairs; realign with a larger `-X` |
 | Re-imports under the same name behave inconsistently | Importer doesn't fully overwrite | `gtrack_rm(name, force=True)` before re-import |
 | `gtrack_liftover` produces NaN-heavy track | Many source bins mapped to overlapping target loci and `multi_target_agg` discarded most | Try `multi_target_agg="mean"` / `"max.coverage_len"` deliberately; inspect the chain coverage |
 | `gtrack_copy(..., db=X)` errors on 2D | Chrom orders differ between source and destination | Reorder the destination DB, or stage via Python (`gextract` + `gtrack_2d_create`) |
 | `BAD_CHROM` (paths that don't ignore unknown chroms) | Source has chroms the gdb doesn't know | Extend the gdb (see `gdb_install_intervals` / `gdb_build_genome`), add aliases, or filter input |
-| `gtrack_2d_import_contacts` 5-20× over-counting | Pooled / scHi-C input + `allow_duplicates=True` (pymisha default) | Pass `allow_duplicates=False` explicitly |
 
 ## Common mistakes
 
 - Round-tripping data already in Python through a temp TSV. `gtrack_create_dense` / `gtrack_create_sparse` take the DataFrame directly - faster and avoids parser-edge cases.
 - Using `gtrack_import_mappedseq` for reads already loaded in Python, instead of `gtrack_create_dense(..., func="coverage")`. The latter is the modern one-call path.
+- Importing paired-end BAMs as single-end reads with a fixed `pileup`. Use `paired=True`; each mate extended by a fixed length throws away the real fragment span and counts every fragment twice.
+- A single-end `pileup` copied from an old script rather than set to the fragment length (100 is too short for typical 150-300bp ChIP fragments).
 - Using `defval=0` for continuous signal (phyloP, normalized ratios). Downstream `.isna()` filters become useless; everything looks like "data".
 - Skipping post-import sampling because the function returned without error. The most common silent failure is chrom-name mismatch → all-NaN track.
 - Treating `gtrack_copy` as a same-DB-only operation. It supports cross-DB copy via `db="/other/groot"`, including format conversion.
-- Assuming `gtrack_2d_import_contacts` defaults `allow_duplicates=False` like R does. **pymisha defaults `True`.** Pass it explicitly for any pooled / non-bulk input.
 - Assuming a one-call file-import variant `gtrack_array_import` exists. It does not in pymisha; load to pandas and use `gtrack_array_create`.
 
 ## Cross-references

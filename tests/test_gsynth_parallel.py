@@ -7,6 +7,7 @@ import os
 import tempfile
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pymisha as pm
@@ -14,8 +15,9 @@ from pymisha.gsynth import (
     _chunk_intervals,
     _compute_total_bases,
     _generate_chunk_seeds,
+    _max_chunk_bases,
     _merge_train_results,
-    _should_parallelize,
+    _n_workers,
 )
 
 
@@ -43,108 +45,76 @@ class TestComputeTotalBases:
         assert _compute_total_bases(iv) == 2500
 
 
-class TestShouldParallelize:
-    """Tests for _should_parallelize."""
-
-    def test_returns_false_when_disabled(self):
-        iv = pm.gintervals_all()
-        do_par, cores = _should_parallelize(iv, False, 4)
-        assert do_par is False
-        assert cores == 1
-
-    def test_returns_false_for_small_genome(self):
-        iv = pm.gintervals(["1"], [0], [1000])
-        do_par, cores = _should_parallelize(iv, True, 4)
-        assert do_par is False
-        assert cores == 1
-
-    def test_returns_false_for_single_row(self):
-        """Even if total bases exceed threshold, a single row cannot be split."""
-        iv = pm.gintervals(["1"], [0], [500000])
-        do_par, cores = _should_parallelize(iv, True, 4, max_chunk_size=100)
-        assert do_par is False
-        assert cores == 1
-
-    def test_returns_true_for_large_genome_many_rows(self):
-        """Multiple rows exceeding threshold should parallelize."""
-        iv = pm.gintervals(
-            ["1", "1", "1"],
-            [0, 100000, 200000],
-            [100000, 200000, 300000],
-        )
-        do_par, cores = _should_parallelize(iv, True, 4, max_chunk_size=100)
-        assert do_par is True
-        assert cores == 3  # capped at number of rows
-
-    def test_num_cores_capped_at_rows(self):
-        iv = pm.gintervals(["1", "1"], [0, 1000], [1000, 2000])
-        do_par, cores = _should_parallelize(iv, True, 10, max_chunk_size=100)
-        assert do_par is True
-        assert cores == 2
-
-    def test_num_cores_defaults_to_cpu_count(self):
-        """When num_cores=None, should use cpu_count (just verify it works)."""
-        iv = pm.gintervals(
-            ["1", "1", "1"],
-            [0, 100000, 200000],
-            [100000, 200000, 300000],
-        )
-        do_par, cores = _should_parallelize(iv, True, None, max_chunk_size=100)
-        assert do_par is True
-        assert cores >= 1
-
-
 class TestChunkIntervals:
-    """Tests for _chunk_intervals."""
+    """Tests for _chunk_intervals: chunks of whole rows, in order, of at most max_bases bases."""
 
-    def test_equal_chunks(self):
-        iv = pm.gintervals(
-            ["1", "1", "1", "1"],
-            [0, 100, 200, 300],
-            [100, 200, 300, 400],
-        )
-        chunks = _chunk_intervals(iv, 2)
-        assert len(chunks) == 2
-        assert len(chunks[0]) == 2
-        assert len(chunks[1]) == 2
+    def _sizes(self, chunks, iterator=None):
+        it = iterator or 1
+        return [int((((c["end"] - 1) // it - c["start"] // it + 1) * it).sum()) for c in chunks]
 
-    def test_more_chunks_than_rows(self):
-        iv = pm.gintervals(["1", "1"], [0, 100], [100, 200])
-        chunks = _chunk_intervals(iv, 5)
-        assert len(chunks) == 2
-        assert len(chunks[0]) == 1
-        assert len(chunks[1]) == 1
+    def test_bound_respected_and_order_preserved(self):
+        rng = np.random.RandomState(5)
+        starts = np.sort(rng.randint(0, 400000, 300))
+        iv = pm.gintervals(["1"] * 300, starts, starts + rng.randint(1, 3000, 300))
+        for bound in (1, 2999, 3000, 10000, 123457, 10**9):
+            chunks = _chunk_intervals(iv, bound)
+            assert len(chunks) >= 1 and all(len(c) > 0 for c in chunks)
+            joined = pd.concat(chunks, ignore_index=True)
+            pd.testing.assert_frame_equal(joined, iv.reset_index(drop=True))
+            for size, c in zip(self._sizes(chunks), chunks, strict=True):
+                assert size <= bound or len(c) == 1
+            # greedy: each chunk would pass the bound with the next row
+            sizes = (iv["end"] - iv["start"]).tolist()
+            pos = 0
+            for c in chunks[:-1]:
+                pos += len(c)
+                assert sum(sizes[pos - len(c):pos + 1]) > bound
 
-    def test_uneven_split(self):
-        iv = pm.gintervals(
-            ["1", "1", "1"],
-            [0, 100, 200],
-            [100, 200, 300],
-        )
-        chunks = _chunk_intervals(iv, 2)
-        assert len(chunks) == 2
-        # 3 rows, 2 chunks => 2+1 or 1+2
-        total_rows = sum(len(c) for c in chunks)
-        assert total_rows == 3
+    def test_oversize_row_is_a_chunk_of_its_own(self):
+        iv = pm.gintervals(["1"] * 5, [0, 5000, 5100, 5200, 100000], [5000, 5100, 5200, 90000, 100100])
+        chunks = _chunk_intervals(iv, 1000)
+        assert [c["start"].tolist() for c in chunks] == [[0], [5000, 5100], [5200], [100000]]
 
-    def test_preserves_data(self):
-        iv = pm.gintervals(
-            ["1", "2"],
-            [0, 0],
-            [1000, 500],
-        )
-        chunks = _chunk_intervals(iv, 2)
-        assert str(chunks[0].iloc[0]["chrom"]) == "chr1"
-        assert str(chunks[1].iloc[0]["chrom"]) == "chr2"
+    def test_rows_count_the_iterator_bins_they_span(self):
+        # [150, 250) spans 2 bins of 100: 200 bases at iterator 100, 100 without an iterator
+        iv = pm.gintervals(["1"] * 4, [150, 1150, 2150, 3150], [250, 1250, 2250, 3250])
+        assert self._sizes(_chunk_intervals(iv, 400, 100), 100) == [400, 400]
+        assert len(_chunk_intervals(iv, 400)) == 1
+
+    def test_one_chunk_is_the_intervals_as_given(self):
+        iv = pm.gintervals(["1", "2"], [0, 0], [1000, 500])
+        chunks = _chunk_intervals(iv, 10**6)
+        assert len(chunks) == 1 and chunks[0] is iv
+
+    def test_default_bound_is_max_data_size_times_iterator(self):
+        old = pm.CONFIG.get("max_data_size")
+        try:
+            pm.CONFIG["max_data_size"] = 1234
+            assert _max_chunk_bases(None, 200) == 1234 * 200
+            assert _max_chunk_bases(None, None) == 1234
+            assert _max_chunk_bases(5000, 200) == 5000
+            with pytest.raises(ValueError, match="max_chunk_size"):
+                _max_chunk_bases(0, 200)
+        finally:
+            pm.CONFIG["max_data_size"] = old
+
+    def test_workers_do_not_change_the_chunks(self):
+        assert _n_workers(False, 8, 10) == 1
+        assert _n_workers(True, 8, 1) == 1
+        assert _n_workers(True, 8, 3) == 3
+        assert _n_workers(True, 2, 10) == 2
 
 
 class TestGenerateChunkSeeds:
     """Tests for _generate_chunk_seeds."""
 
-    def test_none_seed_returns_nones(self):
-        seeds = _generate_chunk_seeds(None, 5)
-        assert len(seeds) == 5
-        assert all(s is None for s in seeds)
+    def test_none_seed_draws_from_numpys_generator(self):
+        np.random.seed(3)
+        seeds1 = _generate_chunk_seeds(None, 5)
+        np.random.seed(3)
+        seeds2 = _generate_chunk_seeds(None, 5)
+        assert seeds1 == seeds2
+        assert all(isinstance(s, int) for s in seeds1)
 
     def test_deterministic(self):
         seeds1 = _generate_chunk_seeds(42, 5)
@@ -167,12 +137,12 @@ class TestMergeTrainResults:
 
     def test_single_chunk_roundtrip(self):
         """Merging a single chunk should produce same counts."""
-        counts = [np.ones((1024, 4), dtype=np.float64) * 10]
+        counts = [np.full((1024, 4), 10, dtype=np.uint64)]
         result = _merge_train_results(
             [{
                 "counts": counts,
                 "total_kmers": 100,
-                "per_bin_kmers": np.array([100.0]),
+                "per_bin_kmers": np.array([100], dtype=np.uint64),
                 "total_masked": 5,
                 "total_n": 3,
             }],
@@ -186,21 +156,21 @@ class TestMergeTrainResults:
 
     def test_two_chunks_sum(self):
         """Merging two chunks should sum counts."""
-        c1 = [np.ones((1024, 4), dtype=np.float64) * 5]
-        c2 = [np.ones((1024, 4), dtype=np.float64) * 7]
+        c1 = [np.full((1024, 4), 5, dtype=np.uint64)]
+        c2 = [np.full((1024, 4), 7, dtype=np.uint64)]
         result = _merge_train_results(
             [
                 {
                     "counts": c1,
                     "total_kmers": 50,
-                    "per_bin_kmers": np.array([50.0]),
+                    "per_bin_kmers": np.array([50], dtype=np.uint64),
                     "total_masked": 2,
                     "total_n": 1,
                 },
                 {
                     "counts": c2,
                     "total_kmers": 70,
-                    "per_bin_kmers": np.array([70.0]),
+                    "per_bin_kmers": np.array([70], dtype=np.uint64),
                     "total_masked": 3,
                     "total_n": 2,
                 },
@@ -211,18 +181,16 @@ class TestMergeTrainResults:
         assert result["total_kmers"] == 120
         assert result["total_masked"] == 5
         assert result["total_n"] == 3
-        np.testing.assert_array_almost_equal(
-            result["counts"][0], np.ones((1024, 4)) * 12
-        )
+        np.testing.assert_array_equal(result["counts"][0], np.full((1024, 4), 12, dtype=np.uint64))
 
     def test_cdf_valid(self):
         """CDF should be monotonically increasing, ending at 1.0."""
-        c1 = [np.random.RandomState(60427).rand(1024, 4) * 100]
+        c1 = [np.random.RandomState(60427).randint(0, 100, (1024, 4)).astype(np.uint64)]
         result = _merge_train_results(
             [{
                 "counts": c1,
                 "total_kmers": 1000,
-                "per_bin_kmers": np.array([1000.0]),
+                "per_bin_kmers": np.array([1000], dtype=np.uint64),
                 "total_masked": 0,
                 "total_n": 0,
             }],
@@ -263,10 +231,8 @@ class TestGsynthTrainParallel:
         assert model.total_kmers > 0
 
     def test_forced_parallel_matches_serial(self):
-        """Parallel train with low threshold should give similar results to serial.
-
-        We compare total_kmers and per-bin counts rather than exact CDF values,
-        since the parallel path re-computes CDFs from merged counts.
+        """Parallel train in many chunks counts the k-mers of the serial one (every field is
+        compared in TestChunksDoNotChangeResults).
         """
         intervals = pm.gintervals_all()
 
@@ -572,9 +538,8 @@ class TestGsynthParallelIntegration:
         """Samples from same model via serial and parallel paths should be
         valid DNA.
 
-        Note: We do NOT require exact equality since the parallel path
-        splits intervals differently which can affect Markov context
-        at chunk boundaries. We only verify both produce valid sequences.
+        Note: the sequences differ: with several chunks each draws from a seed of its own
+        (TestChunksDoNotChangeResults). We only verify both produce valid sequences.
         """
         model = pm.gsynth_train()
         intervals = pm.gintervals_all()
@@ -627,3 +592,147 @@ class TestGsynthParallelIntegration:
         assert len(seqs) == 3
         for seq, expected_len in zip(seqs, expected_lengths, strict=False):
             assert len(seq) == expected_len
+
+
+# ============================================================================
+# Chunks do not change the results
+# ============================================================================
+
+
+MODEL_FIELDS = ("k", "n_dims", "dim_sizes", "dim_specs", "total_bins", "total_kmers", "per_bin_kmers",
+                "total_masked", "total_n", "pseudocount", "min_obs", "iterator", "prior_mode",
+                "prior_matrix", "marginal_fallbacks", "sparse_bins")
+
+
+def _assert_same_model(a, b):
+    for f in MODEL_FIELDS:
+        x, y = getattr(a, f), getattr(b, f)
+        if isinstance(x, np.ndarray):
+            assert x.dtype == y.dtype, f
+            np.testing.assert_array_equal(x, y, err_msg=f)
+        else:
+            assert x == y, f
+    for key in ("counts", "cdf"):
+        xs, ys = a.model_data[key], b.model_data[key]
+        assert len(xs) == len(ys)
+        for x, y in zip(xs, ys, strict=True):
+            assert x.dtype == y.dtype, key
+            np.testing.assert_array_equal(x, y, err_msg=key)  # NaN == NaN here
+
+
+@pytest.fixture
+def chunk_vtracks():
+    pm.gvtrack_create("chunk_vt_d", "dense_track", "avg")
+    pm.gvtrack_create("chunk_vt_g", None, "kmer.frac", kmer="G")
+    yield
+    pm.gvtrack_rm("chunk_vt_d")
+    pm.gvtrack_rm("chunk_vt_g")
+
+
+@pytest.fixture
+def many_intervals():
+    """300 intervals not aligned to the iterator, with overlaps and touching ones."""
+    starts = list(range(0, 400000, 2000)) + list(range(0, 300000, 3000))
+    ends = list(range(1500, 401500, 2000)) + list(range(2900, 302900, 3000))
+    iv = pm.gintervals(["1"] * 200 + ["2"] * 100, starts, ends)
+    extra = pm.gintervals(["1", "1", "X"], [1000, 9000, 0], [4000, 9500, 150000])
+    return pd.concat([iv, extra], ignore_index=True)
+
+
+DIM_D = {"expr": "chunk_vt_d", "breaks": [0, 0.1, 0.2, 0.4, 1]}
+DIM_G = {"expr": "chunk_vt_g", "breaks": [0, 0.2, 0.25, 0.3, 1],
+         "bin_merge": [{"from": 0.3, "to": [0.25, 0.3]}]}
+
+
+class TestChunksDoNotChangeResults:
+
+    @pytest.mark.parametrize("allow_parallel,num_cores", [(False, None), (True, 1), (True, 3), (True, 8)])
+    @pytest.mark.parametrize("max_chunk_size", [1, 5000, 60000])
+    def test_train_chunked_equals_unchunked(self, chunk_vtracks, many_intervals, allow_parallel,
+                                            num_cores, max_chunk_size):
+        kw = {"intervals": many_intervals, "iterator": 100, "k": 3, "min_obs": 2000,
+              "mask": pm.gintervals(["1", "X"], [5000, 100], [20000, 150000])}
+        with pytest.warns(UserWarning, match="fewer than 2000"):
+            ref = pm.gsynth_train(DIM_D, DIM_G, allow_parallel=False, **kw)
+        assert len(ref.sparse_bins) > 0
+        with pytest.warns(UserWarning, match="fewer than 2000"):
+            model = pm.gsynth_train(DIM_D, DIM_G, allow_parallel=allow_parallel, num_cores=num_cores,
+                                    max_chunk_size=max_chunk_size, **kw)
+        _assert_same_model(model, ref)
+
+    @pytest.mark.parametrize("prior,pseudocount", [("marginal", 1.0), ("global", 0.5), ("uniform", 0.0),
+                                                   ("explicit", 2.0)])
+    def test_train_equals_the_cpp_model(self, chunk_vtracks, many_intervals, prior, pseudocount):
+        """The CDF and prior gsynth_train computes from the summed counts of its chunks are those
+        the C++ model computes (pm_gsynth_train), bit for bit."""
+        from pymisha._shared import _df2pymisha, _pymisha
+        from pymisha.gsynth import _canonic_keep_touching, _extract_bin_data
+
+        if prior == "explicit":
+            prior = np.random.RandomState(1).rand(16, 4) * np.array([1, 1, 0, 1])
+            prior[3] = 0  # a row of zeros: uniform
+        model = pm.gsynth_train(DIM_D, DIM_G, intervals=many_intervals, iterator=100, k=2, prior=prior,
+                                pseudocount=pseudocount, max_chunk_size=20000, num_cores=3)
+        iv = _canonic_keep_touching(many_intervals)
+        bins, starts, chroms, breaks, bin_map, _, _, _ = _extract_bin_data(model.dim_specs, iv, 100)
+        cpp = _pymisha.pm_gsynth_train(
+            _df2pymisha(iv), bins, starts, chroms, breaks, bin_map, None, float(pseudocount), 2, 100,
+            "explicit" if isinstance(prior, np.ndarray) else prior,
+            np.ascontiguousarray(prior, dtype=np.float64) if isinstance(prior, np.ndarray) else None)
+        np.testing.assert_array_equal(model.prior_matrix, cpp["prior"])
+        assert model.per_bin_kmers.dtype == cpp["per_bin_kmers"].dtype
+        np.testing.assert_array_equal(model.per_bin_kmers, cpp["per_bin_kmers"])
+        for ours, theirs in zip(model.model_data["counts"], cpp["counts"], strict=True):
+            assert ours.dtype == theirs.dtype
+            np.testing.assert_array_equal(ours, theirs)
+        for ours, theirs in zip(model.model_data["cdf"], cpp["cdf"], strict=True):
+            np.testing.assert_array_equal(ours, theirs)
+        if pseudocount == 0:
+            assert any(np.isnan(c).any() for c in model.model_data["cdf"])
+
+    def test_beyond_max_data_size_in_one_process(self, chunk_vtracks, many_intervals):
+        """More iterator bins than CONFIG['max_data_size'] are processed in chunks, in this process
+        too, with the results of no limit."""
+        kw = {"intervals": many_intervals, "iterator": 1, "k": 1}
+        ref = pm.gsynth_train(DIM_G, **kw)
+        ref_seqs = pm.gsynth_sample(ref, intervals=many_intervals, seed=17, max_chunk_size=200000)
+        old = pm.CONFIG.get("max_data_size")
+        try:
+            pm.CONFIG["max_data_size"] = 200000
+            assert len(_chunk_intervals(many_intervals, 200000)) > 2
+            for allow_parallel in (False, True):
+                model = pm.gsynth_train(DIM_G, allow_parallel=allow_parallel, num_cores=2, **kw)
+                _assert_same_model(model, ref)
+                seqs = pm.gsynth_sample(model, intervals=many_intervals, seed=17,
+                                        allow_parallel=allow_parallel, num_cores=2)
+                assert seqs == ref_seqs
+        finally:
+            pm.CONFIG["max_data_size"] = old
+
+    def test_sample_does_not_depend_on_the_workers(self, chunk_vtracks, many_intervals):
+        model = pm.gsynth_train(DIM_D, intervals=many_intervals, iterator=100, k=3)
+        kw = {"intervals": many_intervals, "max_chunk_size": 30000, "n_samples": 2,
+              "mask_copy": pm.gintervals(["1"], [100], [20000])}
+        runs = [(False, None), (True, 1), (True, 2), (True, 5)]
+        seeded = [pm.gsynth_sample(model, seed=60427, allow_parallel=p, num_cores=c, **kw) for p, c in runs]
+        assert all(s == seeded[0] for s in seeded[1:])
+        unseeded = []
+        for p, c in runs:
+            np.random.seed(9)
+            unseeded.append(pm.gsynth_sample(model, allow_parallel=p, num_cores=c, **kw))
+        assert all(s == unseeded[0] for s in unseeded[1:])
+        assert unseeded[0] != seeded[0]
+
+    def test_each_chunk_draws_from_its_own_seed(self, chunk_vtracks, many_intervals):
+        """Several chunks: the sequences of each are those of sampling it alone with its seed, drawn
+        from *seed* (so they differ from one chunk's)."""
+        from pymisha.gsynth import _genome_order
+
+        model = pm.gsynth_train(DIM_D, intervals=many_intervals, iterator=100, k=3)
+        chunks = _chunk_intervals(_genome_order(many_intervals), 30000, 100)
+        assert len(chunks) > 5
+        seqs = pm.gsynth_sample(model, intervals=many_intervals, seed=5, max_chunk_size=30000, num_cores=3)
+        alone = [s for chunk, chunk_seed in zip(chunks, _generate_chunk_seeds(5, len(chunks)), strict=True)
+                 for s in pm.gsynth_sample(model, intervals=chunk, seed=chunk_seed)]
+        assert seqs == alone
+        assert seqs != pm.gsynth_sample(model, intervals=many_intervals, seed=5)

@@ -995,11 +995,11 @@ pm.CONFIG['multitasking'] = False
 
 ### Limiting the Memory Consumption
 
-For certain functions, multitasking might result in higher memory consumption. The `pm.CONFIG['max_data_size']` parameter is the maximal number of records (rows of a result, values) that a call holds in memory: `gextract`, `gscreen` and the like fail above it, and `gquantiles` samples. It is a count, not a size in bytes. A result too big for memory can be written to a file instead (`gextract(..., file="x.tsv")` or `file="x.parquet"`), which the limit does not bound.
+For certain functions, multitasking might result in higher memory consumption. The `pm.CONFIG['max_data_size']` parameter is the maximal number of records (rows of a result, values) that a call holds in memory: `gextract`, `gscreen` and the like fail above it, and `gquantiles` samples. It is a count, not a size in bytes. pymisha sets it at import as R misha sets `gmax.data.size`, from RAM and cores: `min(RAM in bytes * 0.7 / (70% of the cores), 1e10)`, so the same calls fail or sample on the same host (about 2.8e9 on a 4-core, 8 GB laptop). A result too big for memory can be written to a file instead (`gextract(..., file="x.tsv")` or `file="x.parquet"`), which the limit does not bound.
 
 ```python
 # View the current limit, in records
-print(pm.CONFIG['max_data_size'])   # Default: 10,000,000
+print(pm.CONFIG['max_data_size'])   # Default: as R misha's gmax.data.size, from RAM and cores
 
 # Reduce if memory is limited
 pm.CONFIG['max_data_size'] = 1000000

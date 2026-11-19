@@ -160,6 +160,7 @@ PyObject *pm_intervals_random(PyObject *self, PyObject *args);
 PyObject *pm_parse_wig_or_bedgraph(PyObject *self, PyObject *args);
 PyObject *pm_is_bigwig(PyObject *self, PyObject *args);
 PyObject *pm_parse_bigwig(PyObject *self, PyObject *args);
+PyObject *pm_parse_bigbed(PyObject *self, PyObject *args);
 PyObject *pm_parquet_columns(PyObject *self, PyObject *args);
 PyObject *pm_parquet_import(PyObject *self, PyObject *args);
 PyObject *pm_parquet_write(PyObject *self, PyObject *args);
@@ -280,7 +281,8 @@ static PyMethodDef module_methods[] = {
     {"pm_intervals_random", gcall<pm_intervals_random>, METH_VARARGS, "Generate random non-overlapping genomic intervals (C++ fast path)"},
     {"pm_parse_wig_or_bedgraph", gcall<pm_parse_wig_or_bedgraph>, METH_VARARGS, "Parse a WIG/BedGraph file into chrom/start/end/value arrays (C++ fast path)"},
     {"pm_is_bigwig", gcall<pm_is_bigwig>, METH_VARARGS, "True if a file is a bigWig: its magic number or a .bw/.bigWig name"},
-    {"pm_parse_bigwig", gcall<pm_parse_bigwig>, METH_VARARGS, "Read the full-resolution records of a bigWig into chrom/start/end/value arrays"},
+    {"pm_parse_bigwig", gcall<pm_parse_bigwig>, METH_VARARGS, "Read the full-resolution records of a bigWig, all or those overlapping intervals, into chrom/start/end/value arrays"},
+    {"pm_parse_bigbed", gcall<pm_parse_bigbed>, METH_VARARGS, "Read all the records of a bigBed into chrom/start/end arrays and one array per field"},
     {"pm_parquet_columns", gcall<pm_parquet_columns>, METH_VARARGS, "Names and types of the columns of a Parquet file"},
     {"pm_parquet_import", gcall<pm_parquet_import>, METH_VARARGS, "Import value columns of Parquet files as dense track files"},
     {"pm_parquet_write", gcall<pm_parquet_write>, METH_VARARGS, "Write intervals and values to a Parquet file"},

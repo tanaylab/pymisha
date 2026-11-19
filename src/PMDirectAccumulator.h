@@ -82,7 +82,7 @@ public:
     PMPY finalize(bool none_if_empty = true)
     {
         if (m_row == 0 && none_if_empty) {
-            return PMPY(Py_None, true);
+            return PMPY(Py_NewRef(Py_None), true);
         }
 
         // Truncate arrays if over-allocated

@@ -29,7 +29,7 @@ from ._crc64 import (
     crc64_init as _crc64_init,
 )
 from ._db_trash import _gdb_trash
-from ._log import get_logger
+from ._log import get_logger, user_stacklevel
 from ._name_validation import validate_dotted_name
 from ._shared import (
     CONFIG,
@@ -42,6 +42,7 @@ from ._shared import (
     _config_no_mt,
     _df2pymisha,
     _numpy,
+    _object_chroms,
     _pandas,
     _preprocess_intervals_iterator,
     _progress_context,
@@ -1560,6 +1561,55 @@ _BED_HEADER_RE = re.compile(r"^(track|browser|#|$)")
 _GFF_HEADER_RE = re.compile(r"^#")
 _VCF_HEADER_RE = re.compile(r"^#")
 
+# The columns that each gintervals_import_bed format adds after the six BED
+# columns, named as in the UCSC format descriptions.
+_BED_FORMAT_COLUMNS: dict[str, list[str]] = {
+    "bed": [],
+    "narrowPeak": ["signalValue", "pValue", "qValue", "peak"],
+    "broadPeak": ["signalValue", "pValue", "qValue"],
+}
+
+
+def _bed_format(path: Path, fmt: Any) -> str:
+    """The format argument of gintervals_import_bed, or its guess from the
+    file name when None."""
+    if fmt is None:
+        lname = path.name.lower()
+        for f in _BED_FORMAT_COLUMNS:
+            if f != "bed" and lname.endswith((f".{f.lower()}", f".{f.lower()}.gz")):
+                return f
+        return "bed"
+    if not isinstance(fmt, str) or fmt not in _BED_FORMAT_COLUMNS:
+        valid = ", ".join(f'"{f}"' for f in _BED_FORMAT_COLUMNS)
+        raise ValueError(f"format must be one of {valid}")
+    return fmt
+
+
+def _is_bigbed_file(path: Path) -> bool:
+    """Whether *path* starts with the bigBed magic number (0x8789F2EB), in either byte order."""
+    with open(path, "rb") as fh:
+        return fh.read(4) in (b"\xeb\xf2\x89\x87", b"\x87\x89\xf2\xeb")
+
+
+def _read_bigbed(path: Path) -> pd.DataFrame:
+    """All the records of a bigBed file, in file order: chrom, start, end and the
+    fields the file declares past them, named by its autoSql (R misha's
+    .gread_bigbed). Unknown chromosomes and records past the chromosome end are
+    reported as gtrack_import reports them for a bigWig."""
+    from .tracks import _clip_warning, _report_unknown_chroms, _verify_chroms_matched
+
+    res = _pymisha.pm_parse_bigbed(str(path))
+    _verify_chroms_matched(res, res["num_matched"], str(path))
+    if res["num_clipped"] or res["num_dropped"]:
+        warnings.warn(_clip_warning(str(path), res["num_clipped"], res["num_dropped"], res["first_clipped"]),
+                      stacklevel=user_stacklevel())
+    _report_unknown_chroms(res, res["num_matched"], str(path))
+    names = ["chrom", "start", "end", *res["fields"]]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"bigBed file {path} has more than one column named {', '.join(dup)}")
+    return pd.DataFrame(dict(zip(names, [res["chrom"], res["start"], res["end"], *res["columns"]], strict=True)))
+
 
 def gintervals_import_bed(
     file: str | Path,
@@ -1567,6 +1617,8 @@ def gintervals_import_bed(
     name: bool = True,
     score: bool = True,
     strand: bool = True,
+    keep_order: bool = False,
+    format: str | None = None,
 ) -> pd.DataFrame:
     """
     Import intervals from a BED file.
@@ -1578,6 +1630,23 @@ def gintervals_import_bed(
     transparently.
 
     BED is already 0-based half-open, so coordinates are kept as-is.
+
+    ENCODE narrowPeak (BED6+4) and broadPeak (BED6+3) files carry extra
+    columns, which are added after the BED columns under their UCSC names:
+    ``signalValue``, ``pValue`` and ``qValue`` (float) for both, and
+    ``peak`` (integer) for narrowPeak. ``peak`` is the summit's offset from
+    ``start``; -1 means no summit was called, and is kept as-is.
+
+    By default the intervals are sorted by chrom and start. With
+    ``keep_order=True`` they stay in the file's order, so row ``i`` is the
+    ``i``-th data line, as peak IDs that are row numbers expect. The
+    functions below accept unsorted intervals. ``gextract``, ``gscreen``,
+    ``gintervals_canonic`` and the set operations return their rows in
+    genomic order (``gextract``'s ``intervalID`` column gives the input
+    row, 1-based), while ``gseq_extract``, ``gintervals_neighbors``,
+    ``gintervals_annotate``, ``gintervals_normalize`` and
+    ``gintervals_summary`` return one row per input row in input order.
+    ``gintervals()`` sorts its input.
 
     Parameters
     ----------
@@ -1591,30 +1660,83 @@ def gintervals_import_bed(
     strand : bool, default True
         If True and a 6th column exists, include it as ``strand``
         (mapped to ``1``/``-1``/``0``).
+    keep_order : bool, default False
+        If True, return the intervals in the file's order (header and
+        comment lines skipped) instead of sorting them.
+    format : {"bed", "narrowPeak", "broadPeak"} or None, default None
+        None guesses from the file name: a name ending in ``.narrowPeak``
+        or ``.narrowPeak.gz`` (any case) is narrowPeak, ``.broadPeak`` or
+        ``.broadPeak.gz`` is broadPeak, anything else is BED.
 
     Returns
     -------
     DataFrame
-        Sorted intervals with columns ``chrom``, ``start``, ``end`` and
-        any of the optional metadata columns described above.
+        Intervals with columns ``chrom``, ``start``, ``end`` and any of
+        the optional columns described above, sorted by chrom and start
+        unless ``keep_order`` is True.
 
     Raises
     ------
     FileNotFoundError
         If *file* does not exist.
     ValueError
-        If the file has fewer than three columns or contains no records.
+        If the file has fewer than three columns, fewer than its format
+        needs, or contains no records; if *format* is not a known format;
+        or if a narrowPeak ``peak`` value is not a whole number.
 
     See Also
     --------
     gintervals_import_gff : Import GFF/GTF.
     gintervals_import_vcf : Import VCF.
     gintervals_from_bed : Older 3-column BED reader.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> import tempfile, os
+    >>> f = os.path.join(tempfile.mkdtemp(), "peaks.narrowPeak")
+    >>> with open(f, "w") as fh:
+    ...     _ = fh.write("chr1\\t20000\\t20400\\tpeak_1\\t500\\t.\\t8.1\\t12.3\\t10.2\\t150\\n"
+    ...                  "chr1\\t10000\\t10300\\tpeak_2\\t800\\t.\\t9.4\\t15.0\\t12.8\\t120\\n")
+    >>> peaks = pm.gintervals_import_bed(f, keep_order=True)
+    >>> list(peaks["name"]), list(peaks["peak"])
+    (['peak_1', 'peak_2'], [150, 120])
+
+    200 bp windows centred on the summits, in the file's order: the summit
+    is at ``(start + end) // 2``. Drop rows with ``peak == -1`` (no summit)
+    first.
+
+    >>> summit = peaks["start"] + peaks["peak"]
+    >>> windows = peaks.assign(start=summit - 100, end=summit + 100, peak=100)
+    >>> windows[["chrom", "start", "end", "name"]]
+      chrom  start    end    name
+    0  chr1  20050  20250  peak_1
+    1  chr1  10020  10220  peak_2
     """
     _checkroot()
     path = Path(file)
     if not path.exists():
         raise FileNotFoundError(f"BED file {path} does not exist")
+    _check_flag(keep_order, "keep_order", "keep_order must be True or False")
+    if _is_bigbed_file(path):
+        if format is not None:
+            raise ValueError(
+                f"format cannot be given for bigBed file {path}: a bigBed names its columns in its autoSql"
+            )
+        out = _read_bigbed(path)
+        if out.empty:
+            raise ValueError(f"BED file {path} appears to be empty or contains no data intervals")
+        for col, keep in (("name", name), ("score", score), ("strand", strand)):
+            if not keep and col in out.columns:
+                out = out.drop(columns=col)
+        if "score" in out.columns:
+            out["score"] = _pandas.to_numeric(out["score"], errors="coerce")
+        if "strand" in out.columns:
+            out["strand"] = _normalize_strand_column(out["strand"])
+        return out if keep_order else _sort_intervals_df(out)
+    fmt = _bed_format(path, format)
+    format_cols = _BED_FORMAT_COLUMNS[fmt]
 
     table = _read_table_filtered(path, _BED_HEADER_RE)
     if table.empty:
@@ -1627,6 +1749,10 @@ def gintervals_import_bed(
         )
 
     n_cols = table.shape[1]
+    if format_cols and n_cols < 6 + len(format_cols):
+        raise ValueError(
+            f'BED file {path} has {n_cols} columns, but format "{fmt}" needs {6 + len(format_cols)}'
+        )
     starts = _pandas.to_numeric(table.iloc[:, 1], errors="coerce")
     ends = _pandas.to_numeric(table.iloc[:, 2], errors="coerce")
     if starts.isna().any() or ends.isna().any():
@@ -1646,8 +1772,126 @@ def gintervals_import_bed(
         out["score"] = _pandas.to_numeric(
             table.iloc[:, 4].astype(str), errors="coerce"
         )
+    for i, col in enumerate(format_cols):
+        out[col] = _pandas.to_numeric(table.iloc[:, 6 + i].astype(str), errors="coerce")
+    if fmt == "narrowPeak":
+        # an offset that is not a whole number (or is missing) would silently
+        # shift every window centred on it
+        peak = out["peak"].to_numpy(dtype=float)
+        bad = ~_numpy.isfinite(peak) | (peak != _numpy.round(peak))
+        if bad.any():
+            i = int(_numpy.flatnonzero(bad)[0])
+            raise ValueError(
+                f'narrowPeak file {path}: peak (column 10) must be a whole number, '
+                f'got "{table.iloc[i, 9]}" at data row {i + 1}'
+            )
+        out["peak"] = peak.astype("int64")
 
+    if keep_order:
+        return out
     return _sort_intervals_df(out)
+
+
+def gintervals_import_bigwig(
+    file: str | Path,
+    intervals: pd.DataFrame | str | None = None,
+) -> pd.DataFrame:
+    """
+    Read the records of a bigWig file that overlap intervals.
+
+    Reads the records of a bigWig file over a set of intervals without
+    importing the file into a track. Only the data blocks that the file's
+    index places over the intervals are read and decompressed, so reading a
+    few thousand regions of a large bigWig is fast.
+
+    Each record that overlaps *intervals* is returned once, whole (not
+    clipped to the intervals), also when it overlaps several of them, and the
+    records are sorted by chrom and start. The full-resolution records are
+    read (bedGraph, variableStep and fixedStep sections alike), never the
+    zoom levels; zero-length records are skipped. As in :func:`gtrack_import`,
+    chromosome names are matched to the database through its aliases
+    (``chr1`` <-> ``1``, ...), a file none of whose chromosomes the database
+    has is an error, and a record that runs past the end of its chromosome is
+    clipped to it (dropped if it starts past it) with a warning. With
+    ``intervals=None``, records on chromosomes the database lacks are skipped
+    with a log message, or a warning if one of them looks like a primary
+    chromosome. If no record overlaps *intervals*, the result is a DataFrame
+    of no rows with the same columns (a sparse signal often has no record over
+    a region); with ``intervals=None``, a file of no records is an error.
+
+    The result works directly as the source of a value-based virtual track
+    (:func:`gvtrack_create`), which computes the signal over intervals
+    without importing the file. ``func="sum"`` adds up the values of the
+    records an interval touches, each counted once; ``"weighted.sum"`` weighs
+    each by the number of its bases inside the interval, which is the sum of
+    the signal over the interval's bases. An interval that no record
+    overlaps gets NaN from ``sum``, ``weighted.sum``, ``avg``, ``min``,
+    ``max`` and ``lse``, and 0 from ``size`` and ``exists``.
+
+    Parameters
+    ----------
+    file : str or Path
+        Path to a bigWig file.
+    intervals : DataFrame or str, optional
+        Intervals to read the records of, or the name of an interval set.
+        None reads all the records of the file.
+
+    Returns
+    -------
+    DataFrame
+        Columns ``chrom``, ``start``, ``end`` and ``value``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *file* does not exist.
+    ValueError
+        If the file is not a bigWig, none of its chromosomes is in the
+        database, or, with ``intervals=None``, it has no records.
+
+    See Also
+    --------
+    gtrack_import : Import a bigWig into a track.
+    gvtrack_create : Create a virtual track.
+    gintervals_import_bed : Import a BED or bigBed file.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> peaks = pm.gintervals(["1", "2"], [1000, 3000], [1500, 3600])
+    >>> src = pm.gintervals_import_bigwig("signal.bigWig", peaks)  # doctest: +SKIP
+    >>> pm.gvtrack_create("sig", src=src, func="weighted.sum")  # doctest: +SKIP
+    >>> pm.gextract("sig", peaks, iterator=peaks)  # doctest: +SKIP
+    """
+    from .tracks import _clip_warning, _report_unknown_chroms, _verify_chroms_matched
+
+    _checkroot()
+    path = Path(file)
+    if not path.exists():
+        raise FileNotFoundError(f"bigWig file {path} does not exist")
+    query = None
+    if intervals is not None:
+        intervals = _resolve_intervals(intervals)
+        if not isinstance(intervals, pd.DataFrame) or _is_2d_intervals_df(intervals):
+            raise ValueError("intervals must be 1D intervals or the name of a 1D interval set")
+        query = _intervals_to_cpp(intervals)
+
+    res = _pymisha.pm_parse_bigwig(str(path), query)
+    _verify_chroms_matched(res, res["num_matched"], str(path))
+    if query is None and not len(res["start"]):
+        raise ValueError(f"bigWig file {path} contains no records")
+    if res["num_clipped"] or res["num_dropped"]:
+        warnings.warn(_clip_warning(str(path), res["num_clipped"], res["num_dropped"], res["first_clipped"]),
+                      stacklevel=user_stacklevel())
+    if query is None:
+        _report_unknown_chroms(res, res["num_matched"], str(path))
+    return pd.DataFrame({
+        "chrom": pd.Series(res["chrom"], dtype=str),   # str dtype also when there are no records
+        "start": res["start"],
+        "end": res["end"],
+        "value": res["value"].astype(_numpy.float64),
+    })
 
 
 def gintervals_import_gff(
@@ -5742,7 +5986,7 @@ def giterator_intervals(
             cfg = _cfg
 
         result = _pymisha.pm_iterate(_df2pymisha(intervals), itr, cfg)
-    df = _pymisha2df(result)
+    df = _object_chroms(_pymisha2df(result), as_strings=True)
     if df is not None:
         from .extract import _genome_order
         df = _genome_order(df, intervals)  # rows by genome position, as R

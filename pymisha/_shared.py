@@ -13,6 +13,7 @@ import bisect as _bisect
 import contextlib as _contextlib
 import datetime as _datetime
 import os as _os
+import subprocess as _subprocess
 import sys as _sys
 import warnings as _warnings
 from contextlib import contextmanager
@@ -44,6 +45,63 @@ def _default_max_mem_usage_kb() -> int:
     return max(10_000_000, int(sys_mem * 0.8 / 1024))
 
 
+def _sysctl(name: str) -> str:
+    return _subprocess.run(["/usr/sbin/sysctl", "-n", name], capture_output=True, text=True,
+                           check=True).stdout
+
+
+def _system_memory() -> float:
+    """Total RAM in bytes, as R misha's get_system_memory reads it (ps::ps_system_memory()):
+    MemTotal of /proc/meminfo on Linux, sysctl hw.memsize on macOS, and 8e9 when it cannot be
+    read. R also reads it on Windows, which pymisha does not build for."""
+    total = 0.0
+    try:
+        if _sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    fields = line.split()
+                    if fields[:1] == ["MemTotal:"]:
+                        total = float(fields[1]) * 1024
+                        break
+        elif _sys.platform == "darwin":
+            total = float(_sysctl("hw.memsize"))
+    except (OSError, ValueError, IndexError, _subprocess.SubprocessError):
+        total = 0.0
+    return total if total > 0 else 8e9
+
+
+def _detect_cores() -> int | None:
+    """R's parallel::detectCores() on Linux (the "processor" lines of /proc/cpuinfo) and macOS
+    (sysctl hw.logicalcpu); None when they cannot be read. R also reads them on Solaris and the
+    BSDs, which pymisha does not build for."""
+    try:
+        if _sys.platform.startswith("linux"):
+            with open("/proc/cpuinfo") as f:
+                n = sum(line.startswith("processor") for line in f)
+        elif _sys.platform == "darwin":
+            n = int(_sysctl("hw.logicalcpu"))
+        else:
+            return None
+    except (OSError, ValueError, _subprocess.SubprocessError):
+        return None
+    return n if n >= 1 else None
+
+
+def _optimal_max_data_size(sys_mem: float, num_cores: int | None) -> float:
+    """R misha's calculate_optimal_gmax_data_size, the default gmax.data.size: 70% of the RAM
+    (bytes) over the processes, at most 1e10, where the processes are 70% of the cores. Not
+    CONFIG['max_processes'], which is capped at 32: R keeps the uncapped count here so that the
+    limit, and which calls start sampling, stayed what they were when it capped the processes."""
+    if num_cores is None or num_cores < 1:
+        num_cores = 1
+    estimated_processes = max(int(num_cores * 0.7), 1)
+    return min(sys_mem * 0.7 / estimated_processes, 10e9)
+
+
+# R misha's default gmax.data.size on this host, the same double
+_DEFAULT_MAX_DATA_SIZE = _optimal_max_data_size(_system_memory(), _detect_cores())
+
+
 # Configuration dictionary (following pynaryn pattern)
 CONFIG = {
     'multitasking': True,           # Allow parallel processing
@@ -61,7 +119,10 @@ CONFIG = {
     # actual core count, so a small machine is unaffected, and setting
     # CONFIG['max_processes'] by hand still overrides it.
     'max_processes': max(4, min(32, int((_os.cpu_count() or 1) * 0.7))),
-    'max_data_size': 10000000,      # Max rows in memory
+    # Max records (rows of a result, values) a call holds in memory: above it gextract and the
+    # like fail and gquantiles samples. R misha's gmax.data.size default, from the RAM and the
+    # cores (_optimal_max_data_size), so the same calls fail or sample on the same host.
+    'max_data_size': _DEFAULT_MAX_DATA_SIZE,
     # Memory budget in KB, R misha's gmax.mem.usage: 80% of the RAM, at least
     # 10 GB. The parallel 2D imports start a chromosome pair only when its
     # estimated memory fits into it with the pairs being written.
@@ -107,7 +168,7 @@ CONFIG = {
 # this (R misha's MAX_DATA_SIZE_NO_LIMIT) is no limit
 _NO_LIMIT = 2**53
 # their values when the key is absent
-_LIMIT_DEFAULTS = {"max_data_size": 10_000_000, "max_mem_usage": _NO_LIMIT}
+_LIMIT_DEFAULTS = {"max_data_size": _DEFAULT_MAX_DATA_SIZE, "max_mem_usage": _NO_LIMIT}
 
 
 def _config_limit(name: str, config: dict | None = None) -> int:
@@ -115,10 +176,7 @@ def _config_limit(name: str, config: dict | None = None) -> int:
     in KB), as R misha reads them: None, inf or any value of 2**53 or more is no limit (2**53),
     NaN or a negative value is an error, and a max_data_size below 1 counts as 1. The C++ side
     reads them through this too (PyMisha::load_options)."""
-    cfg = CONFIG if config is None else config
-    if name not in cfg:
-        return _LIMIT_DEFAULTS[name]
-    value = cfg[name]
+    value = (CONFIG if config is None else config).get(name, _LIMIT_DEFAULTS[name])
     if value is None:
         return _NO_LIMIT
     if value is _pandas.NA or (isinstance(value, (float, _numpy.floating)) and _numpy.isnan(value)):
@@ -178,9 +236,18 @@ def _one_random_stream() -> Any:
             _pymisha.pm_rng_stream(False)
 
 
-def _forked_worker_main(conn: Any, fn: Any, args: Any, kid_idx: int) -> None:
+def _forked_worker_main(conn: Any, fn: Any, args: Any, kid_idx: int, parent_pid: int) -> None:
     """Body of a worker of _run_forked: sends ("ok", fn(args)) or ("error", exception)."""
     global _RNG_STREAM_DEPTH
+    # The worker dies with its parent, as the kids of the C++ layer (PyMisha::launch_process). A
+    # worker whose parent was killed would otherwise run on, and block forever sending a result
+    # larger than the pipe holds: it holds the read end of its pipe too.
+    if _sys.platform.startswith("linux"):
+        import ctypes
+        import signal
+        ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    if _os.getppid() != parent_pid:  # the parent died before prctl()
+        _os._exit(1)
     try:
         if _RNG_STREAM_DEPTH:
             # the worker's calls seed from its own numpy state (below), not the parent's stream
@@ -217,7 +284,7 @@ def _run_forked(fn: Any, worker_args: list[Any]) -> tuple[list[Any], list[Any]]:
     try:
         for i, args in enumerate(worker_args):
             recv, send = ctx.Pipe(duplex=False)
-            proc = ctx.Process(target=_forked_worker_main, args=(send, fn, args, i), daemon=True)
+            proc = ctx.Process(target=_forked_worker_main, args=(send, fn, args, i, _os.getpid()), daemon=True)
             proc.start()
             send.close()  # the worker holds the only write end: its death ends the pipe
             procs.append(proc)
@@ -1447,6 +1514,19 @@ def _remap_interval_ids(df, id_map):
     return df
 
 
+def _object_chroms(df, as_strings=False):
+    """df (pm_iterate's) with its categorical chrom column as one str object per chromosome
+    in an object column, which .to_numpy() and the C++ readers take as they are; with
+    as_strings, as a column of the type pandas gives strings (what a str per row gave)."""
+    if df is None or not isinstance(df["chrom"].dtype, _pandas.CategoricalDtype):
+        return df
+    cat = df["chrom"].cat
+    names = cat.categories.to_numpy(dtype=object)[cat.codes.to_numpy()]
+    df["chrom"] = _pandas.Series(names, index=df.index) if as_strings else \
+        _pandas.Series(names, index=df.index, dtype=object)
+    return df
+
+
 def _iterated_intervals(intervals, iterator, *, unlimited=False):
     """Return intervals after applying iterator policy (includes intervalID).
 
@@ -1479,14 +1559,14 @@ def _iterated_intervals(intervals, iterator, *, unlimited=False):
         result = _pymisha.pm_iterate(
             _df2pymisha(new_intervals), new_iterator, cfg
         )
-        out = _pymisha2df(result)
+        out = _object_chroms(_pymisha2df(result))
         return _remap_interval_ids(out, id_map)
     if iterator is None:
         out = intervals.copy()
         out["intervalID"] = _numpy.arange(1, len(out) + 1)
         return out
     result = _pymisha.pm_iterate(_df2pymisha(intervals), iterator, cfg)
-    return _pymisha2df(result)
+    return _object_chroms(_pymisha2df(result))
 
 
 def _chunk_slices(n, chunk_size):

@@ -301,8 +301,7 @@ def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
     ------
     NotImplementedError
         If *expr* references a vtrack that the C++ scanner cannot evaluate
-        (filter-bearing, array-slice, DataFrame-backed, or with a non-C++
-        function).  These vtracks still work through ``gextract``; users can
+        (filter-bearing, or with a non-C++ function).  These vtracks still work through ``gextract``; users can
         materialise the values and write them via ``gtrack_create_sparse``
         / ``gtrack_create_dense``.
     """
@@ -323,8 +322,7 @@ def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
         raise NotImplementedError(
             f"{caller}: expression references virtual track(s) {bad} that "
             "use features not yet supported in the track-creating C++ path "
-            "(filters, array slices, DataFrame sources, or non-aggregation "
-            "functions). Workaround: materialise the values with gextract "
+            "(filters or non-aggregation functions). Workaround: materialise the values with gextract "
             "and write them via gtrack_create_sparse / gtrack_create_dense."
         )
 

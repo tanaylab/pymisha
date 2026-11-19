@@ -478,9 +478,8 @@ class TestGsynthSampleCellMerge:
                      (spec1["breaks"][0] + spec1["breaks"][1]) / 2]
         to_vals = [(spec0["breaks"][-2] + spec0["breaks"][-1]) / 2,
                    (spec1["breaks"][-2] + spec1["breaks"][-1]) / 2]
-        # Force chunking: low max_chunk_size, small interval is still enough
-        # to trigger split given the threshold.
-        ivs = pm.gintervals("1", 0, 50_000)
+        # Several chunks: rows of 10 kb each, a chunk of at most 10 kb
+        ivs = pm.gintervals(["1"] * 5, list(range(0, 50_000, 10_000)), list(range(10_000, 60_000, 10_000)))
         s_serial = pm.gsynth_sample(
             cell_merge_model_2d, intervals=ivs, iterator=200, seed=60427,
             output_format="vector",

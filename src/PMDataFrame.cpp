@@ -149,7 +149,7 @@ void PMDataFrame::col2type(const PMPY &py_col, PMPY &py_vals, int type, const ch
 PMPY PMDataFrame::construct_py(bool none_if_empty)
 {
     if (!num_rows() && none_if_empty)
-        return PMPY(Py_None, true);
+        return PMPY(Py_NewRef(Py_None), true);
 
     PMPY py_answer(PyList_New(m_num_cols + 1), true);
 

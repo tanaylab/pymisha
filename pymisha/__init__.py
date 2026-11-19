@@ -53,7 +53,7 @@ from .db import (
 )
 from .db_attrs import gdb_get_readonly_attrs, gdb_set_readonly_attrs
 from .db_create import gdb_convert_to_indexed, gdb_create, gdb_create_genome, gdb_create_linked
-from .extract import gextract, giterator_intervals_2d, gscreen
+from .extract import gextract, gextract_matrix, giterator_intervals_2d, gscreen
 from .gdir import (
     gdir_cd,
     gdir_create,
@@ -105,6 +105,7 @@ from .intervals import (
     gintervals_from_strings,
     gintervals_from_tuples,
     gintervals_import_bed,
+    gintervals_import_bigwig,
     gintervals_import_genes,
     gintervals_import_gff,
     gintervals_import_vcf,
@@ -296,6 +297,7 @@ __all__ = [
 
     # Track functions
     'gextract',
+    'gextract_matrix',
     'gextract_variants',
     'gscreen',
     'gsummary',
@@ -379,6 +381,7 @@ __all__ = [
     'gintervals_from_strings',
     'gintervals_from_bed',
     'gintervals_import_bed',
+    'gintervals_import_bigwig',
     'gintervals_import_genes',
     'gintervals_import_gff',
     'gintervals_import_vcf',

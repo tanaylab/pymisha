@@ -21,6 +21,7 @@
 #include "GenomeTrackSparse.h"
 #include "GenomeTrackArray.h"
 #include "GenomeTrackInMemory.h"
+#include "PMIntervalsVtrack.h"
 #include "PMTrackExpressionVars.h"
 #include "GenomeSeqFetch.h"
 #include "PWMScorer.h"
@@ -39,6 +40,7 @@ extern PyObject *s_pm_err;
 // Defined in PMStubs.cpp. Declared outside the anonymous namespace below so
 // they keep external linkage.
 extern void normalize_interval_columns(PMPY &py_chrom, PMPY &py_start, PMPY &py_end);
+extern void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &intervals);
 extern void verify_interval_coords(const GenomeChromKey &chromkey, int chromid,
                                    int64_t start, int64_t end);
 extern std::string py_chrom_name(PyObject *val, Py_ssize_t i);
@@ -341,124 +343,113 @@ void convert_py_intervals_basic(PyObject *py_intervals, std::vector<GInterval> &
     }
 }
 
+// The column of a _df2pymisha list named name, a categorical column ([categories, codes])
+// expanded to its values; null if there is none
+static PMPY df_column(PyObject *py_intervals, const char *name)
+{
+    PMPY col;
+    PyObject *colnames = PyList_GetItem(py_intervals, 0);
+    for (Py_ssize_t i = 0; i < PyArray_SIZE((PyArrayObject *)colnames); ++i) {
+        PMPY cname(PyArray_GETITEM((PyArrayObject *)colnames,
+                                   (const char *)PyArray_GETPTR1((PyArrayObject *)colnames, i)), true);
+        if (cname && PyUnicode_Check(cname) && !strcmp(PyUnicode_AsUTF8(cname), name)) {
+            col.assign(PyList_GetItem(py_intervals, i + 1), false);
+            break;
+        }
+    }
+    PyErr_Clear();
+    if (col && PyList_Check(col) && PyList_Size(col) == 2 &&
+        PyArray_Check(PyList_GET_ITEM((PyObject *)col, 0)) && PyArray_Check(PyList_GET_ITEM((PyObject *)col, 1))) {
+        PyObject *expanded = PyObject_GetItem(PyList_GET_ITEM((PyObject *)col, 0), PyList_GET_ITEM((PyObject *)col, 1));
+        if (expanded)
+            col.assign(expanded, true);
+        else
+            PyErr_Clear();
+    }
+    return col;
+}
+
+// The intervals of a vtrack source (DataFrame) in _df2pymisha's format, with their strand, and
+// the values of its value column (the first column that is not chrom, start, end, strand or
+// intervalID) if read_values. Coordinates are read and checked as convert_py_intervals reads
+// them; a strand as parse_strand reads it; a missing or non-numeric value is NaN.
 void convert_py_intervals_with_values(PyObject *py_intervals,
                                       std::vector<GInterval> &intervals,
                                       std::vector<double> &values,
                                       bool *has_values,
-                                      bool *has_strand) {
+                                      bool *has_strand,
+                                      bool read_values = true) {
     if (has_values) *has_values = false;
     if (has_strand) *has_strand = false;
-
-    if (!PyList_Check(py_intervals) || PyList_Size(py_intervals) < 2) {
-        convert_py_intervals_basic(py_intervals, intervals);
-        values.clear();
-        return;
-    }
-
-    PyObject *colnames = PyList_GetItem(py_intervals, 0);
-    if (!colnames || !PyArray_Check(colnames)) {
-        convert_py_intervals_basic(py_intervals, intervals);
-        values.clear();
-        return;
-    }
-
-    Py_ssize_t num_cols = PyArray_SIZE((PyArrayObject *)colnames);
-    int chrom_idx = -1, start_idx = -1, end_idx = -1, strand_idx = -1, value_idx = -1;
-
-    for (Py_ssize_t i = 0; i < num_cols; ++i) {
-        PyObject *name = PyArray_GETITEM((PyArrayObject *)colnames,
-            (const char *)PyArray_GETPTR1((PyArrayObject *)colnames, i));
-        if (name && PyUnicode_Check(name)) {
-            const char *name_str = PyUnicode_AsUTF8(name);
-            if (strcmp(name_str, "chrom") == 0) chrom_idx = i;
-            else if (strcmp(name_str, "start") == 0) start_idx = i;
-            else if (strcmp(name_str, "end") == 0) end_idx = i;
-            else if (strcmp(name_str, "strand") == 0) strand_idx = i;
-            else if (strcmp(name_str, "intervalID") != 0 && value_idx == -1) value_idx = i;
-        }
-        Py_XDECREF(name);
-    }
-
-    if (chrom_idx < 0 || start_idx < 0 || end_idx < 0) {
-        convert_py_intervals_basic(py_intervals, intervals);
-        values.clear();
-        return;
-    }
-
-    PMPY py_chrom(PyList_GetItem(py_intervals, chrom_idx + 1), false);
-    PMPY py_start(PyList_GetItem(py_intervals, start_idx + 1), false);
-    PMPY py_end(PyList_GetItem(py_intervals, end_idx + 1), false);
-    PMPY py_strand;
-    PMPY py_value;
-
-    if (strand_idx >= 0) {
-        py_strand.assign(PyList_GetItem(py_intervals, strand_idx + 1), false);
-        if (has_strand) *has_strand = true;
-    }
-    if (value_idx >= 0) {
-        py_value.assign(PyList_GetItem(py_intervals, value_idx + 1), false);
-        if (has_values) *has_values = true;
-    }
-
-    normalize_interval_columns(py_chrom, py_start, py_end);
-
-    Py_ssize_t len = PyObject_Length(py_chrom);
-    if (len < 0) {
-        PyErr_Clear();
-        TGLError("Cannot determine length of intervals");
-    }
-
-    intervals.clear();
-    intervals.reserve(len);
     values.clear();
-    values.reserve(len);
 
-    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    convert_py_intervals(py_intervals, intervals);
 
-    for (Py_ssize_t i = 0; i < len; ++i) {
-        PMPY chrom_val(PySequence_GetItem(py_chrom, i), true);
-        PMPY start_val(PySequence_GetItem(py_start, i), true);
-        PMPY end_val(PySequence_GetItem(py_end, i), true);
+    if (!PyList_Check(py_intervals) || PyList_Size(py_intervals) < 2 ||
+        !PyArray_Check(PyList_GetItem(py_intervals, 0)))
+        return;
 
-        if (!chrom_val || !start_val || !end_val) {
-            PyErr_Clear();
-            TGLError("Failed to get interval values at index %ld", (long)i);
-        }
+    const size_t n = intervals.size();
+    PyObject *colnames = PyList_GetItem(py_intervals, 0);
+    std::string value_col;
+    for (Py_ssize_t i = 0; i < PyArray_SIZE((PyArrayObject *)colnames) && value_col.empty(); ++i) {
+        PMPY cname(PyArray_GETITEM((PyArrayObject *)colnames,
+                                   (const char *)PyArray_GETPTR1((PyArrayObject *)colnames, i)), true);
+        if (!cname || !PyUnicode_Check(cname))
+            continue;
+        const char *s = PyUnicode_AsUTF8(cname);
+        if (strcmp(s, "chrom") && strcmp(s, "start") && strcmp(s, "end") && strcmp(s, "strand") &&
+            strcmp(s, "intervalID"))
+            value_col = s;
+    }
+    PyErr_Clear();
 
-        int chromid = chromkey.chrom2id(py_chrom_name(chrom_val, i));
-
-        int64_t start = PyLong_AsLongLong(start_val);
-        int64_t end = PyLong_AsLongLong(end_val);
-
-        // a missing (None) or non-integer coordinate, as R says of NA (1-based)
-        if (PyErr_Occurred()) {
-            PyErr_Clear();
-            TGLError("Invalid format of interval at index %ld", (long)i + 1);
-        }
-
-        if (start < 0 || start >= end ||
-            (uint64_t)end > chromkey.get_chrom_size(chromid))
-            verify_interval_coords(chromkey, chromid, start, end);
-
-        char strand = 0;
-        if (py_strand) {
-            PMPY strand_val(PySequence_GetItem(py_strand, i), true);
-            strand = parse_strand(strand_val);
-        }
-
-        intervals.emplace_back(chromid, start, end, strand);
-
-        if (py_value) {
-            PMPY val(PySequence_GetItem(py_value, i), true);
-            double v = std::numeric_limits<double>::quiet_NaN();
-            if (val && val != Py_None) {
-                if (PyNumber_Check(val)) {
-                    PMPY tmp(PyNumber_Float(val), true);
-                    if (tmp) v = PyFloat_AsDouble(tmp);
-                }
+    PMPY py_strand = df_column(py_intervals, "strand");
+    if (py_strand) {
+        if (has_strand) *has_strand = true;
+        PMPY nums;
+        if (PyArray_Check(py_strand) && (PyArray_ISNUMBER((PyArrayObject *)*py_strand) || PyArray_ISBOOL((PyArrayObject *)*py_strand)))
+            nums.assign(PyArray_FROM_OTF(py_strand, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+        PyErr_Clear();
+        if (nums && (size_t)PyArray_SIZE((PyArrayObject *)*nums) == n) {
+            const double *d = (const double *)PyArray_DATA((PyArrayObject *)*nums);
+            for (size_t i = 0; i < n; ++i)
+                intervals[i].strand = d[i] >= 1 ? 1 : d[i] <= -1 ? -1 : 0;
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                PMPY strand_val(PySequence_GetItem(py_strand, i), true);
+                intervals[i].strand = parse_strand(strand_val);
+                PyErr_Clear();
             }
-            values.push_back(v);
         }
+    }
+
+    if (!read_values || value_col.empty())
+        return;
+    PMPY py_value = df_column(py_intervals, value_col.c_str());
+    if (!py_value)
+        return;
+    if (has_values) *has_values = true;
+    PMPY nums;
+    if (PyArray_Check(py_value) && (PyArray_ISNUMBER((PyArrayObject *)*py_value) || PyArray_ISBOOL((PyArrayObject *)*py_value)))
+        nums.assign(PyArray_FROM_OTF(py_value, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
+    PyErr_Clear();
+    if (nums && (size_t)PyArray_SIZE((PyArrayObject *)*nums) == n) {
+        const double *d = (const double *)PyArray_DATA((PyArrayObject *)*nums);
+        values.assign(d, d + n);
+        return;
+    }
+    values.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        PMPY val(PySequence_GetItem(py_value, i), true);
+        double v = std::numeric_limits<double>::quiet_NaN();
+        if (val && val != Py_None && PyNumber_Check(val)) {
+            PMPY tmp(PyNumber_Float(val), true);
+            if (tmp)
+                v = PyFloat_AsDouble(tmp);
+        }
+        PyErr_Clear();
+        values.push_back(v);
     }
 }
 
@@ -807,6 +798,179 @@ static double value_var_filtered(GenomeTrackInMemory &track, const std::string &
     return nan;
 }
 
+// ---- PMIntervalsVtrack: a DataFrame source, read once and evaluated per interval ----
+
+PMIntervalsVtrack::PMIntervalsVtrack(PyObject *spec, const std::string &func) : m_func(func)
+{
+    PyObject *py_src = dict_get(spec, "src");
+    if (!py_src || py_src == Py_None || PyUnicode_Check(py_src))
+        TGLError("Virtual track function %s expects intervals as source", func.c_str());
+
+    PyObject *params_obj = dict_get(spec, "params");
+    if (params_obj && PyList_Check(params_obj) && PyList_Size(params_obj) > 0)
+        params_obj = PyList_GetItem(params_obj, 0);
+    m_param = obj_to_double(params_obj, 0.0);
+    m_percentile = obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
+
+    const bool interval_func = is_interval_func(func);
+    std::vector<GInterval> src_intervals;
+    std::vector<double> src_values;
+    bool has_values = false;
+    bool has_strand = false;
+    convert_py_intervals_with_values(py_src, src_intervals, src_values, &has_values, &has_strand, !interval_func);
+
+    if (!interval_func) {
+        // an in-memory track of the value column, as R misha's Value_var
+        if (!has_values)
+            TGLError("Value-based virtual tracks require a numeric value column");
+        m_kind = VALUE;
+        value_var_track(m_track, src_intervals, src_values, func);
+        return;
+    }
+
+    m_sintervs.swap(src_intervals);
+    std::sort(m_sintervs.begin(), m_sintervs.end(), interval_cmp_start);
+
+    if (func == "distance") {
+        m_kind = DISTANCE;
+        m_dist_margin = m_param * 0.5;
+    } else if (func == "distance.center") {
+        m_kind = DISTANCE_CENTER;
+    } else if (func == "distance.edge") {
+        m_kind = DISTANCE_EDGE;
+    } else if (func == "coverage") {
+        m_kind = COVERAGE;
+        unify_overlaps(m_sintervs);
+    } else {
+        m_kind = NEIGHBOR_COUNT;
+        const double dist = m_param;
+        if (dist < 0)
+            TGLError("neighbor.count distance cannot be negative");
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        m_nc_starts.assign(chromkey.get_num_chroms(), {});
+        m_nc_ends.assign(chromkey.get_num_chroms(), {});
+        for (const auto &interv : m_sintervs) {
+            double expanded_start = (double)interv.start - dist;
+            double expanded_end = (double)interv.end + dist;
+            int64_t new_start = expanded_start < 0.0 ? 0 : (int64_t)std::floor(expanded_start);
+            double chrom_size_d = (double)chromkey.get_chrom_size(interv.chromid);
+            if (expanded_end > chrom_size_d) expanded_end = chrom_size_d;
+            int64_t new_end = (int64_t)std::ceil(expanded_end);
+            if (new_end < new_start) new_end = new_start;
+            m_nc_starts[interv.chromid].push_back(new_start);
+            m_nc_ends[interv.chromid].push_back(new_end);
+        }
+        for (auto &v : m_nc_starts) std::sort(v.begin(), v.end());
+        for (auto &v : m_nc_ends) std::sort(v.begin(), v.end());
+        m_sintervs.clear();
+    }
+}
+
+// The nearest-neighbor index of chromid's source intervals (the same SegmentFinder/NNIterator
+// gintervals_neighbors uses, so the distance functions agree with it, as in R misha 5.9.1)
+void PMIntervalsVtrack::ensure_finder(int chromid)
+{
+    if (m_finder_chromid == chromid)
+        return;
+    m_finder_chromid = chromid;
+    m_finder.reset(0, (int64_t)g_pmdb->chromkey().get_chrom_size(chromid));
+    GInterval lo_key(chromid, 0, 1, 0);
+    auto lo = std::lower_bound(m_sintervs.begin(), m_sintervs.end(), lo_key, interval_cmp_start);
+    for (auto it = lo; it != m_sintervs.end() && it->chromid == chromid; ++it)
+        m_finder.insert(*it);
+}
+
+// lower_bound of interval in the start-sorted source: sequential while queries advance, a binary
+// search when they jump back
+size_t PMIntervalsVtrack::lower_bound_start(const GInterval &interval)
+{
+    if (interval.chromid == m_scan_last_chrom && interval.start >= m_scan_last_start) {
+        while (m_scan_idx < m_sintervs.size() && interval_cmp_start(m_sintervs[m_scan_idx], interval))
+            ++m_scan_idx;
+    } else {
+        m_scan_idx = (size_t)(std::lower_bound(m_sintervs.begin(), m_sintervs.end(), interval, interval_cmp_start) -
+                              m_sintervs.begin());
+    }
+    m_scan_last_start = interval.start;
+    m_scan_last_chrom = interval.chromid;
+    return m_scan_idx;
+}
+
+double PMIntervalsVtrack::eval(const GInterval &interval)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    switch (m_kind) {
+    case VALUE:
+        return value_var_unfiltered(m_track, m_func, interval, m_percentile);
+
+    case DISTANCE: {
+        // the nearest source to the interval's center, measured at its edges (0, or a normalized
+        // fraction of the margin, inside)
+        ensure_finder(interval.chromid);
+        int64_t coord = (interval.start + interval.end) / 2;
+        if (!m_nn.begin(Segment(coord, coord + 1)))
+            return nan;
+        return m_nn->dist2coord(coord, m_dist_margin);
+    }
+
+    case DISTANCE_CENTER: {
+        // defined only when the center is inside a source interval; NNIterator yields the
+        // intervals that contain it before any that does not, and of those the nearest center wins
+        ensure_finder(interval.chromid);
+        int64_t coord = (interval.start + interval.end) / 2;
+        double best = nan;
+        for (bool ok = m_nn.begin(Segment(coord, coord + 1)); ok; ok = m_nn.next()) {
+            const GInterval &iv = *m_nn;
+            if (coord < iv.start || coord >= iv.end)
+                break;
+            double d = iv.dist2center(coord);
+            if (std::isnan(best) || std::fabs(d) < std::fabs(best))
+                best = d;
+        }
+        return best;
+    }
+
+    case DISTANCE_EDGE:
+        // edge to edge, signed by the source's strand, 0 on overlap (as gintervals_neighbors)
+        ensure_finder(interval.chromid);
+        if (!m_nn.begin(Segment(interval.start, interval.end)))
+            return nan;
+        return (double)interval.dist2interv(*m_nn);
+
+    case COVERAGE: {
+        // the unified source does not overlap itself: of the intervals before the lower bound
+        // only the last can reach into the query
+        if (interval.range() <= 0)
+            return nan;
+        int64_t total_overlap = 0;
+        auto it = m_sintervs.begin() + lower_bound_start(interval);
+        if (it != m_sintervs.begin()) {
+            auto prev = it - 1;
+            if (prev->chromid == interval.chromid && prev->end > interval.start)
+                total_overlap += std::min(interval.end, prev->end) - std::max(interval.start, prev->start);
+        }
+        for (; it != m_sintervs.end() && it->chromid == interval.chromid && it->start < interval.end; ++it) {
+            if (it->end > interval.start)
+                total_overlap += std::min(interval.end, it->end) - std::max(interval.start, it->start);
+        }
+        return (double)total_overlap / (double)interval.range();
+    }
+
+    case NEIGHBOR_COUNT: {
+        if (interval.chromid < 0 || (size_t)interval.chromid >= m_nc_starts.size())
+            return 0;
+        const auto &starts = m_nc_starts[interval.chromid];
+        const auto &ends = m_nc_ends[interval.chromid];
+        size_t num_before_end = std::lower_bound(starts.begin(), starts.end(), interval.end) - starts.begin();
+        size_t num_ended = std::upper_bound(ends.begin(), ends.end(), interval.start) - ends.begin();
+        return (double)(num_before_end - num_ended);
+    }
+    }
+    return nan;
+}
+
+
 PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
 {
     try {
@@ -1036,255 +1200,18 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             }
         }
 
-        // Interval-based vtracks
-        if (func == "distance" || func == "distance.center" || func == "distance.edge" ||
-            func == "coverage" || func == "neighbor.count") {
-            if (!py_src || py_src == Py_None || PyUnicode_Check(py_src)) {
-                TGLError("Virtual track function %s expects intervals as source", func.c_str());
-            }
+        // Interval-based and value-based vtracks: a DataFrame source (PMIntervalsVtrack)
+        if (PMIntervalsVtrack::is_interval_func(func) && (!py_src || py_src == Py_None || PyUnicode_Check(py_src)))
+            TGLError("Virtual track function %s expects intervals as source", func.c_str());
 
-            std::vector<GInterval> src_intervals;
-            std::vector<double> src_values;
-            bool has_values = false;
-            bool has_strand = false;
-            convert_py_intervals_with_values(py_src, src_intervals, src_values, &has_values, &has_strand);
-
-            std::vector<GInterval> sintervs = src_intervals;
-            std::sort(sintervs.begin(), sintervs.end(), interval_cmp_start);
-
-            std::vector<GInterval> eintervs;
-
-            if (func == "coverage") {
-                unify_overlaps(sintervs);
-            }
-
-            double dist_param = obj_to_double(dict_get(py_spec, "params"), 0.0);
-            if (func == "neighbor.count") {
-                double dist = dist_param;
-                if (dist < 0) TGLError("neighbor.count distance cannot be negative");
-                eintervs.clear();
-                eintervs.reserve(sintervs.size());
-                for (const auto &interv : sintervs) {
-                    double expanded_start = (double)interv.start - dist;
-                    double expanded_end = (double)interv.end + dist;
-                    int64_t new_start = expanded_start < 0.0 ? 0 : (int64_t)std::floor(expanded_start);
-                    uint64_t chrom_size = chromkey.get_chrom_size(interv.chromid);
-                    double chrom_size_d = (double)chrom_size;
-                    if (expanded_end > chrom_size_d) expanded_end = chrom_size_d;
-                    int64_t new_end = (int64_t)std::ceil(expanded_end);
-                    if (new_end < new_start) new_end = new_start;
-                    eintervs.emplace_back(interv.chromid, new_start, new_end, interv.strand);
-                }
-                std::sort(eintervs.begin(), eintervs.end(), interval_cmp_start);
-            }
-
-            double dist_margin = (func == "distance") ? (dist_param * 0.5) : 0.0;
-
-            // Hybrid sequential/binary scan state for start-sorted source intervals
-            size_t s_scan_idx = 0;
-            int64_t s_last_key = std::numeric_limits<int64_t>::min();
-            int s_last_chrom = -1;
-            // Hybrid scan state for neighbor.count expanded intervals (start-sorted)
-            size_t nc_scan_idx = 0;
-            int64_t nc_last_key = std::numeric_limits<int64_t>::min();
-            int nc_last_chrom = -1;
-
-            // Adaptive lower_bound on start-sorted sintervs array: sequential when
-            // queries advance monotonically, binary search on backward jump.
-            auto adaptive_lb_start = [&](const GInterval &eval) -> size_t {
-                if (eval.chromid == s_last_chrom && eval.start >= s_last_key) {
-                    while (s_scan_idx < sintervs.size() &&
-                           interval_cmp_start(sintervs[s_scan_idx], eval)) {
-                        ++s_scan_idx;
-                    }
-                } else {
-                    s_scan_idx = (size_t)(std::lower_bound(
-                        sintervs.begin(), sintervs.end(), eval,
-                        interval_cmp_start) - sintervs.begin());
-                }
-                s_last_key = eval.start;
-                s_last_chrom = eval.chromid;
-                return s_scan_idx;
-            };
-
-            // Adaptive lower_bound on neighbor.count's start-sorted expanded eintervs
-            auto adaptive_lb_nc = [&](const GInterval &eval) -> size_t {
-                if (eval.chromid == nc_last_chrom && eval.start >= nc_last_key) {
-                    while (nc_scan_idx < eintervs.size() &&
-                           interval_cmp_start(eintervs[nc_scan_idx], eval)) {
-                        ++nc_scan_idx;
-                    }
-                } else {
-                    nc_scan_idx = (size_t)(std::lower_bound(
-                        eintervs.begin(), eintervs.end(), eval,
-                        interval_cmp_start) - eintervs.begin());
-                }
-                nc_last_key = eval.start;
-                nc_last_chrom = eval.chromid;
-                return nc_scan_idx;
-            };
-
-            // Lazy per-chromosome nearest-neighbor index for distance /
-            // distance.edge / distance.center. The 4-candidate lower_bound
-            // heuristic that previously served these missed enclosing / nested
-            // sources, returning a non-nearest interval (even a nonzero distance
-            // for a query that overlaps a source). Routing through the same
-            // SegmentFinder/NNIterator that gintervals_neighbors uses makes the
-            // distance family agree with it exactly (R misha 5.9.1).
-            SegmentFinder<GInterval> finder;
-            SegmentFinder<GInterval>::NNIterator nn(&finder);
-            int finder_chromid = -1;
-            auto ensure_finder = [&](int chromid) {
-                if (finder_chromid == chromid) return;
-                finder_chromid = chromid;
-                finder.reset(0, (int64_t)chromkey.get_chrom_size(chromid));
-                // sintervs is sorted by (chromid, start, end): find this chrom's
-                // contiguous run via lower_bound and insert it.
-                GInterval lo_key(chromid, 0, 1, 0);
-                auto lo = std::lower_bound(sintervs.begin(), sintervs.end(), lo_key, interval_cmp_start);
-                for (auto it = lo; it != sintervs.end() && it->chromid == chromid; ++it)
-                    finder.insert(*it);
-            };
-
-            for (size_t i = 0; i < intervals.size(); ++i) {
-                GInterval eval;
-                if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
-                    // A window shifted off the chromosome has no answer, for
-                    // every function (misha 5.12.x), not a count of 0.
-                    set_nan(i);
-                    continue;
-                }
-
-                if (func == "distance") {
-                    ensure_finder(eval.chromid);
-                    int64_t coord = (eval.start + eval.end) / 2;
-                    if (!nn.begin(Segment(coord, coord + 1))) {
-                        set_nan(i);
-                    } else {
-                        // Nearest source to the bin center, measured at its edges
-                        // (dist2coord returns 0 / a normalized fraction inside).
-                        out[i] = nn->dist2coord(coord, dist_margin);
-                    }
-                    continue;
-                }
-
-                if (func == "distance.center") {
-                    ensure_finder(eval.chromid);
-                    int64_t coord = (eval.start + eval.end) / 2;
-                    double best = std::numeric_limits<double>::quiet_NaN();
-                    // distance.center is defined only when the bin center sits
-                    // inside a source interval. NNIterator yields candidates by
-                    // increasing proximity, so every interval containing the
-                    // point precedes the first one that doesn't; among the
-                    // containing intervals keep the nearest center. With
-                    // non-overlapping sources there is at most one such interval
-                    // (historical behavior); overlapping sources resolve to the
-                    // nearest center instead of erroring.
-                    for (bool ok = nn.begin(Segment(coord, coord + 1)); ok; ok = nn.next()) {
-                        const GInterval &iv = *nn;
-                        if (coord < iv.start || coord >= iv.end) break;
-                        double d = iv.dist2center(coord);
-                        if (std::isnan(best) || std::fabs(d) < std::fabs(best)) best = d;
-                    }
-                    out[i] = best;
-                    continue;
-                }
-
-                if (func == "distance.edge") {
-                    ensure_finder(eval.chromid);
-                    if (!nn.begin(Segment(eval.start, eval.end))) {
-                        set_nan(i);
-                    } else {
-                        // Nearest source by edge-to-edge distance; the first
-                        // NN result is the closest, matching gintervals_neighbors.
-                        out[i] = (double)eval.dist2interv(*nn);
-                    }
-                    continue;
-                }
-
-                if (func == "coverage") {
-                    if (eval.range() <= 0) {
-                        set_nan(i);
-                        continue;
-                    }
-                    int64_t total_overlap = 0;
-                    size_t idx = adaptive_lb_start(eval);
-                    auto it = sintervs.begin() + idx;
-                    if (it != sintervs.begin()) {
-                        auto prev = it - 1;
-                        if (prev->chromid == eval.chromid && prev->end > eval.start) {
-                            int64_t ov_start = std::max(eval.start, prev->start);
-                            int64_t ov_end = std::min(eval.end, prev->end);
-                            total_overlap += (ov_end - ov_start);
-                        }
-                    }
-                    for (; it != sintervs.end() && it->chromid == eval.chromid && it->start < eval.end; ++it) {
-                        if (it->end > eval.start) {
-                            int64_t ov_start = std::max(eval.start, it->start);
-                            int64_t ov_end = std::min(eval.end, it->end);
-                            total_overlap += (ov_end - ov_start);
-                        }
-                    }
-                    out[i] = (double)total_overlap / (double)eval.range();
-                    continue;
-                }
-
-                if (func == "neighbor.count") {
-                    if (eintervs.empty()) {
-                        out[i] = 0.0;
-                        continue;
-                    }
-                    size_t count = 0;
-                    size_t idx = adaptive_lb_nc(eval);
-                    auto it = eintervs.begin() + idx;
-                    if (it != eintervs.begin()) {
-                        auto prev = it - 1;
-                        while (true) {
-                            if (prev->chromid != eval.chromid) break;
-                            if (prev->end <= eval.start) break;
-                            if (prev->start < eval.end && prev->end > eval.start) ++count;
-                            if (prev == eintervs.begin()) break;
-                            --prev;
-                        }
-                    }
-                    for (; it != eintervs.end() && it->chromid == eval.chromid && it->start < eval.end; ++it) {
-                        if (it->end > eval.start) ++count;
-                    }
-                    out[i] = (double)count;
-                    continue;
-                }
-            }
-
-            return_py(py_vals);
-        }
-
-        // Track-based or value-based vtracks
         if (py_src && py_src != Py_None && !PyUnicode_Check(py_src)) {
-            // Value-based: intervals + values, read as R misha reads them (value_var_track)
-            std::vector<GInterval> src_intervals;
-            std::vector<double> src_values;
-            bool has_values = false;
-            bool has_strand = false;
-            convert_py_intervals_with_values(py_src, src_intervals, src_values, &has_values, &has_strand);
-
-            if (!has_values || src_values.empty()) {
-                TGLError("Value-based virtual tracks require a numeric value column");
-            }
-
-            PyObject *params_obj = dict_get(py_spec, "params");
-            if (params_obj && PyList_Check(params_obj) && PyList_Size(params_obj) > 0) {
-                params_obj = PyList_GetItem(params_obj, 0);
-            }
-            const double percentile = obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
-
-            GenomeTrackInMemory track;
-            value_var_track(track, src_intervals, src_values, func);
+            PMIntervalsVtrack vtrack(py_spec, func);
 
             // With a filter the caller passes the unmasked parts of each interval, consecutive and
             // in order, with the interval each belongs to (part_owner) and its start after the
             // shifts (part_base); the result of an interval goes to its first part.
             PyObject *py_owner = dict_get(py_spec, "part_owner");
-            if (py_owner && py_owner != Py_None) {
+            if (py_owner && py_owner != Py_None && !PMIntervalsVtrack::is_interval_func(func)) {
                 PMPY owner(PyArray_FROM_OTF(py_owner, NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
                 PMPY base(PyArray_FROM_OTF(dict_get(py_spec, "part_base"), NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
                 if (!owner || !base || PyArray_SIZE((PyArrayObject *)*owner) != (npy_intp)intervals.size() ||
@@ -1298,19 +1225,21 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     parts.clear();
                     for (; j < intervals.size() && o[j] == o[i]; ++j)
                         parts.push_back(intervals[j]);
-                    out[i] = value_var_filtered(track, func, parts, b[i], percentile);
+                    out[i] = value_var_filtered(vtrack.track(), func, parts, b[i], vtrack.percentile());
                     i = j;
                 }
                 return_py(py_vals);
             }
 
+            // A window shifted off the chromosome has no answer, for every function (misha
+            // 5.12.x), not a count of 0.
             for (size_t i = 0; i < intervals.size(); ++i) {
                 GInterval eval;
                 if (!apply_shift(intervals[i], sshift, eshift, chromkey, eval)) {
                     set_nan(i);
                     continue;
                 }
-                out[i] = value_var_unfiltered(track, func, eval, percentile);
+                out[i] = vtrack.eval(eval);
             }
 
             return_py(py_vals);

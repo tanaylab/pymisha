@@ -269,7 +269,8 @@ def test_max_data_size_inf_is_no_limit_below_1_counts_as_1_nan_or_negative_is_an
 
 def test_max_data_size_absent_is_the_default(config):
     config.pop("max_data_size")
-    assert _shared._config_limit("max_data_size") == 10_000_000
+    default = _shared._optimal_max_data_size(_shared._system_memory(), _shared._detect_cores())
+    assert _shared._config_limit("max_data_size") == int(default)
     assert len(pm.gextract("dense_track", SCOPE)) == 400
 
 

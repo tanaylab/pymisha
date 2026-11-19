@@ -132,6 +132,7 @@ def pm_summary(
     intervals: Any,
     iterator: int | float | None = ...,
     config: dict[str, Any] | None = ...,
+    vtracks: dict[str, dict[str, Any]] | None = ...,
     /,
 ) -> dict[str, float]:
     """Summarize expression values over intervals.
@@ -139,7 +140,7 @@ def pm_summary(
     Returns dict with keys: 'Total intervals', 'NaN intervals', 'Min',
     'Max', 'Sum', 'Mean', 'Std dev'.
 
-    C++ signature: ``PyArg_ParseTuple(args, "OO|OO", ...)``
+    C++ signature: ``PyArg_ParseTuple(args, "OO|OOO", ...)``
     """
 
 def pm_quantiles(
@@ -148,13 +149,14 @@ def pm_quantiles(
     intervals: Any,
     iterator: int | float | None = ...,
     config: dict[str, Any] | None = ...,
+    vtracks: dict[str, dict[str, Any]] | None = ...,
     /,
 ) -> list[float]:
     """Compute expression quantiles.
 
     Returns a list of quantile values.
 
-    C++ signature: ``PyArg_ParseTuple(args, "OOO|OO", ...)``
+    C++ signature: ``PyArg_ParseTuple(args, "OOO|OOO", ...)``
     """
 
 def pm_intervals_summary(
@@ -434,13 +436,14 @@ def pm_dist(
     iterator: int | float | None = ...,
     include_lowest: bool = ...,
     config: dict[str, Any] | None = ...,
+    vtracks: dict[str, dict[str, Any]] | None = ...,
     /,
 ) -> npt.NDArray[np.float64]:
     """Calculate distribution of track values over bins.
 
     Returns an N-dimensional numpy array of counts.
 
-    C++ signature: ``PyArg_ParseTuple(args, "OOO|OpO", ...)``
+    C++ signature: ``PyArg_ParseTuple(args, "OOO|OpOO", ...)``
     """
 
 def pm_lookup(

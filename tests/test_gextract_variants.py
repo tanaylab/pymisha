@@ -473,7 +473,7 @@ def test_engine_python_path_vtracks_equal_the_same_bin_on_a_really_edited_genome
     row_sub = np.tile(np.arange(len(subs)), len(bins))
     pm.gdb_init(db)
     define_python_path_vtracks()
-    assert not any(_can_vtracks_use_cpp([vt]) for vt in (*PY_PATH_VTRACKS, "v_dist", "v_val"))
+    assert not any(_can_vtracks_use_cpp([vt]) for vt in PY_PATH_VTRACKS)
     for vt in PY_PATH_VTRACKS:
         pm.gdb_init(db)
         define_python_path_vtracks()

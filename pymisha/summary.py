@@ -39,6 +39,38 @@ from .vtracks import _compute_vtrack_values
 _logger = get_logger(__name__)
 
 
+def _cpp_vtracks(exprs: list[str], user_vars: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """The virtual tracks of exprs as the C++ scanner takes them ({} if there are none), or None
+    if the expressions need the Python path: user variables, or a virtual track the scanner does
+    not evaluate (one with a filter, ...)."""
+    if user_vars:
+        return None
+    used = {vt for e in exprs for vt in _find_vtracks_in_expr(e)}
+    if not used:
+        return {}
+    from .extract import _build_vtracks_dict, _can_vtracks_use_cpp
+
+    if not _can_vtracks_use_cpp(used):
+        return None
+    return _build_vtracks_dict(used)
+
+
+def _vtrack_scope(exprs: list[str], intervals: Any, iterator: Any, vtracks: dict[str, Any]) -> tuple[Any, Any]:
+    """The scope and iterator of exprs, which use vtracks, as the Python path chooses them: an
+    implicit iterator comes from the physical tracks if there are any, else from the sources of
+    the vtracks (_default_vtrack_iterator)."""
+    if iterator is None and vtracks:
+        from .extract import _check_dense_bin_sizes, _default_vtrack_iterator
+
+        track_names = _track_names_set()
+        vtrack_names = set(_shared._VTRACKS)
+        if any(_parse_expr_vars(e, track_names, vtrack_names)[1] for e in exprs):
+            _check_dense_bin_sizes(exprs, list(vtracks))
+        else:
+            intervals, iterator = _default_vtrack_iterator(intervals, iterator, exprs, list(vtracks))
+    return intervals, iterator
+
+
 def _positive_zero(q: Any) -> np.ndarray:
     """Quantiles with 0.0 for a zero of either sign, as R misha gives them: which zero a rank
     holds is arbitrary when the values hold both -0 and 0, and differs between paths."""
@@ -239,12 +271,10 @@ def gdist(
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
         return result
 
-    # Check if any expression uses virtual tracks
-    # If so, fall back to Python implementation (virtual tracks not supported in pm_dist yet)
-    has_vtracks = any(_find_vtracks_in_expr(e) for e in exprs)
-
-    if not has_vtracks and not all_user_vars:
-        # Use C++ streaming implementation
+    # The C++ scanner, unless an expression needs the Python path (_cpp_vtracks)
+    vtracks_dict = _cpp_vtracks(exprs, all_user_vars)
+    if vtracks_dict is not None:
+        intervals, iterator = _vtrack_scope(exprs, intervals, iterator, vtracks_dict)
         with _config_no_mt(_itr_id_map) as _base_cfg:
             config = dict(_base_cfg)
             if progress is not None:
@@ -252,7 +282,8 @@ def gdist(
             if progress_desc:
                 config["progress_desc"] = progress_desc
 
-            result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config)
+            result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config,
+                                      vtracks_dict or None)
 
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -1073,10 +1104,11 @@ def gsummary(
         )
         return _gsummary_from_values(values)
 
-    vtracks_used = _find_vtracks_in_expr(expr)
-    if not vtracks_used and not user_vars:
+    vtracks_dict = _cpp_vtracks([expr], user_vars)
+    if vtracks_dict is not None:
+        intervals, iterator = _vtrack_scope([expr], intervals, iterator, vtracks_dict)
         with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, _cfg)
+            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, _cfg, vtracks_dict or None)
         if result is None:
             return _pandas.Series(
                 [0.0, 0.0, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan],
@@ -1217,10 +1249,12 @@ def gquantiles(
             quantiles = _numpy.nanquantile(values, pct)
         return _pandas.Series(_positive_zero(quantiles), index=pct)
 
-    vtracks_used = _find_vtracks_in_expr(expr)
-    if not vtracks_used and not user_vars:
+    vtracks_dict = _cpp_vtracks([expr], user_vars)
+    if vtracks_dict is not None:
+        intervals, iterator = _vtrack_scope([expr], intervals, iterator, vtracks_dict)
         with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
+            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg,
+                                           vtracks_dict or None)
         if result is None:
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
         else:

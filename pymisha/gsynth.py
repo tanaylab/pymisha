@@ -20,14 +20,11 @@ import pandas as _pd
 import yaml as _yaml  # type: ignore[import-untyped]
 
 from ._safe_pickle import restricted_load
-from ._shared import _checkroot, _df2pymisha, _map_forked, _pymisha
+from ._shared import _checkroot, _config_limit, _df2pymisha, _map_forked, _pymisha
 from .extract import _maybe_load_intervals_set, gextract
 from .intervals import gintervals_all
 
 _logger = _logging.getLogger(__name__)
-
-# Default chunk size threshold for parallel processing (1 billion bases)
-GSYNTH_MAX_CHUNK_SIZE = int(1e9)
 
 # Canonical names: "misha" (binary), "fasta", "vector". "seq" is the
 # legacy PyMisha alias for "misha".
@@ -893,7 +890,8 @@ def _extract_bin_data(
 
 
 # ---------------------------------------------------------------------------
-# Parallel processing helpers
+# Chunks: gsynth_train and gsynth_sample process their intervals in chunks of
+# whole rows, one after the other or in parallel processes
 # ---------------------------------------------------------------------------
 
 def _compute_total_bases(intervals: _pd.DataFrame) -> int:
@@ -901,114 +899,72 @@ def _compute_total_bases(intervals: _pd.DataFrame) -> int:
     return int((intervals["end"] - intervals["start"]).sum())
 
 
-def _should_parallelize(intervals: _pd.DataFrame, allow_parallel: bool, num_cores: int | None,
-                        max_chunk_size: int | None = None) -> tuple[bool, int]:
-    """Determine whether parallel processing should be used.
-
-    Returns (do_parallel, effective_cores) tuple.
-    """
-    if not allow_parallel:
-        return False, 1
-
+def _max_chunk_bases(max_chunk_size: int | None, iterator: int | None) -> int:
+    """The most bases a chunk holds: *max_chunk_size*, by default CONFIG['max_data_size'] times
+    *iterator* (1 when None), so that the iterator bins of a chunk fit in one gextract."""
     if max_chunk_size is None:
-        max_chunk_size = GSYNTH_MAX_CHUNK_SIZE
+        return _config_limit("max_data_size") * (iterator or 1)
+    if max_chunk_size < 1:
+        raise ValueError(f"max_chunk_size must be a positive number of bases, got {max_chunk_size}")
+    return int(max_chunk_size)
 
-    total_bases = _compute_total_bases(intervals)
-    if total_bases <= max_chunk_size:
-        return False, 1
 
-    n_rows = len(intervals)
-    if n_rows <= 1:
-        return False, 1
+def _chunk_intervals(intervals: _pd.DataFrame, max_bases: int, iterator: int | None = None) -> list[_pd.DataFrame]:
+    """*intervals* in chunks of consecutive whole rows, in order, each of at most *max_bases*
+    bases; a row of more is a chunk of its own. A row's bases are those of the *iterator* bins it
+    spans (bins x iterator), or its length when *iterator* is None."""
+    starts = intervals["start"].to_numpy(dtype=_numpy.int64)
+    ends = intervals["end"].to_numpy(dtype=_numpy.int64)
+    it = iterator or 1
+    sizes = _numpy.where(ends > starts, ((ends - 1) // it - starts // it + 1) * it, 0)
+    cuts = [0]
+    total = 0
+    for i, size in enumerate(sizes.tolist()):
+        if total and total + size > max_bases:
+            cuts.append(i)
+            total = 0
+        total += size
+    if len(cuts) == 1:
+        return [intervals]
+    cuts.append(len(intervals))
+    return [intervals.iloc[a:b].reset_index(drop=True) for a, b in zip(cuts, cuts[1:], strict=False)]
 
+
+def _n_workers(allow_parallel: bool, num_cores: int | None, n_chunks: int) -> int:
+    """The number of processes that run *n_chunks* chunks: 1 (this process) unless parallel."""
+    if not allow_parallel or n_chunks <= 1:
+        return 1
     if num_cores is None:
         num_cores = _multiprocessing.cpu_count()
-    effective_cores = max(1, min(int(num_cores), n_rows))
-    if effective_cores <= 1:
-        return False, 1
-
-    return True, effective_cores
+    return max(1, min(int(num_cores), n_chunks))
 
 
-def _chunk_intervals(intervals: _pd.DataFrame, n_chunks: int) -> list[_pd.DataFrame]:
-    """Split intervals DataFrame into approximately equal chunks by row.
-
-    Each chunk is a contiguous slice of the intervals DataFrame.
-    Returns a list of DataFrames.
-    """
-    n_rows = len(intervals)
-    if n_chunks >= n_rows:
-        # One row per chunk
-        return [intervals.iloc[[i]].reset_index(drop=True)
-                for i in range(n_rows)]
-
-    chunk_size = n_rows // n_chunks
-    remainder = n_rows % n_chunks
-    chunks = []
-    start = 0
-    for i in range(n_chunks):
-        end = start + chunk_size + (1 if i < remainder else 0)
-        chunks.append(intervals.iloc[start:end].reset_index(drop=True))
-        start = end
-    return chunks
+def _map_chunks(fn: _Any, items: list[_Any], n_workers: int) -> list[_Any]:
+    """fn(item) for each of *items*, in order: one after the other in this process when
+    *n_workers* is 1, else in at most *n_workers* forked processes."""
+    if n_workers <= 1:
+        return [fn(item) for item in items]
+    return _map_forked(fn, items, n_workers)
 
 
-def _generate_chunk_seeds(seed: int | None, n_chunks: int) -> list[int | None]:
-    """Generate reproducible per-chunk seeds from a master seed.
-
-    If seed is None, returns a list of Nones.
-    """
-    if seed is None:
-        return [None] * n_chunks
-    rng = _numpy.random.RandomState(seed)
+def _generate_chunk_seeds(seed: int | None, n_chunks: int) -> list[int]:
+    """A seed for each chunk, drawn from *seed* or, when it is None, from numpy's global generator
+    (which numpy.random.seed sets): the draws of a chunk do not depend on the process that runs
+    it."""
+    rng = _numpy.random if seed is None else _numpy.random.RandomState(seed)
     return [int(rng.randint(0, 2**31 - 1)) for _ in range(n_chunks)]
 
 
-def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
-    """Worker function for parallel gsynth_train.
-
-    Runs in a forked subprocess. The child inherits the parent's
-    fully-initialized C++ and Python state via fork(), so no
-    re-initialization is needed.
-
-    Parameters
-    ----------
-    args : tuple
-        (chunk_intervals_dict, dim_specs_dicts, mask_dict,
-         iterator, pseudocount, total_bins, parsed_specs, k)
-
-    Returns
-    -------
-    dict
-        With keys 'counts', 'total_kmers', 'per_bin_kmers',
-        'total_masked', 'total_n'.
-    """
-    (chunk_intervals_dict, dim_specs_dicts, mask_dict,
-     iterator, pseudocount, total_bins, parsed_specs_data, k) = args
-
-    import pandas as pd
-    chunk_intervals = pd.DataFrame(chunk_intervals_dict)
-
-    mask = pd.DataFrame(mask_dict) if mask_dict is not None else None
-
-    # Reconstruct parsed_specs
-    parsed_specs = []
-    for sp in parsed_specs_data:
-        parsed_specs.append({
-            "expr": sp["expr"],
-            "breaks": sp["breaks"],
-            "num_bins": sp["num_bins"],
-            "bin_merge": sp.get("bin_merge"),
-            "bin_map": sp.get("bin_map"),
-        })
-
-    # Extract bin data for this chunk
-    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes, _, _ = \
+def _worker_train_chunk(chunk_intervals: _pd.DataFrame, parsed_specs: list[dict[str, _Any]],
+                        mask: _pd.DataFrame | None, iterator: int | None, pseudocount: float,
+                        k: int) -> dict[str, _Any]:
+    """The k-mer counts and totals of one chunk of gsynth_train: a dict with 'counts',
+    'total_kmers', 'per_bin_kmers', 'total_masked' and 'total_n'."""
+    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, _, _, _ = \
         _extract_bin_data(parsed_specs, chunk_intervals, iterator)
 
-    # Call C++ backend. Workers always train with a uniform prior — the
-    # CDF here is discarded and recomputed from the merged counts in
-    # _merge_train_results, where the requested prior is applied.
+    # The CDF computed here (with a uniform prior) is discarded: _merge_train_results computes it
+    # from the counts of all the chunks, with the requested prior
     py_mask = _df2pymisha(mask) if mask is not None else None
     result = _pymisha.pm_gsynth_train(
         _df2pymisha(chunk_intervals),
@@ -1027,18 +983,34 @@ def _worker_train_chunk(args: tuple[_Any, ...]) -> dict[str, _Any]:
         None,
     )
 
-    # Return only what we need for merging (numpy arrays + scalars)
     return {
         "counts": result["counts"],
         "total_kmers": int(result["total_kmers"]),
-        "per_bin_kmers": result["per_bin_kmers"].copy(),
+        "per_bin_kmers": result["per_bin_kmers"],
         "total_masked": int(result["total_masked"]),
         "total_n": int(result["total_n"]),
     }
 
 
+def _sum_train_results(chunk_results: _Any, total_bins: int, k: int) -> dict[str, _Any]:
+    """The sums of the counts and totals of *chunk_results* (an iterable of results of
+    _worker_train_chunk, consumed one at a time), as a result of the same form."""
+    counts = [_numpy.zeros((4 ** k, 4), dtype=_numpy.uint64) for _ in range(total_bins)]
+    per_bin_kmers = _numpy.zeros(total_bins, dtype=_numpy.uint64)
+    total_kmers = total_masked = total_n = 0
+    for cr in chunk_results:
+        total_kmers += cr["total_kmers"]
+        per_bin_kmers += cr["per_bin_kmers"]
+        total_masked += cr["total_masked"]
+        total_n += cr["total_n"]
+        for b in range(total_bins):
+            counts[b] += cr["counts"][b]
+    return {"counts": counts, "total_kmers": total_kmers, "per_bin_kmers": per_bin_kmers,
+            "total_masked": total_masked, "total_n": total_n}
+
+
 def _merge_train_results(
-    chunk_results: list[dict[str, _Any]],
+    chunk_results: _Any,
     total_bins: int,
     pseudocount: float,
     k: int = 5,
@@ -1049,11 +1021,13 @@ def _merge_train_results(
 
     Sums count arrays across chunks, resolves the per-bin Dirichlet prior
     on the merged counts, and recomputes CDFs from the posterior
-    ``P(a|c,b) = (N + alpha * pi_a(b)) / (sum_a N + alpha)``.
+    ``P(a|c,b) = (N + alpha * pi_a(b)) / (sum_a N + alpha)``, as the C++
+    model computes them (pm_gsynth_train), so that the model does not
+    depend on the chunks.
 
     Parameters
     ----------
-    chunk_results : list of dict
+    chunk_results : iterable of dict
         Each dict has 'counts', 'total_kmers', 'per_bin_kmers',
         'total_masked', 'total_n'.
     total_bins : int
@@ -1074,22 +1048,8 @@ def _merge_train_results(
         'per_bin_kmers', 'total_masked', 'total_n', 'prior',
         'marginal_fallbacks'.
     """
-    num_kmers = 4 ** k
-
-    merged_counts = [_numpy.zeros((num_kmers, 4), dtype=_numpy.float64)
-                     for _ in range(total_bins)]
-    merged_total_kmers = 0
-    merged_per_bin_kmers = _numpy.zeros(total_bins, dtype=_numpy.float64)
-    merged_total_masked = 0
-    merged_total_n = 0
-
-    for cr in chunk_results:
-        merged_total_kmers += cr["total_kmers"]
-        merged_per_bin_kmers += cr["per_bin_kmers"]
-        merged_total_masked += cr["total_masked"]
-        merged_total_n += cr["total_n"]
-        for b in range(total_bins):
-            merged_counts[b] += cr["counts"][b]
+    merged = _sum_train_results(chunk_results, total_bins, k)
+    merged_counts = merged["counts"]
 
     # Resolve per-bin prior pi(b) -----------------------------------------
     pi = _numpy.full((total_bins, 4), 0.25, dtype=_numpy.float64)
@@ -1125,34 +1085,24 @@ def _merge_train_results(
         for b in range(total_bins):
             row = prior_matrix[b].copy()
             s = row.sum()
-            if s > 0:
+            if not s <= 0:
                 pi[b] = row / s
     else:
         raise ValueError(f"Unknown prior_mode: {prior_mode!r}")
 
-    # Posterior CDF: (N + alpha*pi) / (sum_a N + alpha) -------------------
+    # Posterior CDF: (N + alpha*pi) / (sum_a N + alpha), in single precision as the C++ model
+    # keeps it (0/0, an unseen context with no pseudocount, is NaN there too)
     merged_cdf = []
-    for b in range(total_bins):
-        counts_b = merged_counts[b]
-        n_total = counts_b.sum(axis=1, keepdims=True)
-        denom = n_total + pseudocount
-        # avoid division by zero (denom is alpha > 0 unless pseudocount==0)
-        denom = _numpy.where(denom == 0, 1.0, denom)
-        probs = (counts_b + pseudocount * pi[b]) / denom
-        cdf = _numpy.cumsum(probs, axis=1)
-        cdf[:, -1] = 1.0
-        merged_cdf.append(cdf)
+    with _numpy.errstate(invalid="ignore", divide="ignore"):
+        for b in range(total_bins):
+            counts_b = merged_counts[b].astype(_numpy.float64)
+            denom = counts_b.sum(axis=1, keepdims=True) + pseudocount
+            probs = (counts_b + pseudocount * pi[b]) / denom
+            cdf = _numpy.cumsum(probs, axis=1).astype(_numpy.float32).astype(_numpy.float64)
+            cdf[:, -1] = 1.0
+            merged_cdf.append(cdf)
 
-    return {
-        "counts": merged_counts,
-        "cdf": merged_cdf,
-        "total_kmers": merged_total_kmers,
-        "per_bin_kmers": merged_per_bin_kmers,
-        "total_masked": merged_total_masked,
-        "total_n": merged_total_n,
-        "prior": pi,
-        "marginal_fallbacks": marginal_fallbacks,
-    }
+    return {**merged, "cdf": merged_cdf, "prior": pi, "marginal_fallbacks": marginal_fallbacks}
 
 
 def _warn_sparse_used(sparse: _numpy.ndarray, min_obs: int, bin_indices: _numpy.ndarray) -> None:
@@ -1171,46 +1121,14 @@ def _warn_sparse_used(sparse: _numpy.ndarray, min_obs: int, bin_indices: _numpy.
 
 
 def _worker_sample_chunk(args: tuple[_Any, ...]) -> tuple[list[str], _numpy.ndarray]:
-    """Worker function for parallel gsynth_sample.
+    """The sequences of one chunk of gsynth_sample, and the flat bins (0-based) it used.
 
-    Runs in a forked subprocess. The child inherits the parent's
-    fully-initialized C++ and Python state via fork(), so no
-    re-initialization is needed.
-
-    Parameters
-    ----------
-    args : tuple
-        (chunk_intervals_dict, dim_specs_list, cdf_list,
-         iterator, mask_copy_dict, n_samples, chunk_seed, bin_merge, k)
-
-    Returns
-    -------
-    tuple
-        Sampled sequences for this chunk, and the flat bins (0-based) it used.
+    *args* is (chunk_intervals, dim_specs, cdf_list, iterator, mask_copy, n_samples, chunk_seed,
+    bin_merge, k, preserve_n).
     """
-    (chunk_intervals_dict, dim_specs_list, cdf_list_data,
-     iterator, mask_copy_dict, n_samples, chunk_seed,
+    (chunk_intervals, dim_specs, cdf_list, iterator, mask_copy, n_samples, chunk_seed,
      sample_bin_merge, k, preserve_n) = args
 
-    import pandas as pd
-    chunk_intervals = pd.DataFrame(chunk_intervals_dict)
-    mask_copy = pd.DataFrame(mask_copy_dict) if mask_copy_dict is not None else None
-
-    # Reconstruct dim_specs
-    dim_specs = []
-    for sp in dim_specs_list:
-        dim_specs.append({
-            "expr": sp["expr"],
-            "breaks": sp["breaks"],
-            "num_bins": sp["num_bins"],
-            "bin_merge": sp.get("bin_merge"),
-            "bin_map": sp.get("bin_map"),
-        })
-
-    # Reconstruct CDF list (already numpy arrays)
-    cdf_list = cdf_list_data
-
-    # Extract bin data for this chunk
     bin_indices, iter_starts, _, flat_breaks, _, _, iter_ends, iter_ivids = \
         _extract_bin_data(dim_specs, chunk_intervals, iterator,
                           sample_bin_merge=sample_bin_merge)
@@ -1322,11 +1240,10 @@ def gsynth_train(
     When called with no dimension specifications, trains a single unstratified
     (0-D) model.
 
-    For large genomes (total bases > threshold), intervals can be split into
-    chunks and processed in parallel using multiple cores. Each chunk trains
-    independently, and the resulting k-mer count arrays are merged before
-    computing the final CDF. This matches the R ``misha`` parallel gsynth
-    behavior.
+    The intervals are processed in chunks of whole rows (see
+    *max_chunk_size*), one after the other or in parallel processes. The
+    k-mer counts of the chunks are summed before the CDF is computed, so the
+    model does not depend on the chunks.
 
     Parameters
     ----------
@@ -1387,17 +1304,21 @@ def gsynth_train(
           ``pi``. Each row is renormalised to sum to 1; rows summing to
           zero fall back to uniform.
     allow_parallel : bool, default True
-        Whether to enable parallel chunking for large genomes.  When
-        ``True`` and the total bases exceed *max_chunk_size*, intervals
-        are split across multiple processes.  When ``False``, always
-        runs single-threaded.
+        Whether several chunks run in parallel processes.  When ``False``,
+        they run one after the other in this process.
     num_cores : int, optional
-        Number of worker processes.  If ``None``, defaults to
-        ``multiprocessing.cpu_count()``.  Capped at the number of
-        interval rows.
+        The most chunks that run at once.  If ``None``, defaults to
+        ``multiprocessing.cpu_count()``.  It does not change the chunks.
     max_chunk_size : int, optional
-        Total-base threshold above which parallel processing triggers.
-        Defaults to ``GSYNTH_MAX_CHUNK_SIZE`` (1 billion).
+        The most bases a chunk holds.  The intervals (after overlapping ones
+        are unified) are cut, in order, into chunks of consecutive whole rows
+        of at most *max_chunk_size* bases, a row counting the iterator bins it
+        spans times the iterator (its length when there are no dimensions or
+        no fixed iterator bin size).  A row of more bases is a chunk of its
+        own: rows are not split.  Defaults to ``CONFIG['max_data_size']``
+        times the iterator (times 1 without a fixed iterator bin size), so
+        that the track values of a chunk fit in one extraction; a single row
+        of more bins than ``CONFIG['max_data_size']`` still exceeds it.
 
     Returns
     -------
@@ -1489,115 +1410,36 @@ def gsynth_train(
                 spec["breaks"], spec["bin_merge"]
             ).tolist()
 
-    # Compute total_bins and dim_sizes early (needed for parallel path)
     dim_sizes = [sp["num_bins"] for sp in parsed_specs] if parsed_specs else [1]
     total_bins = 1
     for ds in dim_sizes:
         total_bins *= int(ds)
+    if prior_matrix_arg is not None and prior_matrix_arg.shape[0] != total_bins:
+        raise ValueError(
+            f"explicit prior must have {total_bins} rows (one per "
+            f"flat bin), got {prior_matrix_arg.shape[0]}"
+        )
 
-    # Check whether to parallelize
-    do_parallel, effective_cores = _should_parallelize(
-        intervals, allow_parallel, num_cores, max_chunk_size
+    # Chunks of whole rows: a (k+1)-mer never crosses from one interval into the next, so the
+    # summed counts of the chunks are those of all the intervals at once
+    size_iter = iterator if parsed_specs else None
+    chunks = _chunk_intervals(intervals, _max_chunk_bases(max_chunk_size, size_iter), size_iter)
+    n_workers = _n_workers(allow_parallel, num_cores, len(chunks))
+    if len(chunks) > 1:
+        _logger.info("Training on %s bases in %d chunks, %d at a time...",
+                     f"{_compute_total_bases(intervals):,}", len(chunks), n_workers)
+
+    def train_group(group: list[_pd.DataFrame]) -> dict[str, _Any]:
+        # a process sums the counts of its chunks as it goes: one chunk's counts at a time
+        return _sum_train_results(
+            (_worker_train_chunk(chunk, parsed_specs, mask, iterator, pseudocount, k) for chunk in group),
+            total_bins, k)
+
+    groups = [chunks[i::n_workers] for i in range(n_workers)]
+    result = _merge_train_results(
+        _map_chunks(train_group, groups, n_workers), total_bins, pseudocount, k=k,
+        prior_mode=prior_mode, prior_matrix=prior_matrix_arg,
     )
-
-    if do_parallel:
-        _logger.info(
-            "Large genome detected (%s bases). "
-            "Processing %d chunks across %d cores...",
-            f"{_compute_total_bases(intervals):,}",
-            len(intervals),
-            effective_cores,
-        )
-
-        chunks = _chunk_intervals(intervals, effective_cores)
-        mask_dict = mask.to_dict(orient="list") if mask is not None else None
-        parsed_specs_data = [
-            dict(sp.items()) for sp in parsed_specs
-        ]
-
-        worker_args = [
-            (chunk.to_dict(orient="list"), parsed_specs_data,
-             mask_dict, iterator, pseudocount, total_bins,
-             parsed_specs_data, k)
-            for chunk in chunks
-        ]
-
-        chunk_results = _map_forked(_worker_train_chunk, worker_args, effective_cores)
-
-        # Merge results from all chunks (resolves prior on merged counts).
-        if prior_matrix_arg is not None and prior_matrix_arg.shape[0] != total_bins:
-            raise ValueError(
-                f"explicit prior must have {total_bins} rows (one per "
-                f"flat bin), got {prior_matrix_arg.shape[0]}"
-            )
-        result = _merge_train_results(
-            chunk_results, total_bins, pseudocount, k=k,
-            prior_mode=prior_mode, prior_matrix=prior_matrix_arg,
-        )
-
-        return _mark_sparse_bins(GsynthModel(
-            k=k,
-            n_dims=len(parsed_specs),
-            dim_sizes=dim_sizes,
-            dim_specs=parsed_specs,
-            total_bins=total_bins,
-            model_data={
-                "counts": result["counts"],
-                "cdf": result["cdf"],
-            },
-            total_kmers=int(result["total_kmers"]),
-            per_bin_kmers=result["per_bin_kmers"],
-            total_masked=int(result["total_masked"]),
-            total_n=int(result["total_n"]),
-            pseudocount=pseudocount,
-            min_obs=min_obs,
-            iterator=iterator,
-            prior_mode=prior_mode,
-            prior_matrix=result["prior"],
-            marginal_fallbacks=int(result["marginal_fallbacks"]),
-        ))
-
-    # --- Single-process path (original logic) ---
-
-    bin_indices, iter_starts, iter_chroms, flat_breaks, bin_map, dim_sizes, _, _ = \
-        _extract_bin_data(parsed_specs, intervals, iterator)
-
-    # Call C++ backend
-    py_mask = _df2pymisha(mask) if mask is not None else None
-    if prior_matrix_arg is not None:
-        # Total bins must match for explicit mode.
-        if prior_matrix_arg.shape[0] != total_bins:
-            raise ValueError(
-                f"explicit prior must have {total_bins} rows (one per "
-                f"flat bin), got {prior_matrix_arg.shape[0]}"
-            )
-        prior_arg_for_cpp = _numpy.ascontiguousarray(
-            prior_matrix_arg, dtype=_numpy.float64
-        )
-    else:
-        prior_arg_for_cpp = None
-
-    result = _pymisha.pm_gsynth_train(
-        _df2pymisha(intervals),
-        bin_indices,
-        iter_starts,
-        iter_chroms,
-        flat_breaks,
-        bin_map,
-        py_mask,
-        float(pseudocount),
-        int(k),
-        # 0D: one iter_start per interval, so no bin-size bound (as gsynth_sample); bounding it
-        # trained only the first bin of each interval (R misha 5.15 trains the whole scope)
-        _ITER_SIZE_NO_CONSTRAINT if not parsed_specs else _resolve_iter_size(iterator),
-        str(prior_mode),
-        prior_arg_for_cpp,
-    )
-
-    # Build model
-    total_bins = 1
-    for dim_size in dim_sizes:
-        total_bins *= int(dim_size)
 
     return _mark_sparse_bins(GsynthModel(
         k=k,
@@ -1617,10 +1459,9 @@ def gsynth_train(
         min_obs=min_obs,
         iterator=iterator,
         prior_mode=prior_mode,
-        prior_matrix=result.get("prior"),
-        marginal_fallbacks=int(result.get("marginal_fallbacks", 0)),
+        prior_matrix=result["prior"],
+        marginal_fallbacks=int(result["marginal_fallbacks"]),
     ))
-
 
 
 # ---------------------------------------------------------------------------
@@ -1656,11 +1497,10 @@ def gsynth_sample(
     encounters regions with only N bases, it falls back to uniform random
     base selection until a valid context is established.
 
-    For large genomes (total bases > threshold), intervals can be split into
-    chunks and processed in parallel using multiple cores. Each chunk samples
-    independently and the resulting sequences are concatenated. For file
-    output modes (``"fasta"`` or ``"seq"``), the parallel path first samples
-    to in-memory vectors and then writes the combined result.
+    The intervals are sampled in chunks of whole rows (see
+    *max_chunk_size*), one after the other or in parallel processes, and the
+    sequences of the chunks are joined in genome order. With several chunks,
+    file output is written from the sequences held in memory.
 
     Parameters
     ----------
@@ -1707,6 +1547,10 @@ def gsynth_sample(
     seed : int, optional
         Random seed for reproducibility.  If ``None``, the draws follow
         numpy's global generator, so ``numpy.random.seed`` reproduces them.
+        With several chunks (see *max_chunk_size*), each chunk draws from a
+        seed of its own, drawn from *seed* (or numpy's generator): the
+        sequences are the same whatever *allow_parallel* and *num_cores*,
+        but differ from those of other chunks of the same intervals.
     bin_merge : list, optional
         Sampling-time bin merge overrides, one element per model dimension.
         Each element is either ``None`` (use the training-time bin_merge)
@@ -1726,17 +1570,22 @@ def gsynth_sample(
         in-process ``cdf_list``, so there is no array duplication (though
         parallel workers re-pickle the cdf_list and lose this saving).
     allow_parallel : bool, default True
-        Whether to enable parallel chunking for large genomes.  When
-        ``True`` and the total bases exceed *max_chunk_size*, intervals
-        are split across multiple processes.  When ``False``, always
-        runs single-threaded.
+        Whether several chunks run in parallel processes.  When ``False``,
+        they run one after the other in this process.
     num_cores : int, optional
-        Number of worker processes.  If ``None``, defaults to
-        ``multiprocessing.cpu_count()``.  Capped at the number of
-        interval rows.
+        The most chunks that run at once.  If ``None``, defaults to
+        ``multiprocessing.cpu_count()``.  It does not change the chunks or
+        the sequences.
     max_chunk_size : int, optional
-        Total-base threshold above which parallel processing triggers.
-        Defaults to ``GSYNTH_MAX_CHUNK_SIZE`` (1 billion).
+        The most bases a chunk holds.  The intervals, in genome order, are
+        cut into chunks of consecutive whole rows of at most *max_chunk_size*
+        bases, a row counting the iterator bins it spans times the iterator
+        (its length for an unstratified model).  A row of more bases is a
+        chunk of its own: rows are not split.  Defaults to
+        ``CONFIG['max_data_size']`` times the iterator (times 1 for an
+        unstratified model), so that the track values of a chunk fit in one
+        extraction; a single row of more bins than
+        ``CONFIG['max_data_size']`` still exceeds it.
 
     Returns
     -------
@@ -1798,45 +1647,29 @@ def gsynth_sample(
 
     # Sparse bins sampled uniformly, then per-joint-cell CDF redirects (cell_merge) on top of
     # bin_merge. Returns a (possibly modified) shallow copy of model.model_data["cdf"];
-    # both the parallel and serial paths below consume this same list.
+    # both paths below (several chunks, one chunk) consume this same list.
     sparse = _nan_cdf_bins(model.model_data["cdf"])
     cdf_list = _apply_cell_merge_to_cdf_list(model, cell_merge, bin_merge, sparse)
 
-    # Check whether to parallelize
-    do_parallel, effective_cores = _should_parallelize(
-        intervals, allow_parallel, num_cores, max_chunk_size
-    )
+    # In genome order, as the C++ sampler outputs them: the chunks then join in its order
+    ordered = _genome_order(intervals)
+    size_iter = iterator if model.n_dims > 0 else None
+    chunks = _chunk_intervals(ordered, _max_chunk_bases(max_chunk_size, size_iter), size_iter)
 
-    if do_parallel:
-        _logger.info(
-            "Large genome detected (%s bases). "
-            "Sampling %d chunks across %d cores...",
-            f"{_compute_total_bases(intervals):,}",
-            len(intervals),
-            effective_cores,
-        )
+    if len(chunks) > 1:
+        intervals = ordered
+        n_workers = _n_workers(allow_parallel, num_cores, len(chunks))
+        _logger.info("Sampling %s bases in %d chunks, %d at a time...",
+                     f"{_compute_total_bases(intervals):,}", len(chunks), n_workers)
 
-        # In genome order, as the C++ sampler outputs them: the chunks then join in its order
-        intervals = _genome_order(intervals)
-        chunks = _chunk_intervals(intervals, effective_cores)
+        # a seed for each chunk, whichever process samples it
         chunk_seeds = _generate_chunk_seeds(seed, len(chunks))
-
-        mask_copy_dict = (mask_copy.to_dict(orient="list")
-                          if mask_copy is not None else None)
-        dim_specs_list = [
-            dict(sp.items()) for sp in model.dim_specs
-        ]
-
         worker_args = [
-            (chunk.to_dict(orient="list"), dim_specs_list,
-             cdf_list, iterator, mask_copy_dict, n_samples,
+            (chunk, model.dim_specs, cdf_list, iterator, mask_copy, n_samples,
              chunk_seeds[i], bin_merge, model_k, preserve_n)
             for i, chunk in enumerate(chunks)
         ]
-
-        # without a seed, each chunk draws its own numbers from numpy's generator, reseeded for
-        # its chunk (_run_forked)
-        chunk_results = _map_forked(_worker_sample_chunk, worker_args, effective_cores)
+        chunk_results = _map_chunks(_worker_sample_chunk, worker_args, n_workers)
 
         # Concatenate all sequence lists
         all_seqs = [s for seqs, _ in chunk_results for s in seqs]
@@ -1847,7 +1680,8 @@ def gsynth_sample(
         if output is None:
             return all_seqs
 
-        # Write to file
+        # ponytail: the sequences of all the chunks are held in memory before they are written;
+        # append each chunk's to the file as it ends if that is too much
         output_path = str(output)
         parent = _os.path.dirname(output_path)
         if parent:
@@ -1864,7 +1698,7 @@ def gsynth_sample(
             return all_seqs
         return None
 
-    # Determine output format code
+    # One chunk: the C++ sampler writes the output itself, drawing from *seed* as is
     if output is None:
         fmt_code = _OUTPUT_FORMAT_CODES["vector"]
         output_path = ""
@@ -1881,9 +1715,6 @@ def gsynth_sample(
         _extract_bin_data(model.dim_specs, intervals, iterator,
                           sample_bin_merge=bin_merge)
     _warn_sparse_used(sparse, model.min_obs, bin_indices)
-
-    # cdf_list was computed once near the top (sparse bins uniform, cell_merge redirects
-    # applied); reuse it here so the serial path stays consistent with the parallel path.
 
     # Prepare mask_copy
     py_mask_copy = _df2pymisha(mask_copy) if mask_copy is not None else None

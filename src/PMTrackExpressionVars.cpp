@@ -649,6 +649,13 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
             } else {
                 vvar.values[idx] = eval_value_based_vtrack(vvar, eval);
             }
+        } else if (vvar.intervals_src) {
+            // A DataFrame source; a window shifted off the chromosome has no answer
+            GInterval eval;
+            if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval))
+                vvar.values[idx] = std::nan("");
+            else
+                vvar.values[idx] = vvar.intervals_src->eval(eval);
         } else {
             // Fallback: should not happen if add_vtrack_var was correct
             vvar.values[idx] = std::nan("");
@@ -848,9 +855,10 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
                 m_value_vtrack_groups[key] = m_vtrack_vars.size() - 1;
             }
         }
+    } else if (py_src && py_src != Py_None) {
+        // A DataFrame source: R misha's Interv_var / Value_var
+        vvar.intervals_src = std::make_unique<PMIntervalsVtrack>(spec, func);
     } else {
-        // Interval-based or DataFrame source — delegate to pm_vtrack_compute
-        // This should not happen on the C++ path (Python filters these out)
         TGLError("Virtual track '%s' has unsupported source type for C++ inline evaluation",
                  vtrack_name.c_str());
     }

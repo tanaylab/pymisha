@@ -2,7 +2,7 @@
 //
 // Plain-text only: gtrack_import unzips a .gz / .zip file first, as misha does.
 //
-// pm_is_bigwig / pm_parse_bigwig: misha's native bigWig reader (BigWig.cpp).
+// pm_is_bigwig / pm_parse_bigwig / pm_parse_bigbed: misha's native bigWig and bigBed reader (BigWig.cpp).
 
 #include "pymisha.h"
 #include "BigWig.h"
@@ -15,6 +15,11 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// PMStubs.cpp
+extern void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &intervals);
+extern void intervals_sort(std::vector<GInterval> &intervals);
+extern void intervals_unify_overlaps(std::vector<GInterval> &intervals, bool merge_touching);
 
 namespace {
 
@@ -391,16 +396,89 @@ static PyObject *string_list(const std::vector<std::string> &strs)
     return list;
 }
 
+// The database names of the chromosomes of intervals, as a numpy object array: one string object
+// per chromosome, shared by its rows. nullptr on error.
+static PyObject *chrom_array(const GIntervals &intervals, const GenomeChromKey &chromkey)
+{
+    npy_intp n = (npy_intp)intervals.size();
+    PMPY py_chrom(PyArray_SimpleNew(1, &n, NPY_OBJECT), true);
+    if (!py_chrom)
+        return nullptr;
+
+    std::vector<PMPY> names(chromkey.get_num_chroms());
+    PyObject **chrom_data = (PyObject **)PyArray_DATA((PyArrayObject *)*py_chrom);
+    for (npy_intp i = 0; i < n; ++i) {
+        PMPY &name = names[intervals[i].chromid];
+        if (!name) {
+            const string &s = chromkey.id2chrom(intervals[i].chromid);
+            name.assign(PyUnicode_FromStringAndSize(s.data(), s.size()), true);
+            if (!name)
+                return nullptr;
+        }
+        Py_INCREF((PyObject *)name);
+        chrom_data[i] = name;
+    }
+    py_chrom.to_be_stolen();
+    return py_chrom;
+}
+
+// Fills result with chrom, start and end of intervals and the reports of the reader (see
+// pm_parse_bigwig). false on error.
+static bool fill_result(PyObject *result, const GIntervals &intervals, const BigWig &reader, const GenomeChromKey &chromkey)
+{
+    npy_intp n = (npy_intp)intervals.size();
+    PMPY py_chrom(chrom_array(intervals, chromkey), true);
+    PMPY py_start(PyArray_SimpleNew(1, &n, NPY_INT64), true);
+    PMPY py_end(PyArray_SimpleNew(1, &n, NPY_INT64), true);
+    if (!py_chrom || !py_start || !py_end)
+        return false;
+    for (npy_intp i = 0; i < n; ++i) {
+        ((int64_t *)PyArray_DATA((PyArrayObject *)*py_start))[i] = intervals[i].start;
+        ((int64_t *)PyArray_DATA((PyArrayObject *)*py_end))[i] = intervals[i].end;
+    }
+
+    const UnknownChroms &unknown = reader.get_unknown_chroms();
+    PMPY py_unknown(string_list(unknown.names()), true);
+    PMPY py_primary(string_list(unknown.primary_names()), true);
+    PMPY py_num_unknown(PyLong_FromUnsignedLongLong(unknown.num()), true);
+    PMPY py_truncated(PyBool_FromLong(unknown.truncated()), true);
+    PMPY py_num_primary(PyLong_FromUnsignedLongLong(unknown.num_primary()), true);
+    PMPY py_num_matched(PyLong_FromUnsignedLongLong(reader.get_num_matched_chroms()), true);
+    PMPY py_num_clipped(PyLong_FromUnsignedLongLong(reader.get_num_clipped()), true);
+    PMPY py_num_dropped(PyLong_FromUnsignedLongLong(reader.get_num_dropped()), true);
+    const string &first_clipped = reader.get_first_clipped();
+    PMPY py_first_clipped(PyUnicode_DecodeUTF8(first_clipped.data(), first_clipped.size(), "replace"), true);
+    if (!py_unknown || !py_primary || !py_num_unknown || !py_truncated || !py_num_primary || !py_num_matched || !py_num_clipped ||
+        !py_num_dropped || !py_first_clipped)
+        return false;
+
+    PyDict_SetItemString(result, "chrom", py_chrom);
+    PyDict_SetItemString(result, "start", py_start);
+    PyDict_SetItemString(result, "end", py_end);
+    PyDict_SetItemString(result, "unknown", py_unknown);
+    PyDict_SetItemString(result, "num_unknown", py_num_unknown);
+    PyDict_SetItemString(result, "truncated", py_truncated);
+    PyDict_SetItemString(result, "unknown_primary", py_primary);
+    PyDict_SetItemString(result, "num_primary", py_num_primary);
+    PyDict_SetItemString(result, "num_matched", py_num_matched);
+    PyDict_SetItemString(result, "num_clipped", py_num_clipped);
+    PyDict_SetItemString(result, "num_dropped", py_num_dropped);
+    PyDict_SetItemString(result, "first_clipped", py_first_clipped);
+    return true;
+}
+
 /*
- * pm_parse_bigwig(path) -> dict
+ * pm_parse_bigwig(path, intervals=None) -> dict
  *
  * Reads the full-resolution records of a bigWig with misha's reader (BigWig.cpp), with its checks:
  * records are sorted and non-overlapping, a record that runs past the end of its chromosome is
  * clipped to it (dropped if it starts at or past the end), zero-length records are skipped, a
- * truncated or corrupt file is an error.
+ * truncated or corrupt file is an error. With intervals (the _intervals_to_cpp format), only the
+ * records that overlap them are returned, each once and whole, and only the data blocks the index
+ * places over them are read; only those records are counted as clipped or dropped.
  *
  * Returns: dict with keys
- *   - "chrom", "start", "end", "value": the records, chrom holding database chromosome names
+ *   - "chrom", "start", "end", "value": the records, sorted, chrom holding database chromosome names
  *   - "unknown": up to 5 names of bigWig chromosomes with data that the database lacks
  *   - "num_unknown": the number of such names
  *   - "truncated": whether num_unknown is a lower bound (see UnknownChroms)
@@ -415,6 +493,78 @@ static PyObject *string_list(const std::vector<std::string> &strs)
 PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
 {
     const char *path;
+    PyObject *py_intervals = Py_None;
+    if (!PyArg_ParseTuple(args, "s|O", &path, &py_intervals))
+        return nullptr;
+
+    try {
+        PyMisha pymisha(true);
+
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        bool all = py_intervals == Py_None;
+        BigWig bigwig;
+        GIntervals query, chrom_query, data, res;
+
+        bigwig.init(chromkey, path);
+        if (!all) {
+            convert_py_intervals(py_intervals, query);
+            intervals_sort(query);
+            intervals_unify_overlaps(query, true);
+        }
+
+        GIntervals::const_iterator iquery = query.begin();
+        for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+            if (all) {
+                for (uint64_t iblock = 0; bigwig.get_data(chromid, iblock, data); ++iblock) {
+                    res.insert(res.end(), data.begin(), data.end());
+                    check_interrupt();
+                }
+            } else {
+                chrom_query.clear();
+                for (; iquery != query.end() && iquery->chromid == chromid; ++iquery)
+                    chrom_query.push_back(*iquery);
+                if (!chrom_query.empty()) {
+                    bigwig.get_data(chromid, chrom_query, data);
+                    res.insert(res.end(), data.begin(), data.end());
+                }
+            }
+            check_interrupt();
+        }
+
+        npy_intp n = (npy_intp)res.size();
+        PMPY py_value(PyArray_SimpleNew(1, &n, NPY_FLOAT32), true);
+        PMPY result(PyDict_New(), true);
+        if (!py_value || !result || !fill_result(result, res, bigwig, chromkey))
+            return_err();
+        for (npy_intp i = 0; i < n; ++i)
+            memcpy((float *)PyArray_DATA((PyArrayObject *)*py_value) + i, &res[i].udata, sizeof(float));
+        PyDict_SetItemString(result, "value", py_value);
+        return_py(result);
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return_err();
+    } catch (const std::bad_alloc &) {
+        PyMisha::handle_error("Out of memory");
+        return_err();
+    }
+}
+
+/*
+ * pm_parse_bigbed(path) -> dict
+ *
+ * Reads all the records of a bigBed with misha's reader (BigWig.cpp), in file order. Records on
+ * chromosomes the database lacks are skipped, records past the end of their chromosome are clipped
+ * or dropped as by pm_parse_bigwig.
+ *
+ * Returns: dict with the keys of pm_parse_bigwig except "value", and
+ *   - "fields": the names of the fields past chrom, start and end, from the file's autoSql (or the
+ *     BED standard names if it has none)
+ *   - "columns": their values, one numpy array per field: float64 for a numeric autoSql type,
+ *     object (str) otherwise
+ */
+PyObject *pm_parse_bigbed(PyObject *self, PyObject *args)
+{
+    const char *path;
     if (!PyArg_ParseTuple(args, "s", &path))
         return nullptr;
 
@@ -422,85 +572,54 @@ PyObject *pm_parse_bigwig(PyObject *self, PyObject *args)
         PyMisha pymisha(true);
 
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
-        BigWig bigwig;
-        GIntervals data;
-        std::vector<int> chromids;
-        std::vector<int64_t> start;
-        std::vector<int64_t> end;
-        std::vector<float> value;
+        BigWig bigbed;
+        BigWig::BedRecords records;
 
-        bigwig.init(chromkey, path);
-        for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
-            for (uint64_t iblock = 0; bigwig.get_data(chromid, iblock, data); ++iblock) {
-                for (const GInterval &interv : data) {
-                    float v;
-                    memcpy(&v, &interv.udata, sizeof(v));
-                    chromids.push_back(chromid);
-                    start.push_back(interv.start);
-                    end.push_back(interv.end);
-                    value.push_back(v);
-                }
-                check_interrupt();
-            }
-        }
+        bigbed.init(chromkey, path, true);
+        bigbed.read_bed(records);
 
-        npy_intp n = (npy_intp)start.size();
-        PMPY py_chrom(PyArray_SimpleNew(1, &n, NPY_OBJECT), true);
-        PMPY py_start(PyArray_SimpleNew(1, &n, NPY_INT64), true);
-        PMPY py_end(PyArray_SimpleNew(1, &n, NPY_INT64), true);
-        PMPY py_value(PyArray_SimpleNew(1, &n, NPY_FLOAT32), true);
-        if (!py_chrom || !py_start || !py_end || !py_value)
-            return_err();
-
-        // one string object per chromosome, shared by its rows
-        std::vector<PMPY> names(chromkey.get_num_chroms());
-        PyObject **chrom_data = (PyObject **)PyArray_DATA((PyArrayObject *)*py_chrom);
-        for (npy_intp i = 0; i < n; ++i) {
-            PMPY &name = names[chromids[i]];
-            if (!name) {
-                const string &s = chromkey.id2chrom(chromids[i]);
-                name.assign(PyUnicode_FromStringAndSize(s.data(), s.size()), true);
-                if (!name)
-                    return_err();
-            }
-            Py_INCREF((PyObject *)name);
-            chrom_data[i] = name;
-        }
-        if (n) {
-            memcpy(PyArray_DATA((PyArrayObject *)*py_start), start.data(), n * sizeof(int64_t));
-            memcpy(PyArray_DATA((PyArrayObject *)*py_end), end.data(), n * sizeof(int64_t));
-            memcpy(PyArray_DATA((PyArrayObject *)*py_value), value.data(), n * sizeof(float));
-        }
-
-        const UnknownChroms &unknown = bigwig.get_unknown_chroms();
-        PMPY py_unknown(string_list(unknown.names()), true);
-        PMPY py_primary(string_list(unknown.primary_names()), true);
-        PMPY py_num_unknown(PyLong_FromUnsignedLongLong(unknown.num()), true);
-        PMPY py_truncated(PyBool_FromLong(unknown.truncated()), true);
-        PMPY py_num_primary(PyLong_FromUnsignedLongLong(unknown.num_primary()), true);
-        PMPY py_num_matched(PyLong_FromUnsignedLongLong(bigwig.get_num_matched_chroms()), true);
-        PMPY py_num_clipped(PyLong_FromUnsignedLongLong(bigwig.get_num_clipped()), true);
-        PMPY py_num_dropped(PyLong_FromUnsignedLongLong(bigwig.get_num_dropped()), true);
-        const string &first_clipped = bigwig.get_first_clipped();
-        PMPY py_first_clipped(PyUnicode_DecodeUTF8(first_clipped.data(), first_clipped.size(), "replace"), true);
+        const std::vector<BigWig::Field> &fields = bigbed.get_fields();
+        npy_intp n = (npy_intp)records.intervals.size();
+        std::vector<std::string> names;
+        PMPY py_columns(PyList_New(fields.size()), true);
         PMPY result(PyDict_New(), true);
-        if (!py_unknown || !py_primary || !py_num_unknown || !py_truncated || !py_num_primary || !py_num_matched || !py_num_clipped ||
-            !py_num_dropped || !py_first_clipped || !result)
+        if (!py_columns || !result || !fill_result(result, records.intervals, bigbed, chromkey))
             return_err();
 
-        PyDict_SetItemString(result, "chrom", py_chrom);
-        PyDict_SetItemString(result, "start", py_start);
-        PyDict_SetItemString(result, "end", py_end);
-        PyDict_SetItemString(result, "value", py_value);
-        PyDict_SetItemString(result, "unknown", py_unknown);
-        PyDict_SetItemString(result, "num_unknown", py_num_unknown);
-        PyDict_SetItemString(result, "truncated", py_truncated);
-        PyDict_SetItemString(result, "unknown_primary", py_primary);
-        PyDict_SetItemString(result, "num_primary", py_num_primary);
-        PyDict_SetItemString(result, "num_matched", py_num_matched);
-        PyDict_SetItemString(result, "num_clipped", py_num_clipped);
-        PyDict_SetItemString(result, "num_dropped", py_num_dropped);
-        PyDict_SetItemString(result, "first_clipped", py_first_clipped);
+        for (size_t ifield = 0; ifield < fields.size(); ++ifield) {
+            PyObject *col;
+
+            names.push_back(fields[ifield].name);
+            if (fields[ifield].numeric) {
+                col = PyArray_SimpleNew(1, &n, NPY_FLOAT64);
+                if (col && n)
+                    memcpy(PyArray_DATA((PyArrayObject *)col), records.values[ifield].data(), n * sizeof(double));
+            } else {
+                col = PyArray_SimpleNew(1, &n, NPY_OBJECT);
+                if (col) {
+                    PyObject **data = (PyObject **)PyArray_DATA((PyArrayObject *)col);
+                    for (npy_intp i = 0; i < n; ++i) {
+                        const std::string &str = records.texts[ifield][i];
+                        data[i] = PyUnicode_DecodeUTF8(str.data(), str.size(), "replace");
+                        if (!data[i]) {
+                            Py_DECREF(col);
+                            col = nullptr;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!col)
+                return_err();
+            PyList_SET_ITEM((PyObject *)py_columns, ifield, col);
+            check_interrupt();
+        }
+
+        PMPY py_fields(string_list(names), true);
+        if (!py_fields)
+            return_err();
+        PyDict_SetItemString(result, "fields", py_fields);
+        PyDict_SetItemString(result, "columns", py_columns);
         return_py(result);
     } catch (TGLException &e) {
         PyMisha::handle_error(e.msg());

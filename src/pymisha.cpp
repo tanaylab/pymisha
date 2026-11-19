@@ -16,6 +16,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "pymisha.h"
 #include "pmutils.h"
@@ -473,6 +476,17 @@ pid_t PyMisha::launch_process()
         if (pm::g_rng_stream)
             drand48();
     } else {   // a child process
+        // A kid dies with its parent. A kid whose parent was killed would otherwise run on, and wait
+        // forever for the FIFO lock (lock_multitask_fifo) when the kid that held it died: killed
+        // with the parent, or ended by its write to a FIFO nobody reads (verror() _exit()s it with
+        // the lock held).
+        // ponytail: Linux only; elsewhere such a kid still hangs - a getppid() poll in its waits would cover it
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+        if (getppid() != s_parent_pid)   // the parent died before prctl()
+            _exit(1);
+
         s_is_kid = true;
         // s_kid_index is this kid's index here (the parent increments it after the fork)
         pm::reseed_kid_rng(s_kid_index);

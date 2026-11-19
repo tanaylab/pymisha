@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.21.0 (2026-11-19)
+
+### Breaking
+
+* `CONFIG["max_data_size"]` defaults to R misha's `gmax.data.size`, set from the system memory and cores (70% of the RAM over 70% of the cores, at most 1e10 records; about 8.5e9 on a 1 TB, 128-core host) instead of 10,000,000. The same calls fail or sample (`gquantiles` and the like) as in R on the same host, and results that stopped with "exceeded the maximum allowed" now complete, using the memory they need. For the old limit, set `pm.CONFIG["max_data_size"] = 10_000_000`.
+
+### Features
+
+* New `gintervals_import_bigwig` reads the records of a bigWig over a set of intervals without importing a track, reading only the data blocks under them. The result works as a value-based virtual track source. As R misha.
+* New `gextract_matrix` returns track expression values over equal-width intervals as an `(N, L)` float64 array, or `(N, L, E)` for several expressions, with bins counted from each interval's start, without building the long gextract table, as R misha's `gextract.matrix`.
+* `gintervals_import_bed` reads bigBed files, with the extra fields named and typed by the file's autoSql, as R misha.
+* `gintervals_import_bed` gains `keep_order` (keep the file's row order) and `format` (`"narrowPeak"` and `"broadPeak"` files get their `signalValue`, `pValue`, `qValue` and, for narrowPeak, `peak` columns; guessed from the file name), as R misha.
+
+### Performance
+
+* A virtual track on a DataFrame source (`coverage`, `distance`, `neighbor.count`, ... of intervals; `avg`, `sum`, `max`, ... of a value column, such as the records of a bigWig) is computed in the C++ scanner, as R computes it, by `gextract`, `gscreen`, `gsummary`, `gquantiles`, `gdist`, `gtrack_create` and the functions built on `gextract`; it was computed in Python over every iterator interval. hg38, 105.7 million 1 bp bins of 50,000 windows, `coverage` of 300,000 intervals: `gextract` 47 s and 18.9 GB -> 14 s and 13.3 GB, `gsummary` about 2 hours -> 3 s. `gsummary`, `gquantiles` and `gdist` of any virtual track the scanner computes no longer go through Python either. A virtual track with a filter, and an expression with Python variables, still do.
+* The iterator intervals that the Python paths use (`giterator_intervals`; `gextract`, `gscreen`, `gsummary`, ... of an expression with a Python variable or a filtered virtual track) carry the chromosome as a code per row instead of a string: `gextract` over 105.7 million rows with a Python variable, 47 s -> 27 s.
+
+### Fixes
+
+* A value-based virtual track whose source has no rows gives NaN (0 for `size` and `exists`) instead of an error, as R misha.
+* `neighbor.count` of a DataFrame source missed a source interval that a shorter one, ending before the window, follows in start order.
+* `gscreen` of a virtual track on a DataFrame source returns the intervals in genome order, as for any other expression and as R; they came in the order of the scope.
+* `gextract`, `gscreen`, `gdist`, `gsummary` and `gquantiles` of a virtual track computed in Python (such as `coverage` of an intervals source), `giterator_intervals` and `glookup` no longer leak about 80 MB per million iterator rows on every call.
+* On Linux, the processes a multitasking call starts end when the Python session is killed. They used to run on, and most then waited forever.
+* `gsynth_train` and `gsynth_sample` process their intervals in chunks of whole rows of at most `max_chunk_size` bases (iterator bins times the iterator), by default `CONFIG['max_data_size']` bins, one after the other or in parallel. A scope of more bins than `CONFIG['max_data_size']` no longer fails with "Result size exceeded the maximum allowed", with `allow_parallel=False` too. `max_chunk_size` used to be only a threshold for running in parallel (default 1e9 bases), with `num_cores` setting the number of chunks.
+* A model `gsynth_train` built in parallel had float64 counts and a CDF that differed from the serial one by up to 3e-8 (and was not NaN for unseen contexts with `pseudocount=0`). Models are now the same however they are chunked.
+* With several chunks, `gsynth_sample` draws each chunk from its own seed, drawn from `seed` (or numpy's generator), so the sequences no longer depend on `num_cores` or `allow_parallel`. With one chunk they are as before.
+
 ## v0.20.1 (2026-11-10)
 
 ### Fixes

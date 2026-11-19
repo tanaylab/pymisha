@@ -102,6 +102,9 @@ Attach the genome you need once at the top and stay on it. Switching `gsetroot` 
 
 **Many-track strategy.** `pm.CONFIG["multitasking_strategy"] = "auto" | "tracks" | "tiles"` controls how the engine parallelizes a multi-track `gextract`. `"tiles"` (the historical default) parallelizes across genome tiles within one expression at a time - good for a few heavy tracks. `"tracks"` parallelizes across the *expressions* in `["...", "..."]` instead - dramatically faster for thousands of motif / feature tracks where each is cheap individually. `"auto"` picks per call. For motif-scan workloads (hundreds of PSSMs over the genome) set `"tracks"` explicitly.
 
+**Avoid:**
+- `pm.CONFIG["multitaksing"] = False` - typo of `multitasking`. `pm.CONFIG` is a plain dict and accepts unknown keys silently; this is a no-op.
+
 ## 3. Function chooser tables
 
 Pick the verb by *what's returned*, not by alphabetical proximity.
@@ -111,6 +114,7 @@ Pick the verb by *what's returned*, not by alphabetical proximity.
 | Verb | Returns | When |
 |---|---|---|
 | `gextract` | DataFrame | Values to look at, plot, or join. |
+| `gextract_matrix` | `(N, L)` / `(N, L, E)` float64 array | Per-bin values over equal-width windows, one row per window in input order. |
 | `gscreen`  | intervals frame | Filter to a region set (peaks above threshold). |
 | `gquantiles` | quantile cutoffs | Pick a threshold, normalize. Argument is `percentiles=` (0..1), **not** `probs=`. |
 | `gdist`    | N-d count array (or DataFrame with `dataframe=True`) | Binned joint distribution (signal × distance, etc.). |
@@ -127,8 +131,8 @@ Pick the verb by *what's returned*, not by alphabetical proximity.
 
 | Use | Returns | When |
 |---|---|---|
-| `gvtrack_create(_, src, "distance")` / `"distance.center"` / `"distance.edge"` | per-bin signed numeric column | You're sweeping the genome at fixed resolution and want distance as a feature alongside other tracks. |
-| `gintervals_neighbors(a, b)` | paired-row frame (a + b + signed `dist`) | k-NN, distance bands via `mindist` / `maxdist`, asymmetric upstream/downstream. |
+| `gvtrack_create(_, src, "distance")` / `"distance.center"` / `"distance.edge"` | per-bin numeric column, signed only when the source has a strand | You're sweeping the genome at fixed resolution and want distance as a feature alongside other tracks. |
+| `gintervals_neighbors(a, b)` | paired-row frame (a + b + `dist`, signed only by a strand) | k-NN, distance bands via `mindist` / `maxdist`, asymmetric upstream/downstream. |
 | `gintervals_annotate(intervs, annot, annotation_columns)` | input rows + selected annot cols + `dist` | Attach gene symbol + distance to a fixed query frame without changing row count. |
 
 ### Aggregators (`func=` on `gvtrack_create`)
@@ -149,7 +153,6 @@ Pick the verb by *what's returned*, not by alphabetical proximity.
 | Wrong | Right | Why it bites |
 |---|---|---|
 | `gquantiles(x, probs=0.9)` | `gquantiles(x, percentiles=0.9)` | `probs` is silently swallowed by `**kwargs`; default `percentiles=0.5` (median) is used. |
-| `gextract("track > 5", ..., intervals_set_out="...")` and assume `intervalID` is dropped | Use `intervals_join="intervals"` to drop `intervalID` and attach input columns | Default `intervals_join="id"` keeps the `intervalID` column; downstream joins that match on `chrom/start/end` get the right shape but lose row identity if multiple iterator bins map to one input. |
 
 ## 4. Recipes
 
@@ -177,6 +180,24 @@ genes = pm.gintervals_import_gff("refseq.gff", feature="exon", attrs=True)
 snps  = pm.gintervals_import_vcf("snps.vcf",  info=True)
 ```
 
+`gintervals_import_bed` sorts by default; `keep_order=True` keeps the file's row order (header lines skipped), which peak IDs that are row numbers need. `format="narrowPeak"` / `"broadPeak"` (guessed from a `.narrowPeak` / `.broadPeak` name, `.gz` too) adds `signalValue`, `pValue`, `qValue` and, for narrowPeak, `peak`, the summit's offset from `start` (`-1` = no summit). Summit-centred windows, with the summit at `(start + end) // 2`:
+
+```python
+peaks = pm.gintervals_import_bed("ENCFF000ABC.narrowPeak.gz", keep_order=True)
+peaks = peaks[peaks["peak"] >= 0]
+summit = peaks["start"] + peaks["peak"]
+win = peaks.assign(start=summit - 250, end=summit + 250, peak=250)
+```
+
+`gintervals_import_bed` also reads a bigBed (detected by its magic number, not its name): columns are chrom, start, end, then the file's fields in order, named and typed by its autoSql (numeric autoSql types -> float64; strings, arrays, enums and itemRgb stay str). `format` must be `None` for a bigBed.
+
+**bigWig signal over intervals, without importing a track.** `pm.gintervals_import_bigwig(file, intervals)` returns the records (chrom, start, end, value) overlapping the intervals, whole and each once, reading only the data blocks under them. Feed it to a value-based vtrack; `weighted.sum` is the per-base sum (what `bbi.stackup(..., summary="sum")` gives), `sum` adds each touched record's value once:
+
+```python
+pm.gvtrack_create("sig", src=pm.gintervals_import_bigwig("signal.bigWig", peaks), func="weighted.sum")
+pm.gextract("sig", peaks, iterator=peaks)   # NaN where no record overlaps
+```
+
 **Sort and merge overlaps (`gintervals_canonic`).** When you want a non-overlapping, sorted set - typical after `pd.concat`'ing per-condition `gscreen` results. To fold per-row metadata into the merged set, use `pm.gintervals_mark_overlaps` (tags each source row with its merge-group ID) and aggregate per group:
 
 ```python
@@ -194,6 +215,8 @@ merged = (
 ```
 
 `gintervals_mark_overlaps` is `gintervals_canonic` plus a join-friendly group column; reach for it when you need custom per-merged-region aggregation. Bare `gintervals_canonic(...)` is fine when you only want the merged intervals frame and don't need to carry source metadata.
+
+Both also merge intervals that only touch (`end` of one == `start` of the next). To merge overlapping sites but keep adjacent ones apart, pass `unify_touching_intervals=False` to either. `pm.gintervals_canonic(x).attrs["mapping"]` gives, for each row of `x`, the 1-based row of the merged set it went into; that array is the `overlap_group` column.
 
 If you want to *keep* duplicate / overlapping rows (paired matches, parallel rows per sample), skip canonic.
 
@@ -221,7 +244,7 @@ peaks = pm.gintervals(chroms=peaks["chrom"],
 peaks = pm.gintervals_canonic(peaks)
 ```
 
-**Clip to genome bounds.** `pm.gintervals_force_range(intervs)` clamps `start >= 0` and `end <= chrom_len`. Use after any expansion that may push past chromosome ends.
+**Clip to genome bounds.** `pm.gintervals_force_range(intervs)` clamps `start >= 0` and `end <= chrom_len`. Use after any expansion that may push past chromosome ends. It shortens windows silently, so for fixed-width windows (model inputs, `gextract_matrix`) drop the rows whose width changed: `win = pm.gintervals_force_range(win); win = win[win["end"] - win["start"] == width]`.
 
 **Symmetric expansion.** No one-call helper - the manual form is short:
 
@@ -240,20 +263,20 @@ my_peaks = pm.gintervals_load("intervs.my.peaks")
 **Avoid:**
 - `(start + end) / 2` - float division yields non-integer centers. Always `(start + end) // 2`.
 - `gintervals_canonic` reflexively after every `pd.concat` - only run it when you actually want overlaps merged.
-- Base `pd.DataFrame({"chrom": ..., "start": ..., "end": ...})` skips coordinate validation against the active genome. Pass through `pm.gintervals(...)`; it validates chrom names and clamps types.
+- Base `pd.DataFrame({"chrom": ..., "start": ..., "end": ...})` - checked against the genome only when a query reads it. Pass through `pm.gintervals(...)` for validation, unless the row order matters (A9).
 - Hand-rolling fixed-width peaks via `assign` when `pm.gintervals_normalize(intervs, size)` does the same in one call.
 
 ### 4.2 Annotate intervals with nearby features
 
 Two primitives, different return shapes:
 
-- **`gintervals_neighbors(query, target, ...)`** - paired-row output, one input row × matched neighbor; signed `dist` column. Good for k-NN, distance-banded matching, asymmetric upstream/downstream.
-- **`gintervals_annotate(intervals, annotation_intervals, annotation_columns=, ...)`** - column-attach output, preserves row count and order. Good for "add gene symbol + signed distance".
+- **`gintervals_neighbors(query, target, ...)`** - paired-row output, one input row × matched neighbor; `dist` column (sign rule below). Good for k-NN, distance-banded matching, asymmetric upstream/downstream.
+- **`gintervals_annotate(intervals, annotation_intervals, annotation_columns=, ...)`** - column-attach output, preserves row count and order. Good for "add gene symbol + distance".
 
 ```python
 tss = pm.gintervals_load("intervs.global.tss")
 
-# Nearest neighbor with signed distance, dropping unmatched rows:
+# Nearest neighbor, dropping unmatched rows:
 near = pm.gintervals_neighbors(peaks, tss)
 
 # Distance-banded - keep all peaks (na_if_notfound is the key flag):
@@ -261,6 +284,11 @@ near = pm.gintervals_neighbors(peaks, tss, maxdist=50_000, na_if_notfound=True)
 
 # k nearest neighbors:
 knn = pm.gintervals_neighbors(peaks, tss, maxneighbors=5)
+
+# Every overlapping pair (e.g. motif hits inside peaks). maxdist=0 also returns
+# intervals that only touch (end == start), so keep the true overlaps:
+ov = pm.gintervals_neighbors(peaks, hits, maxneighbors=1_000_000, mindist=0, maxdist=0)
+ov = ov[(ov["start1"] < ov["end"]) & (ov["end1"] > ov["start"])]
 
 # Strand-aware variants:
 pm.gintervals_neighbors_upstream(peaks, tss, maxdist=100_000)
@@ -276,7 +304,11 @@ peaks = pm.gintervals_annotate(peaks, tss,
                                na_value=float("nan"))
 ```
 
-Signed-distance convention: positive `dist` means the target is downstream of the query (in genome coordinates if query has no strand; in transcription direction if `use_intervals1_strand=True`).
+Sign of `dist` (the same for `gintervals_annotate`'s distance column). It is never signed by genome coordinates alone:
+
+- **Default:** it follows the target's (`intervals2`) strand: positive when the query lies downstream of the target in the target's direction, negative upstream. A peak 1 kb downstream of a + strand TSS has `dist = 1000`.
+- **Target without a `strand` column:** `dist` is unsigned (never negative), so a negative `mindist` or `dist < 0` matches nothing.
+- **`use_intervals1_strand=True`** (and `gintervals_neighbors_upstream/downstream/directional`): it follows the query's strand: positive when the target lies downstream of the query, negative upstream, on either strand. A query without a `strand` column counts as +, which gives the sign in genome coordinates (positive = target to the right).
 
 **Promoters from TSS.** Manual one-step recipe:
 
@@ -317,7 +349,7 @@ Same row count and order as the input; coordinates are rewritten only for rows t
 **Avoid:**
 - `gintervals_neighbors` without `na_if_notfound=True` when annotating a fixed set - rows with no neighbor in range are dropped silently.
 - `gintervals_neighbors` when you only want to *attach* columns to an existing frame - `gintervals_annotate` is the right tool.
-- Forgetting that `dist` is *signed*. Filter with `abs(dist) < W`; bare `dist < W` accepts arbitrary upstream distances.
+- Assuming `dist` is signed by genome position. It is signed only by a strand (the target's, by default), so check which one before filtering on its sign. Filter on size with `abs(dist) < W`; with a strand, bare `dist < W` accepts arbitrary upstream distances.
 
 ### 4.3 Distance flavors
 
@@ -326,10 +358,10 @@ Same row count and order as the input; coordinates are rewritten only for rows t
 | `func` | Measures | Returns 0 when | Notes |
 |---|---|---|---|
 | `"distance"` | Iterator-bin *center* → nearest source *edge* (outside); *normalized* fractional position when inside. | Bin center exactly on a source edge | Mixed semantics - fine for genome-wide profiles, surprising if you assumed pure edge-to-edge. |
-| `"distance.center"` | Iterator-bin *center* → nearest source *center*. | Bin center coincides with a source center | Use for anchor-to-anchor offsets in meta-profiles. |
+| `"distance.center"` | Iterator-bin *center* → *center* of the source interval containing it; NaN when the bin center is outside every source interval. | Bin center coincides with a source center | Use for offsets inside source intervals (e.g. position within a peak); for distance to anchors outside them use `distance` or `distance.edge`. |
 | `"distance.edge"` | *Edge-to-edge*, same as `gintervals_neighbors`. | Iterator interval overlaps the source | Use when you specifically want `gintervals_neighbors` semantics inside a vtrack. |
 
-All three return *signed* distance when the source has a `strand` column (sign = direction relative to strand); unsigned otherwise. All three return NaN when the chromosome has no source intervals.
+All three return *signed* distance when the source has a `strand` column (sign = direction relative to strand); unsigned otherwise. All three return NaN when the chromosome has no source intervals, and `distance.center` also when the bin center is outside every source interval.
 
 ```python
 pm.gvtrack_create("d_tss", src="intervs.global.tss", func="distance")
@@ -346,7 +378,7 @@ For 2D, bind a 1D `distance` vtrack to one axis of a 2D iteration with `pm.gvtra
 
 **Avoid:**
 - Treating distance vtrack values as unsigned - `abs(d_tss) < W` is almost always what you want.
-- Forgetting NaN on chromosomes with no source intervals. Wrap with `ifelse(is.na(d_x), 1e18, d_x)` inside the expression if you want "no neighbor = infinitely far".
+- Forgetting NaN on chromosomes with no source intervals. Wrap with `np.where(np.isnan(d_x), np.inf, d_x)` inside the expression if you want "no neighbor = infinitely far".
 
 ### 4.4 Extract per-region values
 
@@ -394,15 +426,15 @@ per_peak = pm.gextract(["k27", "atac"],
 **NaN handling - crucial gotcha.** Sparse tracks return NaN at unmeasured bins; many dense tracks also have NaNs. Fill at extract time, inside the expression string:
 
 ```python
-pm.gextract(["ifelse(is.na(epi.atac.es), 0, epi.atac.es)",
-             "ifelse(is.na(cpgs.meth),  0, cpgs.meth)"],
+pm.gextract(["np.where(np.isnan(epi.atac.es), 0, epi.atac.es)",
+             "np.where(np.isnan(cpgs.meth),  0, cpgs.meth)"],
             intervals=peaks, iterator=peaks,
             colnames=["atac", "meth"])
 ```
 
-Treat this as a default, not an edge case. Expression strings stay R-like (`ifelse`, `is.na`) regardless of whether you call them from R or Python - they're parsed by the same misha expression engine in C++.
+Treat this as a default, not an edge case. Expressions are Python, not R: each track or vtrack name is bound to a NumPy array of bin values, functions come from `np.` (`np.where`, `np.isnan`, `np.log2`, `np.minimum`) plus `abs`, `min`, `max` and `round`, and R's `ifelse`, `is.na`, `pmin` or `log2` are refused. `&`, `|` and `~` work element-wise, and comparisons bind tighter than them as in R, so `"a > 5 & b < 3"` needs no parentheses.
 
-**Expression functions must be vectorized.** The C++ engine passes track *vectors* to your expression and expects a same-length vector back. Standard vectorized expression-language ops all work (`+`, `-`, `*`, `/`, `<`, `>`, `&`, `|`, `ifelse`, `pmin`, `pmax`, `log`, `log2`, `exp`, `abs`). The pitfall is scalar-result functions like `mean(track)`, `min(track)`, `sum(track)`: those collapse the vector to one number, which the engine then recycles across every bin. There's no `pmean`; for per-element averaging across two tracks, hand-roll: `"ifelse(is.na(a), b, ifelse(is.na(b), a, (a + b) / 2))"`. (`(a + b) / 2` alone is wrong: it propagates NaN whenever *either* input is NaN, so any position where one track has data and the other doesn't comes out as NaN instead of the value you have.)
+**Expression functions must be vectorized.** The engine passes track *arrays* to your expression and expects a same-length array back. Arithmetic, comparisons, `abs` and NumPy's element-wise functions all work (`np.where`, `np.minimum`, `np.maximum`, `np.fmin` / `np.fmax`, `np.log`, `np.log2`, `np.exp`). The pitfall is functions that reduce the array, like `min(track)`, `max(track)` or `np.mean(track)`: those collapse the evaluation buffer to one number, which NumPy then broadcasts across every bin of the buffer (A14f). There's no `pmean`; for per-element averaging across two tracks, spell out the NaN cases: `"np.where(np.isnan(a), b, np.where(np.isnan(b), a, (a + b) / 2))"`. (`(a + b) / 2` alone is wrong: it propagates NaN whenever *either* input is NaN, so any position where one track has data and the other doesn't comes out as NaN instead of the value you have.)
 
 **Tiled bins inside intervals.** For sub-region resolution (per-bin profile), pass an integer iterator:
 
@@ -413,6 +445,23 @@ prof = pm.gextract("epi.k27me3.es",
 ```
 
 **Iterator coordinate gotcha.** `iterator=20` tiles bins relative to **chromosome start**, not to each interval's start - so two peaks at different chromosome offsets get *misaligned* bin grids. For interval-relative bin indices use `pm.giterator_intervals(intervals=peaks, iterator=20, interval_relative=True)`.
+
+**Equal-width windows as an N x L array (`gextract_matrix`).** For per-base (or per-bin) profiles over many windows of the same width, e.g. model inputs or motif-hit masks, skip the long table:
+
+```python
+# windows around the summits, in the peaks' row order (pm.gintervals() would sort them, A14b)
+peaks = pm.gintervals_import_bed("peaks.narrowPeak.gz", keep_order=True)
+peaks = peaks[peaks["peak"] >= 0]
+summit = peaks["start"] + peaks["peak"]
+win = peaks.assign(start=summit - 1057, end=summit + 1057)                          # 2114bp
+sig = pm.gextract_matrix("atac.es", win)                                            # (len(win), 2114) float64
+pm.gvtrack_create("hit_cov", motif_hits, func="coverage")
+mask = pm.gextract_matrix("hit_cov", win) > 0                                       # boolean mask
+win32 = peaks.assign(start=summit - 1056, end=summit + 1056)                        # 2112 = 66 x 32
+arr = pm.gextract_matrix(["atac.es", "k27"], win32, iterator=32)                     # (N, 66, 2)
+```
+
+Row `i` is input row `i` (unsorted, duplicated and overlapping rows are fine); columns are in genomic order whatever the strand; the third axis follows the order of `expr` (`colnames` is only checked, a numpy array has no axis names). All windows must have the same width and `iterator` must divide it. Unlike gextract's integer iterator, the bins start at each window's start (as `giterator_intervals(..., interval_relative=True)`), so any start works. Values are what gextract gives for each bin as an iterator interval, NaN included; a dense-track bin that overlaps several track bins gets their plain mean, not weighted by overlap. A window past a chromosome end is an error, as in gextract. Same as R misha's `gextract.matrix`.
 
 **One row per stored position (`iterator=<track>`).** For sparse-aligned data - per-CpG methylation, per-fragment coverage:
 
@@ -449,8 +498,9 @@ Pass `labels=False` to skip MultiIndex construction (faster on million-row input
 
 **Avoid:**
 - Looping `gextract` over a list of tracks. Always one call with `["track1", "track2", ...]`.
-- Post-extract `prof.fillna(0)` when you can write `"ifelse(is.na(track), 0, track)"` inside the expression.
-- Scalar-result functions (`mean(track)`, `min(track)`, `sum(track)`) inside an expression - they collapse per-bin vectors.
+- Post-extract `prof.fillna(0)` when you can write `"np.where(np.isnan(track), 0, track)"` inside the expression.
+- R functions in an expression (`ifelse`, `is.na`, `pmin`, `log2`) - pymisha refuses them; use the `np.` equivalents.
+- Reducing functions (`min(track)`, `max(track)`, `np.mean(track)`) inside an expression - they collapse the per-bin array to one value (A14f).
 - `iterator=peaks` when you want sub-region resolution. Use `iterator=20`.
 - Forgetting that `iterator=20` is chromosome-relative, not interval-relative.
 - Skipping `.sort_values("intervalID")` when downstream code assumes input row order.
@@ -541,7 +591,7 @@ pm.gscreen("abs(d_tss) > 5000 & abs(d_rmsk) > 100",
 **Avoid:**
 - Hardcoded literal thresholds (`gscreen("track > 1870", ...)`) - uninterpretable across datasets; derive from `gquantiles`.
 - `gquantiles(x, probs=0.9)` - wrong argument name. Always `percentiles=`.
-- `gquantiles` on a track with many NaNs assumed to include zeros. NaN positions are silently dropped. Wrap with `"ifelse(is.na(track), 0, track)"` if zeros should count.
+- `gquantiles` on a track with many NaNs assumed to include zeros. NaN positions are silently dropped. Wrap with `"np.where(np.isnan(track), 0, track)"` if zeros should count.
 
 ### 4.7 Joint distributions, summaries, correlations
 
@@ -597,7 +647,7 @@ Four creation primitives:
 ```python
 pm.gtrack_create("epi.k27me3.log",
                  description="log2(K27me3 + 1)",
-                 expr="log2(epi.k27me3.es + 1)",
+                 expr="np.log2(epi.k27me3.es + 1)",
                  iterator=20)
 ```
 
@@ -606,7 +656,7 @@ pm.gtrack_create("epi.k27me3.log",
 ```python
 peaks_ind = peaks.assign(value=1)
 pm.gvtrack_create("peak_ind", src=peaks_ind, func="max")
-pm.gextract("ifelse(is.na(peak_ind), 0, peak_ind)",
+pm.gextract("np.where(np.isnan(peak_ind), 0, peak_ind)",
             intervals=pm.gintervals_all(), iterator=20)
 ```
 

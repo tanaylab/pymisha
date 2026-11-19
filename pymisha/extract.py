@@ -219,6 +219,16 @@ def _check_seq_vtrack_iterator(exprs, used_vtracks) -> None:
             )
 
 
+def _check_df_vtrack_iterator(exprs, used_vtracks) -> None:
+    """R's error for an expression with a vtrack on a DataFrame, no track and no iterator: there
+    is nothing to iterate (the scanner would iterate the scope intervals as they are)."""
+    if any(isinstance((_shared._VTRACKS.get(vt) or {}).get("src"), _pandas.DataFrame) for vt in used_vtracks or ()):
+        if len(exprs) == 1:
+            raise ValueError("Cannot implicitly determine iterator policy:\n"
+                             f'track expression "{exprs[0]}" does not contain any tracks.')
+        raise ValueError("Cannot implicitly determine iterator policy: track expressions do not contain any tracks.")
+
+
 def _check_dense_bin_sizes(exprs, used_vtracks) -> None:
     """R's error for an implicit iterator over dense tracks of different bin sizes: those in
     the expressions and the sources of their virtual tracks (an explicit iterator reads them)."""
@@ -315,6 +325,10 @@ _CPP_VALUE_FUNCS = {
     "sample.pos.relative",
 }
 
+# Functions of a DataFrame source evaluated in C++ (PMIntervalsVtrack): R's Interv_var functions
+# and, for a source with a value column, its Value_var functions
+_CPP_INTERVALS_FUNCS = {"distance", "distance.center", "distance.edge", "coverage", "neighbor.count"}
+
 # Column-reduction functions supported by an array-slice virtual track in C++
 # (GenomeTrackArray::SliceFunctions).
 _CPP_ARRAY_SLICE_FUNCS = {"avg", "min", "max", "sum", "stddev", "quantile"}
@@ -326,7 +340,7 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
     Returns True if every vtrack is eligible for inline C++ evaluation.
     A vtrack is eligible when:
       - It has no filter attached.
-      - Its source is None (sequence-based) or a string (physical track name).
+      - Its source is None (sequence-based), a string (physical track name) or a DataFrame.
       - Its function is in the supported set.
     """
     for name in vtrack_names:
@@ -355,8 +369,8 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
             if func not in _CPP_VALUE_FUNCS:
                 return False
         elif isinstance(src, _pandas.DataFrame):
-            # DataFrame source — must go to Python for now
-            return False
+            if func not in _CPP_VALUE_FUNCS and func not in _CPP_INTERVALS_FUNCS:
+                return False
         else:
             return False
     return True
@@ -439,10 +453,10 @@ def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[st
         spec.pop("filter", None)
         spec.pop("filter_key", None)
         spec.pop("filter_stats", None)
-        # Strip DataFrame src (shouldn't happen on this path)
+        # A DataFrame source in the format C++ reads (PMIntervalsVtrack)
         src = spec.get("src")
         if isinstance(src, _pandas.DataFrame):
-            spec.pop("src_df", None)
+            spec["src"] = _df2pymisha(src)
         result[name] = spec
     return result
 
@@ -3240,6 +3254,7 @@ def gextract(
 
     if iterator is None and not used_tracks:
         _check_seq_vtrack_iterator(exprs, used_vtracks)  # a physical track gives the iterator
+        _check_df_vtrack_iterator(exprs, used_vtracks)
 
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars
@@ -3489,6 +3504,148 @@ def gextract(
     )
 
 
+def gextract_matrix(
+    expr: str | list[str],
+    intervals: pd.DataFrame | str,
+    iterator: int = 1,
+    colnames: str | list[str] | None = None,
+) -> Any:
+    """Return track expression values over equal-width intervals as a matrix.
+
+    Evaluates track expressions in fixed bins over each interval, like
+    :func:`gextract` with an iterator, and returns the values as an array
+    with one row per interval and one column per bin.
+
+    All intervals must have the same width ``W``, and *iterator* must divide
+    it. Row ``i`` of the result holds the values of row ``i`` of *intervals*,
+    in ``W // iterator`` columns ordered by genomic coordinate, left to right.
+    A ``strand`` column is ignored: columns are in genomic order on both
+    strands. Rows may be unsorted, duplicated, overlapping or on several
+    chromosomes; each one is extracted on its own.
+
+    The bins start at each interval's start, as in :func:`giterator_intervals`
+    with ``interval_relative=True``: column ``j`` (0-based) of row ``i``
+    covers ``[start_i + j * iterator, start_i + (j + 1) * iterator)``. When
+    every start is a multiple of *iterator* these are the bins of gextract's
+    integer iterator. As in gextract, an interval that extends past the end
+    of its chromosome is an error.
+
+    Each value is the one gextract returns for that bin as an iterator
+    interval, NaN included. For a dense track, a bin that overlaps several of
+    the track's bins gets the plain mean of their non-NaN values, not
+    weighted by the length of each overlap. The result is allocated once and
+    filled by calling gextract on consecutive chunks of *intervals*, so
+    memory use stays close to the size of the result.
+
+    Parameters
+    ----------
+    expr : str or list of str
+        One or more track expressions, as in :func:`gextract`.
+    intervals : DataFrame or str
+        1D intervals of equal width, or the name of an intervals set.
+    iterator : int, default 1
+        Bin size: a positive integer that divides the width of the intervals.
+    colnames : str or list of str, optional
+        Checked against the number of expressions, as in :func:`gextract`.
+        A numpy array has no dimension names: the third dimension follows the
+        order of *expr*.
+
+    Returns
+    -------
+    numpy.ndarray
+        float64 of shape ``(len(intervals), W // iterator)`` for one
+        expression, or ``(len(intervals), W // iterator, len(expr))`` for a
+        list of several.
+
+    See Also
+    --------
+    gextract : Track expression values as a DataFrame.
+    giterator_intervals : The bins, with ``interval_relative=True``.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> intervs = pm.gintervals(["1", "2"], [1000, 2000], [1100, 2100])
+    >>> pm.gextract_matrix("dense_track", intervs).shape
+    (2, 100)
+    >>> pm.gextract_matrix(["dense_track", "sparse_track"], intervs, iterator=10).shape
+    (2, 10, 2)
+    >>> unaligned = pm.gintervals(["1", "2"], [1005, 2017], [1101, 2113])
+    >>> pm.gextract_matrix("dense_track", unaligned, iterator=32).shape
+    (2, 3)
+    """
+    from .intervals import gintervals_load, giterator_intervals
+
+    _checkroot()
+    caller_ns = _caller_namespace(depth=1)
+
+    exprs = [expr] if isinstance(expr, str) else list(expr)
+    if isinstance(colnames, str):
+        colnames = [colnames]
+    if colnames is not None and len(colnames) != len(exprs):
+        raise ValueError("Number of column names must match the number of track expressions")
+
+    if isinstance(intervals, str):
+        intervals = gintervals_load(intervals)
+    if not isinstance(intervals, pd.DataFrame) or list(intervals.columns[:3]) != ["chrom", "start", "end"]:
+        raise ValueError("intervals must be 1D intervals")
+    if len(intervals) == 0:
+        raise ValueError("intervals is empty")
+    if (
+        isinstance(iterator, (bool, _numpy.bool_))
+        or not isinstance(iterator, numbers.Real)
+        or not math.isfinite(iterator)
+        or iterator <= 0
+        or iterator != int(iterator)
+    ):
+        raise ValueError("iterator must be a positive integer bin size")
+    iterator = int(iterator)
+
+    starts = intervals["start"].to_numpy(dtype=_numpy.int64)
+    width = int(intervals["end"].iloc[0]) - int(starts[0])
+    if width <= 0 or not (intervals["end"].to_numpy(dtype=_numpy.int64) - starts == width).all():
+        raise ValueError("All intervals must have the same positive width")
+    if width % iterator:
+        raise ValueError(f"iterator ({iterator}) does not divide the width of the intervals ({width})")
+    # gextract's integer iterator places bins at multiples of iterator on the
+    # chromosome; they are the interval-relative bins only when every start is
+    # on that grid
+    relative = bool((starts % iterator).any())
+
+    num_intervals = len(intervals)
+    num_bins = width // iterator
+    num_exprs = len(exprs)
+    res = _numpy.full((num_intervals, num_bins, num_exprs), _numpy.nan)
+    intervals = intervals[["chrom", "start", "end"]]
+    # about 1e6 values per gextract call, within max_data_size rows: larger chunks
+    # raise the peak memory (a gextract DataFrame takes several times its values)
+    # and gain no speed
+    chunk_rows = max(1, int(min(1e6 / num_exprs, _shared._config_limit("max_data_size")) // num_bins))
+
+    for first in range(0, num_intervals, chunk_rows):
+        last = min(first + chunk_rows, num_intervals)
+        chunk = intervals.iloc[first:last]
+        if relative:
+            bins = giterator_intervals(None, chunk, iterator=iterator, interval_relative=True)
+            bin_rows = bins["intervalID"].to_numpy()
+            bins = bins[["chrom", "start", "end"]]
+            # the bins are also the scope: as an iterator alone, overlapping bins
+            # of different intervals are merged into one block, but each scope
+            # interval gets its own row, with intervalID pointing into bins
+            vals = gextract(exprs, bins, iterator=bins, vars=caller_ns, progress=False)
+            rows = first + bin_rows[vals["intervalID"].to_numpy() - 1] - 1
+        else:
+            vals = gextract(exprs, chunk, iterator=iterator, vars=caller_ns, progress=False)
+            rows = first + vals["intervalID"].to_numpy() - 1
+        # rows of vals map to cells by interval and start, not by their order
+        cols = (vals["start"].to_numpy() - starts[rows]) // iterator
+        for i in range(num_exprs):
+            res[rows, cols, i] = vals.iloc[:, 3 + i].to_numpy()
+
+    return res[:, :, 0] if num_exprs == 1 else res
+
+
 def gscreen(
     expr: str, intervals: pd.DataFrame | str | None = None, vars: dict[str, Any] | None = None, **kwargs: Any
 ) -> pd.DataFrame | None:
@@ -3627,6 +3784,8 @@ def gscreen(
 
     if not expr_tracks:
         intervals, iterator = _default_vtrack_iterator(intervals, iterator, [expr], expr_vtracks)
+        if iterator is None:
+            _check_df_vtrack_iterator([expr], expr_vtracks)
 
     # Check if vtracks can go through C++ path
     cpp_vtracks = expr_vtracks and _can_vtracks_use_cpp(expr_vtracks) and not user_vars

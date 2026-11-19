@@ -16,52 +16,42 @@ Specialized recipes that aren't part of the everyday flow. Read [`pymisha-core.m
 **Goal.** For a peak set, get a `(peak × offset)` signal matrix you can heatmap, row-cluster, or average into a smooth meta-profile.
 
 ```python
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# 1. Anchor: per-peak center as a 1bp interval frame.
-center = (peaks["start"] + peaks["end"]) // 2
-center_1bp = pm.gintervals(chroms=peaks["chrom"], starts=center, ends=center + 1)
+# 1. Equal-width windows centered on the peak midpoints, in the peaks' row order.
+W = 1000
+mid = (peaks["start"] + peaks["end"]) // 2
+win = peaks.assign(start=mid - W, end=mid + W)
+win = pm.gintervals_force_range(win)
+win = win[win["end"] - win["start"] == 2 * W]      # drop windows clipped at a chromosome end
 
-# 2. Distance vtrack -> signed offset at each iterator bin.
-pm.gvtrack_create("d_center", src=center_1bp, func="distance.center")
-
-# 3. Expand region symmetrically and extract one or more tracks at fine bins.
-region = peaks.assign(start=center - W, end=center + W + 20)
-spat = pm.gextract(["d_center", *track_names],
-                   intervals=region,
-                   iterator=20,
-                   colnames=["d_center", *track_names])
-
-# 4. Reshape long -> wide (peak x offset bin) for one track at a time.
-mat = (spat
-       .assign(bin=lambda d: np.floor(d["d_center"] / 20).astype(int))
-       .query("abs(bin) <= @W / 20")
-       .pivot_table(index="intervalID",
-                    columns="bin",
-                    values=track_names[0],
-                    aggfunc="mean",
-                    fill_value=0)
-       .sort_index())
+# 2. Row i = window i, column j = the 20bp bin starting at -W + 20 * j.
+mat = pd.DataFrame(
+    pm.gextract_matrix("np.where(np.isnan(epi.k27me3.es), 0, epi.k27me3.es)", win, iterator=20),
+    index=win.index, columns=np.arange(-W, W, 20))
+profile = mat.mean()
 ```
 
-`distance.center` is the right flavor here - anchor → anchor.
+The bins start at each window's start, so every row shares the same offset axis (an integer `gextract` iterator would put them on the chromosome's grid, A13).
 
 **Variants.**
-- **Multi-track in one pass.** Pass the whole list to `gextract`; pivot once per track from the same long-format frame.
-- **Pre-aggregated sum (no offset axis).** If you don't need the offset axis, skip `d_center` and build a window vtrack: `pm.gvtrack_create("v", track, "sum", sshift=-W, eshift=W)`, then `pm.gextract("v", intervals=peaks, iterator=peaks)`.
-- **Argmax-recenter first.** When peak centers are coarse, refine via the `groupby + idxmax` recipe in pymisha-core §4.6 before building `center_1bp`.
+- **Multi-track in one pass.** `pm.gextract_matrix(track_names, win, iterator=20)` returns an `(N, L, E)` array, the third axis in the order of `track_names`.
+- **Stranded anchors (TSS).** Columns are in genomic order whatever the strand; flip the minus-strand rows to read upstream -> downstream: `minus = (win["strand"] == -1).to_numpy(); mat.loc[minus] = mat.loc[minus].to_numpy()[:, ::-1]`.
+- **Pre-aggregated sum (no offset axis).** If you don't need the offset axis, skip the matrix and build a window vtrack: `pm.gvtrack_create("v", track, "sum", sshift=-W, eshift=W)`, then `pm.gextract("v", intervals=peaks, iterator=peaks)`.
+- **Argmax-recenter first.** When peak centers are coarse, refine via the `groupby + idxmax` recipe in pymisha-core §4.6 before building the windows.
 
 **Avoid:**
 - `(peaks["start"] + peaks["end"]) / 2` - float division yields non-integer centers. Always `// 2`.
-- Forgetting to wrap the signal column with `"ifelse(is.na(...), 0, ...)"` inside the extract expression.
-- Using `func="distance"` instead of `func="distance.center"` - the default `distance` mixes edge and normalized-in-interval semantics, which is *not* what an anchor-relative offset matrix needs.
+- Forgetting to wrap the signal column with `"np.where(np.isnan(...), 0, ...)"` inside the extract expression.
+- Building the offset axis from a `distance.center` vtrack on 1bp centers - `distance.center` is NaN wherever the bin center is outside a source interval, so every bin but the center's comes back NaN.
+- Rebuilding the windows with `pm.gintervals()` - it sorts them, so row `i` of the matrix is no longer peak `i` (A14b).
 
 ## 2. 2D contact pile-ups
 
 **Goal.** From a 2D contact track (Hi-C / capture-HiC), build a feature-pair contact density matrix - e.g. CTCF × CTCF, enhancer × promoter - stratified by genomic distance.
 
-**Build a 2D pair iterator.** `pm.giterator_cartesian_grid(intervals1, expansion1, intervals2, expansion2, min_band_idx, max_band_idx)` produces a 2D iterator over the cartesian product of two 1D intervals sets, each row expanded by `expansionN`.
+**Build a 2D pair iterator.** `pm.giterator_cartesian_grid(intervals1, expansion1, intervals2, expansion2, min_band_idx, max_band_idx)` produces a 2D iterator over the cartesian product of two 1D intervals sets. `expansionN` is a sorted list of offsets from each interval's center, and consecutive values are bin edges: `[-1000, 1000]` gives one 2kb bin per center, `np.arange(-1000, 1001, 200)` ten. A single number is an error.
 
 Self-pair (CTCF × CTCF) restricted to a cis off-diagonal band - the common case. `intervals2=None` makes it a self-pair, which is the form that supports `min_band_idx` / `max_band_idx`:
 
@@ -69,12 +59,12 @@ Self-pair (CTCF × CTCF) restricted to a cis off-diagonal band - the common case
 sites = pm.gintervals_load("intervs.ctcf_peaks")
 
 it = pm.giterator_cartesian_grid(
-    intervals1=sites,  expansion1=1000,
-    intervals2=None,   expansion2=None,
-    min_band_idx=1, max_band_idx=None)         # cis-only, off-diagonal
+    intervals1=sites,  expansion1=[-1000, 1000],
+    intervals2=None,   expansion2=None,           # None: same as expansion1
+    min_band_idx=1, max_band_idx=len(sites))    # cis-only, off-diagonal
 ```
 
-`min_band_idx` / `max_band_idx` restrict to a diagonal band - `1, None` is "off-diagonal cis only", `1, 1` is "near-diagonal", `0, 0` is "diagonal only". **Constraint:** band-index filtering requires `intervals2=None`. For an explicit pair of two different intervals sets (`sites_x` × `sites_y`), pass `intervals2=sites_y` and omit `min_band_idx` / `max_band_idx` - the band filter is unavailable in that mode.
+`min_band_idx` / `max_band_idx` restrict to a diagonal band - `1, len(sites)` is "off-diagonal cis only", `1, 1` is "near-diagonal", `0, 0` is "diagonal only". Give both as integers or neither (`None` or `np.inf` for one of them is an error). **Constraint:** band-index filtering requires `intervals2=None`. For an explicit pair of two different intervals sets (`sites_x` × `sites_y`), pass `intervals2=sites_y` and omit `min_band_idx` / `max_band_idx` - the band filter is unavailable in that mode.
 
 **Aggregate contacts in the 2D window per pair.**
 
@@ -85,20 +75,26 @@ pair_mat = pm.gextract("obs", intervals=it, iterator=it,
                        band=(-100_000_000, -1000))   # exclude near-diagonal trivial contacts
 ```
 
-`band=(-1e8, -1e3)` keeps only contacts at least 1kb off-diagonal. The `band=` arg is a 2D-specific feature of `gextract` / `gdist`.
+`band=(-1e8, -1e3)` keeps only contacts at least 1kb off-diagonal. The `band=` arg is a 2D-specific feature of `gextract` / `gscreen` / `gdist`.
 
 **Per-axis distance binning** (asymmetric feature pile-up). Use the explicit-pair iterator (two different intervals sets, no band filter):
 
 ```python
 sites_x = pm.gintervals_load("intervs.ctcf_peaks")
 sites_y = pm.gintervals_load("intervs.global.tss")
+grid = list(range(-1000, 1001, 200))
 it_pair = pm.giterator_cartesian_grid(
-    intervals1=sites_x, expansion1=1000,
-    intervals2=sites_y, expansion2=1000)        # no band_idx in explicit-pair mode
+    intervals1=sites_x, expansion1=grid,
+    intervals2=sites_y, expansion2=grid)        # no band_idx in explicit-pair mode
 
-pm.gvtrack_create("dx", src=sites_x, func="distance.center")
+# Signed offset of each bin from the nearest center: `distance` to 1bp + strand centers.
+def centers(x):
+    m = (x["start"] + x["end"]) // 2
+    return pm.gintervals(x["chrom"], m, m + 1, strand=1)
+
+pm.gvtrack_create("dx", src=centers(sites_x), func="distance")
 pm.gvtrack_iterator("dx", dim=1)
-pm.gvtrack_create("dy", src=sites_y, func="distance.center")
+pm.gvtrack_create("dy", src=centers(sites_y), func="distance")
 pm.gvtrack_iterator("dy", dim=2)
 
 h = pm.gdist("dx", dist_breaks,
@@ -136,7 +132,7 @@ pm.gtrack_2d_create("hic.derived", "Per-rectangle scores",
 - 2D iterator without `min_band_idx` / `max_band_idx` when you only care about cis - the implicit "everything" scope is much slower.
 - `gtrack_2d_create` with overlapping rectangles - 2D tracks expect non-overlapping cells.
 - Forgetting `band=(-X, -Y)` on cis extracts - the near-diagonal dominates the signal numerically.
-- `gtrack_2d_import_contacts(... allow_duplicates=True)` (the default in pymisha) for pooled scHi-C or other workflows where duplicate fend pairs are not real duplicate contacts - inflates counts. Pass `allow_duplicates=False` deliberately. (Note: this default differs from R misha, which defaults `allow.duplicates=FALSE`.)
+- Per-axis offsets from `distance.center` vtracks on the sites - NaN for every grid bin whose center lies outside a site. Note that `distance` measures to the nearest center, which near clustered sites can be a neighbor's.
 
 ## 3. Insulation, directionality index, domain borders
 
@@ -251,22 +247,24 @@ pm.gvtrack_create("cg_frac", None, "kmer.frac", kmer="CG", strand=1)
 
 For ephemeral analyses, the two-vtrack-plus-expression form above is fine; for tracks you'll reuse, materialize via `gtrack_create` over a kmer vtrack.
 
-**Motif file readers.** pymisha can read PSSMs from HOMER, JASPAR, and MEME motif files - useful when you don't have a separate motif-database package installed. See `pm.motif_import` for the reader entry points. The resulting matrix plugs straight into the `pssm=` kwarg of `gvtrack_create`.
+**Motif file readers.** pymisha can read PSSMs from HOMER, JASPAR, and MEME motif files - useful when you don't have a separate motif-database package installed: `pm.gseq_read_homer(file)`, `pm.gseq_read_jaspar(file)`, `pm.gseq_read_meme(file)`. Each returns a dict of motif id -> probability matrix (a DataFrame with columns `A`, `C`, `G`, `T`), and each matrix plugs straight into the `pssm=` kwarg of `gvtrack_create`.
 
-**PWM kwargs - direct, not nested.** Unlike R misha's `params = list(pssm=..., prior=..., bidirect=..., strand=...)`, pymisha takes PWM / kmer parameters as **direct keyword arguments** on `gvtrack_create`: `pssm=`, `prior=`, `bidirect=`, `strand=`, `extend=`, `score_thresh=`, `max_edits=`, `max_indels=`, `direction=`, `score_min=`, `score_max=`, `kmer=`. The `params=` arg on `gvtrack_create` is reserved for the scalar parameter of a few non-PWM funcs (e.g. `quantile` percentile, `neighbor.count` maxdist).
+**PWM kwargs - direct or as a dict.** pymisha takes PWM / kmer parameters as **direct keyword arguments** on `gvtrack_create`: `pssm=`, `prior=`, `bidirect=`, `strand=`, `extend=`, `score_thresh=`, `max_edits=`, `max_indels=`, `direction=`, `score_min=`, `score_max=`, `kmer=`. Since 0.15.0 they can also go in a `params` dict, as R misha's `params = list(pssm = ..., prior = ...)`, but not both ways in one call (an error).
 
 **PWM vtrack semantics.** A PWM vtrack scans the source sequence with sliding windows of width `nrow(pssm)`. Per-window score = log-likelihood under the PSSM relative to a uniform background (modulated by `prior`). Different funcs aggregate the per-window scores differently:
 
 | `func` | What it returns per iterator bin | Aggregation across windows |
 |---|---|---|
 | `"pwm"`     | log-sum-exp of all window scores in the iterator interval | LSE (soft sum) |
-| `"pwm.max"` | the maximum window score in the iterator interval | best-window |
+| `"pwm.max"` | the maximum window score in the iterator interval. Under `bidirect=True` each window's score is itself the LSE over the two strands - see the bidirect table below | best-window |
 | `"pwm.max.pos"` | the **1-based** position of the best-scoring window's first base, measured in bp from the start of the scanned region. **Sign carries strand** when `bidirect=True`: `+pos` = best window is on the forward strand, `-pos` = reverse strand. With `bidirect=False` the value is always positive. | argmax |
-| `"pwm.count"` | number of windows with score ≥ `score.thresh` | count above threshold |
+| `"pwm.count"` | number of windows with score ≥ `score_thresh` (**required** - see below) | count above threshold |
 | `"pwm.edit_distance"` | min #edits to raise (`direction="above"`) or disrupt (`direction="below"`) the best-window score across `score.thresh` | search over edit budget |
 | `"pwm.edit_distance.lse"` | same but LSE of windows, not the max | LSE-based |
 | `"pwm.edit_distance.pos"` / `"pwm.edit_distance.lse.pos"` | 1-based position of an edit in the optimal edit set; exactly "the most impactful single edit" only when one edit suffices. Same sign-by-strand convention as `pwm.max.pos` when `bidirect=True` | argmax over edit positions |
 | `"pwm.n_mutations"` | number of single-base substitutions that each *independently* bring a window across `score_thresh`; `0` if already met, `NaN` if no single edit suffices | max across windows |
+
+**`score_thresh` is mandatory for `pwm.count`** (and for `gseq_pwm(mode="count")`), with no default. A PWM score is a log-likelihood, so its usable range depends entirely on the PSSM, the `prior` and any spatial weights - a threshold of 0 counts nothing for any realistic matrix, and a threshold far below the matrix's minimum counts every window. Calibrate first: run the same scan with `pwm.max` (or `gseq_pwm(mode="max")`) over the intervals you care about, look at the score range, and pick a threshold inside it.
 
 **Edit-distance knobs.** `direction="above"` (default) finds the minimum edits to *raise* the score across `score_thresh` - "how close is this site to becoming a hit". `direction="below"` finds the minimum edits to *disrupt* an existing hit - "how robust is this site". `max_edits` caps the total budget (exhaustive search for `max_edits <= 2`, greedy heuristic for `max_edits >= 3`). `max_indels` allows insertions / deletions in addition to substitutions. `score_min` / `score_max` clip the per-window score range before the edit search to keep the optimization bounded. With `bidirect=True`, an edit's effect is evaluated against both strands and the better orientation is kept.
 
@@ -280,15 +278,16 @@ The two params interact, and which one wins depends on `bidirect`:
 
 | `bidirect` | `strand` | What the engine actually scans |
 |---|---|---|
-| `True` *(default)* | *(ignored)* | Both strands at every window position; the per-window score is the LSE of forward + reverse-complement matches (for `pwm` / `pwm.count`) or the max of the two (for `pwm.max` / `*.pos`). |
+| `True` *(default)* | *(ignored)* | Both strands at every window position. For `pwm`, `pwm.count` **and `pwm.max`** the per-window score is the LSE of the forward and reverse-complement matches; `pwm.max` then takes the max over those per-window LSEs. A hit in a palindromic window therefore reads `single-strand max + log 2`. Only the `*.pos` funcs take the per-window max instead of the LSE - they have to pick one strand to report in the sign. |
 | `False` | `+1` *(default)* | Forward strand only. |
 | `False` | `-1` | Reverse-complement strand only. (Positions are remapped back to the original strand's coordinates, so values stay positive and comparable to the forward-strand walk.) |
 
 So `strand` is a no-op while `bidirect=True`. To get strand-resolved hits, you must set `bidirect=False` explicitly. Note also that there is **no `strand=0`** for PWM (that's the kmer convention); the PWM equivalent of "both strands" is `bidirect=True`.
 
 ```python
-# bidirect=True (default): both strands at every position, keep the better.
-# The .pos value carries strand info: +pos = forward hit, -pos = reverse hit.
+# bidirect=True (default): both strands at every position, LSE-combined
+# into the pwm.max score. The .pos value instead picks the better strand and
+# carries it in the sign: +pos = forward hit, -pos = reverse hit.
 pm.gvtrack_create("ctcf_max", src=None, func="pwm.max",
                   pssm=ctcf_pssm, prior=0.01, bidirect=True)
 
@@ -300,7 +299,7 @@ pm.gvtrack_create("ctcf_rev", src=None, func="pwm.max",
                   pssm=ctcf_pssm, prior=0.01, strand=-1, bidirect=False)
 ```
 
-**Position semantics (`pwm.max.pos`, `pwm.edit_distance.pos`).** All `*.pos` values are **1-based** bp offsets *relative to the iterator interval* (after any `gvtrack_iterator()` `sshift` / `eshift` shifts), pointing at the first base of the best window **in forward-strand orientation** - on either strand and under either `bidirect` setting. `pos = 1` means the best window starts at the very first base of the (possibly shifted) iterator interval; the motif occupies `pos .. pos + nrow(pssm) - 1` in forward coordinates in every case. The sign convention above only applies under `bidirect=True`, where it says *which strand won*, not which end you are pointed at; under `bidirect=False` the value is always positive regardless of `strand`.
+**Position semantics (`pwm.max.pos`, `pwm.edit_distance.pos`).** All `*.pos` values are **1-based** bp offsets *relative to the iterator interval* (after any `gvtrack_iterator()` `sshift` / `eshift` shifts), pointing at the first base of the best window **in forward-strand orientation** - on either strand and under either `bidirect` setting. `pos = 1` means the best window starts at the very first base of the (possibly shifted) iterator interval; the motif occupies `pos .. pos + nrow(pssm) - 1` in forward coordinates in every case. The sign convention above only applies under `bidirect=True`, where it says *which strand won*, not which end you are pointed at; under `bidirect=False` the value is always positive regardless of `strand`. Note the consequence of the LSE/max split above: the window `pwm.max.pos` points at is **not** guaranteed to be the window that produced the `pwm.max` score - `*.pos` is the argmax of the per-position max, `pwm.max` is the max of the per-position LSE, and they diverge whenever the reverse strand contributes enough at a neighbouring position to flip which window wins the LSE. Do not treat `pwm.max` as "the score at `pwm.max.pos`".
 
 Ties break by scan order, which is strand-dependent: `strand=1` (and `bidirect=True`) keeps the most 5' tied anchor and the forward strand wins a tie at the same coordinate, but `bidirect=False, strand=-1` scans a reverse-complemented buffer and so keeps the most 3' tied anchor in forward coordinates.
 
@@ -354,7 +353,7 @@ pm.gtrack_import("epi.k27me3.es",
                  defval=float("nan"))
 ```
 
-`gtrack_import` auto-dispatches on extension (`.bw`, `.wig`, `.bed`, `.txt` / `.tsv`).
+`gtrack_import` auto-dispatches on extension (`.bw`, `.wig`, `.bed`, `.txt` / `.tsv`) and on the PAR1 magic of a Parquet file (one value column; use `pm.gtrack_import_parquet()` for several).
 
 **BED-style read intervals (Python DataFrame) → pileup track in one call.** `gtrack_create_dense(..., func="coverage")`: bin value = `sum(value_i * overlap_i / binsize)` = average per-base signal in the bin. With `values=np.ones(len(reads))`, this is a ChIP-seq-style pileup in a single call:
 
@@ -383,7 +382,7 @@ pm.gtrack_import_mappedseq("atac.es",
                            remove_dups=True)
 ```
 
-BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). C++ fast-path since v0.1.95 (3-5x over the legacy Python loop). R-parity: chromosome names must match the DB's chromkey verbatim (no `chr1` → `1` rewrite). SAM / BAM `POS` is 1-based and each read is placed at its 0-based 5' base (a reverse read at its rightmost aligned base, from the CIGAR); unmapped, secondary, QC-failed and supplementary records are skipped, and `min_mapq` drops low-MAPQ records. `paired=True` with a `binsize` imports paired-end fragments: from the proper pairs of a SAM / BAM (`cols_order=None`), or from a fragment file (chrom, start, end in columns 1-3, e.g. a 10x `fragments.tsv.gz`). `file` may also be a named pipe carrying SAM or text.
+BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). Chromosome names are matched through the alias chain (`chr1` ↔ `1`, `M` ↔ `MT`), as in R misha. SAM / BAM `POS` is 1-based and each read is placed at its 0-based 5' base (a reverse read at its rightmost aligned base, from the CIGAR); unmapped, secondary, QC-failed and supplementary records are skipped, and `min_mapq` drops low-MAPQ records. `paired=True` with a `binsize` imports paired-end fragments: from the proper pairs of a SAM / BAM (`cols_order=None`), or from a fragment file (chrom, start, end in columns 1-3, e.g. a 10x `fragments.tsv.gz`). `file` may also be a named pipe carrying SAM or text.
 
 **Per-fragment 2D contacts → 2D track.**
 
@@ -410,7 +409,7 @@ pm.gtrack_export_bedgraph("epi.k27me3.es",
                           name="K27me3 ES (peaks only)")         # track header line
 ```
 
-**Persist provenance at import.** Use `pm.gtrack_attr_set(track, "source", ...)` / `pm.gtrack_attr_set(track, "date", ...)` post-import so the track survives someone trying to reproduce your analysis a year later.
+**Persist provenance at import.** Pass `attrs={"source": ..., "date": ...}` to `gtrack_import` (or `pm.gtrack_attr_set` post-import) so the track survives someone trying to reproduce your analysis a year later.
 
 **Copy a track between databases.** `pm.gtrack_copy(src, dest=None, db=None, overwrite=False)` copies a track from the *active* trackdb to `db` (another trackdb on disk), preserving indexed-format files, attributes, and metadata. `dest=None` keeps the same name in the destination; pass a list of `src` names with `dest` as a namespace prefix to copy many at once. Useful for staging tracks from a personal trackdb to a shared one, or for promoting a derived track from a project-local trackdb (attached via `gdataset_load`) into the main `<GROOT>`. Distinct from `gsetroot` (which only switches which DB is *active*) and `gdataset_load` (which *attaches* a secondary DB read-only).
 

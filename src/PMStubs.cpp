@@ -1602,9 +1602,7 @@ static PMPY build_extract_df(const std::vector<std::string> &exprs,
         df.val_long(i, 3 + exprs.size(), result.interval_ids[i]);
     }
 
-    PMPY result_df = df.construct_py(true);
-    result_df.to_be_stolen();
-    return result_df;
+    return df.construct_py(true);
 }
 
 static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
@@ -1613,14 +1611,19 @@ static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
     size_t num_cols = 4;  // chrom, start, end, intervalID
     PMDataFrame df(intervals.size(), num_cols, "intervals");
 
-    df.init_col(0, "chrom", PMDataFrame::STR);
+    // chrom as a categorical of the chromosome ids: a str object per row cost more than the scan
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    std::vector<std::string> chrom_names(chromkey.get_num_chroms());
+    for (size_t id = 0; id < chrom_names.size(); ++id)
+        chrom_names[id] = chromkey.id2chrom(id);
+    df.init_col(0, "chrom", PMDataFrame::CAT);
+    df.cats(0, chrom_names);
     df.init_col(1, "start", PMDataFrame::LONG);
     df.init_col(2, "end", PMDataFrame::LONG);
     df.init_col(3, "intervalID", PMDataFrame::LONG);
 
-    const GenomeChromKey &chromkey = g_pmdb->chromkey();
     for (size_t i = 0; i < intervals.size(); ++i) {
-        df.val_str(i, 0, chromkey.id2chrom(intervals[i].chromid).c_str());
+        df.val_long(i, 0, intervals[i].chromid);
         df.val_long(i, 1, intervals[i].start);
         df.val_long(i, 2, intervals[i].end);
         if (i < interval_ids.size()) {
@@ -1630,9 +1633,7 @@ static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
         }
     }
 
-    PMPY result_df = df.construct_py(true);
-    result_df.to_be_stolen();
-    return result_df;
+    return df.construct_py(true);
 }
 
 static std::vector<GInterval> compute_screen(const std::string &expr,
@@ -2314,7 +2315,8 @@ struct SummaryStats {
 static SummaryStats compute_summary(const std::string &expr,
                                     const std::vector<GInterval> &intervals,
                                     long iterator_policy,
-                                    PyObject *progress_cb)
+                                    PyObject *progress_cb,
+                                    PyObject *py_vtracks = nullptr)
 {
     SummaryStats summary;
     if (intervals.empty())
@@ -2326,7 +2328,7 @@ static SummaryStats compute_summary(const std::string &expr,
         scanner.set_progress_callback(progress_cb);
         scanner.report_progress(false);
     }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
     for (; !scanner.isend(); scanner.next()) {
         summary.update(scanner.vdouble(0));
@@ -2444,8 +2446,9 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
         PyObject *py_intervals = NULL;
         PyObject *py_iterator = NULL;
         PyObject *py_config = NULL;
+        PyObject *py_vtracks = NULL;
 
-        if (!PyArg_ParseTuple(args, "OO|OO", &py_expr, &py_intervals, &py_iterator, &py_config)) {
+        if (!PyArg_ParseTuple(args, "OO|OOO", &py_expr, &py_intervals, &py_iterator, &py_config, &py_vtracks)) {
             verror("Invalid arguments to pm_summary");
         }
 
@@ -2514,7 +2517,7 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
                         size_t end = (intervals.size() * (kid + 1)) / num_kids;
                         sub.assign(intervals.begin() + start, intervals.begin() + end);
                     }
-                    SummaryStats kid_summary = compute_summary(expr, sub, iterator_policy, progress_cb);
+                    SummaryStats kid_summary = compute_summary(expr, sub, iterator_policy, progress_cb, py_vtracks);
                     PyMisha::write_multitask_fifo(&kid_summary, sizeof(kid_summary));
                     _exit(0);
                 }
@@ -2529,7 +2532,7 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
             while (PyMisha::wait_for_kids(1))
                 ;
         } else {
-            summary = compute_summary(expr, intervals, iterator_policy, progress_cb);
+            summary = compute_summary(expr, intervals, iterator_policy, progress_cb, py_vtracks);
         }
 
         double total_bins = summary.num_bins;
@@ -2688,7 +2691,8 @@ static void fill_stream_percentiler(const std::string &expr,
                                     const std::vector<GInterval> &intervals,
                                     long iterator_policy,
                                     StreamPercentiler<double> &sp,
-                                    PyObject *progress_cb)
+                                    PyObject *progress_cb,
+                                    PyObject *py_vtracks = nullptr)
 {
     if (intervals.empty())
         return;
@@ -2699,7 +2703,7 @@ static void fill_stream_percentiler(const std::string &expr,
         scanner.set_progress_callback(progress_cb);
         scanner.report_progress(false);
     }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
     for (; !scanner.isend(); scanner.next()) {
         double val = scanner.vdouble(0);
@@ -2790,8 +2794,10 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
         PyObject *py_intervals = NULL;
         PyObject *py_iterator = NULL;
         PyObject *py_config = NULL;
+        PyObject *py_vtracks = NULL;
 
-        if (!PyArg_ParseTuple(args, "OOO|OO", &py_expr, &py_percentiles, &py_intervals, &py_iterator, &py_config)) {
+        if (!PyArg_ParseTuple(args, "OOO|OOO", &py_expr, &py_percentiles, &py_intervals, &py_iterator, &py_config,
+                              &py_vtracks)) {
             verror("Invalid arguments to pm_quantiles");
         }
 
@@ -2893,7 +2899,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
                     }
 
                     StreamPercentiler<double> sp(kid_sampling_buf_size, 0, 0);
-                    fill_stream_percentiler(expr, sub, iterator_policy, sp, progress_cb);
+                    fill_stream_percentiler(expr, sub, iterator_policy, sp, progress_cb, py_vtracks);
 
                     uint64_t stream_size = sp.stream_size();
                     uint64_t sample_size = sp.samples().size();
@@ -2994,7 +3000,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             if (!intervals.empty()) {
                 uint64_t sampling_buf_size = g_pymisha->max_data_size();
                 StreamPercentiler<double> sp(sampling_buf_size, 0, 0);
-                fill_stream_percentiler(expr, intervals, iterator_policy, sp, progress_cb);
+                fill_stream_percentiler(expr, intervals, iterator_policy, sp, progress_cb, py_vtracks);
 
                 bool estimated = calc_quantiles(sp, percentiles, quantiles);
                 if (estimated) {
@@ -4864,7 +4870,8 @@ static std::vector<uint64_t> compute_dist(
     const std::vector<GInterval> &intervals,
     const BinsManager &bins_manager,
     long iterator_policy,
-    PyObject *progress_cb)
+    PyObject *progress_cb,
+    PyObject *py_vtracks = nullptr)
 {
     uint64_t totalbins = bins_manager.get_total_bins();
     std::vector<uint64_t> distribution(totalbins, 0);
@@ -4877,7 +4884,7 @@ static std::vector<uint64_t> compute_dist(
         scanner.set_progress_callback(progress_cb);
         scanner.report_progress(false);
     }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
 
     unsigned num_exprs = exprs.size();
     std::vector<double> vals(num_exprs);
@@ -4965,9 +4972,10 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
         PyObject *py_iterator = NULL;
         int include_lowest = 0;
         PyObject *py_config = NULL;
+        PyObject *py_vtracks = NULL;
 
-        if (!PyArg_ParseTuple(args, "OOO|OpO", &py_exprs, &py_breaks_list, &py_intervals,
-                              &py_iterator, &include_lowest, &py_config)) {
+        if (!PyArg_ParseTuple(args, "OOO|OpOO", &py_exprs, &py_breaks_list, &py_intervals,
+                              &py_iterator, &include_lowest, &py_config, &py_vtracks)) {
             verror("Invalid arguments to pm_dist");
         }
 
@@ -5091,7 +5099,7 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
                         sub.assign(intervals.begin() + start, intervals.begin() + end);
                     }
                     std::vector<uint64_t> kid_dist =
-                        compute_dist(exprs, sub, bins_manager, iterator_policy, progress_cb);
+                        compute_dist(exprs, sub, bins_manager, iterator_policy, progress_cb, py_vtracks);
 
                     // Write distribution array
                     PyMisha::write_multitask_fifo(kid_dist.data(), totalbins * sizeof(uint64_t));
@@ -5113,7 +5121,7 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
             while (PyMisha::wait_for_kids(1))
                 ;
         } else {
-            distribution = compute_dist(exprs, intervals, bins_manager, iterator_policy, progress_cb);
+            distribution = compute_dist(exprs, intervals, bins_manager, iterator_policy, progress_cb, py_vtracks);
         }
 
         // Create N-dimensional result array
@@ -5306,9 +5314,7 @@ static PMPY build_lookup_df(const LookupResult &result)
         df.val_long(i, 4, result.interval_ids[i]);
     }
 
-    PMPY result_df = df.construct_py(true);
-    result_df.to_be_stolen();
-    return result_df;
+    return df.construct_py(true);
 }
 
 // pm_lookup(exprs, breaks_list, lookup_table, intervals, iterator, include_lowest, force_binning, config)
@@ -6165,11 +6171,11 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
     if (sample_size == 0)
         sample_size = 1;
 
-    // with no limit, the samplers grow with the values instead
-    const bool reserve = sample_size < PyMisha::MAX_DATA_SIZE_NO_LIMIT;
-    StreamSampler<ValuePair> pair_sampler(sample_size, reserve);
-    StreamSampler<double> x_sampler(sample_size, reserve);
-    StreamSampler<double> y_sampler(sample_size, reserve);
+    // The samplers grow with the values, as R misha's gcor: CONFIG['max_data_size'] follows the
+    // RAM (billions of records), and reserving it up front would ask for hundreds of GB.
+    StreamSampler<ValuePair> pair_sampler(sample_size);
+    StreamSampler<double> x_sampler(sample_size);
+    StreamSampler<double> y_sampler(sample_size);
 
     uint64_t non_nan = 0;
 
