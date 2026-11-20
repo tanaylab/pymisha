@@ -39,7 +39,15 @@ def test_pm_lookup_result_has_no_extra_reference():
 def test_pm_iterate_empty_result_owns_its_none():
     empty = _shared._df2pymisha(pm.gintervals("1", 0, 100).iloc[:0])
     assert _pymisha.pm_iterate(empty, 10, _shared.CONFIG) is None
-    before = sys.getrefcount(None)
-    for _ in range(1000):
-        _pymisha.pm_iterate(empty, 10, _shared.CONFIG)
-    assert abs(sys.getrefcount(None) - before) < 100
+    # coverage's tracer (Python 3.10, coverage 7.16) keeps two references to None per call of a
+    # measured function, and pm_iterate calls three pymisha functions
+    tracer = sys.gettrace()
+    sys.settrace(None)
+    try:
+        before = sys.getrefcount(None)
+        for _ in range(1000):
+            _pymisha.pm_iterate(empty, 10, _shared.CONFIG)
+        drift = sys.getrefcount(None) - before
+    finally:
+        sys.settrace(tracer)
+    assert abs(drift) < 100

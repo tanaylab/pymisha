@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.21.1 (2026-11-20)
+
+### Tests
+
+* The test that `pm_iterate` owns the `None` it returns for an empty result no longer fails on Python 3.10 under coverage, whose tracer holds references to `None`. The package itself is unchanged.
+
 ## v0.21.0 (2026-11-19)
 
 ### Breaking
