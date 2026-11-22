@@ -95,7 +95,8 @@ def _both_ways(call, forks=True):
     """Run *call* serially and through the track-parallel path."""
     with _force(False):
         serial = call()
-    with _force(True):
+    # max_processes defaults to 1 on a host of 2 cores
+    with _force(True, max_processes=4):
         faults = resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt
         parallel = call()
         assert (resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt > faults) == forks

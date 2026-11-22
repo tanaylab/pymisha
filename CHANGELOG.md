@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.22.1 (2026-11-22)
+
+### Tests
+
+* The multitasking tests set the number of processes and the `max_data_size` they rely on, so they pass on hosts with few cores and little RAM, such as the CI runners. With R misha's defaults such a host runs these calls in one process, and the tests expected them to fork. The package itself is unchanged.
+
 ## v0.22.0 (2026-11-22)
 
 ### Breaking

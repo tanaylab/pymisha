@@ -115,9 +115,11 @@ jobs:
       - name: Collect C++ coverage
         run: |
           GCDA_DIR=$(find build/ -name '*.gcda' -printf '%h\n' | sort -u | head -1)
-          lcov --capture --directory "$GCDA_DIR" -o cpp-coverage-raw.info --gcov-tool gcov -q
+          # lcov 2 stops on a lambda that gcov reports as not run although its lines ran
+          lcov --capture --directory "$GCDA_DIR" -o cpp-coverage-raw.info --gcov-tool gcov -q \
+            --ignore-errors inconsistent
           lcov --remove cpp-coverage-raw.info '/usr/*' '*/numpy/*' '*/python*' \
-            -o cpp-coverage.info -q
+            -o cpp-coverage.info -q --ignore-errors inconsistent
           echo "### C++ Coverage" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           lcov --summary cpp-coverage.info 2>&1 | tail -3 >> $GITHUB_STEP_SUMMARY

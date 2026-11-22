@@ -114,6 +114,7 @@ def test_track_parallel_gextract_fails_when_a_worker_dies_instead_of_dropping_it
         return orig(args)
 
     monkeypatch.setattr(_extract, "_worker_extract_tracks", die_in_worker)
+    monkeypatch.setattr(_extract.os, "cpu_count", lambda: 4)   # 3 workers, at most one per core
     saved = dict(pm.CONFIG)
     try:
         pm.CONFIG.update({"multitasking": True, "multitasking_strategy": "tracks", "max_processes": 3,

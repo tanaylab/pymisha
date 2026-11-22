@@ -74,8 +74,12 @@ def _vtracks(db):
 
 
 def _run(call, multitask, **cfg):
-    """call() with multitasking on (min_scope4process 0, up to 8 kids) or off, and whether it forked."""
+    """call() with multitasking on (min_scope4process 0, up to 8 kids) or off, and whether it forked.
+    max_data_size is one a small host can map: the default, sized from the RAM, makes gquantiles'
+    kids' blocks of a sparse track (whose bins cannot be estimated) more than half the RAM of a
+    16 GB host, which then runs the call in one process."""
     saved = dict(pm.CONFIG)
+    cfg = {"max_data_size": 10_000_000, **cfg}
     pm.CONFIG.update(multitasking=multitask, max_processes=8, min_scope4process=0, progress=False, **cfg)
     try:
         before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt

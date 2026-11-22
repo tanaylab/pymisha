@@ -306,13 +306,15 @@ def test_a_killed_kid_fails_the_call():
 # except in gextract and gscreen). The address space is limited to what the session holds plus
 # 256 MB, which the shared memory of these calls exceeds (it is sized by max_data_size, or half the
 # RAM); a call whose kids hand over a few hundred bytes (gsummary, gdist, Pearson's gcor) still
-# multitasks.
+# multitasks. With max_data_size at 50 million that is 0.4 to 2.2 GB, which a small host maps when
+# the address space is not limited; the default, sized from the RAM, makes gquantiles' kid blocks
+# (the implicit iterator's bins are not estimated) more than half the RAM of a 7 GB host.
 _NO_SHM_SCRIPT = textwrap.dedent("""
     import resource, sys
     import numpy as np
     import pymisha as pm
     pm.gdb_init(sys.argv[1])
-    pm.CONFIG.update(progress=False, max_processes=4, min_scope4process=0)
+    pm.CONFIG.update(progress=False, max_processes=4, min_scope4process=0, max_data_size=50_000_000)
     scope = pm.gintervals_all()
     calls = {
         "gextract": lambda: pm.gextract(["dense_track", "dense_track + 1"], scope),

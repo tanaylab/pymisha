@@ -290,7 +290,7 @@ def test_max_processes_is_capped_at_32():
     from pymisha._shared import CONFIG
 
     cores = os.cpu_count() or 1
-    assert CONFIG["max_processes"] == max(4, min(32, int(cores * 0.7)))
+    assert CONFIG["max_processes"] == max(1, min(32, int(cores * 0.7)))
     assert CONFIG["max_processes"] <= 32
 
     prev = CONFIG["max_processes"]
