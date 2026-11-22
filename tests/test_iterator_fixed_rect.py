@@ -619,7 +619,6 @@ def test_fixed_rect_multitask_equals_single_task():
             "multitasking": True,
             "max_processes": 4,
             "min_scope4process": 0,
-            "min_intervs4process": 0,
         })
         r4 = pm.gextract("rects_track", intervals=intervals, iterator=(50_000, 50_000))
     finally:
@@ -655,7 +654,6 @@ def test_fixed_rect_reducing_vtrack_multitask_equivalence(_init_db):
             "multitasking": True,
             "max_processes": 4,
             "min_scope4process": 0,
-            "min_intervs4process": 0,
         })
         r4 = pm.gextract("v_avg_mt", intervals=intervals, iterator=(100_000, 100_000))
     finally:

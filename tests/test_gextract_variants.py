@@ -17,6 +17,7 @@ import pytest
 from _potts_oracle import potts_ref_model
 
 import pymisha as pm
+import pymisha.variants
 from pymisha.extract import _can_vtracks_use_cpp
 from pymisha.variants import _gextract_variants_impl, _gvariants_eval, _gvariants_reach
 
@@ -461,7 +462,9 @@ def define_python_path_vtracks():
     pm.gvtrack_create("v_val", val, func="avg")
 
 
-def test_engine_python_path_vtracks_equal_the_same_bin_on_a_really_edited_genome(make_seq_db):
+@pytest.mark.parametrize("python_path", [False, True], ids=["scanner", "python"])
+def test_engine_python_path_vtracks_equal_the_same_bin_on_a_really_edited_genome(make_seq_db, python_path,
+                                                                                  monkeypatch):
     seq = variant_test_seq(seed=13)
     db = make_seq_db(seq)
     # Every fifth base, the masked ones included, each changed to the next base.
@@ -473,7 +476,11 @@ def test_engine_python_path_vtracks_equal_the_same_bin_on_a_really_edited_genome
     row_sub = np.tile(np.arange(len(subs)), len(bins))
     pm.gdb_init(db)
     define_python_path_vtracks()
-    assert not any(_can_vtracks_use_cpp([vt]) for vt in PY_PATH_VTRACKS)
+    # the scanner takes a filtered vtrack; the Python path (an expression with a Python variable)
+    # scores the parts in vtracks.py
+    assert all(_can_vtracks_use_cpp([vt]) for vt in PY_PATH_VTRACKS)
+    if python_path:
+        monkeypatch.setattr(pymisha.variants, "_can_vtracks_use_cpp", lambda names: False)
     for vt in PY_PATH_VTRACKS:
         pm.gdb_init(db)
         define_python_path_vtracks()

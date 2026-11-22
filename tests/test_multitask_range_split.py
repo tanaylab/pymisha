@@ -21,8 +21,7 @@ def _cfg(monkeypatch):
     # set on pm.CONFIG itself: the C++ side reads part of it from there
     def cfg(multitask):
         for k, v in {"progress": False, "multitasking": multitask,
-                     "min_scope4process": 0 if multitask else 10**9,
-                     "min_intervs4process": 0 if multitask else 10**9}.items():
+                     "min_scope4process": 0 if multitask else 10**9}.items():
             monkeypatch.setitem(pm.CONFIG, k, v)
         return pm.CONFIG
     return cfg

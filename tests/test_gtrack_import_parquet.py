@@ -273,7 +273,7 @@ def test_rows_past_the_chromosome_end_are_clipped_or_dropped_with_one_warning_se
            f"the chromosome end were dropped; the first is row 31 (row group 0) of {f}: (chr1, 992, 1024), "
            "chromosome size 1000")
     for multitask in (False, True):
-        pm.CONFIG.update({"multitasking": multitask, "max_processes": 4, "min_processes": 4})
+        pm.CONFIG.update({"multitasking": multitask, "max_processes": 4})
         prefix = "mt_" if multitask else "s_"
         warns = _collect_warnings(lambda prefix=prefix: pm.gtrack_import_parquet("test", f, 32, track_prefix=prefix))
         assert warns == [msg], prefix

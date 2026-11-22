@@ -81,6 +81,14 @@ public:
     // Bin coordinates, for use as a scanner iterator (one interval per bin).
     const std::vector<GInterval> &get_intervals();
 
+    bool item_at(int, int64_t coord, int64_t &start, int64_t &end) override {
+        const std::vector<GInterval> &intervs = get_intervals();
+        return interval_at(intervs.begin(), intervs.end(), coord, start, end);
+    }
+
+    // The value of the idx-th interval: its columns reduced by the slice function
+    float get_sliced_val(uint64_t idx);
+
 protected:
     static const int RECORD_SIZE;  // bytes per interval-table record
 
@@ -110,7 +118,6 @@ protected:
     void  read_intervals_map();
     void  read_array_vals(uint64_t idx);
     float get_array_val(uint64_t islice);
-    float get_sliced_val(uint64_t idx);
     void  calc_vals(const GInterval &interval);
     bool  check_first_overlap(size_t idx, const GInterval &interval) const;
 };

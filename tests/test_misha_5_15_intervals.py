@@ -213,7 +213,6 @@ def test_summary_stddev_for_large_values(monkeypatch):  # R :164, :193
                                rtol=1e-9)
     monkeypatch.setitem(pm.CONFIG, "multitasking", True)
     monkeypatch.setitem(pm.CONFIG, "max_processes", 4)
-    monkeypatch.setitem(pm.CONFIG, "min_processes", 4)
     monkeypatch.setitem(pm.CONFIG, "min_scope4process", 1)
     np.testing.assert_allclose(float(pm.gsummary(expr, pm.gintervals_all(), iterator=1000)["Std dev"]), want,
                                rtol=1e-9)

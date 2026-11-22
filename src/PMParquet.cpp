@@ -25,7 +25,6 @@
 #include <numeric>
 #include <set>
 #include <cstring>
-#include <thread>
 #include <tuple>
 
 #include <sys/mman.h>
@@ -579,15 +578,15 @@ const char *parquet_type_name(const ParquetColumn &col, const parquet::FileMetaD
 	return "other";
 }
 
-// R misha's import_num_kids, with the worker count of the other pymisha multitasking paths: the
-// cores, at least min_processes and at most max_processes
+// R misha's import_num_kids: at most 2 processes per core (R's gmax.processes2core) and
+// max_processes
 int import_num_kids(uint64_t num_tasks)
 {
 	if (!g_pymisha->multitasking_avail())
 		return 1;
 
-	int max_kids = max((int)thread::hardware_concurrency(), g_pymisha->min_processes());
-	max_kids = min(min(max_kids, g_pymisha->max_processes()), MAX_KIDS);
+	int max_kids = (int)min<int64_t>(2 * max(1L, sysconf(_SC_NPROCESSORS_ONLN)), g_pymisha->max_processes());
+	max_kids = min(max_kids, MAX_KIDS);
 	return (int)max(min((uint64_t)max_kids, num_tasks), (uint64_t)1);
 }
 

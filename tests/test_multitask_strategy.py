@@ -47,12 +47,12 @@ def test_track_parallel_matches_serial():
     saved = config.copy()
 
     try:
-        config.update({"multitasking": False, "min_processes": 1, "max_processes": 1})
+        config.update({"multitasking": False, "max_processes": 1})
         serial = pm.gextract(exprs, intervals, iterator=100)
 
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "tracks",
         })
         parallel = pm.gextract(exprs, intervals, iterator=100)
@@ -75,8 +75,8 @@ def test_track_parallel_matches_tile_parallel():
 
     try:
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "tiles",
         })
         tiles = pm.gextract(exprs, intervals, iterator=100)
@@ -104,8 +104,8 @@ def test_strategy_auto_default_uses_tiles_for_few_exprs():
         serial = pm.gextract(["dense_track"], intervals, iterator=100)
 
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "auto",
         })
         auto = pm.gextract(["dense_track"], intervals, iterator=100)
@@ -131,8 +131,8 @@ def test_strategy_auto_uses_tracks_for_many_exprs():
         serial = pm.gextract(exprs, intervals, iterator=100)
 
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "auto",
         })
         auto = pm.gextract(exprs, intervals, iterator=100)
@@ -154,7 +154,7 @@ def test_invalid_strategy_rejected():
 
     try:
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
+            "multitasking": True, "min_scope4process": 0,
             "max_processes": 2,
             "multitasking_strategy": "bogus",
         })
@@ -187,8 +187,8 @@ def test_strategy_tracks_routes_through_track_parallel(monkeypatch):
     saved = config.copy()
     try:
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "tracks",
         })
         pm.gextract(exprs, intervals, iterator=100)
@@ -199,7 +199,8 @@ def test_strategy_tracks_routes_through_track_parallel(monkeypatch):
 
 
 def test_strategy_auto_with_many_exprs_routes_through_track_parallel(monkeypatch):
-    """auto + >= 8 exprs should use the track-parallel orchestrator."""
+    """auto + >= 8 exprs over >= 1000 intervals of an iterator of intervals uses the
+    track-parallel orchestrator; with a bin size it does not (R misha's rule)."""
     from pymisha import extract as _extract_mod
 
     calls = []
@@ -211,17 +212,19 @@ def test_strategy_auto_with_many_exprs_routes_through_track_parallel(monkeypatch
 
     monkeypatch.setattr(_extract_mod, "_parallel_extract_tracks", spy, raising=False)
 
-    intervals = _make_intervals()
+    intervals = pm.gintervals("1", list(range(0, 200000, 200)), list(range(100, 200100, 200)))
     exprs = _many_exprs(10)
     config = pm.CONFIG
     saved = config.copy()
     try:
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "auto",
         })
         pm.gextract(exprs, intervals, iterator=100)
+        assert not calls, "a bin-size iterator is split by tiles"
+        pm.gextract(exprs, intervals, iterator=intervals)
     finally:
         _restore(config, saved)
 
@@ -254,8 +257,8 @@ def test_file_and_intervals_set_out_are_written_under_strategy_tracks(tmp_path, 
         config.update({"multitasking": False})
         ref = pm.gextract(exprs, intervals, iterator=100)
         config.update({
-            "multitasking": True, "min_intervs4process": 0, "min_scope4process": 0,
-            "min_processes": 3, "max_processes": 3,
+            "multitasking": True, "min_scope4process": 0,
+            "max_processes": 3,
             "multitasking_strategy": "tracks",
         })
 

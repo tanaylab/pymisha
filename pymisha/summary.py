@@ -19,7 +19,6 @@ from ._shared import (
     _checkroot,
     _chunk_slices,
     _config_limit,
-    _config_no_mt,
     _df2pymisha,
     _numpy,
     _pandas,
@@ -275,15 +274,14 @@ def gdist(
     vtracks_dict = _cpp_vtracks(exprs, all_user_vars)
     if vtracks_dict is not None:
         intervals, iterator = _vtrack_scope(exprs, intervals, iterator, vtracks_dict)
-        with _config_no_mt(_itr_id_map) as _base_cfg:
-            config = dict(_base_cfg)
-            if progress is not None:
-                config["progress"] = progress
-            if progress_desc:
-                config["progress_desc"] = progress_desc
+        config = dict(CONFIG)
+        if progress is not None:
+            config["progress"] = progress
+        if progress_desc:
+            config["progress_desc"] = progress_desc
 
-            result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config,
-                                      vtracks_dict or None)
+        result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config,
+                                  vtracks_dict or None)
 
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -1107,8 +1105,8 @@ def gsummary(
     vtracks_dict = _cpp_vtracks([expr], user_vars)
     if vtracks_dict is not None:
         intervals, iterator = _vtrack_scope([expr], intervals, iterator, vtracks_dict)
-        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, _cfg, vtracks_dict or None)
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_summary(expr, _df2pymisha(intervals), iterator, CONFIG, vtracks_dict or None)
         if result is None:
             return _pandas.Series(
                 [0.0, 0.0, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan, _numpy.nan],
@@ -1252,8 +1250,8 @@ def gquantiles(
     vtracks_dict = _cpp_vtracks([expr], user_vars)
     if vtracks_dict is not None:
         intervals, iterator = _vtrack_scope([expr], intervals, iterator, vtracks_dict)
-        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg,
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG,
                                            vtracks_dict or None)
         if result is None:
             quantiles = _numpy.full(pct.shape, _numpy.nan, dtype=float)
@@ -1362,8 +1360,8 @@ def gintervals_summary(
         iterator = orig_iterator
         assert isinstance(intervals, _pandas.DataFrame)
     if not use_extract_path:
-        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, _cfg)
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_intervals_summary(expr, _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
             out = intervals[_interval_coord_cols(intervals)].copy()
             out["Total intervals"] = 0.0
@@ -1525,8 +1523,8 @@ def gintervals_quantiles(
         iterator = orig_iterator
         assert isinstance(intervals, _pandas.DataFrame)
     if not use_extract_path:
-        with _config_no_mt(_itr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
-            result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, _cfg)
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_intervals_quantiles(expr, pct.tolist(), _df2pymisha(intervals), iterator, CONFIG)
         if result is None:
             out = intervals[_interval_coord_cols(intervals)].copy()
             for name in pct_names:
@@ -1696,9 +1694,8 @@ def gpartition(
             if out is None:
                 return None
         else:
-            with _config_no_mt(_itr_id_map) as _cfg:
-                result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator,
-                                               include_lowest, _cfg)
+            result = _pymisha.pm_partition(expr, breaks_list, _df2pymisha(intervals), iterator,
+                                           include_lowest, CONFIG)
             if result is None:
                 return None
             out = _pandas.DataFrame(result)

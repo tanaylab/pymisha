@@ -803,13 +803,16 @@ def _compute_value_df_vtrack(
     """A filtered value-based vtrack (a DataFrame source), as R misha's ValueVarProcessor: the
     source is held as R's in-memory track holds it (values as floats), and C++ reads the unmasked
     parts of each interval (pm_vtrack_compute with part_owner). "nearest" without a value in the
-    parts is the value whose unmasked stretch is nearest to them (_nearest_unmasked)."""
+    parts is the value whose unmasked stretch is nearest to them (_nearest_unmasked).
+    neighbor.count too: each source interval near the parts counted once, as R."""
     func = str(payload_eval.get("func", "avg")).lower()
     out = _numpy.full(len(intervals), _numpy.nan, dtype=float)
     src_df = payload_eval.get("src_df")
     seg_df = _build_unmasked_segments(intervals, payload_eval, filter_df)
-    if src_df is None or len(src_df) == 0 or seg_df is None or len(seg_df) == 0:
+    if seg_df is None or len(seg_df) == 0:
         return out  # every interval masked entirely (or empty after the shifts): NaN, as R
+    if func != "neighbor.count" and (src_df is None or len(src_df) == 0):
+        return out
 
     oi = seg_df["orig_idx"].to_numpy(dtype=_numpy.int64)
     payload = {k: v for k, v in payload_eval.items() if k != "src_df"}
@@ -823,6 +826,7 @@ def _compute_value_df_vtrack(
         last = _numpy.r_[first[1:], len(oi)] - 1
         need = _numpy.isnan(vals[first])
         if need.any():
+            assert src_df is not None  # only neighbor.count goes on without a source
             masks = _mask_by_chrom(filter_df)
             chroms = seg_df["chrom"].astype(str).to_numpy()
             p_start = seg_df["start"].to_numpy(dtype=_numpy.int64)
@@ -1920,7 +1924,7 @@ def _compute_vtrack_values(
     if row_subs is not None:
         payload_eval["row_subs"] = row_subs
 
-    if payload.get("src_df") is not None and func in _VALUE_DF_PY_FUNCS:
+    if payload.get("src_df") is not None and (func in _VALUE_DF_PY_FUNCS or func == "neighbor.count"):
         return _compute_value_df_vtrack(intervals, payload_eval, filter_df)
 
     if func in _FILTER_PASSTHROUGH_FUNCS:

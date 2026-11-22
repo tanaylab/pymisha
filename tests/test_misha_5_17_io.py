@@ -116,8 +116,8 @@ def test_track_parallel_gextract_fails_when_a_worker_dies_instead_of_dropping_it
     monkeypatch.setattr(_extract, "_worker_extract_tracks", die_in_worker)
     saved = dict(pm.CONFIG)
     try:
-        pm.CONFIG.update({"multitasking": True, "multitasking_strategy": "tracks", "min_processes": 3,
-                          "max_processes": 3, "min_intervs4process": 0, "min_scope4process": 0})
+        pm.CONFIG.update({"multitasking": True, "multitasking_strategy": "tracks", "max_processes": 3,
+                          "min_scope4process": 0})
         exprs = ["dense_track", "dense_track * 3", "dense_track * 2"]
         iv = pm.gintervals("1", 0, 100000)
         with pytest.raises(RuntimeError, match="1 of 3 worker processes ended without returning a result"):
@@ -127,28 +127,6 @@ def test_track_parallel_gextract_fails_when_a_worker_dies_instead_of_dropping_it
         got = pm.gextract(exprs, iv, iterator=100, colnames=["a", "b", "c"])
         pm.CONFIG["multitasking"] = False
         pd.testing.assert_frame_equal(got, pm.gextract(exprs, iv, iterator=100, colnames=["a", "b", "c"]))
-    finally:
-        _restore(pm.CONFIG, saved)
-
-
-def test_tiled_gextract_fails_when_a_worker_dies(monkeypatch):
-    from pymisha import extract as _extract
-
-    parent_pid = os.getpid()
-    orig = _extract._worker_extract_chunk
-
-    def die_in_worker(args):
-        if os.getpid() != parent_pid and str(args[0]["chrom"][0]) in ("2", "chr2"):
-            os.kill(os.getpid(), 9)
-        return orig(args)
-
-    monkeypatch.setattr(_extract, "_worker_extract_chunk", die_in_worker)
-    saved = dict(pm.CONFIG)
-    try:
-        pm.CONFIG.update({"multitasking": True, "multitasking_strategy": "tiles", "min_processes": 4,
-                          "max_processes": 4, "min_intervs4process": 0, "min_scope4process": 0})
-        with pytest.raises(RuntimeError, match=r"Child process \d+ ended unexpectedly \(signal 9\)"):
-            pm.gextract("dense_track", pm.gintervals(["1", "2"], 0, 100000), iterator=100)
     finally:
         _restore(pm.CONFIG, saved)
 

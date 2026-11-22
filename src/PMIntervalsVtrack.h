@@ -18,9 +18,17 @@
 #include <vector>
 
 #include "pymisha.h"
+#include "Filter.h"
 #include "GInterval.h"
 #include "GenomeTrackInMemory.h"
 #include "SegmentFinder.h"
+
+// The value of func over parts, the unmasked parts of an interval whose start after the shifts is
+// base_start, read from track (R misha's ValueVarProcessor with a filter); the track computes SIZE
+// and the functions func reads. Also used for a filtered vtrack on a track. "nearest" is the
+// average of the values, NaN without one.
+double value_var_filtered(GenomeTrack1D &track, const std::string &func, std::vector<GInterval> parts,
+                          int64_t base_start, double percentile);
 
 class PMIntervalsVtrack {
 public:
@@ -37,6 +45,14 @@ public:
 
     // The value over interval (the iterator interval after the shifts, start < end)
     double eval(const GInterval &interval);
+
+    // The value over parts, the non-empty parts of interval outside filter (R misha's Interv_var
+    // and Value_var with a filter)
+    double eval_filtered(const GInterval &interval, const std::vector<GInterval> &parts, const Genome1DFilter &filter);
+
+    // neighbor.count over parts (sorted, not overlapping, of one chromosome): the source intervals
+    // within the distance of any part, each counted once, as R misha
+    double neighbor_count(const std::vector<GInterval> &parts) const;
 
     // The in-memory track of a value-based source, and the percentile of "quantile"
     GenomeTrackInMemory &track() { return m_track; }
@@ -67,15 +83,17 @@ private:
     int64_t m_scan_last_start{0};
     int     m_scan_last_chrom{-1};
 
-    // NEIGHBOR_COUNT: per chromosome, the starts and the ends of the source intervals expanded by
-    // the distance, each sorted. An expanded interval overlaps [s, e) unless it starts at e or
-    // later or ends at s or earlier, and every one that ends by s starts before e: the count is
-    // #(start < e) - #(end <= s).
-    std::vector<std::vector<int64_t>> m_nc_starts;
+    // NEIGHBOR_COUNT: per chromosome, the source intervals expanded by the distance, sorted by
+    // start, the running max of their ends, and their ends sorted. An expanded interval overlaps
+    // [s, e) unless it starts at e or later or ends at s or earlier, and every one that ends by s
+    // starts before e: the count is #(start < e) - #(end <= s).
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> m_nc_intervs;
+    std::vector<std::vector<int64_t>> m_nc_max_end;
     std::vector<std::vector<int64_t>> m_nc_ends;
 
     void ensure_finder(int chromid);
     size_t lower_bound_start(const GInterval &interval);
+    int64_t covered_bp(const GInterval &interval);
 };
 
 #endif /* PMINTERVALSVTRACK_H_ */

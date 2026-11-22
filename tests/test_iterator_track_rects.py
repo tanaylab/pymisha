@@ -652,7 +652,7 @@ def test_track_rects_multitask_equals_single_task(_init_db, rects_track):
         r1 = pm.gextract(rects_track, intervals=intervals, iterator=rects_track)
         pm.CONFIG.update({
             "multitasking": True, "max_processes": 4,
-            "min_scope4process": 1, "min_intervs4process": 1,
+            "min_scope4process": 1,
         })
         r4 = pm.gextract(rects_track, intervals=intervals, iterator=rects_track)
     finally:

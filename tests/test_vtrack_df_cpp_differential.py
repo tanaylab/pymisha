@@ -1,7 +1,7 @@
 """A virtual track on a DataFrame source, evaluated in the C++ scanner, against the Python path.
 
 The scanner reads the source once and evaluates each iterator interval (PMIntervalsVtrack). The
-Python path, kept for what the scanner does not take (filters, user variables, 2D iterators),
+Python path, kept for what the scanner does not take (user variables, 2D iterators),
 iterates the intervals first and computes the vtrack over all of them with pm_vtrack_compute; it
 is forced here by making _can_vtracks_use_cpp refuse every vtrack. Both share the evaluator, so
 the interval functions and the counting value functions are also checked against a direct
@@ -301,13 +301,12 @@ def test_no_iterator(python_path):
     npt.assert_array_equal(pm.gsummary("c", scope).to_numpy(), python_path(pm.gsummary, "c", scope).to_numpy())
 
 
-def test_filter_and_user_vars_keep_the_python_path(monkeypatch):
+def test_filtered_vtrack_takes_the_scanner(monkeypatch):
     src = pd.DataFrame({"chrom": "1", "start": [100, 400], "end": [300, 600], "score": [1.0, 3.0]})
     pm.gvtrack_create("f", src, func="sum")
     pm.gvtrack_filter("f", pd.DataFrame({"chrom": ["1"], "start": [350], "end": [700]}))
     pm.gvtrack_create("g", src, func="sum")
-    assert not _extract._can_vtracks_use_cpp(["f", "g"])
-    assert _extract._can_vtracks_use_cpp(["g"])
+    assert _extract._can_vtracks_use_cpp(["f", "g"])
     res = pm.gextract(["f", "g"], pm.gintervals("1", 0, 1000), iterator=500)
     npt.assert_array_equal(res["f"].to_numpy(), [1.0, np.nan])
     npt.assert_array_equal(res["g"].to_numpy(), [4.0, 3.0])

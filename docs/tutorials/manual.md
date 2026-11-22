@@ -979,8 +979,7 @@ The multitasking behavior is controlled through the `pm.CONFIG` dictionary:
 ```python
 # View current settings
 print(pm.CONFIG['multitasking'])    # True/False -- enable/disable parallelism
-print(pm.CONFIG['max_processes'])   # Upper bound on worker processes
-print(pm.CONFIG['min_processes'])   # Minimum workers for multitasking
+print(pm.CONFIG['max_processes'])   # Upper bound on worker processes: 70% of the cores, 1 to 32, as R misha
 
 # Adjust settings
 pm.CONFIG['multitasking'] = True
@@ -992,6 +991,8 @@ Multitasking can be completely switched off:
 ```python
 pm.CONFIG['multitasking'] = False
 ```
+
+A call divides its scope among at most `min(2 * cores, max_processes)` processes, as R misha does: by whole chromosomes, or, with a bin size as the iterator, into ranges of at least 500 kb and 50,000 bins each (`gextract`, `gscreen`, `gsummary`, `gdist` and Pearson's `gcor`). A process takes whole chromosomes until it holds more than `pm.CONFIG['min_scope4process']` bp (10,000). The rows come back in the order one process gives them. The processes evaluate the expressions without Python: names of tracks and virtual tracks, numbers, `+ - * /`, comparisons and `& |`. An expression with anything else (a numpy function, `CHROM`, `START`, `END`) is computed in one process. So is a call whose processes' shared memory (sized by `max_data_size`, or half the RAM) cannot be mapped, where R misha reports an error.
 
 ### Limiting the Memory Consumption
 

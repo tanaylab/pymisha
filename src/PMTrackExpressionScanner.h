@@ -25,11 +25,29 @@ public:
     PMTrackExprScanner();
     ~PMTrackExprScanner();
 
-    // Begin scanning with given expressions and intervals
+    // Begin scanning with given expressions and intervals: prepare() and start()
     // py_vtracks: optional Python dict mapping vtrack_name -> spec dict
     bool begin(const std::vector<std::string> &exprs, ValType valtype,
                const std::vector<GInterval> &intervals, int64_t iterator_policy,
                PyObject *py_vtracks = nullptr);
+
+    // Parses the expressions, compiles those that Python evaluates and allocates the buffers:
+    // everything that calls into Python but evaluating an expression. A multitasking parent calls
+    // it before it forks, and each kid then calls start() on its part of the scope.
+    void prepare(const std::vector<std::string> &exprs, ValType valtype, int64_t iterator_policy,
+                 PyObject *py_vtracks = nullptr);
+
+    // Starts the scan over intervals (after prepare()). In a kid (kid_can_scan()) it does not call
+    // into Python.
+    bool start(const std::vector<GInterval> &intervals);
+
+    // Whether a forked kid can run the scan, which it does without calling into Python: the
+    // expressions are names of tracks and virtual tracks, or ones it evaluates in C++ (CppExpr in
+    // PMTrackExpressionScanner.cpp)
+    bool kid_can_scan() const { return m_kid_can_scan; }
+
+    // The bin size of a fixed-bin iterator, 0 for any other (after prepare())
+    int64_t fixed_bin_size() const { return m_fixed_bin_size; }
 
     // Apply (*subs)[i] to the sequence while the i-th iterator interval is
     // computed (gextract_variants). Call before begin() with iterator policy
@@ -165,9 +183,19 @@ private:
     static const int REPORT_INTERVAL;
     static const int MIN_REPORT_INTERVAL;
 
+    int64_t m_iterator_policy{0};
+    int64_t m_fixed_bin_size{0};
+
+    // The expressions as compiled for Python, and what a kid evaluates instead (see prepare())
+    struct CppExpr;
+    std::vector<std::string> m_exprs4compile;
+    std::vector<std::unique_ptr<CppExpr>> m_cpp_exprs;
+    std::vector<std::vector<double>> m_cpp_out;
+    std::vector<std::vector<char>> m_cpp_out_bool;
+    bool m_kid_can_scan{true};
+
     // Internal methods
-    void check(const std::vector<std::string> &exprs, const std::vector<GInterval> &intervals,
-               int64_t iterator_policy, ValType valtype, PyObject *py_vtracks = nullptr);
+    void check(const std::vector<std::string> &exprs, ValType valtype, PyObject *py_vtracks = nullptr);
     void define_py_vars(unsigned eval_buf_limit);
     void prepopulate_chrom_cache(const std::vector<GInterval> &intervals);
     bool next_batch();

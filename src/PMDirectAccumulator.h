@@ -73,6 +73,23 @@ public:
         ++m_row;
     }
 
+    // Writes n rows given by columns (values[i] points to the n values of expression i)
+    void append_rows(size_t n, const int32_t *chromids, const int64_t *starts, const int64_t *ends,
+                     const double *const *values, const int64_t *interval_ids)
+    {
+        while (m_row + n > m_alloc_size)
+            grow();
+        if (!n)
+            return;
+        std::memcpy(m_p_chromids + m_row, chromids, n * sizeof(int32_t));
+        std::memcpy(m_p_starts + m_row, starts, n * sizeof(int64_t));
+        std::memcpy(m_p_ends + m_row, ends, n * sizeof(int64_t));
+        for (size_t i = 0; i < m_num_expr_cols; ++i)
+            std::memcpy(m_p_values[i] + m_row, values[i], n * sizeof(double));
+        std::memcpy(m_p_interval_ids + m_row, interval_ids, n * sizeof(int64_t));
+        m_row += n;
+    }
+
     // Number of rows accumulated so far
     size_t size() const { return m_row; }
 
@@ -289,37 +306,38 @@ private:
         m_alloc_size = m_row;
     }
 
+    // The chrom column as [names, codes, "plain"]: the names of the chromosomes the rows are on and,
+    // per row, the index of its name (the chromids array, rewritten). _pymisha2df makes it a plain
+    // column of the names (not a categorical), much faster than from a str object per row.
     PMPY build_chrom_column()
     {
-        npy_intp dims[1] = {static_cast<npy_intp>(m_row)};
-        PMPY py_chrom(PyArray_SimpleNew(1, dims, NPY_OBJECT), true);
-        PyObject **chrom_data = static_cast<PyObject **>(PyArray_DATA(
-            reinterpret_cast<PyArrayObject *>(static_cast<PyObject *>(py_chrom))));
-
-        // Cache chrom strings to avoid repeated PyUnicode_FromString
-        std::unordered_map<int32_t, PyObject *> chrom_cache;
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        std::vector<int32_t> code_of(chromkey.get_num_chroms(), -1);
+        std::vector<int32_t> used;
 
         for (size_t i = 0; i < m_row; ++i) {
-            int32_t cid = m_p_chromids[i];
-            auto it = chrom_cache.find(cid);
-            PyObject *chrom_str;
-            if (it != chrom_cache.end()) {
-                chrom_str = it->second;
-            } else {
-                chrom_str = PyUnicode_FromString(chromkey.id2chrom(cid).c_str());
-                chrom_cache[cid] = chrom_str;
+            int32_t &cid = m_p_chromids[i];
+            if (code_of[cid] < 0) {
+                code_of[cid] = (int32_t)used.size();
+                used.push_back(cid);
             }
-            Py_INCREF(chrom_str);
-            chrom_data[i] = chrom_str;
+            cid = code_of[cid];
         }
 
-        // Release the cache references
-        for (auto &pair : chrom_cache) {
-            Py_DECREF(pair.second);
-        }
+        npy_intp dims[1] = {static_cast<npy_intp>(used.size())};
+        PMPY py_names(PyArray_SimpleNew(1, dims, NPY_OBJECT), true);
+        PyObject **names = static_cast<PyObject **>(PyArray_DATA(
+            reinterpret_cast<PyArrayObject *>(static_cast<PyObject *>(py_names))));
+        for (size_t i = 0; i < used.size(); ++i)
+            names[i] = PyUnicode_FromString(chromkey.id2chrom(used[i]).c_str());
 
-        return py_chrom;
+        PMPY py_col(PyList_New(3), true);
+        py_names.to_be_stolen();
+        PyList_SetItem(py_col, 0, py_names);
+        m_py_chromids.to_be_stolen();
+        PyList_SetItem(py_col, 1, m_py_chromids);
+        PyList_SetItem(py_col, 2, PyUnicode_FromString("plain"));
+        return py_col;
     }
 
     void build_and_set_colnames(PMPY &py_answer)

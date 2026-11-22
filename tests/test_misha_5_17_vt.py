@@ -291,7 +291,6 @@ def test_weighted_sum_is_the_same_with_multitasking_and_on_an_indexed_database(w
         for multitask in (False, True):
             ws_db(indexed)
             monkeypatch.setitem(pm.CONFIG, "multitasking", multitask)
-            monkeypatch.setitem(pm.CONFIG, "min_processes", 4)
             monkeypatch.setitem(pm.CONFIG, "max_processes", 4)
             monkeypatch.setitem(pm.CONFIG, "min_scope4process", 1)
             # the same track under two shifts and next to other functions
@@ -696,7 +695,6 @@ def test_a_dense_track_at_its_own_bin_size_reads_the_same_in_bulk(same_both_path
 def test_a_dense_track_reads_the_same_in_bulk_in_multitasking(same_both_paths, monkeypatch):
     check = same_both_paths
     monkeypatch.setitem(pm.CONFIG, "multitasking", True)
-    monkeypatch.setitem(pm.CONFIG, "min_processes", 4)
     monkeypatch.setitem(pm.CONFIG, "max_processes", 4)
     monkeypatch.setitem(pm.CONFIG, "min_scope4process", 1000)
     scope = _bulk_scope()

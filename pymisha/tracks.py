@@ -40,7 +40,6 @@ from ._shared import (
     _check_flag,
     _check_intervals_strand,
     _checkroot,
-    _config_no_mt,
     _df2pymisha,
     _pm_dbreload,
     _preprocess_intervals_iterator,
@@ -301,7 +300,7 @@ def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
     ------
     NotImplementedError
         If *expr* references a vtrack that the C++ scanner cannot evaluate
-        (filter-bearing, or with a non-C++ function).  These vtracks still work through ``gextract``; users can
+        (one with a non-C++ function).  These vtracks still work through ``gextract``; users can
         materialise the values and write them via ``gtrack_create_sparse``
         / ``gtrack_create_dense``.
     """
@@ -322,7 +321,7 @@ def _resolve_vtracks_for_cpp_expr(expr: str, caller: str) -> dict | None:
         raise NotImplementedError(
             f"{caller}: expression references virtual track(s) {bad} that "
             "use features not yet supported in the track-creating C++ path "
-            "(filters or non-aggregation functions). Workaround: materialise the values with gextract "
+            "(non-aggregation functions). Workaround: materialise the values with gextract "
             "and write them via gtrack_create_sparse / gtrack_create_dense."
         )
 
@@ -2514,9 +2513,9 @@ def gtrack_create(
 
     vtracks_dict = _resolve_vtracks_for_cpp_expr(expr, "gtrack_create")
 
-    with _config_no_mt(_itr_id_map) as _cfg, _atomic_track_create(track):
+    with _atomic_track_create(track):
         _pymisha.pm_track_create_expr(
-            track, str(expr), _df2pymisha(all_intervs), iterator, _cfg, vtracks_dict
+            track, str(expr), _df2pymisha(all_intervs), iterator, _shared.CONFIG, vtracks_dict
         )
 
     try:

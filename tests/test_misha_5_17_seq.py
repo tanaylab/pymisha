@@ -389,8 +389,8 @@ def kid_points():
 
 @pytest.fixture
 def multitask(monkeypatch):
-    for key, val in {"multitasking": True, "max_processes": 3, "min_processes": 3,
-                     "min_scope4process": 1, "min_intervs4process": 0, "progress": False}.items():
+    for key, val in {"multitasking": True, "max_processes": 3,
+                     "min_scope4process": 1, "progress": False}.items():
         monkeypatch.setitem(_shared.CONFIG, key, val)
 
 

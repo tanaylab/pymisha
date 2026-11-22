@@ -14,7 +14,7 @@ import pymisha as pm
 COLS = ["chrom", "start", "end", "dense_track", "intervalID"]
 _FORCE_PARALLEL = {
     "multitasking": True, "max_processes": 4,
-    "min_intervs4process": 0, "min_scope4process": 0, "progress": False,
+    "min_scope4process": 0, "progress": False,
 }
 
 

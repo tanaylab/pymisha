@@ -1247,3 +1247,14 @@ class TestSetOpCoordinateValidation:
         res = pm.gintervals_canonic(good)
         assert res is not None
         assert len(res) == 1  # merged overlapping
+
+
+def test_gscreen_of_a_track_name_is_r_misha_error():
+    # a track's values are numbers, not a logical result; it crashed
+    pm.gvtrack_create("gscreen_name_vt", "dense_track", func="avg")
+    try:
+        for expr in ("dense_track", "gscreen_name_vt"):
+            with pytest.raises(pm.error, match=f'Expression "{expr}" does not produce a logical result'):
+                pm.gscreen(expr, pm.gintervals("1", 0, 10000))
+    finally:
+        pm.gvtrack_rm("gscreen_name_vt")

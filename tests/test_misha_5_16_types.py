@@ -319,7 +319,7 @@ S2 = DF(dict(chrom=["chr1", "chr2"], start=[0, 0], end=[500000, 300000]))
 
 
 def _multitask(config):
-    config.update(multitasking=True, max_processes=4, min_processes=2, min_scope4process=1, min_intervs4process=1)
+    config.update(multitasking=True, max_processes=4, min_scope4process=1)
 
 
 def _child_cpu():
@@ -406,7 +406,7 @@ def test_multitasking_must_be_true_or_false(config):
 
 
 def test_out_of_range_integer_config_leaves_no_python_error(config):
-    for key in ("min_processes", "max_processes", "min_scope4process", "min_intervs4process", "eval_buf_size"):
+    for key in ("max_processes", "min_scope4process", "eval_buf_size"):
         old = config[key]
         config[key] = 2**70
         with pytest.raises(_pymisha.error, match=rf"CONFIG\['{key}'\] is out of range"):

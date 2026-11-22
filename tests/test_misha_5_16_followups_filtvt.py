@@ -1,9 +1,10 @@
 """Filtered virtual tracks read their source once for all the iterator intervals.
 
-A filtered track vtrack reads the source over the union of the intervals' spans, a run of
-intervals at a time, and gives each unmasked part the items it reads; a value-based vtrack
-looks only at the source intervals near each interval. The values must be exactly those of
-reading each interval on its own, which the reference functions here do.
+On the Python path, a filtered track vtrack reads the source over the union of the intervals'
+spans, a run of intervals at a time, and gives each unmasked part the items it reads; a
+value-based vtrack looks only at the source intervals near each interval. The scanner reads the
+parts of each interval as it goes. The values must be exactly those of reading each interval on
+its own, which the reference functions here do (lse on the scanner: up to float rounding).
 """
 
 import numpy as np
@@ -11,6 +12,7 @@ import pandas as pd
 import pytest
 
 import pymisha as pm
+from pymisha import extract as _extract
 from pymisha import vtracks as vt
 
 SEED = 60427
@@ -177,7 +179,8 @@ TRACK_FUNCS = ["avg", "sum", "size", "stddev", "quantile", "lse", "max.pos.abs",
 @pytest.mark.parametrize(("track", "read_rows"), [
     ("dense_track", None), ("dense_track", 3), ("sparse_track", None), ("array_track", None)])
 def test_filtered_track_vtrack_matches_reading_each_interval(track, read_rows, monkeypatch):
-    if read_rows is not None:  # a dense track read in many runs of intervals
+    if read_rows is not None:  # the Python path, a dense track read in many runs of intervals
+        monkeypatch.setattr(_extract, "_can_vtracks_use_cpp", lambda names: False)
         monkeypatch.setattr(vt, "_UNMASKED_READ_ROWS", read_rows)
     rng = np.random.default_rng(SEED)
     for _ in range(6):
@@ -190,4 +193,8 @@ def test_filtered_track_vtrack_matches_reading_each_interval(track, read_rows, m
             got = pm.gextract("vt_filt", J, iterator=J)
             got = got.sort_values("intervalID")["vt_filt"].to_numpy(dtype=float).tolist()
             want = _ref_track_values(track, func, J, mask, sshift, eshift, 0.3)
-            assert repr(got) == repr(want), (track, func)
+            if func == "lse" and read_rows is None:
+                # the scanner merges the parts' log-sum-exps, each a float, as R misha
+                np.testing.assert_allclose(got, want, rtol=1e-6, err_msg=f"{track} {func}")
+            else:
+                assert repr(got) == repr(want), (track, func)

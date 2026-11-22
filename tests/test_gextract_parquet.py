@@ -75,7 +75,7 @@ def _six_chrom_db(tmp_path, sizes=(200000,) * 6):
     db = _mk_db(tmp_path / "sixdb", dict(zip(chroms, sizes, strict=True)))
     iv = pd.concat([_bins_of(c, s, 50) for c, s in zip(chroms, sizes, strict=True)], ignore_index=True)
     pm.gtrack_create_dense("six", "six", iv, iv["start"] / 50 + (iv["chrom"].map(chroms.index) + 1) / 8, 50)
-    pm.CONFIG.update({"max_processes": 4, "min_processes": 4, "min_scope4process": 1000, "min_intervs4process": 0})
+    pm.CONFIG.update({"max_processes": 4, "min_scope4process": 1000})
     return db
 
 
@@ -556,7 +556,7 @@ def test_int64_coordinates_when_one_chromosome_of_the_scope_needs_them(tmp_path)
     pm.gtrack_create_dense(
         "big", "big", pm.gintervals(["chr1", "chr2"], [2147480000, 0], [2147483648, 10000]), [5.0, 7.0], 1000000
     )
-    pm.CONFIG.update({"max_processes": 4, "min_processes": 4, "min_scope4process": 1000, "min_intervs4process": 0})
+    pm.CONFIG.update({"max_processes": 4, "min_scope4process": 1000})
     f = str(tmp_path / "x.parquet")
     # the chr2 rows alone would fit INT32
     scope = pm.gintervals(["chr1", "chr2"], [2147000000, 0], [2147483648, 10000])

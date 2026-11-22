@@ -36,10 +36,10 @@ def test_gextract_multitask_matches_single():
     saved = config.copy()
 
     try:
-        config.update({"multitasking": False, "min_processes": 2, "max_processes": 2})
+        config.update({"multitasking": False, "max_processes": 2})
         single = pm.gextract("dense_track", intervals)
 
-        config.update({"multitasking": True, "min_processes": 2, "max_processes": 2})
+        config.update({"multitasking": True, "max_processes": 2})
         multi = pm.gextract("dense_track", intervals)
     finally:
         config.update(saved)
@@ -53,10 +53,10 @@ def test_gscreen_multitask_matches_single():
     saved = config.copy()
 
     try:
-        config.update({"multitasking": False, "min_processes": 2, "max_processes": 2})
+        config.update({"multitasking": False, "max_processes": 2})
         single = pm.gscreen("dense_track > 0.2", intervals)
 
-        config.update({"multitasking": True, "min_processes": 2, "max_processes": 2})
+        config.update({"multitasking": True, "max_processes": 2})
         multi = pm.gscreen("dense_track > 0.2", intervals)
     finally:
         config.update(saved)
@@ -74,10 +74,10 @@ def test_gextract_multitask_large_output_matches_single():
     saved = config.copy()
 
     try:
-        config.update({"multitasking": False, "min_processes": 3, "max_processes": 3})
+        config.update({"multitasking": False, "max_processes": 3})
         single = pm.gextract("dense_track", intervals, iterator=100)
 
-        config.update({"multitasking": True, "min_processes": 3, "max_processes": 3})
+        config.update({"multitasking": True, "max_processes": 3})
         multi = pm.gextract("dense_track", intervals, iterator=100)
     finally:
         config.update(saved)
@@ -113,14 +113,12 @@ def test_single_chrom_fixedbin_multitask_matches_serial():
     try:
         config.update({
             "multitasking": False,
-            "min_processes": 2,
             "max_processes": 8,
         })
         serial = pm.gextract("dense_track", intervals, iterator=20, colnames=["value"])
 
         config.update({
             "multitasking": True,
-            "min_processes": 2,
             "max_processes": 8,
         })
         multi = pm.gextract("dense_track", intervals, iterator=20, colnames=["value"])
@@ -153,14 +151,12 @@ def test_single_chrom_vtrack_shifted_multitask_matches_serial():
         try:
             config.update({
                 "multitasking": False,
-                "min_processes": 2,
                 "max_processes": 8,
             })
             serial = pm.gextract(vt_name, intervals, iterator=20)
 
             config.update({
                 "multitasking": True,
-                "min_processes": 2,
                 "max_processes": 8,
             })
             multi = pm.gextract(vt_name, intervals, iterator=20)
@@ -196,14 +192,12 @@ def test_small_multichrom_multitask_matches_serial():
     try:
         config.update({
             "multitasking": False,
-            "min_processes": 2,
             "max_processes": 8,
         })
         serial = pm.gextract("dense_track", intervals, iterator=20, colnames=["value"])
 
         config.update({
             "multitasking": True,
-            "min_processes": 2,
             "max_processes": 8,
         })
         multi = pm.gextract("dense_track", intervals, iterator=20, colnames=["value"])
@@ -217,23 +211,22 @@ def test_small_multichrom_multitask_matches_serial():
 # A kid whose parent is killed ends with it
 # ---------------------------------------------------------------------------
 
-# Forks 4 kids that run for about a second: kids of the C++ layer (pm_extract), or Python workers
-# (_run_forked) that then send a result larger than a pipe holds.
+# Forks kids that run for minutes: 3 kids of the C++ layer (gquantiles splits the test genome by its
+# 3 chromosomes), on a scan that calls no Python, or 4 Python workers (_run_forked) that then send a
+# result larger than a pipe holds.
 _KIDS_SCRIPT = textwrap.dedent("""
     import sys, time
-    import __main__
     import pymisha as pm
     pm.gdb_init(sys.argv[1])
     if sys.argv[2] == "cpp":
-        import _pymisha
-        from pymisha._shared import _df2pymisha
-        def slow(x):
-            time.sleep(0.005)
-            return x
-        __main__.slow = slow
-        pm.CONFIG.update(multitasking=True, min_processes=4, max_processes=4, min_scope4process=0,
-                         min_intervs4process=0, progress=False)
-        _pymisha.pm_extract(["slow(dense_track)"], _df2pymisha(pm.gintervals_all()), 1, pm.CONFIG)
+        pm.CONFIG.update(multitasking=True, max_processes=4, min_scope4process=0, progress=False)
+        # each bin counts the k-mer over 100 kb
+        pm.gvtrack_create("slow_kmer", None, func="kmer.count", kmer="A")
+        pm.gvtrack_iterator("slow_kmer", sshift=-50000, eshift=50000)
+        try:
+            pm.gquantiles("slow_kmer", [0.5], pm.gintervals_all(), iterator=1)
+        except Exception as e:
+            print("ERROR:", e, flush=True)
     else:
         from pymisha._shared import _run_forked
         def work(n):
@@ -241,6 +234,7 @@ _KIDS_SCRIPT = textwrap.dedent("""
             return b"x" * n
         _run_forked(work, [10**7] * 4)
 """)
+_NUM_KIDS = {"cpp": 3, "python": 4}
 
 
 def _kids(pid):
@@ -252,7 +246,7 @@ def _runs(pid):
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):   # ended before the open, or before the read
         return False
 
 
@@ -268,10 +262,10 @@ def test_kids_end_when_their_parent_is_killed(kind):
     left = []
     try:
         deadline = time.monotonic() + 60
-        while len(kids) < 4 and parent.poll() is None and time.monotonic() < deadline:
+        while len(kids) < _NUM_KIDS[kind] and parent.poll() is None and time.monotonic() < deadline:
             time.sleep(0.01)
             kids = _kids(parent.pid)
-        assert len(kids) == 4 and all(_runs(k) for k in kids), kids
+        assert len(kids) == _NUM_KIDS[kind] and all(_runs(k) for k in kids), kids
         parent.kill()
         parent.wait()
         deadline = time.monotonic() + 20
@@ -284,3 +278,79 @@ def test_kids_end_when_their_parent_is_killed(kind):
             parent.wait()
         for k in left:
             os.kill(k, signal.SIGKILL)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the kids from /proc")
+def test_a_killed_kid_fails_the_call():
+    # as the out-of-memory killer would: the call fails, it does not return the other kids' result
+    parent = subprocess.Popen([sys.executable, "-c", _KIDS_SCRIPT, str(TESTDB_ROOT), "cpp"],
+                              cwd=str(Path(__file__).resolve().parent.parent), stdout=subprocess.PIPE, text=True)
+    try:
+        kids = []
+        deadline = time.monotonic() + 60
+        while len(kids) < 3 and parent.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            kids = _kids(parent.pid)
+        assert len(kids) == 3, kids
+        os.kill(kids[1], signal.SIGKILL)
+        out, _ = parent.communicate(timeout=60)
+        assert f"ERROR: Child process {kids[1]} ended unexpectedly (signal 9)" in out, out
+        assert not [k for k in kids if _runs(k)]
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+
+
+# A call whose kids' shared memory cannot be mapped runs in one process (R misha reports an error,
+# except in gextract and gscreen). The address space is limited to what the session holds plus
+# 256 MB, which the shared memory of these calls exceeds (it is sized by max_data_size, or half the
+# RAM); a call whose kids hand over a few hundred bytes (gsummary, gdist, Pearson's gcor) still
+# multitasks.
+_NO_SHM_SCRIPT = textwrap.dedent("""
+    import resource, sys
+    import numpy as np
+    import pymisha as pm
+    pm.gdb_init(sys.argv[1])
+    pm.CONFIG.update(progress=False, max_processes=4, min_scope4process=0)
+    scope = pm.gintervals_all()
+    calls = {
+        "gextract": lambda: pm.gextract(["dense_track", "dense_track + 1"], scope),
+        "gscreen": lambda: pm.gscreen("dense_track > 0.2", scope),
+        "glookup": lambda: pm.glookup(np.arange(3.0), "dense_track", [0, 0.1, 0.2, 1], intervals=scope),
+        "gquantiles": lambda: pm.gquantiles("dense_track", [0.1, 0.5, 0.9], scope),
+        "gintervals_quantiles": lambda: pm.gintervals_quantiles("dense_track", [0.1, 0.5], scope),
+        "gcor": lambda: pm.gcor("dense_track", "dense_track * 2", intervals=scope, method="spearman.exact"),
+    }
+
+    def faults():
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt
+
+    pm.CONFIG["multitasking"] = False
+    expected = {name: call() for name, call in calls.items()}
+    pm.CONFIG["multitasking"] = True
+    for name, call in calls.items():
+        before = faults()
+        call()
+        print("FORKS", name, faults() > before)
+    vm = int(open("/proc/self/status").read().split("VmSize:")[1].split()[0]) * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (vm + (256 << 20), resource.RLIM_INFINITY))
+    for name, call in calls.items():
+        before = faults()
+        got = call()
+        same = got.equals(expected[name]) if hasattr(got, "equals") else np.array_equal(got, expected[name])
+        print("NO_SHM", name, faults() > before, same)
+""")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="limits the address space and reads /proc")
+def test_a_call_whose_shared_memory_cannot_be_mapped_runs_in_one_process():
+    proc = subprocess.run([sys.executable, "-c", _NO_SHM_SCRIPT, str(TESTDB_ROOT)], capture_output=True, text=True,
+                          cwd=str(Path(__file__).resolve().parent.parent), timeout=300)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = [line.split() for line in proc.stdout.splitlines()]
+    forks = {w[1]: w[2] for w in out if w[0] == "FORKS"}
+    no_shm = {w[1]: w[2:] for w in out if w[0] == "NO_SHM"}
+    assert len(forks) == len(no_shm) == 6, proc.stdout
+    assert all(v == "True" for v in forks.values()), forks   # they multitask otherwise
+    assert all(v == ["False", "True"] for v in no_shm.values()), no_shm   # one process, the same result

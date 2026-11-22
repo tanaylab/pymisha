@@ -74,7 +74,15 @@ extern int  g_rng_kid_idx;   // the index of this kid or pool worker, -1 in the 
 // call per part of its scope draws what one call over the whole scope draws
 extern bool g_rng_stream;
 
-// Seeds drand48 from numpy's global generator (and the kid index); defined in pymisha.cpp
+// The seed of a kid's first draw, which a kid does not take from Python itself: numpy's next draw,
+// taken by the parent before it forks, with numpy's state then put back (a kid that drew from
+// numpy left the parent's state as it was too). g_rng_peeked is reset by each top-level call.
+extern bool     g_rng_peeked;
+extern uint32_t g_rng_peeked_seed;
+void rng_peek();
+
+// Seeds drand48 from numpy's global generator, in a kid from g_rng_peeked_seed (and the kid
+// index); defined in pymisha.cpp
 void rng_load();
 
 // A uniform draw in [0, 1)

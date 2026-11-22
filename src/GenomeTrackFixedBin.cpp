@@ -14,7 +14,7 @@
 void GenomeTrackFixedBin::classify_fast_path_mode()
 {
 	// Escape hatch: force the generic recompute path (benchmarking + safety toggle).
-	if (std::getenv("PYMISHA_DISABLE_SLIDING_REDUCER")) {
+	if (m_sliding_disabled || std::getenv("PYMISHA_DISABLE_SLIDING_REDUCER")) {
 		m_fast_path_mode = -1;
 		return;
 	}

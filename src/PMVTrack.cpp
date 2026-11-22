@@ -655,8 +655,8 @@ static double value_var_sample(GenomeTrack1D &track, const std::vector<GInterval
 // The value of a value-based vtrack over the unmasked parts of an interval whose start after the
 // shifts is base_start (R misha's ValueVarProcessor with a filter). "nearest" without a value in
 // the parts is NaN here: the caller looks for the nearest unmasked value outside them.
-static double value_var_filtered(GenomeTrackInMemory &track, const std::string &func, std::vector<GInterval> parts,
-                                 int64_t base_start, double percentile)
+double value_var_filtered(GenomeTrack1D &track, const std::string &func, std::vector<GInterval> parts,
+                          int64_t base_start, double percentile)
 {
     const double nan = std::numeric_limits<double>::quiet_NaN();
 
@@ -847,7 +847,8 @@ PMIntervalsVtrack::PMIntervalsVtrack(PyObject *spec, const std::string &func) : 
         if (dist < 0)
             TGLError("neighbor.count distance cannot be negative");
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
-        m_nc_starts.assign(chromkey.get_num_chroms(), {});
+        m_nc_intervs.assign(chromkey.get_num_chroms(), {});
+        m_nc_max_end.assign(chromkey.get_num_chroms(), {});
         m_nc_ends.assign(chromkey.get_num_chroms(), {});
         for (const auto &interv : m_sintervs) {
             double expanded_start = (double)interv.start - dist;
@@ -857,11 +858,16 @@ PMIntervalsVtrack::PMIntervalsVtrack(PyObject *spec, const std::string &func) : 
             if (expanded_end > chrom_size_d) expanded_end = chrom_size_d;
             int64_t new_end = (int64_t)std::ceil(expanded_end);
             if (new_end < new_start) new_end = new_start;
-            m_nc_starts[interv.chromid].push_back(new_start);
+            m_nc_intervs[interv.chromid].emplace_back(new_start, new_end);
             m_nc_ends[interv.chromid].push_back(new_end);
         }
-        for (auto &v : m_nc_starts) std::sort(v.begin(), v.end());
-        for (auto &v : m_nc_ends) std::sort(v.begin(), v.end());
+        for (size_t c = 0; c < m_nc_intervs.size(); ++c) {
+            std::sort(m_nc_intervs[c].begin(), m_nc_intervs[c].end());
+            std::sort(m_nc_ends[c].begin(), m_nc_ends[c].end());
+            int64_t max_end = 0;
+            for (const auto &iv : m_nc_intervs[c])
+                m_nc_max_end[c].push_back(max_end = std::max(max_end, iv.second));
+        }
         m_sintervs.clear();
     }
 }
@@ -894,6 +900,24 @@ size_t PMIntervalsVtrack::lower_bound_start(const GInterval &interval)
     m_scan_last_start = interval.start;
     m_scan_last_chrom = interval.chromid;
     return m_scan_idx;
+}
+
+// The bp of interval that the (unified) source covers. The source does not overlap itself: of the
+// intervals before the lower bound only the last can reach into the interval.
+int64_t PMIntervalsVtrack::covered_bp(const GInterval &interval)
+{
+    int64_t total_overlap = 0;
+    auto it = m_sintervs.begin() + lower_bound_start(interval);
+    if (it != m_sintervs.begin()) {
+        auto prev = it - 1;
+        if (prev->chromid == interval.chromid && prev->end > interval.start)
+            total_overlap += std::min(interval.end, prev->end) - std::max(interval.start, prev->start);
+    }
+    for (; it != m_sintervs.end() && it->chromid == interval.chromid && it->start < interval.end; ++it) {
+        if (it->end > interval.start)
+            total_overlap += std::min(interval.end, it->end) - std::max(interval.start, it->start);
+    }
+    return total_overlap;
 }
 
 double PMIntervalsVtrack::eval(const GInterval &interval)
@@ -938,36 +962,81 @@ double PMIntervalsVtrack::eval(const GInterval &interval)
             return nan;
         return (double)interval.dist2interv(*m_nn);
 
-    case COVERAGE: {
-        // the unified source does not overlap itself: of the intervals before the lower bound
-        // only the last can reach into the query
+    case COVERAGE:
         if (interval.range() <= 0)
             return nan;
-        int64_t total_overlap = 0;
-        auto it = m_sintervs.begin() + lower_bound_start(interval);
-        if (it != m_sintervs.begin()) {
-            auto prev = it - 1;
-            if (prev->chromid == interval.chromid && prev->end > interval.start)
-                total_overlap += std::min(interval.end, prev->end) - std::max(interval.start, prev->start);
-        }
-        for (; it != m_sintervs.end() && it->chromid == interval.chromid && it->start < interval.end; ++it) {
-            if (it->end > interval.start)
-                total_overlap += std::min(interval.end, it->end) - std::max(interval.start, it->start);
-        }
-        return (double)total_overlap / (double)interval.range();
-    }
+        return (double)covered_bp(interval) / (double)interval.range();
 
     case NEIGHBOR_COUNT: {
-        if (interval.chromid < 0 || (size_t)interval.chromid >= m_nc_starts.size())
+        if (interval.chromid < 0 || (size_t)interval.chromid >= m_nc_intervs.size())
             return 0;
-        const auto &starts = m_nc_starts[interval.chromid];
+        const auto &intervs = m_nc_intervs[interval.chromid];
         const auto &ends = m_nc_ends[interval.chromid];
-        size_t num_before_end = std::lower_bound(starts.begin(), starts.end(), interval.end) - starts.begin();
+        size_t num_before_end = std::lower_bound(intervs.begin(), intervs.end(), interval.end,
+            [](const std::pair<int64_t, int64_t> &iv, int64_t coord) { return iv.first < coord; }) - intervs.begin();
         size_t num_ended = std::upper_bound(ends.begin(), ends.end(), interval.start) - ends.begin();
         return (double)(num_before_end - num_ended);
     }
     }
     return nan;
+}
+
+double PMIntervalsVtrack::eval_filtered(const GInterval &interval, const std::vector<GInterval> &parts,
+                                        const Genome1DFilter &filter)
+{
+    switch (m_kind) {
+    case VALUE: {
+        const double v = value_var_filtered(m_track, m_func, parts, interval.start, m_percentile);
+        if (m_func != "nearest" || !std::isnan(v))
+            return v;
+        // no value in the parts: the value whose unmasked stretch is nearest to them
+        size_t begin, end;
+        m_track.chrom_range(interval.chromid, begin, end);
+        const std::vector<float> &vals = m_track.get_vals();
+        return nearest_unmasked_value(m_track.get_intervals(), begin, end, [&](size_t i) { return vals[i]; },
+                                      filter, parts);
+    }
+
+    case COVERAGE: {
+        // the unmasked bp the source covers, of all unmasked bp
+        int64_t covered = 0, total = 0;
+        for (const auto &part : parts) {
+            covered += covered_bp(part);
+            total += part.range();
+        }
+        return (double)covered / (double)total;
+    }
+
+    case NEIGHBOR_COUNT:
+        return neighbor_count(parts);
+
+    default:
+        // the distance functions do not look at the filter
+        return eval(interval);
+    }
+}
+
+double PMIntervalsVtrack::neighbor_count(const std::vector<GInterval> &parts) const
+{
+    const int chromid = parts.front().chromid;
+    if (chromid < 0 || (size_t)chromid >= m_nc_intervs.size())
+        return 0;
+    const auto &intervs = m_nc_intervs[chromid];
+    const auto &max_end = m_nc_max_end[chromid];
+
+    // every interval before the first whose running max end passes the first part's start ends by it
+    size_t i = std::partition_point(max_end.begin(), max_end.end(),
+                                    [&](int64_t end) { return end <= parts.front().start; }) - max_end.begin();
+    size_t count = 0;
+    auto part = parts.begin();
+    for (; i < intervs.size() && intervs[i].first < parts.back().end; ++i) {
+        // the interval overlaps a part only if it overlaps the first part ending after its start
+        while (part->end <= intervs[i].first)
+            ++part;
+        if (part->start < intervs[i].second)
+            ++count;
+    }
+    return (double)count;
 }
 
 
@@ -1211,7 +1280,7 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
             // in order, with the interval each belongs to (part_owner) and its start after the
             // shifts (part_base); the result of an interval goes to its first part.
             PyObject *py_owner = dict_get(py_spec, "part_owner");
-            if (py_owner && py_owner != Py_None && !PMIntervalsVtrack::is_interval_func(func)) {
+            if (py_owner && py_owner != Py_None && (!PMIntervalsVtrack::is_interval_func(func) || func == "neighbor.count")) {
                 PMPY owner(PyArray_FROM_OTF(py_owner, NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
                 PMPY base(PyArray_FROM_OTF(dict_get(py_spec, "part_base"), NPY_INT64, NPY_ARRAY_IN_ARRAY | NPY_ARRAY_FORCECAST), true);
                 if (!owner || !base || PyArray_SIZE((PyArrayObject *)*owner) != (npy_intp)intervals.size() ||
@@ -1225,7 +1294,8 @@ PyObject *pm_vtrack_compute(PyObject *self, PyObject *args)
                     parts.clear();
                     for (; j < intervals.size() && o[j] == o[i]; ++j)
                         parts.push_back(intervals[j]);
-                    out[i] = value_var_filtered(vtrack.track(), func, parts, b[i], vtrack.percentile());
+                    out[i] = func == "neighbor.count" ? vtrack.neighbor_count(parts) :
+                        value_var_filtered(vtrack.track(), func, parts, b[i], vtrack.percentile());
                     i = j;
                 }
                 return_py(py_vals);

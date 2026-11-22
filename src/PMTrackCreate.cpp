@@ -36,6 +36,7 @@
 #include "GenomeTrackSparse.h"
 #include "PMTrackExpressionScanner.h"
 #include "PMTrackExpressionIterator.h"
+#include "PMMultitask.h"
 #include "IndexedTrackWriter.h"
 #include "TrackIndex.h"
 
@@ -775,6 +776,42 @@ PyObject *pm_track_create_dense(PyObject *self, PyObject *args)
     }
 }
 
+// Writes the files of the chromosomes the scan of scanner (prepared) over intervals reaches: dense of
+// binsize bp bins, or sparse (binsize 0)
+static void write_track_files(PMTrackExprScanner &scanner, const vector<GInterval> &intervals, const string &track_dir,
+                              int64_t binsize)
+{
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    int cur_chromid = -1;
+
+    scanner.start(intervals);
+    if (binsize > 0) {
+        GenomeTrackFixedBin gtrack;
+        for (; !scanner.isend(); scanner.next()) {
+            const GInterval &interv = scanner.last_interval();
+            if (interv.chromid != cur_chromid) {
+                cur_chromid = interv.chromid;
+                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
+                gtrack.init_write(path.c_str(), (unsigned)binsize, cur_chromid);
+            }
+            gtrack.write_next_bin((float)scanner.vdouble());
+        }
+        gtrack.flush_writes();   // the last file written; see pm_track_create_sparse
+    } else {
+        GenomeTrackSparse gtrack;
+        for (; !scanner.isend(); scanner.next()) {
+            const GInterval &interv = scanner.last_interval();
+            if (interv.chromid != cur_chromid) {
+                cur_chromid = interv.chromid;
+                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
+                gtrack.init_write(path.c_str(), cur_chromid);
+            }
+            gtrack.write_next_interval(interv, (float)scanner.vdouble());
+        }
+        gtrack.flush_writes();
+    }
+}
+
 PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
 {
     try {
@@ -810,74 +847,59 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
         ensure_track_dir(track_dir);
 
         PMTrackExprScanner scanner;
-        PyObject *progress_cb = get_progress_cb_local(py_config);
-        if (progress_cb && !PyMisha::is_kid()) {
-            scanner.set_progress_callback(progress_cb);
-            scanner.report_progress(false);
+        scanner.prepare({string(expr)}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
+        const int64_t binsize = scanner.fixed_bin_size();   // 0: a sparse track
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+
+        // As R misha's gtrack.create: kids of whole chromosomes, each writing the files of its
+        // chromosomes, in a scope whose chromosomes are in order, so that every file is written by
+        // one process in one go (a chromosome met again would be rewritten from its start). R
+        // writes an indexed database's track.dat in one process; pymisha writes the per-chromosome
+        // files there too, and converts them after, so it multitasks on both formats.
+        std::vector<std::vector<SplitInterval>> plan;
+        if (scanner.kid_can_scan())
+            plan = plan_kids(intervals, 0, 0);
+
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, 0)) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                write_track_files(scanner, sub, track_dir, binsize);
+                // a file whose last buffer failed to reach the disk when it was closed
+                if (*BufferedFile::write_error())
+                    verror("%s", BufferedFile::write_error());
+            });
+        } else {
+            PyObject *progress_cb = get_progress_cb_local(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
+            }
+            write_track_files(scanner, intervals, track_dir, binsize);
         }
 
-        vector<string> exprs = {string(expr)};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
-
-        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+        // The chromosomes the scan did not reach: on a per-chromosome database every one gets a
+        // file; on an indexed one a sparse track of no interval gets a file per chromosome too,
+        // which tells the indexed conversion that the track is sparse
         const bool indexed_db = db_is_indexed();
         vector<bool> created(chromkey.get_num_chroms(), false);
-
-        if (dynamic_cast<PMFixedBinIterator *>(scanner.get_iterator())) {
-            PMFixedBinIterator *fitr = dynamic_cast<PMFixedBinIterator *>(scanner.get_iterator());
-            int64_t binsize = fitr ? fitr->get_bin_size() : 0;
-            if (binsize <= 0)
-                verror("Failed to infer dense iterator binsize");
-
-            GenomeTrackFixedBin gtrack;
-            int cur_chromid = -1;
-            for (; !scanner.isend(); scanner.next()) {
-                const GInterval &interv = scanner.last_interval();
-                if (interv.chromid != cur_chromid) {
-                    cur_chromid = interv.chromid;
-                    string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
-                    gtrack.init_write(path.c_str(), (unsigned)binsize, cur_chromid);
-                    created[cur_chromid] = true;
-                }
-                float v = (float)scanner.vdouble();
-                gtrack.write_next_bin(v);
+        bool any_created = false;
+        for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+            created[chromid] = file_exists(track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid));
+            any_created |= created[chromid];
+        }
+        if (!indexed_db || (!binsize && !any_created)) {
+            GenomeTrackFixedBin dense;
+            GenomeTrackSparse sparse;
+            for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
+                if (created[chromid])
+                    continue;
+                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
+                if (binsize)
+                    dense.init_write(path.c_str(), (unsigned)binsize, chromid);
+                else
+                    sparse.init_write(path.c_str(), chromid);
             }
-
-            if (!indexed_db) {
-                for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
-                    if (created[chromid])
-                        continue;
-                    string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
-                    gtrack.init_write(path.c_str(), (unsigned)binsize, chromid);
-                }
-            }
-            gtrack.flush_writes();   // the last file written; see pm_track_create_sparse
-        } else {
-            GenomeTrackSparse gtrack;
-            int cur_chromid = -1;
-            for (; !scanner.isend(); scanner.next()) {
-                const GInterval &interv = scanner.last_interval();
-                if (interv.chromid != cur_chromid) {
-                    cur_chromid = interv.chromid;
-                    string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
-                    gtrack.init_write(path.c_str(), cur_chromid);
-                    created[cur_chromid] = true;
-                }
-                float v = (float)scanner.vdouble();
-                gtrack.write_next_interval(interv, v);
-            }
-
-            // With no interval at all, an indexed database too gets a file per chromosome:
-            // what tells the indexed conversion that the track is sparse
-            if (!indexed_db || none_of(created.begin(), created.end(), [](bool c) { return c; })) {
-                for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
-                    if (created[chromid])
-                        continue;
-                    string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
-                    gtrack.init_write(path.c_str(), chromid);
-                }
-            }
-            gtrack.flush_writes();   // the last file written; see pm_track_create_sparse
+            dense.flush_writes();   // the last file written; see pm_track_create_sparse
+            sparse.flush_writes();
         }
 
         return_none();

@@ -11,6 +11,7 @@ import pytest
 from _potts_oracle import POTTS_BASES, potts_ref_anchors, potts_ref_model
 
 import pymisha as pm
+import pymisha.extract
 from pymisha.extract import _can_vtracks_use_cpp
 
 
@@ -94,10 +95,11 @@ def test_max_edits_is_validated():
                               params=dict(m, score_thresh=0, max_edits=me))
 
 
-# Not in R's suite. A filtered vtrack is scored part by part through
-# pm_vtrack_compute (src/PMVTrack.cpp), a second C++ path next to the
-# expression scanner's; max_edits has to reach both.
-def test_a_filtered_potts_max_with_max_edits_1_scores_like_the_unfiltered_one():
+# Not in R's suite. A filtered vtrack is scored part by part by the expression
+# scanner, and, on the Python path (an expression with a Python variable),
+# through pm_vtrack_compute (src/PMVTrack.cpp); max_edits has to reach both.
+@pytest.mark.parametrize("python_path", [False, True], ids=["scanner", "python"])
+def test_a_filtered_potts_max_with_max_edits_1_scores_like_the_unfiltered_one(python_path, monkeypatch):
     m = potts_ref_model(6, npair_mode="full", seed=13)
     params = dict(m, bidirect=True, max_edits=1)
     pm.gvtrack_create("p1", None, "potts.max", params=params)
@@ -105,7 +107,9 @@ def test_a_filtered_potts_max_with_max_edits_1_scores_like_the_unfiltered_one():
     pm.gvtrack_create("p0", None, "potts.max", params=dict(m, bidirect=True))
     # A mask far from the bins leaves each one a single unmasked part.
     pm.gvtrack_filter("p1f", filter=pm.gintervals(1, 400000, 400100))
-    assert not _can_vtracks_use_cpp(["p1f"])  # so it is scored part by part
+    assert _can_vtracks_use_cpp(["p1f"])
+    if python_path:
+        monkeypatch.setattr(pymisha.extract, "_can_vtracks_use_cpp", lambda names: False)
     x = pm.gextract(["p1", "p1f", "p0"], pm.gintervals(1, 10000, 10200), iterator=20)
     np.testing.assert_allclose(x["p1f"], x["p1"], rtol=1e-6)
     assert (x["p1f"] > x["p0"] + 1e-6).all()

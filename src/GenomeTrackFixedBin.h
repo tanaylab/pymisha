@@ -46,6 +46,10 @@ public:
 
 	unsigned get_bin_size() const { return m_bin_size; }
 
+	// Read every interval afresh, summing its bins in order, never by sliding the window of the
+	// interval before (classify_fast_path_mode)
+	void disable_sliding() { m_sliding_disabled = true; }
+
 	bool item_at(int chromid, int64_t coord, int64_t &start, int64_t &end) override {
 		if (!m_bin_size)
 			return false;
@@ -84,6 +88,7 @@ protected:
 		(1u << LSE) | (1u << EXISTS) | (1u << SIZE);
 
 	int       m_fast_path_mode{0};   // 0=unclassified, 1=sliding reducers, -1=generic
+	bool      m_sliding_disabled{false};
 	RunningLogSumExp m_running_lse;
 	std::deque<float> m_lse_window_bins;   // raw window values incl. NaN placeholders
 	int64_t   m_lse_prev_sbin{-1};

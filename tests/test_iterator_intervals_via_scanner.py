@@ -130,7 +130,6 @@ def test_intervals_via_scanner_multitask_equivalence(_init_db, rects_track, monk
             "multitasking": True,
             "max_processes": 4,
             "min_scope4process": 1,
-            "min_intervs4process": 1,
         })
         r4 = pm.gextract(rects_track, intervals=intervals)
     finally:

@@ -26,8 +26,6 @@ from ._shared import (
     _chrom_names,
     _chunk_slices,
     _config_multitasking,
-    _config_no_mt,
-    _dead_worker_message,
     _df2pymisha,
     _iterated_intervals,
     _numpy,
@@ -339,9 +337,9 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
 
     Returns True if every vtrack is eligible for inline C++ evaluation.
     A vtrack is eligible when:
-      - It has no filter attached.
       - Its source is None (sequence-based), a string (physical track name) or a DataFrame.
       - Its function is in the supported set.
+    A filter (gvtrack_filter) is applied by the scanner too.
     """
     for name in vtrack_names:
         cfg = _shared._VTRACKS.get(name)
@@ -354,10 +352,6 @@ def _can_vtracks_use_cpp(vtrack_names: set[str] | list[str]) -> bool:
             sfunc = str((cfg.get("slice") or {}).get("func", "avg")).lower()
             if sfunc not in _CPP_ARRAY_SLICE_FUNCS:
                 return False
-        # Filter vtracks must go through Python
-        filt = cfg.get("filter")
-        if filt is not None and not (isinstance(filt, _pandas.DataFrame) and len(filt) == 0):
-            return False
         src = cfg.get("src")
         func = str(cfg.get("func", "avg")).lower()
         if src is None:
@@ -449,8 +443,9 @@ def _build_vtracks_dict(vtrack_names: set[str] | list[str]) -> dict[str, dict[st
         pssm = spec.get("pssm")
         if pssm is not None and isinstance(pssm, _pandas.DataFrame):
             spec["pssm"] = pssm.to_numpy(dtype=float, copy=False)
-        # Strip filter-related keys (shouldn't be present but be safe)
-        spec.pop("filter", None)
+        # The mask in the format C++ reads (PMTrackExpressionVars), None for none
+        filt = spec.pop("filter", None)
+        spec["filter"] = _df2pymisha(filt) if filt is not None and len(filt) else None
         spec.pop("filter_key", None)
         spec.pop("filter_stats", None)
         # A DataFrame source in the format C++ reads (PMIntervalsVtrack)
@@ -2610,85 +2605,23 @@ def _extract_2d_to_file(
         _write_tsv_parts(file, part_rows(), ["chrom1", "start1", "end1", "chrom2", "start2", "end2", *value_names])
 
 
-def _worker_extract_chunk(args: tuple[Any, ...]) -> pd.DataFrame | None:
-    """Worker function for parallel gextract (runs in forked subprocess)."""
-    if len(args) == 5:
-        (chunk_dict, exprs, iterator_val, config_dict, vtracks_dict) = args
-    else:
-        (chunk_dict, exprs, iterator_val, config_dict) = args
-        vtracks_dict = None
-    chunk_intervals = _pandas.DataFrame(chunk_dict)
-    result = _pymisha.pm_extract(
-        exprs,
-        _df2pymisha(chunk_intervals),
-        iterator_val,
-        config_dict,
-        vtracks_dict,
-    )
-    return _pymisha2df(result)
-
-
 _VALID_STRATEGIES = ("auto", "tracks", "tiles")
-# Track count at or above which "auto" picks track-parallel.
-# Matches R misha 5.6.18 threshold (>= 8 tracks + non-streaming iterator).
+# Track and interval counts at or above which "auto" picks track-parallel, as
+# R misha's .gmultitasking_strategy (with an iterator of intervals)
 _AUTO_TRACKS_MIN_EXPRS = 8
-
-
-def _workload_too_small_for_fork(
-    intervals: pd.DataFrame, max_procs: int, config: dict
-) -> bool:
-    """Return True if the workload is below the multitask thresholds.
-
-    Mirrors the C++ ``choose_num_kids`` gating (min_intervs4process,
-    min_scope4process) so the Python-level worker-pool fork is also
-    skipped when serial is expected to win.
-    """
-    if max_procs < 2:
-        return True
-    n = len(intervals)
-    min_intervs = int(config.get("min_intervs4process", 250_000))
-    if min_intervs > 0 and n < min_intervs:
-        return True
-    min_scope = int(config.get("min_scope4process", 1_000_000_000))
-    if min_scope > 0 and "start" in intervals.columns and "end" in intervals.columns:
-        # Sum can overflow Python int? No - Python ints are arbitrary precision.
-        scope = int((intervals["end"].to_numpy() - intervals["start"].to_numpy()).sum())
-        if scope // max_procs < min_scope:
-            return True
-    return False
+_AUTO_TRACKS_MIN_INTERVALS = 1000
 
 
 def _effective_max_procs(config: dict) -> int:
-    """Worker count the C++ side would pick, mirroring ``choose_num_kids``.
+    """The number of Python workers: ``max_processes``, at most one per core.
 
-    The C++ scanner clamps to ``hardware_concurrency`` before applying
-    ``max_processes``; the Python fork paths used ``max_processes`` raw, so on
-    a machine with fewer cores than that they oversubscribed (e.g. 56
-    expressions on a 4-core laptop forked one worker per expression).
+    The Python fork paths used ``max_processes`` raw, so on a machine with
+    fewer cores than that they oversubscribed (e.g. 56 expressions on a
+    4-core laptop forked one worker per expression).
     """
     hw = os.cpu_count() or 1
-    lo = int(config.get("min_processes", 1) or 1)
     hi = int(config.get("max_processes", 1) or 1)
-    return max(1, min(max(hw, lo), hi))
-
-
-def _tracks_workload_too_small_for_fork(
-    intervals: pd.DataFrame, n_exprs: int, config: dict
-) -> bool:
-    """Return True if a track-parallel fork is not worth it.
-
-    The ``_workload_too_small_for_fork`` floors are expressed in base-pairs
-    of scope because they were calibrated for the *tiles* strategy, where
-    every worker walks its own slice of the genome.  Track-parallel splits
-    the *expressions* instead, so the work scales with intervals x
-    expressions and a bp-scope floor vetoes exactly the workloads it helps
-    most (many tracks over a modest peak set).  Reuse ``min_intervs4process``
-    as the floor, counting per-expression interval visits.
-    """
-    min_intervs = int(config.get("min_intervs4process", 250_000))
-    if min_intervs <= 0:
-        return False
-    return len(intervals) * max(1, n_exprs) < min_intervs
+    return max(1, min(hw, hi))
 
 
 def _validate_strategy(strategy: str) -> str:
@@ -2701,23 +2634,26 @@ def _validate_strategy(strategy: str) -> str:
     return s
 
 
-def _resolve_parallel_strategy(strategy: str, n_exprs: int, iterator: Any) -> str:
-    """Decide between 'tracks' and 'tiles' given the configured strategy.
+def _resolve_parallel_strategy(strategy: str, n_exprs: int, iterator: Any, n_intervals: int) -> str:
+    """Decide between 'tracks' and 'tiles' given the configured strategy, as R misha's
+    .gmultitasking_strategy.
 
-    'auto' picks 'tracks' when there are enough expressions to amortize fork
-    overhead AND the iterator is non-streaming (fixed bin size or a concrete
-    interval set - i.e., output size is predictable per worker). Otherwise
-    'tiles' (the legacy chrom-parallel path).
+    'auto' picks 'tracks' (each worker extracts some of the expressions over all
+    the intervals) for at least 8 expressions over at least 1000 intervals with an
+    iterator of intervals; otherwise 'tiles' (the C++ scan forks, each kid
+    extracting all the expressions over a part of the scope).
     """
     s = _validate_strategy(strategy)
     if s != "auto":
         return s
-    if n_exprs < _AUTO_TRACKS_MIN_EXPRS:
+    if n_exprs < _AUTO_TRACKS_MIN_EXPRS or n_intervals < _AUTO_TRACKS_MIN_INTERVALS:
         return "tiles"
-    # Heuristic for "non-streaming" iterator: an int (fixed binsize) or a
-    # concrete DataFrame is predictable; named-track/string iterators may
-    # produce variable output and are kept on the tiles path.
-    if isinstance(iterator, (int, _pandas.DataFrame)):
+    # Only an iterator of intervals (a DataFrame or an intervals set, which gextract
+    # turns into -1 before this): with a bin size the tiles split the bins over all
+    # the workers, where each track-parallel worker scans all of them (measured
+    # 6-17x slower by R misha on a 10.7M-bin scan).
+    if isinstance(iterator, _pandas.DataFrame) or (
+            isinstance(iterator, (int, _numpy.integer)) and not isinstance(iterator, bool) and iterator < 0):
         return "tracks"
     return "tiles"
 
@@ -2840,125 +2776,6 @@ def _parallel_extract_tracks(
         parts.append(first_df[[sort_key]].copy())
 
     return _pandas.concat(parts, axis=1)
-
-
-def _parallel_extract(
-    exprs: list[str],
-    intervals: pd.DataFrame,
-    iterator: Iterator | str,
-    config: dict[str, Any],
-    vtracks_dict: dict[str, dict[str, Any]] | None = None,
-) -> pd.DataFrame | None:
-    """Split the scope into bp-balanced range chunks and extract in parallel.
-
-    Each worker handles a contiguous run of (possibly range-split) sub-intervals
-    spanning roughly equal base-pairs, so a single huge interval (e.g. a whole
-    chromosome in ALLGENOME) is spread across workers instead of bounding wall
-    time on one kid. For a fixed-bin (int) iterator, splits are aligned to bin
-    boundaries so the emitted genome-aligned bins are byte-identical to a serial
-    extraction; for other iterator types intervals are kept whole (a mid-interval
-    split could change which iterator intervals are emitted at the boundary).
-
-    Returns a merged DataFrame with intervalIDs remapped to the original scope
-    rows (matching a serial extraction over *intervals*), or ``None`` to signal
-    the caller to fall back to the serial path.
-    """
-    max_procs = _effective_max_procs(config)
-    if max_procs < 2:
-        return None
-
-    chrom_col = intervals["chrom"].to_numpy()
-    start_col = intervals["start"].to_numpy()
-    end_col = intervals["end"].to_numpy()
-    total_bp = int(_numpy.maximum(end_col - start_col, 0).sum())
-    if total_bp <= 0:
-        return None
-
-    bin_size = (
-        int(iterator)
-        if isinstance(iterator, (int, _numpy.integer)) and int(iterator) > 0
-        else None
-    )
-
-    # ceil(total_bp / max_procs): target bp per worker.
-    target_bp = max(1, -(-total_bp // max_procs))
-
-    # Tile the scope into sub-intervals in original row order, each tagged with
-    # its parent (original) row index.
-    subs: list[tuple[Any, int, int, int]] = []
-    for i in range(len(chrom_col)):
-        c = chrom_col[i]
-        s = int(start_col[i])
-        e = int(end_col[i])
-        if e <= s or bin_size is None or (e - s) <= target_bp:
-            subs.append((c, s, e, i))
-            continue
-        # Split [s, e) into bin-aligned pieces of ~target_bp.
-        step = max(bin_size, (target_bp // bin_size) * bin_size)
-        cur = s
-        while cur < e:
-            nxt = cur + step
-            if nxt < e:
-                nxt = (nxt // bin_size) * bin_size  # align down to a bin boundary
-                if nxt <= cur:
-                    nxt = cur + step
-            else:
-                nxt = e
-            subs.append((c, cur, min(nxt, e), i))
-            cur = nxt
-
-    if len(subs) < 2:
-        return None
-
-    # Partition the ordered sub-intervals into <= max_procs contiguous,
-    # bp-balanced runs (preserves original order on concatenation).
-    n_workers = min(max_procs, len(subs))
-    runs: list[list[tuple[Any, int, int, int]]] = [[] for _ in range(n_workers)]
-    run_bp = [0] * n_workers
-    w = 0
-    for sub in subs:
-        runs[w].append(sub)
-        run_bp[w] += max(0, sub[2] - sub[1])
-        if run_bp[w] >= target_bp and w < n_workers - 1:
-            w += 1
-    runs = [r for r in runs if r]
-
-    if len(runs) < 2:
-        return None  # everything landed in one run -> serial is just as fast
-
-    worker_config = dict(config)
-    worker_config["progress"] = False
-    worker_config["multitasking"] = False  # workers must not fork again
-
-    worker_args = []
-    run_parent_maps = []
-    for r in runs:
-        chunk_dict = {
-            "chrom": [x[0] for x in r],
-            "start": [x[1] for x in r],
-            "end": [x[2] for x in r],
-        }
-        worker_args.append((chunk_dict, exprs, iterator, worker_config, vtracks_dict))
-        run_parent_maps.append(_numpy.array([x[3] for x in r], dtype=_numpy.int64))
-
-    results, dead = _run_forked(_worker_extract_chunk, worker_args)
-    # A worker that died would leave its rows out of the result: as the C++ scanner reports a kid
-    if dead:
-        raise RuntimeError(_dead_worker_message(dead))
-
-    dfs = []
-    for df, parent_map in zip(results, run_parent_maps, strict=False):
-        if df is not None and len(df) > 0:
-            if "intervalID" in df.columns:
-                # C++ intervalID is 1-based within the run -> the run's k-th
-                # sub-interval -> its parent row -> original global 1-based id.
-                local_ids = df["intervalID"].to_numpy()
-                df = df.copy()
-                df["intervalID"] = parent_map[local_ids - 1] + 1
-            dfs.append(df)
-    if not dfs:
-        return _pandas.DataFrame()
-    return _pandas.concat(dfs, ignore_index=True)
 
 
 # The first suggestion of gextract's error for a result over CONFIG['max_data_size'], as R misha's
@@ -3259,68 +3076,45 @@ def gextract(
     # Check if vtracks can go through C++ path
     cpp_vtracks_extract = used_vtracks and _can_vtracks_use_cpp(used_vtracks) and not all_user_vars
 
-    def extract_frame(scope, id_map, mt_map, prog, allow_parallel):
+    def extract_frame(scope, id_map, prog, allow_parallel):
         """The rows of the expressions over *scope* (a scope after the iterator preprocessing
         above), in the order of the scan, their intervalID mapped through *id_map*, or None if
-        there are none. *mt_map* is the id map of a DataFrame iterator, which keeps the scan in
-        one process; *allow_parallel*: whether the Python fork paths may be used."""
+        there are none. *allow_parallel*: whether the Python fork paths may be used."""
 
         if (not used_vtracks and not all_user_vars) or cpp_vtracks_extract:
             vtracks_dict = _build_vtracks_dict(used_vtracks) if cpp_vtracks_extract else None
-            # Try parallel extraction if max_processes > 1.
-            # Skip when a custom progress callback is provided (not compatible
-            # with forked workers) or when file output is requested.
-            # Resolve the strategy before entering _config_no_mt: track-parallel is
-            # worth forking even when the iterator came in as a DataFrame, which
-            # otherwise pins the whole extraction to one process.
-            strategy = _resolve_parallel_strategy(
-                str(CONFIG.get("multitasking_strategy", "auto")),
-                n_exprs=len(exprs),
-                iterator=iterator,
-            )
-            track_parallel = strategy == "tracks" and not _tracks_workload_too_small_for_fork(
-                scope, len(exprs), CONFIG
-            )
-            with _config_no_mt(mt_map, keep=track_parallel) as _cfg:
-                df = None
-                # Mirror the C++ gate, which divides the scope by the same
-                # core-clamped worker count it would actually fork.
-                _max_procs = _effective_max_procs(_cfg)
-                use_parallel = (
-                    _config_multitasking(_cfg)
-                    and _max_procs > 1
-                    and not callable(prog)
-                    and allow_parallel
-                    and (
-                        track_parallel
-                        or not _workload_too_small_for_fork(scope, _max_procs, _cfg)
-                    )
+            # The track-parallel strategy forks Python workers, each extracting some of the
+            # expressions; otherwise (the tiles strategy) the C++ scan forks, as R misha's,
+            # whatever the iterator: its kids return the rows of one process, intervalIDs included.
+            # Not with a custom progress callback, which a forked worker cannot call, or for a
+            # part of a file= output.
+            df = None
+            if (
+                _resolve_parallel_strategy(
+                    str(CONFIG.get("multitasking_strategy", "auto")),
+                    n_exprs=len(exprs),
+                    iterator=iterator,
+                    n_intervals=len(scope),
+                ) == "tracks"
+                and _config_multitasking(CONFIG)
+                and _effective_max_procs(CONFIG) > 1
+                and not callable(prog)
+                and allow_parallel
+            ):
+                df = _parallel_extract_tracks(
+                    exprs, scope, iterator, CONFIG, vtracks_dict=vtracks_dict,
                 )
-                if use_parallel:
-                    if track_parallel:
-                        df = _parallel_extract_tracks(
-                            exprs, scope, iterator, _cfg, vtracks_dict=vtracks_dict,
-                        )
-                    if df is None:
-                        df = _parallel_extract(exprs, scope, iterator, _cfg, vtracks_dict=vtracks_dict)
 
-                if df is None:
-                    with _progress_context(prog, desc=progress_desc):
-                        # The C++ scanner cannot fork under a DataFrame-derived
-                        # iterator: intervalIDs are sequential indices into the
-                        # intersected scope and _remap_interval_ids relies on that.
-                        _serial_cfg = _cfg
-                        if mt_map is not None and _config_multitasking(_cfg):
-                            _serial_cfg = dict(_cfg)
-                            _serial_cfg["multitasking"] = False
-                        result = _pymisha.pm_extract(
-                            exprs,
-                            _df2pymisha(scope),
-                            iterator,
-                            _serial_cfg,
-                            vtracks_dict,
-                        )
-                    df = _pymisha2df(result)
+            if df is None:
+                with _progress_context(prog, desc=progress_desc):
+                    result = _pymisha.pm_extract(
+                        exprs,
+                        _df2pymisha(scope),
+                        iterator,
+                        CONFIG,
+                        vtracks_dict,
+                    )
+                df = _pymisha2df(result)
             df = _remap_interval_ids(df, id_map)
             if colnames is not None and df is not None and isinstance(df, _pandas.DataFrame):
                 # Build rename map: old expression columns -> new names
@@ -3339,8 +3133,7 @@ def gextract(
             if iterator is None and used_vtracks:
                 _check_dense_bin_sizes(exprs, used_vtracks)
             track_exprs = list(used_tracks)
-            with _config_no_mt(mt_map) as _cfg:
-                base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(scope), iterator, _cfg)
+            base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(scope), iterator, CONFIG)
             base_df = _pymisha2df(base_result)
             if base_df is None:
                 raise RuntimeError("Failed to extract physical track values for mixed expression")
@@ -3489,14 +3282,14 @@ def gextract(
             binsize = _implicit_binsize(exprs)
         _extract_to_file(
             # as before, a part is not split between Python workers; the C++ scan may fork
-            lambda scope, id_map: extract_frame(scope, id_map, _itr_id_map, False, False),
+            lambda scope, id_map: extract_frame(scope, id_map, False, False),
             intervals, iterator, binsize, _itr_id_map,
             input_intervals_for_join if isinstance(input_intervals_for_join, pd.DataFrame) else None, file,
             list(colnames) if colnames is not None else exprs, parquet_kw, progress, progress_desc,
         )
         return None
 
-    df = extract_frame(intervals, _itr_id_map, _itr_id_map, progress, True)
+    df = extract_frame(intervals, _itr_id_map, progress, True)
     return _apply_extract_output(
         df, intervals_set_out, is_2d=False,
         intervals_join=intervals_join,
@@ -3792,12 +3585,12 @@ def gscreen(
 
     if (not expr_vtracks and not user_vars) or cpp_vtracks:
         vtracks_dict = _build_vtracks_dict(expr_vtracks) if cpp_vtracks else None
-        with _config_no_mt(_scr_id_map) as _cfg, _progress_context(progress, desc=progress_desc):
+        with _progress_context(progress, desc=progress_desc):
             result = _pymisha.pm_screen(
                 expr,
                 _df2pymisha(intervals),
                 iterator,
-                _cfg,
+                CONFIG,
                 vtracks_dict,
             )
         return _pymisha2df(result)
@@ -3810,8 +3603,7 @@ def gscreen(
         if iterator is None and expr_vtracks:
             _check_dense_bin_sizes([expr], expr_vtracks)
         track_exprs = list(expr_tracks)
-        with _config_no_mt(_scr_id_map) as _cfg:
-            base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, _cfg)
+        base_result = _pymisha.pm_extract(track_exprs, _df2pymisha(intervals), iterator, CONFIG)
         base_df = _pymisha2df(base_result)
         if base_df is None:
             raise RuntimeError("Failed to extract physical track values for mixed expression")

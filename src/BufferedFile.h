@@ -92,8 +92,14 @@ protected:
 	int64_t     m_sbuf_pos;
 	int64_t     m_ebuf_pos;
 	bool        m_writable{false};
+	pid_t       m_pid{0};    // the process that opened the file
 
 	void init(unsigned bufsize);
+
+	// A forked kid that reads a file its parent opened shares the file offset with the parent and
+	// the other kids, and a read of one moves it under the others (R misha #153). The kid reads
+	// through a descriptor of its own instead.
+	void reopen_in_kid();
 
 private:
 	static char s_write_error[1000];
@@ -165,6 +171,8 @@ inline uint64_t BufferedFile::read(void *ptr, uint64_t size)
     }
 
     // we must perform a new read
+    if (m_pid != getpid())
+        reopen_in_kid();
     if (m_phys_pos != m_virt_pos)
         fseeko(m_fp, m_virt_pos, SEEK_SET);
 

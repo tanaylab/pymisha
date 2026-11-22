@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.22.0 (2026-11-22)
+
+### Breaking
+
+* `CONFIG["min_intervs4process"]` and `CONFIG["min_processes"]` are removed; R misha has neither floor. `CONFIG["max_processes"]` defaults to R misha's `gmax.processes`, 70% of the cores between 1 and 32 (it was at least 4): a host of 5 cores or fewer forks fewer processes, and `max_processes = 1` means one process.
+
+### Performance
+
+* Multitasking works as in R misha, and whole-genome calls use it: the scope is split among up to `min(2 x cores, max_processes)` processes by chromosome, or, with a bin size as the iterator, into ranges of at least 500 kb and 50,000 bins; each process hands its result over in shared memory, and the rows come back in the order of one process. `CONFIG["min_scope4process"]` defaults to R's 10,000 bp (it was 1e9 bp per process, which kept every hg38 call in one process). The processes do not call into Python; they evaluate expressions of track and virtual track names, numbers, `+ - * /`, comparisons and `& |` themselves, and any other expression runs in one process. A DataFrame iterator no longer keeps `gsummary`, `gquantiles`, `gdist`, `gscreen`, `glookup` and the functions built on `gextract` in one process. Where the processes' shared memory cannot be mapped, the call runs in one process (R misha reports an error, except in `gextract` and `gscreen`). hg38 on 128 cores, 10.7 million 300 bp bins, a filtered `avg` virtual track: `gextract` 2.7 s -> 0.6 s (R 0.9 s), `gsummary` 2.1 s -> 0.2 s (R 0.5 s), with ±1 kb shifts `gextract` 6.0 s -> 0.7 s (R 1.6 s); `kmer.count` over chr1 and chr2 in 50 bp bins: `gextract` 5.9 s -> 0.7 s (R 0.9 s), `gsummary` 5.3 s -> 0.3 s (R 0.5 s). The rows and values are those of one process, except the sum, mean and standard deviation of `gsummary` and Pearson's `gcor`, merged across the processes in R's order (here `gsummary`'s now equal R's to the last digit).
+* `gextract` builds its `chrom` column about 8 times faster (0.4 s less on 10.7 million rows).
+* `gtrack_create` multitasks as R misha's `gtrack.create`: each process writes the files of whole chromosomes, which are the same bytes one process writes. pymisha does so on an indexed database too, whose track it converts after (R writes it in one process). hg38 on 128 cores: `tn5bias * 2` in 300 bp bins 1.6 s -> 0.18 s (R 0.4 s); with a DataFrame iterator of 500,000 intervals 0.6 s -> 0.44 s (R 0.4 s).
+* A virtual track with a filter (`gvtrack_filter`) is computed in the C++ scanner, as R computes it: the mask is subtracted from each iterator interval after the shifts, and the function computed over the parts left. This holds for `gextract`, `gscreen`, `gsummary`, `gquantiles`, `gdist`, `gextract_variants`, the functions built on `gextract`, and `gtrack_create`, which refused such a virtual track. hg38, 10.7 million 300 bp bins under the 748,000 LTR intervals, `avg` of a dense track: `gextract` 13 s and 3.1 GB -> 2.8 s and 1.7 GB, `gsummary` 26 minutes -> 2 s; `kmer.count` over 9.8 million 50 bp bins: `gextract` 59 s -> 6 s, `gsummary` 26 minutes -> 6 s. The values are unchanged, except `lse` of a track, which merges the log-sum-exps of the unmasked parts as R does (a relative difference of up to 1e-7).
+
+### Fixes
+
+* `neighbor.count` of a virtual track with a filter counts each source interval once, as R misha. A source interval near several unmasked parts of an iterator interval was counted once per part.
+* `gscreen` of a track or virtual track name raises R misha's error ("does not produce a logical result") instead of crashing Python.
+* `gintervals_summary` and `gpartition` run in one process, as in R misha.
+
 ## v0.21.1 (2026-11-20)
 
 ### Tests

@@ -58,8 +58,7 @@ def test_range_split_gives_every_process_its_share_the_last_one_too():
 
 def test_multitask_gextract_returns_the_data_frame_of_the_serial_path_1d_and_2d():
     saved = dict(pm.CONFIG)
-    pm.CONFIG.update(progress=False, max_processes=8, min_processes=8, min_scope4process=1,
-                     min_intervs4process=0)
+    pm.CONFIG.update(progress=False, max_processes=8, min_scope4process=1)
     sizes = {"1": 500000, "2": 300000, "X": 200000}
     # 22 intervals that do not touch, so that the scope is split between processes
     big = pd.concat([pm.gintervals(c, np.arange(0, n - 40000, 41000), np.arange(0, n - 40000, 41000) + 40000)
@@ -191,8 +190,7 @@ def config():
 def _serial_and_parallel(config, f, kids):
     config.update(multitasking=False)
     serial = f()
-    config.update(multitasking=True, max_processes=kids, min_processes=kids,
-                  min_scope4process=0, min_intervs4process=0)
+    config.update(multitasking=True, max_processes=kids, min_scope4process=0)
     parallel = f()
     return serial, parallel
 
@@ -276,13 +274,10 @@ _FORK_PRELUDE = textwrap.dedent("""
     import pandas as pd
     import pymisha as pm
     pm.gdb_init(sys.argv[1])
-    pm.CONFIG.update(multitasking=True, max_processes=4, min_processes=4, min_scope4process=1,
-                     min_intervs4process=0, progress=False)
-    # 8 intervals that do not touch (touching ones would be merged into one per chromosome):
-    # as many processes as max_processes, up to 8
-    SCOPE = pd.DataFrame({"chrom": ["1"] * 5 + ["2"] * 3,
-                          "start": [0, 100000, 200000, 300000, 400000, 0, 100000, 200000],
-                          "end": [90000, 190000, 290000, 390000, 490000, 90000, 190000, 290000]})
+    pm.CONFIG.update(multitasking=True, max_processes=4, min_scope4process=1, progress=False)
+    # The scope is split by chromosome, as R misha splits it: a process per chromosome, up to
+    # max_processes (3 processes with max_processes 4, 2 with 2)
+    SCOPE = pm.gintervals_all()
 
     def fork_warnings(f):
         with warnings.catch_warnings(record=True) as w:
@@ -323,7 +318,7 @@ def test_session_holding_much_memory_in_4k_pages_is_warned_once():
     assert _counts(out, "EXTRACT") == [0]
     text = " ".join(line for line in out if line.startswith("TEXT "))
     assert "This Python session holds 64.0 GB of memory in 4 KB pages" in text
-    assert "Each of the 4 processes" in text
+    assert "Each of the 3 processes" in text
     assert "max_processes" in text
     assert "once per session" in text
 
@@ -332,7 +327,7 @@ def test_no_fork_cost_warning_for_a_small_session_few_gb_or_no_multitasking():
     call = 'print("N", fork_warnings(lambda: pm.gsummary("dense_track", SCOPE)))\n'
     # this session, as it is: small
     assert _counts(_run_fresh(call), "N") == [0]
-    # 8 GB in 4 KB pages with 4 processes: forks of about a second, below the threshold
+    # 8 GB in 4 KB pages with 3 processes: forks of about a second, below the threshold
     assert _counts(_run_fresh(call, "8000000000"), "N") == [0]
     # nothing is forked
     assert _counts(_run_fresh("pm.CONFIG['multitasking'] = False\n" + call, "64000000000"), "N") == [0]
@@ -341,11 +336,12 @@ def test_no_fork_cost_warning_for_a_small_session_few_gb_or_no_multitasking():
 def test_fork_cost_warning_is_shown_by_a_call_that_then_fails_and_not_again():
     # R queues the warning with the call's diagnostics, which a failed call drops, so there
     # the next call warns. pymisha raises it before forking, so the failing call shows it.
-    # The expression fails in every kid: the arrays it reads hold fewer than 10^9 values.
+    # The extraction fails in the kids: their rows exceed max_data_size.
     out = _run_fresh("""
         def failing():
             try:
-                pm.gsummary("dense_track[1000000000]", SCOPE)
+                pm.CONFIG["max_data_size"] = 1000
+                pm.gextract("dense_track", SCOPE)
             except Exception as e:
                 print("FAILED", type(e).__name__)
                 return
@@ -359,19 +355,20 @@ def test_fork_cost_warning_is_shown_by_a_call_that_then_fails_and_not_again():
 
 
 def test_session_checked_with_few_processes_is_checked_again_with_more():
-    # 50 GB of anonymous memory, 30 GB of it in huge pages: 20 GB in 4 KB pages, below the
-    # threshold (GB x processes of 128) with 4 processes and above it with 8. The first call
+    # 80 GB of anonymous memory, 30 GB of it in huge pages: 50 GB in 4 KB pages, below the
+    # threshold (GB x processes of 128) with 2 processes and above it with 3. The first call
     # reads how much is in huge pages; the second must not reuse its verdict.
     out = _run_fresh("""
+        pm.CONFIG.update(max_processes=2)
         print("FEW", fork_warnings(lambda: pm.gsummary("dense_track", SCOPE)))
-        pm.CONFIG.update(max_processes=8, min_processes=8)
+        pm.CONFIG.update(max_processes=4)
         print("MORE", fork_warnings(lambda: pm.gsummary("dense_track", SCOPE)))
-    """, "50000000000,30000000000")
+    """, "80000000000,30000000000")
     assert _counts(out, "FEW") == [0], out
     assert _counts(out, "MORE") == [1], out
     text = " ".join(line for line in out if line.startswith("TEXT "))
-    assert "holds 20.0 GB of memory in 4 KB pages" in text
-    assert "Each of the 8 processes" in text
+    assert "holds 50.0 GB of memory in 4 KB pages" in text
+    assert "Each of the 3 processes" in text
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +614,7 @@ def test_gquantiles_finds_a_high_percentile_as_fast_as_a_low_one(tmp_path):
     pm.gdb_init(db)
     saved = dict(pm.CONFIG)
     try:
-        pm.CONFIG.update(progress=False, max_data_size=int(1e10), multitasking=True, min_scope4process=1,
-                         min_intervs4process=0)
+        pm.CONFIG.update(progress=False, max_data_size=int(1e10), multitasking=True, min_scope4process=1)
         rng = np.random.default_rng(60427)
         for chrom, size in sizes:
             starts = np.arange(0, size, 20)

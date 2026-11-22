@@ -4,6 +4,7 @@
 #include "pymisha.h"
 #include "PMDataFrame.h"
 #include "PMDirectAccumulator.h"
+#include "PMMultitask.h"
 #include "PMDb.h"
 #include "PMTrackExpressionScanner.h"
 #include "PMTrackExpressionIterator.h"
@@ -1075,11 +1076,6 @@ PyObject *pm_dbunload(PyObject *self, PyObject *args)
 //  Range-based interval splitting for intra-chromosome parallelization
 // ---------------------------------------------------------------------------
 
-struct SplitInterval {
-    GInterval interval;
-    uint64_t original_idx;  // 0-based index into original intervals vector
-};
-
 // Port of R misha's split_intervals_1d_by_range: walk intervals linearly,
 // accumulate range per worker, split individual intervals at bin-aligned
 // boundaries.
@@ -1239,10 +1235,8 @@ PyObject *pm_split_by_range_shares(PyObject *self, PyObject *args)
     }
 }
 
-static void extract_sub_intervals(
-    const std::vector<SplitInterval> &split,
-    std::vector<GInterval> &sub,
-    std::vector<uint64_t> *id_remap = nullptr)
+void extract_sub_intervals(const std::vector<SplitInterval> &split, std::vector<GInterval> &sub,
+                           std::vector<uint64_t> *id_remap)
 {
     sub.clear();
     sub.reserve(split.size());
@@ -1257,57 +1251,103 @@ static void extract_sub_intervals(
     }
 }
 
-// Forward declaration (defined later)
-static int choose_num_kids(uint64_t num_intervals, int64_t total_scope_bp = -1);
-
 static int64_t total_intervals_scope(const std::vector<GInterval> &intervals) {
     int64_t total = 0;
     for (const auto &iv : intervals) total += iv.end - iv.start;
     return total;
 }
 
-static int choose_num_kids_for_range(size_t num_intervals, int64_t total_range, int64_t bin_size)
+// See PMMultitask.h
+std::vector<std::vector<SplitInterval>> plan_kids(const std::vector<GInterval> &intervals, int64_t range_split_bin,
+                                                  int64_t iterator_policy)
 {
-    if (!g_pymisha->multitasking_avail())
-        return 0;
+    std::vector<std::vector<SplitInterval>> kids;
+    if (!g_pymisha->multitasking_avail() || intervals.empty())
+        return kids;
 
-    int hw = std::thread::hardware_concurrency();
-    int max_p = g_pymisha->max_processes();
-    int min_p = g_pymisha->min_processes();
-    int target = std::clamp(hw ? hw : max_p, min_p, max_p);
+    const int64_t num_cores = std::max(1L, sysconf(_SC_NPROCESSORS_ONLN));
+    const int max_kids = (int)std::min<int64_t>(std::min<int64_t>(2 * num_cores, g_pymisha->max_processes()), MAX_KIDS);
+    if (max_kids < 2)
+        return kids;
 
-    // Range-based: at least 50000 bins per worker.
-    int64_t total_bins = (total_range + bin_size - 1) / bin_size;
-    int64_t min_bins_per_kid = 50000;
-    int desired = std::min((int64_t)target, (total_bins + min_bins_per_kid - 1) / min_bins_per_kid);
-    if (desired < 1) desired = 1;
+    int64_t range = total_intervals_scope(intervals);
+    const uint64_t min_scope = g_pymisha->min_scope4process();
 
-    int count_based = choose_num_kids(num_intervals, total_range);
+    if (range_split_bin > 0) {
+        // Below 500 kb a kid's share takes less time than the kid costs (R misha)
+        const uint64_t scope_floor = std::max<uint64_t>(min_scope, 500000);
+        const uint64_t total_bins = (uint64_t)((range + range_split_bin - 1) / range_split_bin);
+        const uint64_t by_bins = std::max<uint64_t>(1, (total_bins + 49999) / 50000);
+        if ((uint64_t)range > scope_floor) {
+            uint64_t by_scope = ((uint64_t)range + scope_floor - 1) / scope_floor;
+            int desired = (int)std::min<uint64_t>(max_kids, std::min(by_scope, by_bins));
+            if (desired >= 2)
+                split_intervals_by_range(intervals, desired, range_split_bin, kids);
+        }
+    } else {
+        // the chromosomes' runs in the scope
+        int num_chroms = 1;
+        for (size_t i = 1; i < intervals.size(); ++i) {
+            if (!iterator_policy && intervals[i].chromid < intervals[i - 1].chromid)
+                return kids;
+            num_chroms += intervals[i].chromid != intervals[i - 1].chromid;
+        }
+        int num_avail_kids = std::min(max_kids, num_chroms) - 1;
+        int num_remaining_chroms = num_chroms - 1;
+        int64_t kid_range = 0;
 
-    int result = std::max(count_based, (int)desired);
-    if (result < 2)
-        return 0;
+        kids.emplace_back();
+        for (size_t i = 0; i < intervals.size(); ++i) {
+            if (i && intervals[i].chromid != intervals[i - 1].chromid && num_avail_kids) {
+                int64_t chrom_range = 0;
+                for (size_t j = i; j < intervals.size() && intervals[j].chromid == intervals[i].chromid; ++j)
+                    chrom_range += intervals[j].end - intervals[j].start;
 
-    // Scope floor: also require each kid sees min_scope4process bp on the
-    // range-based path. Without this, dense scans on small scopes pay
-    // fork+IPC cost that exceeds the parallel compute win.
-    uint64_t min_scope = g_pymisha->min_scope4process();
-    if (min_scope > 0 && total_range > 0) {
-        uint64_t scope_per_kid = (uint64_t)total_range / (uint64_t)result;
-        if (scope_per_kid < min_scope)
-            return 0;
+                if ((uint64_t)kid_range > min_scope && (uint64_t)range > min_scope &&
+                    (uint64_t)(kid_range + chrom_range) >= (uint64_t)(range / num_avail_kids)) {
+                    --num_avail_kids;
+                    kid_range = 0;
+                    kids.emplace_back();
+                }
+                --num_remaining_chroms;
+                num_avail_kids = std::min(num_avail_kids, num_remaining_chroms);
+            }
+            const int64_t interv_range = intervals[i].end - intervals[i].start;
+            kid_range += interv_range;
+            range -= interv_range;
+            kids.back().push_back({intervals[i], (uint64_t)i});
+        }
     }
 
-    return std::min(result, target);
+    if (kids.size() < 2)
+        kids.clear();
+    return kids;
+}
+
+// The number of bins a fixed-bin iterator (iterator_policy > 0) gives over intervals, as R misha's
+// estimate_fixed_bin_bins(); 0 for any other iterator
+static uint64_t estimate_fixed_bins(const std::vector<GInterval> &intervals, int64_t iterator_policy)
+{
+    if (iterator_policy <= 0)
+        return 0;
+    uint64_t bins = 0;
+    for (const GInterval &interval : intervals) {
+        int64_t start_bin = (int64_t)floor(interval.start / (double)iterator_policy);
+        int64_t end_bin = (int64_t)ceil(interval.end / (double)iterator_policy);
+        if (end_bin > start_bin)
+            bins += (uint64_t)(end_bin - start_bin);
+    }
+    return bins;
+}
+
+// The scope's row (1-based) of the current interval of a kid's scan, from its intervals' rows
+static inline uint64_t scope_row_id(const PMTrackExprScanner &scanner, const std::vector<uint64_t> &ids)
+{
+    uint64_t local_id = scanner.last_interval_id();
+    return local_id >= 1 && local_id <= ids.size() ? ids[local_id - 1] + 1 : local_id;
 }
 
 // ---------------------------------------------------------------------------
-
-struct ExtractResult {
-    std::vector<GInterval> intervals;
-    std::vector<std::vector<double>> values;
-    std::vector<uint64_t> interval_ids;
-};
 
 static PyObject *get_progress_cb(PyObject *py_config)
 {
@@ -1396,213 +1436,108 @@ long parse_iterator_policy(PyObject *py_iterator, long default_policy, const cha
     return default_policy;
 }
 
-static ExtractResult run_extract(const std::vector<std::string> &exprs,
-                                 const std::vector<GInterval> &intervals,
-                                 long iterator_policy,
-                                 uint64_t interval_id_offset,
-                                 PyObject *progress_cb,
-                                 const std::vector<uint64_t> *id_remap = nullptr,
-                                 PyObject *py_vtracks = nullptr)
-{
-    ExtractResult result;
-    if (intervals.empty()) {
-        return result;
-    }
-
-    PMTrackExprScanner scanner;
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
-
-    result.values.assign(exprs.size(), {});
-
-    uint64_t est_size = scanner.get_iterator()->size();
-    if (est_size > 0) {
-        result.intervals.reserve(est_size);
-        for (auto &v : result.values) {
-            v.reserve(est_size);
-        }
-        result.interval_ids.reserve(est_size);
-    }
-
-    for (; !scanner.isend(); scanner.next()) {
-        result.intervals.push_back(scanner.last_interval());
-
-        for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
-            result.values[iexpr].push_back(scanner.vdouble(iexpr));
-        }
-
-        if (id_remap) {
-            uint64_t local_id = scanner.last_interval_id();
-            if (local_id >= 1 && local_id <= (uint64_t)id_remap->size()) {
-                result.interval_ids.push_back((*id_remap)[local_id - 1] + 1);
-            } else {
-                result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
-            }
-        } else {
-            result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
-        }
-
-        g_pymisha->verify_max_data_size(result.intervals.size(), "Result", "rows");
-        check_interrupt();
-    }
-
-    return result;
-}
-
 // Direct-to-NumPy extract: scans directly into PMDirectAccumulator,
 // bypassing intermediate std::vector storage and the PMDataFrame copy.
 static void run_extract_direct(PMDirectAccumulator &acc,
-                               const std::vector<std::string> &exprs,
+                               PMTrackExprScanner &scanner,
+                               size_t num_exprs,
                                const std::vector<std::string> &colnames,
-                               const std::vector<GInterval> &intervals,
-                               long iterator_policy,
-                               uint64_t interval_id_offset,
-                               PyObject *progress_cb,
-                               const std::vector<uint64_t> *id_remap = nullptr,
-                               PyObject *py_vtracks = nullptr)
+                               const std::vector<GInterval> &intervals)
 {
     if (intervals.empty()) {
         return;
     }
 
-    PMTrackExprScanner scanner;
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
+    scanner.start(intervals);
 
     uint64_t est_size = scanner.get_iterator()->size();
     acc.init(est_size, colnames);
 
     // Temporary buffer for per-row expression values
-    std::vector<double> row_values(exprs.size());
+    std::vector<double> row_values(num_exprs);
 
     for (; !scanner.isend(); scanner.next()) {
         const GInterval &interval = scanner.last_interval();
 
-        for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
+        for (size_t iexpr = 0; iexpr < num_exprs; ++iexpr) {
             row_values[iexpr] = scanner.vdouble(iexpr);
         }
 
-        uint64_t interval_id;
-        if (id_remap) {
-            uint64_t local_id = scanner.last_interval_id();
-            if (local_id >= 1 && local_id <= (uint64_t)id_remap->size()) {
-                interval_id = (*id_remap)[local_id - 1] + 1;
-            } else {
-                interval_id = scanner.last_interval_id() + interval_id_offset;
-            }
-        } else {
-            interval_id = scanner.last_interval_id() + interval_id_offset;
-        }
-
         acc.write_row(interval.chromid, interval.start, interval.end,
-                      row_values.data(), interval_id);
+                      row_values.data(), scanner.last_interval_id());
 
         g_pymisha->verify_max_data_size(acc.size(), "Result", "rows");
         check_interrupt();
     }
 }
 
-// Sort accumulator in-place by (intervalID, chromid, start, end)
-static void sort_accumulator(PMDirectAccumulator &acc)
+// The result size of a kid of gextract: a row is start, end, intervalID, the values, chromid
+static inline uint64_t extract_kid_row_size(size_t num_exprs)
 {
-    const size_t n = acc.num_rows();
-    if (n <= 1) return;
-
-    int32_t *chromids = acc.chromids();
-    int64_t *starts = acc.starts();
-    int64_t *ends = acc.ends();
-    long *ids = acc.interval_ids();
-    size_t num_expr = acc.num_expr_cols();
-
-    // Build sort order
-    std::vector<size_t> order(n);
-    for (size_t i = 0; i < n; ++i) order[i] = i;
-
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        if (ids[a] != ids[b]) return ids[a] < ids[b];
-        if (chromids[a] != chromids[b]) return chromids[a] < chromids[b];
-        if (starts[a] != starts[b]) return starts[a] < starts[b];
-        return ends[a] < ends[b];
-    });
-
-    // Check if already sorted
-    bool already_sorted = true;
-    for (size_t i = 0; i < n; ++i) {
-        if (order[i] != i) { already_sorted = false; break; }
-    }
-    if (already_sorted) return;
-
-    // Apply permutation in-place using temporary buffers
-    // Chromids
-    {
-        std::vector<int32_t> tmp(n);
-        for (size_t i = 0; i < n; ++i) tmp[i] = chromids[order[i]];
-        std::memcpy(chromids, tmp.data(), n * sizeof(int32_t));
-    }
-    // Starts
-    {
-        std::vector<int64_t> tmp(n);
-        for (size_t i = 0; i < n; ++i) tmp[i] = starts[order[i]];
-        std::memcpy(starts, tmp.data(), n * sizeof(int64_t));
-    }
-    // Ends
-    {
-        std::vector<int64_t> tmp(n);
-        for (size_t i = 0; i < n; ++i) tmp[i] = ends[order[i]];
-        std::memcpy(ends, tmp.data(), n * sizeof(int64_t));
-    }
-    // Values
-    for (size_t iexpr = 0; iexpr < num_expr; ++iexpr) {
-        double *vals = acc.values(iexpr);
-        std::vector<double> tmp(n);
-        for (size_t i = 0; i < n; ++i) tmp[i] = vals[order[i]];
-        std::memcpy(vals, tmp.data(), n * sizeof(double));
-    }
-    // IntervalIDs
-    {
-        std::vector<long> tmp(n);
-        for (size_t i = 0; i < n; ++i) tmp[i] = ids[order[i]];
-        std::memcpy(ids, tmp.data(), n * sizeof(long));
-    }
+    return 3 * sizeof(int64_t) + num_exprs * sizeof(double) + sizeof(int32_t);
 }
 
-static PMPY build_extract_df(const std::vector<std::string> &exprs,
+// gextract over the kids of plan (the scanner prepared, the shared memory too): each kid hands over
+// its rows by columns, and the parent puts them one after another in kid order, which is the order
+// of one process
+static void run_extract_kids(PMDirectAccumulator &acc,
+                             PMTrackExprScanner &scanner,
+                             size_t num_exprs,
                              const std::vector<std::string> &colnames,
-                             const ExtractResult &result)
+                             const std::vector<std::vector<SplitInterval>> &plan)
 {
-    size_t num_cols = 3 + exprs.size() + 1;  // chrom, start, end + exprs + intervalID
-    PMDataFrame df(result.intervals.size(), num_cols, "intervals");
+    static_assert(sizeof(long) == sizeof(int64_t), "intervalID is a long");
+    fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
+        std::vector<int64_t> starts, ends, row_ids;
+        std::vector<int32_t> chromids;
+        std::vector<std::vector<double>> values(num_exprs);
 
-    df.init_col(0, "chrom", PMDataFrame::STR);
-    df.init_col(1, "start", PMDataFrame::LONG);
-    df.init_col(2, "end", PMDataFrame::LONG);
-
-    for (size_t i = 0; i < exprs.size(); ++i) {
-        df.init_col(3 + i, colnames[i].c_str(), PMDataFrame::DOUBLE);
-    }
-
-    df.init_col(3 + exprs.size(), "intervalID", PMDataFrame::LONG);
-
-    const GenomeChromKey &chromkey = g_pmdb->chromkey();
-    for (size_t i = 0; i < result.intervals.size(); ++i) {
-        df.val_str(i, 0, chromkey.id2chrom(result.intervals[i].chromid).c_str());
-        df.val_long(i, 1, result.intervals[i].start);
-        df.val_long(i, 2, result.intervals[i].end);
-
-        for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
-            df.val_double(i, 3 + iexpr, result.values[iexpr][i]);
+        for (scanner.start(sub); !scanner.isend(); scanner.next()) {
+            const GInterval &interval = scanner.last_interval();
+            starts.push_back(interval.start);
+            ends.push_back(interval.end);
+            chromids.push_back(interval.chromid);
+            row_ids.push_back((int64_t)scope_row_id(scanner, ids));
+            for (size_t iexpr = 0; iexpr < num_exprs; ++iexpr)
+                values[iexpr].push_back(scanner.vdouble(iexpr));
+            g_pymisha->verify_max_data_size(starts.size(), "Result", "rows");
+            PyMisha::update_res_data_size(starts.size());
         }
 
-        df.val_long(i, 3 + exprs.size(), result.interval_ids[i]);
-    }
+        const size_t n = starts.size();
+        char *res = (char *)PyMisha::allocate_res(n);
+        auto pack = [&](const void *src, size_t bytes) {
+            if (bytes)
+                memcpy(res, src, bytes);
+            res += bytes;
+        };
+        pack(starts.data(), n * sizeof(int64_t));
+        pack(ends.data(), n * sizeof(int64_t));
+        pack(row_ids.data(), n * sizeof(int64_t));
+        for (size_t iexpr = 0; iexpr < num_exprs; ++iexpr)
+            pack(values[iexpr].data(), n * sizeof(double));
+        pack(chromids.data(), n * sizeof(int32_t));
+    });
 
-    return df.construct_py(true);
+    uint64_t total = 0;
+    for (size_t kid = 0; kid < plan.size(); ++kid)
+        total += PyMisha::get_kid_res_size(kid);
+    g_pymisha->verify_max_data_size(total, "Result", "rows");
+
+    acc.init(total, colnames);
+    std::vector<const double *> values(num_exprs);
+    for (size_t kid = 0; kid < plan.size(); ++kid) {
+        const size_t n = PyMisha::get_kid_res_size(kid);
+        const char *res = (const char *)PyMisha::get_kid_res(kid);
+        const int64_t *starts = (const int64_t *)res;
+        const int64_t *ends = starts + n;
+        const int64_t *row_ids = ends + n;
+        const double *vals = (const double *)(row_ids + n);
+        for (size_t iexpr = 0; iexpr < num_exprs; ++iexpr)
+            values[iexpr] = vals + iexpr * n;
+        const int32_t *chromids = (const int32_t *)(vals + num_exprs * n);
+        acc.append_rows(n, chromids, starts, ends, values.data(), row_ids);
+    }
 }
 
 static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
@@ -1636,23 +1571,15 @@ static PMPY build_intervals_df(const std::vector<GInterval> &intervals,
     return df.construct_py(true);
 }
 
-static std::vector<GInterval> compute_screen(const std::string &expr,
-                                             const std::vector<GInterval> &intervals,
-                                             long iterator_policy,
-                                             PyObject *progress_cb,
-                                             PyObject *py_vtracks = nullptr)
+// The intervals where the expression of scanner (prepared, LOGICAL_T) is true, over intervals: runs of
+// adjacent true iterator intervals are merged
+static std::vector<GInterval> compute_screen(PMTrackExprScanner &scanner, const std::vector<GInterval> &intervals)
 {
     std::vector<GInterval> out_intervals;
     if (intervals.empty())
         return out_intervals;
 
-    PMTrackExprScanner scanner;
-    std::vector<std::string> exprs = {expr};
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::LOGICAL_T, intervals, iterator_policy, py_vtracks);
+    scanner.start(intervals);
 
     GInterval prev_interval(-1, -1, -1);
     bool have_prev = false;
@@ -1670,6 +1597,8 @@ static std::vector<GInterval> compute_screen(const std::string &expr,
                 if (have_prev) {
                     out_intervals.push_back(prev_interval);
                     g_pymisha->verify_max_data_size(out_intervals.size(), "Result");
+                    if (PyMisha::is_kid())
+                        PyMisha::update_res_data_size(out_intervals.size());
                 }
                 prev_interval = cur_interval;
                 have_prev = true;
@@ -1678,6 +1607,8 @@ static std::vector<GInterval> compute_screen(const std::string &expr,
             if (have_prev) {
                 out_intervals.push_back(prev_interval);
                 g_pymisha->verify_max_data_size(out_intervals.size(), "Result");
+                if (PyMisha::is_kid())
+                    PyMisha::update_res_data_size(out_intervals.size());
                 have_prev = false;
             }
         }
@@ -1690,80 +1621,6 @@ static std::vector<GInterval> compute_screen(const std::string &expr,
     }
 
     return out_intervals;
-}
-
-static void merge_adjacent(std::vector<GInterval> &intervals)
-{
-    if (intervals.empty())
-        return;
-
-    std::vector<GInterval> merged;
-    merged.reserve(intervals.size());
-
-    GInterval current = intervals.front();
-    for (size_t i = 1; i < intervals.size(); ++i) {
-        const GInterval &next = intervals[i];
-        if (current.chromid == next.chromid && current.end == next.start) {
-            current.end = next.end;
-        } else {
-            merged.push_back(current);
-            current = next;
-        }
-    }
-    merged.push_back(current);
-    intervals.swap(merged);
-}
-
-static void sort_extract_result(ExtractResult &result)
-{
-    const size_t n = result.intervals.size();
-    if (n <= 1) {
-        return;
-    }
-
-    std::vector<size_t> order(n);
-    for (size_t i = 0; i < n; ++i) {
-        order[i] = i;
-    }
-
-    std::sort(order.begin(), order.end(), [&result](size_t a, size_t b) {
-        const uint64_t ida = result.interval_ids[a];
-        const uint64_t idb = result.interval_ids[b];
-        if (ida != idb) {
-            return ida < idb;
-        }
-        const GInterval &ia = result.intervals[a];
-        const GInterval &ib = result.intervals[b];
-        if (ia.chromid != ib.chromid) {
-            return ia.chromid < ib.chromid;
-        }
-        if (ia.start != ib.start) {
-            return ia.start < ib.start;
-        }
-        return ia.end < ib.end;
-    });
-
-    std::vector<GInterval> sorted_intervals;
-    std::vector<uint64_t> sorted_interval_ids;
-    sorted_intervals.reserve(n);
-    sorted_interval_ids.reserve(n);
-
-    std::vector<std::vector<double>> sorted_values(result.values.size());
-    for (auto &vals : sorted_values) {
-        vals.reserve(n);
-    }
-
-    for (size_t idx : order) {
-        sorted_intervals.push_back(result.intervals[idx]);
-        sorted_interval_ids.push_back(result.interval_ids[idx]);
-        for (size_t iexpr = 0; iexpr < result.values.size(); ++iexpr) {
-            sorted_values[iexpr].push_back(result.values[iexpr][idx]);
-        }
-    }
-
-    result.intervals.swap(sorted_intervals);
-    result.interval_ids.swap(sorted_interval_ids);
-    result.values.swap(sorted_values);
 }
 
 // Track extraction - main function
@@ -1821,145 +1678,23 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
                exprs.size(), intervals.size(), iterator_policy);
 
         PMDirectAccumulator acc;
+        PMTrackExprScanner scanner;
+        scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // A kid does not call into Python, so a scan that evaluates an expression in Python runs here
+        std::vector<std::vector<SplitInterval>> plan;
+        if (scanner.kid_can_scan())
+            plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
-        if (use_range_split) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, extract_kid_row_size(exprs.size()))) {
+            run_extract_kids(acc, scanner, exprs.size(), colnames, plan);
         } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
-
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            struct ExtractHeader {
-                uint64_t nrows;
-                uint64_t nexprs;
-            };
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    std::vector<uint64_t> id_remap;
-                    uint64_t id_offset = 0;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub, &id_remap);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                        id_offset = start;
-                    }
-                    ExtractResult kid_result = run_extract(exprs, sub, iterator_policy, id_offset, progress_cb,
-                                                           !id_remap.empty() ? &id_remap : nullptr, py_vtracks);
-
-                    ExtractHeader header{kid_result.intervals.size(), exprs.size()};
-                    std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 + sizeof(uint64_t) +
-                                             sizeof(double) * exprs.size());
-
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-
-                        for (size_t i = 0; i < kid_result.intervals.size(); ++i) {
-                            size_t offset = 0;
-                            int32_t chromid = kid_result.intervals[i].chromid;
-                            memcpy(rowbuf.data() + offset, &chromid, sizeof(chromid));
-                            offset += sizeof(chromid);
-                            memcpy(rowbuf.data() + offset, &kid_result.intervals[i].start, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            memcpy(rowbuf.data() + offset, &kid_result.intervals[i].end, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            memcpy(rowbuf.data() + offset, &kid_result.interval_ids[i], sizeof(uint64_t));
-                            offset += sizeof(uint64_t);
-
-                            for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
-                                double value = kid_result.values[iexpr][i];
-                                memcpy(rowbuf.data() + offset, &value, sizeof(double));
-                                offset += sizeof(double);
-                            }
-
-                            PyMisha::write_multitask_fifo_unlocked(rowbuf.data(), rowbuf.size());
-                        }
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-
-                    _exit(0);
-                }
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
             }
-
-            // Parent: read FIFO data directly into accumulator.
-            // Each kid writes [header][rows...] atomically under the FIFO lock,
-            // so we read header+rows for each kid sequentially.
-            // We don't know total rows upfront, so init with a reasonable estimate
-            // and let the accumulator grow as needed.
-            acc.init(intervals.size(), colnames);
-
-            std::vector<double> row_values(exprs.size());
-            std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 + sizeof(uint64_t) +
-                                     sizeof(double) * exprs.size());
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                ExtractHeader header{0, 0};
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-
-                if (header.nexprs != exprs.size()) {
-                    verror("Multitask extract returned mismatched expression count");
-                }
-
-                for (uint64_t i = 0; i < header.nrows; ++i) {
-                    PyMisha::read_multitask_fifo(rowbuf.data(), rowbuf.size());
-
-                    size_t offset = 0;
-                    int32_t chromid = -1;
-                    int64_t start = 0;
-                    int64_t end = 0;
-                    uint64_t interval_id = 0;
-                    memcpy(&chromid, rowbuf.data() + offset, sizeof(chromid));
-                    offset += sizeof(chromid);
-                    memcpy(&start, rowbuf.data() + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    memcpy(&end, rowbuf.data() + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    memcpy(&interval_id, rowbuf.data() + offset, sizeof(uint64_t));
-                    offset += sizeof(uint64_t);
-
-                    for (size_t iexpr = 0; iexpr < exprs.size(); ++iexpr) {
-                        memcpy(&row_values[iexpr], rowbuf.data() + offset, sizeof(double));
-                        offset += sizeof(double);
-                    }
-
-                    acc.write_row(chromid, start, end, row_values.data(), interval_id);
-                }
-            }
-
-            sort_accumulator(acc);
-
-            while (PyMisha::wait_for_kids(1))
-                ;
-        } else {
-            // Single-process path: scan directly into NumPy arrays
-            run_extract_direct(acc, exprs, colnames, intervals, iterator_policy, 0,
-                               progress_cb, nullptr, py_vtracks);
+            run_extract_direct(acc, scanner, exprs.size(), colnames, intervals);
         }
 
         if (acc.size() == 0) {
@@ -2101,113 +1836,53 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
                expr.c_str(), intervals.size(), iterator_policy);
 
         std::vector<GInterval> out_intervals;
+        PMTrackExprScanner scanner;
+        scanner.prepare({expr}, PMTrackExprScanner::LOGICAL_T, iterator_policy, py_vtracks);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_screen = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (scanner.kid_can_scan())
+            plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
-        if (use_range_split_screen) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
+        // a record: start, end, chromid
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, 2 * sizeof(int64_t) + sizeof(int32_t))) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                std::vector<GInterval> kid_intervals = compute_screen(scanner, sub);
+                const size_t n = kid_intervals.size();
+                char *res = (char *)PyMisha::allocate_res(n);
+                for (size_t i = 0; i < n; ++i) {
+                    memcpy(res + i * sizeof(int64_t), &kid_intervals[i].start, sizeof(int64_t));
+                    memcpy(res + (n + i) * sizeof(int64_t), &kid_intervals[i].end, sizeof(int64_t));
+                    int32_t chromid = kid_intervals[i].chromid;
+                    memcpy(res + 2 * n * sizeof(int64_t) + i * sizeof(int32_t), &chromid, sizeof(int32_t));
+                }
+            });
 
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            struct ScreenHeader {
-                uint64_t nrows;
-            };
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-                    std::vector<GInterval> kid_intervals = compute_screen(expr, sub, iterator_policy, progress_cb, py_vtracks);
-
-                    ScreenHeader header{kid_intervals.size()};
-                    std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2);
-
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-
-                        for (const auto &interval : kid_intervals) {
-                            size_t offset = 0;
-                            int32_t chromid = interval.chromid;
-                            memcpy(rowbuf.data() + offset, &chromid, sizeof(chromid));
-                            offset += sizeof(chromid);
-                            memcpy(rowbuf.data() + offset, &interval.start, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            memcpy(rowbuf.data() + offset, &interval.end, sizeof(int64_t));
-                            PyMisha::write_multitask_fifo_unlocked(rowbuf.data(), rowbuf.size());
-                        }
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-
-                    _exit(0);
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                const size_t n = PyMisha::get_kid_res_size(kid);
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                for (size_t i = 0; i < n; ++i) {
+                    int64_t start, end;
+                    int32_t chromid;
+                    memcpy(&start, res + i * sizeof(int64_t), sizeof(int64_t));
+                    memcpy(&end, res + (n + i) * sizeof(int64_t), sizeof(int64_t));
+                    memcpy(&chromid, res + 2 * n * sizeof(int64_t) + i * sizeof(int32_t), sizeof(int32_t));
+                    // A run of true intervals across the cut between two kids comes back in two parts,
+                    // which one process merges
+                    if (!i && !out_intervals.empty() && out_intervals.back().chromid == chromid &&
+                        out_intervals.back().end == start)
+                        out_intervals.back().end = end;
+                    else
+                        out_intervals.emplace_back(chromid, start, end);
                 }
             }
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                ScreenHeader header{0};
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-
-                std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2);
-                for (uint64_t i = 0; i < header.nrows; ++i) {
-                    PyMisha::read_multitask_fifo(rowbuf.data(), rowbuf.size());
-
-                    size_t offset = 0;
-                    int32_t chromid = -1;
-                    int64_t start = 0;
-                    int64_t end = 0;
-                    memcpy(&chromid, rowbuf.data() + offset, sizeof(chromid));
-                    offset += sizeof(chromid);
-                    memcpy(&start, rowbuf.data() + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    memcpy(&end, rowbuf.data() + offset, sizeof(int64_t));
-
-                    out_intervals.emplace_back(chromid, start, end);
-                }
-            }
-
-            std::sort(out_intervals.begin(), out_intervals.end(),
-                      [](const GInterval &a, const GInterval &b) {
-                          if (a.chromid != b.chromid)
-                              return a.chromid < b.chromid;
-                          if (a.start != b.start)
-                              return a.start < b.start;
-                          return a.end < b.end;
-                      });
-
-            merge_adjacent(out_intervals);
-
-            while (PyMisha::wait_for_kids(1))
-                ;
         } else {
-            out_intervals = compute_screen(expr, intervals, iterator_policy, progress_cb, py_vtracks);
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
+            }
+            out_intervals = compute_screen(scanner, intervals);
         }
 
         if (out_intervals.empty()) {
@@ -2312,24 +1987,14 @@ struct SummaryStats {
     }
 };
 
-static SummaryStats compute_summary(const std::string &expr,
-                                    const std::vector<GInterval> &intervals,
-                                    long iterator_policy,
-                                    PyObject *progress_cb,
-                                    PyObject *py_vtracks = nullptr)
+// The summary of the expression of scanner (prepared) over intervals
+static SummaryStats compute_summary(PMTrackExprScanner &scanner, const std::vector<GInterval> &intervals)
 {
     SummaryStats summary;
     if (intervals.empty())
         return summary;
 
-    PMTrackExprScanner scanner;
-    std::vector<std::string> exprs = {expr};
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
-
+    scanner.start(intervals);
     for (; !scanner.isend(); scanner.next()) {
         summary.update(scanner.vdouble(0));
         check_interrupt();
@@ -2403,39 +2068,6 @@ static void compute_interval_summaries(const std::string &expr,
     }
 }
 
-static int choose_num_kids(uint64_t num_intervals, int64_t total_scope_bp)
-{
-    if (!g_pymisha->multitasking_avail())
-        return 0;
-
-    unsigned int hw = std::thread::hardware_concurrency();
-    int target = hw ? static_cast<int>(hw) : g_pymisha->max_processes();
-    target = std::max(target, g_pymisha->min_processes());
-    target = std::min(target, g_pymisha->max_processes());
-
-    if (target < 2 || num_intervals < static_cast<uint64_t>(target))
-        return 0;
-
-    // Workload floors: fork-based multitasking pays an upfront cost
-    // (fork + sem/mmap setup) plus per-row FIFO marshalling. Below these
-    // thresholds, parallel is measured to lose by 20-200x vs serial on
-    // hg38/Phylo447 sparse-track gextract/gquantiles/gsummary/gscreen.
-    uint64_t min_intervs = g_pymisha->min_intervs4process();
-    if (min_intervs > 0 && num_intervals < min_intervs)
-        return 0;
-
-    if (total_scope_bp >= 0) {
-        uint64_t min_scope = g_pymisha->min_scope4process();
-        if (min_scope > 0) {
-            uint64_t scope_per_kid = (uint64_t)total_scope_bp / (uint64_t)target;
-            if (scope_per_kid < min_scope)
-                return 0;
-        }
-    }
-
-    return target;
-}
-
 // Summarize expression values over intervals
 PyObject *pm_summary(PyObject *self, PyObject *args)
 {
@@ -2481,58 +2113,33 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
         }
 
         SummaryStats summary;
+        PMTrackExprScanner scanner;
+        if (!intervals.empty())
+            scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_sum = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (!intervals.empty() && scanner.kid_can_scan())
+            plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
-        if (use_range_split_sum) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
-
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-                    SummaryStats kid_summary = compute_summary(expr, sub, iterator_policy, progress_cb, py_vtracks);
-                    PyMisha::write_multitask_fifo(&kid_summary, sizeof(kid_summary));
-                    _exit(0);
-                }
-            }
-
-            for (int kid = 0; kid < num_kids; ++kid) {
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), sizeof(SummaryStats), 0)) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                SummaryStats kid_summary = compute_summary(scanner, sub);
+                memcpy(PyMisha::allocate_res(0), &kid_summary, sizeof(kid_summary));
+            });
+            // merged in kid order, as R misha merges them
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
                 SummaryStats kid_summary;
-                PyMisha::read_multitask_fifo(&kid_summary, sizeof(kid_summary));
+                memcpy(&kid_summary, PyMisha::get_kid_res(kid), sizeof(kid_summary));
                 summary.merge(kid_summary);
             }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
         } else {
-            summary = compute_summary(expr, intervals, iterator_policy, progress_cb, py_vtracks);
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
+            }
+            summary = compute_summary(scanner, intervals);
         }
 
         double total_bins = summary.num_bins;
@@ -2687,23 +2294,14 @@ static bool calc_quantiles(StreamPercentiler<double> &sp, std::vector<Percentile
     return estimated_results;
 }
 
-static void fill_stream_percentiler(const std::string &expr,
-                                    const std::vector<GInterval> &intervals,
-                                    long iterator_policy,
-                                    StreamPercentiler<double> &sp,
-                                    PyObject *progress_cb,
-                                    PyObject *py_vtracks = nullptr)
+// The values of the expression of scanner (prepared) over intervals, into sp
+static void fill_stream_percentiler(PMTrackExprScanner &scanner, const std::vector<GInterval> &intervals,
+                                    StreamPercentiler<double> &sp)
 {
     if (intervals.empty())
         return;
 
-    PMTrackExprScanner scanner;
-    std::vector<std::string> exprs = {expr};
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
+    scanner.start(intervals);
 
     for (; !scanner.isend(); scanner.next()) {
         double val = scanner.vdouble(0);
@@ -2713,12 +2311,11 @@ static void fill_stream_percentiler(const std::string &expr,
     }
 }
 
-static bool compute_interval_quantiles(const std::string &expr,
+// The quantiles of the expression of scanner (prepared) over each of intervals
+static bool compute_interval_quantiles(PMTrackExprScanner &scanner,
                                         const std::vector<GInterval> &intervals,
-                                        long iterator_policy,
                                         std::vector<Percentile> &percentiles,
-                                        std::vector<double> &quantiles,
-                                        PyObject *progress_cb)
+                                        std::vector<double> &quantiles)
 {
     const size_t num_intervals = intervals.size();
     const size_t num_percentiles = percentiles.size();
@@ -2727,13 +2324,7 @@ static bool compute_interval_quantiles(const std::string &expr,
     if (intervals.empty())
         return false;
 
-    PMTrackExprScanner scanner;
-    std::vector<std::string> exprs = {expr};
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.start(intervals);
 
     StreamPercentiler<double> sp(g_pymisha->max_data_size(), 0, 0);
     std::vector<double> interval_quantiles(num_percentiles, std::numeric_limits<double>::quiet_NaN());
@@ -2859,66 +2450,37 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
         }
 
         std::vector<double> quantiles(n, std::numeric_limits<double>::quiet_NaN());
+        PMTrackExprScanner scanner;
+        if (!intervals.empty())
+            scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_q = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // R misha splits gquantiles' scope by chromosome only; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (!intervals.empty() && scanner.kid_can_scan())
+            plan = plan_kids(intervals, 0, iterator_policy);
+        const int num_kids = plan.size();
 
-        if (use_range_split_q) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
+        // Each kid's sample is a fixed-size block of the shared memory: max_data_size / num_kids
+        // values, or no more than the iterator's bins (as R misha)
+        uint64_t kid_sampling_buf_size = 0;
+        if (num_kids) {
+            kid_sampling_buf_size = PyMisha::kid_buf_size(num_kids, sizeof(double));
+            const uint64_t estimated_bins = estimate_fixed_bins(intervals, iterator_policy);
+            if (estimated_bins && estimated_bins < kid_sampling_buf_size)
+                kid_sampling_buf_size = estimated_bins;
         }
 
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            uint64_t kid_sampling_buf_size = (uint64_t)std::ceil(g_pymisha->max_data_size() / (double)num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-
-                    StreamPercentiler<double> sp(kid_sampling_buf_size, 0, 0);
-                    fill_stream_percentiler(expr, sub, iterator_policy, sp, progress_cb, py_vtracks);
-
-                    uint64_t stream_size = sp.stream_size();
-                    uint64_t sample_size = sp.samples().size();
-
-                    struct Header {
-                        uint64_t stream_size;
-                        uint64_t sample_size;
-                    } header{stream_size, sample_size};
-
-                    std::vector<char> buffer(sizeof(header) + sample_size * sizeof(double));
-                    memcpy(buffer.data(), &header, sizeof(header));
-                    if (sample_size > 0) {
-                        memcpy(buffer.data() + sizeof(header), sp.samples().data(), sample_size * sizeof(double));
-                    }
-
-                    PyMisha::write_multitask_fifo(buffer.data(), buffer.size());
-                    _exit(0);
-                }
-            }
+        if (num_kids &&
+            PyMisha::prepare4multitasking(num_kids, 2 * sizeof(uint64_t) + kid_sampling_buf_size * sizeof(double), 0)) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                StreamPercentiler<double> sp(kid_sampling_buf_size, 0, 0);
+                fill_stream_percentiler(scanner, sub, sp);
+                uint64_t header[2] = {sp.stream_size(), sp.samples().size()};
+                char *res = (char *)PyMisha::allocate_res(0);
+                memcpy(res, header, sizeof(header));
+                if (header[1])
+                    memcpy(res + sizeof(header), sp.samples().data(), header[1] * sizeof(double));
+            });
 
             double min_sampling_rate = 1.0;
             uint64_t total_stream_size = 0;
@@ -2930,24 +2492,20 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
             kid_sample_sizes.reserve(num_kids);
 
             for (int kid = 0; kid < num_kids; ++kid) {
-                struct Header {
-                    uint64_t stream_size;
-                    uint64_t sample_size;
-                } header{0, 0};
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                uint64_t header[2];
+                memcpy(header, res, sizeof(header));
+                std::vector<double> samples(header[1]);
+                if (header[1])
+                    memcpy(samples.data(), res + sizeof(header), header[1] * sizeof(double));
 
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-                std::vector<double> samples(header.sample_size);
-                if (header.sample_size > 0) {
-                    PyMisha::read_multitask_fifo(samples.data(), header.sample_size * sizeof(double));
-                }
-
-                if (header.stream_size > 0) {
-                    double rate = header.sample_size / (double)header.stream_size;
+                if (header[0] > 0) {
+                    double rate = header[1] / (double)header[0];
                     min_sampling_rate = std::min(min_sampling_rate, rate);
-                    total_stream_size += header.stream_size;
+                    total_stream_size += header[0];
                 }
-                kid_stream_sizes.push_back(header.stream_size);
-                kid_sample_sizes.push_back(header.sample_size);
+                kid_stream_sizes.push_back(header[0]);
+                kid_sample_sizes.push_back(header[1]);
                 kid_samples.push_back(std::move(samples));
             }
 
@@ -2993,14 +2551,16 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
                              "Adjust CONFIG['max_data_size'] to increase the limit.",
                              1);
             }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
         } else {
             if (!intervals.empty()) {
+                PyObject *progress_cb = get_progress_cb(py_config);
+                if (progress_cb) {
+                    scanner.set_progress_callback(progress_cb);
+                    scanner.report_progress(false);
+                }
                 uint64_t sampling_buf_size = g_pymisha->max_data_size();
                 StreamPercentiler<double> sp(sampling_buf_size, 0, 0);
-                fill_stream_percentiler(expr, intervals, iterator_policy, sp, progress_cb, py_vtracks);
+                fill_stream_percentiler(scanner, intervals, sp);
 
                 bool estimated = calc_quantiles(sp, percentiles, quantiles);
                 if (estimated) {
@@ -3058,84 +2618,11 @@ PyObject *pm_intervals_summary(PyObject *self, PyObject *args)
 
         g_pymisha->verify_max_data_size(intervals.size(), "Result");
 
+        // In one process, as R misha's gintervals.summary
         std::vector<double> values;
-        int num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
-
-                    std::vector<SummaryStats> summaries;
-                    compute_interval_summaries(expr, sub, iterator_policy, summaries, progress_cb);
-
-                    std::vector<double> kid_values;
-                    fill_summary_values(summaries, kid_values);
-
-                    struct Header {
-                        uint64_t start_idx;
-                        uint64_t count;
-                    } header{start, sub.size()};
-
-                    // One message per kid: hold the lock across all of it, or kids
-                    // interleave their fields in the FIFO.
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-                        if (!kid_values.empty())
-                            PyMisha::write_multitask_fifo_unlocked(kid_values.data(),
-                                                                   kid_values.size() * sizeof(double));
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-
-                    _exit(0);
-                }
-            }
-
-            values.assign(intervals.size() * SUMMARY_COLS, std::numeric_limits<double>::quiet_NaN());
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                struct Header {
-                    uint64_t start_idx;
-                    uint64_t count;
-                } header{0, 0};
-
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-                std::vector<double> kid_values(header.count * SUMMARY_COLS);
-                if (!kid_values.empty()) {
-                    PyMisha::read_multitask_fifo(kid_values.data(),
-                                                 kid_values.size() * sizeof(double));
-                }
-
-                for (size_t i = 0; i < header.count; ++i) {
-                    size_t dst = (header.start_idx + i) * SUMMARY_COLS;
-                    size_t src = i * SUMMARY_COLS;
-                    for (int c = 0; c < SUMMARY_COLS; ++c) {
-                        values[dst + c] = kid_values[src + c];
-                    }
-                }
-            }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
-        } else {
-            std::vector<SummaryStats> summaries;
-            compute_interval_summaries(expr, intervals, iterator_policy, summaries, progress_cb);
-            fill_summary_values(summaries, values);
-        }
+        std::vector<SummaryStats> summaries;
+        compute_interval_summaries(expr, intervals, iterator_policy, summaries, get_progress_cb(py_config));
+        fill_summary_values(summaries, values);
 
         PMDataFrame df(intervals.size(), 3 + SUMMARY_COLS, "intervals");
         df.init_col(0, "chrom", PMDataFrame::STR);
@@ -3256,86 +2743,43 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
 
         std::vector<double> quantiles;
         bool estimated_any = false;
+        PMTrackExprScanner scanner;
+        if (!intervals.empty())
+            scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy);
 
-        int num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
+        // R misha splits the scope by chromosome; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (!intervals.empty() && scanner.kid_can_scan())
+            plan = plan_kids(intervals, 0, iterator_policy);
 
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
+        // a kid's result: whether a quantile is estimated, then the quantiles of its intervals
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), sizeof(uint64_t), n * sizeof(double))) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                std::vector<double> kid_quantiles;
+                uint64_t estimated = compute_interval_quantiles(scanner, sub, percentiles, kid_quantiles);
+                char *res = (char *)PyMisha::allocate_res(sub.size());
+                memcpy(res, &estimated, sizeof(estimated));
+                if (!kid_quantiles.empty())
+                    memcpy(res + sizeof(estimated), kid_quantiles.data(), kid_quantiles.size() * sizeof(double));
+            });
 
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    size_t start = (intervals.size() * kid) / num_kids;
-                    size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                    std::vector<GInterval> sub(intervals.begin() + start, intervals.begin() + end);
-
-                    std::vector<double> kid_quantiles;
-                    bool estimated = compute_interval_quantiles(expr, sub, iterator_policy,
-                                                                percentiles, kid_quantiles, progress_cb);
-
-                    struct Header {
-                        uint64_t start_idx;
-                        uint64_t count;
-                        uint64_t estimated;
-                    } header{start, sub.size(), estimated ? 1ULL : 0ULL};
-
-                    // One message per kid: hold the lock across all of it, or kids
-                    // interleave their fields in the FIFO.
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-                        if (!kid_quantiles.empty())
-                            PyMisha::write_multitask_fifo_unlocked(kid_quantiles.data(),
-                                                                   kid_quantiles.size() * sizeof(double));
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-
-                    _exit(0);
-                }
+            quantiles.assign(intervals.size() * static_cast<size_t>(n), std::numeric_limits<double>::quiet_NaN());
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                uint64_t estimated;
+                memcpy(&estimated, res, sizeof(estimated));
+                estimated_any |= estimated != 0;
+                for (size_t i = 0; i < plan[kid].size(); ++i)
+                    memcpy(&quantiles[plan[kid][i].original_idx * n], res + sizeof(estimated) + i * n * sizeof(double),
+                           n * sizeof(double));
             }
-
-            quantiles.assign(intervals.size() * static_cast<size_t>(n),
-                             std::numeric_limits<double>::quiet_NaN());
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                struct Header {
-                    uint64_t start_idx;
-                    uint64_t count;
-                    uint64_t estimated;
-                } header{0, 0, 0};
-
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-                std::vector<double> kid_quantiles(header.count * static_cast<size_t>(n));
-                if (!kid_quantiles.empty()) {
-                    PyMisha::read_multitask_fifo(kid_quantiles.data(),
-                                                 kid_quantiles.size() * sizeof(double));
-                }
-
-                if (header.estimated)
-                    estimated_any = true;
-
-                for (size_t i = 0; i < header.count; ++i) {
-                    size_t dst = (header.start_idx + i) * static_cast<size_t>(n);
-                    size_t src = i * static_cast<size_t>(n);
-                    for (Py_ssize_t j = 0; j < n; ++j) {
-                        quantiles[dst + static_cast<size_t>(j)] = kid_quantiles[src + static_cast<size_t>(j)];
-                    }
-                }
+        } else if (!intervals.empty()) {
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
             }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
-        } else {
-            estimated_any = compute_interval_quantiles(expr, intervals, iterator_policy,
-                                                      percentiles, quantiles, progress_cb);
+            estimated_any = compute_interval_quantiles(scanner, intervals, percentiles, quantiles);
         }
 
         if (estimated_any) {
@@ -4195,90 +3639,9 @@ PyObject *pm_partition(PyObject *self, PyObject *args)
             return Py_None;
         }
 
-        std::vector<PartitionInterval> result;
-
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_part = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
-
-        if (use_range_split_part) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
-
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-                    std::vector<PartitionInterval> kid_result =
-                        compute_partition(expr, sub, bin_finder, iterator_policy, progress_cb);
-
-                    // Write number of results first, then each result
-                    size_t count = kid_result.size();
-                    // One message per kid: hold the lock across all of it, or kids
-                    // interleave their fields in the FIFO.
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&count, sizeof(count));
-                        for (const auto &pi : kid_result) {
-                            PyMisha::write_multitask_fifo_unlocked(&pi.chromid, sizeof(pi.chromid));
-                            PyMisha::write_multitask_fifo_unlocked(&pi.start, sizeof(pi.start));
-                            PyMisha::write_multitask_fifo_unlocked(&pi.end, sizeof(pi.end));
-                            PyMisha::write_multitask_fifo_unlocked(&pi.bin, sizeof(pi.bin));
-                        }
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-                    _exit(0);
-                }
-            }
-
-            // Read results from all children
-            for (int kid = 0; kid < num_kids; ++kid) {
-                size_t count;
-                PyMisha::read_multitask_fifo(&count, sizeof(count));
-                for (size_t i = 0; i < count; ++i) {
-                    int chromid;
-                    int64_t start, end;
-                    int bin;
-                    PyMisha::read_multitask_fifo(&chromid, sizeof(chromid));
-                    PyMisha::read_multitask_fifo(&start, sizeof(start));
-                    PyMisha::read_multitask_fifo(&end, sizeof(end));
-                    PyMisha::read_multitask_fifo(&bin, sizeof(bin));
-                    result.emplace_back(chromid, start, end, bin);
-                }
-            }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
-        } else {
-            result = compute_partition(expr, intervals, bin_finder, iterator_policy, progress_cb);
-        }
+        // In one process, as R misha's gpartition
+        std::vector<PartitionInterval> result =
+            compute_partition(expr, intervals, bin_finder, iterator_policy, get_progress_cb(py_config));
 
         if (result.empty()) {
             // Return None for no results
@@ -4865,13 +4228,9 @@ PyObject *pm_intervals_covered_bp(PyObject *self, PyObject *args) {
 
 
 // Helper to compute distribution for a subset of intervals (used by workers)
-static std::vector<uint64_t> compute_dist(
-    const std::vector<std::string> &exprs,
-    const std::vector<GInterval> &intervals,
-    const BinsManager &bins_manager,
-    long iterator_policy,
-    PyObject *progress_cb,
-    PyObject *py_vtracks = nullptr)
+// The distribution of the expressions of scanner (prepared) over intervals
+static std::vector<uint64_t> compute_dist(PMTrackExprScanner &scanner, size_t num_exprs_,
+                                          const std::vector<GInterval> &intervals, const BinsManager &bins_manager)
 {
     uint64_t totalbins = bins_manager.get_total_bins();
     std::vector<uint64_t> distribution(totalbins, 0);
@@ -4879,14 +4238,9 @@ static std::vector<uint64_t> compute_dist(
     if (intervals.empty() || totalbins == 0)
         return distribution;
 
-    PMTrackExprScanner scanner;
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
+    scanner.start(intervals);
 
-    unsigned num_exprs = exprs.size();
+    unsigned num_exprs = num_exprs_;
     std::vector<double> vals(num_exprs);
 
     for (; !scanner.isend(); scanner.next()) {
@@ -5061,67 +4415,35 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
         }
 
         std::vector<uint64_t> distribution;
+        PMTrackExprScanner scanner;
+        if (totalbins)
+            scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_dist = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (totalbins && scanner.kid_can_scan())
+            plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
-        if (use_range_split_dist) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), totalbins * sizeof(uint64_t), 0)) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                std::vector<uint64_t> kid_dist = compute_dist(scanner, exprs.size(), sub, bins_manager);
+                memcpy(PyMisha::allocate_res(0), kid_dist.data(), totalbins * sizeof(uint64_t));
+            });
 
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-                    std::vector<uint64_t> kid_dist =
-                        compute_dist(exprs, sub, bins_manager, iterator_policy, progress_cb, py_vtracks);
-
-                    // Write distribution array
-                    PyMisha::write_multitask_fifo(kid_dist.data(), totalbins * sizeof(uint64_t));
-                    _exit(0);
-                }
-            }
-
-            // Collect results from all children
-            distribution.resize(totalbins, 0);
+            distribution.assign(totalbins, 0);
             std::vector<uint64_t> kid_dist(totalbins);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                PyMisha::read_multitask_fifo(kid_dist.data(), totalbins * sizeof(uint64_t));
-                for (uint64_t i = 0; i < totalbins; ++i) {
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                memcpy(kid_dist.data(), PyMisha::get_kid_res(kid), totalbins * sizeof(uint64_t));
+                for (uint64_t i = 0; i < totalbins; ++i)
                     distribution[i] += kid_dist[i];
-                }
             }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
         } else {
-            distribution = compute_dist(exprs, intervals, bins_manager, iterator_policy, progress_cb, py_vtracks);
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
+            }
+            distribution = compute_dist(scanner, exprs.size(), intervals, bins_manager);
         }
 
         // Create N-dimensional result array
@@ -5162,28 +4484,24 @@ struct LookupResult {
     std::vector<uint64_t> interval_ids;
 };
 
+// glookup with the expressions of scanner (prepared) over intervals; ids: in a kid, the scope's row of
+// each of its intervals (NULL: the intervals are the scope)
 static LookupResult compute_lookup(
-    const std::vector<std::string> &exprs,
+    PMTrackExprScanner &scanner,
+    size_t num_exprs_,
     const std::vector<GInterval> &intervals,
     const BinsManager &bins_manager,
     const std::vector<double> &lookup_table,
     bool force_binning,
-    long iterator_policy,
-    uint64_t interval_id_offset,
-    PyObject *progress_cb)
+    const std::vector<uint64_t> *ids)
 {
     LookupResult result;
     if (intervals.empty())
         return result;
 
-    PMTrackExprScanner scanner;
-    if (progress_cb && !PyMisha::is_kid()) {
-        scanner.set_progress_callback(progress_cb);
-        scanner.report_progress(false);
-    }
-    scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
+    scanner.start(intervals);
 
-    unsigned num_exprs = exprs.size();
+    unsigned num_exprs = num_exprs_;
     std::vector<double> vals(num_exprs);
 
     uint64_t est_size = scanner.get_iterator()->size();
@@ -5247,51 +4565,15 @@ static LookupResult compute_lookup(
 
         result.intervals.push_back(scanner.last_interval());
         result.values.push_back(value);
-        result.interval_ids.push_back(scanner.last_interval_id() + interval_id_offset);
+        result.interval_ids.push_back(ids ? scope_row_id(scanner, *ids) : scanner.last_interval_id());
 
         g_pymisha->verify_max_data_size(result.intervals.size(), "Result");
+        if (ids)
+            PyMisha::update_res_data_size(result.intervals.size());
         check_interrupt();
     }
 
     return result;
-}
-
-static void sort_lookup_result(LookupResult &result)
-{
-    const size_t n = result.intervals.size();
-    if (n <= 1)
-        return;
-
-    std::vector<size_t> order(n);
-    for (size_t i = 0; i < n; ++i) order[i] = i;
-
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        if (result.intervals[a].chromid != result.intervals[b].chromid)
-            return result.intervals[a].chromid < result.intervals[b].chromid;
-        if (result.intervals[a].start != result.intervals[b].start)
-            return result.intervals[a].start < result.intervals[b].start;
-        return result.intervals[a].end < result.intervals[b].end;
-    });
-
-    // Check if already sorted
-    bool sorted = true;
-    for (size_t i = 0; i < n; ++i) {
-        if (order[i] != i) { sorted = false; break; }
-    }
-    if (sorted) return;
-
-    // Apply permutation
-    std::vector<GInterval> tmp_intervals(n);
-    std::vector<double> tmp_values(n);
-    std::vector<uint64_t> tmp_ids(n);
-    for (size_t i = 0; i < n; ++i) {
-        tmp_intervals[i] = result.intervals[order[i]];
-        tmp_values[i] = result.values[order[i]];
-        tmp_ids[i] = result.interval_ids[order[i]];
-    }
-    result.intervals.swap(tmp_intervals);
-    result.values.swap(tmp_values);
-    result.interval_ids.swap(tmp_ids);
 }
 
 static PMPY build_lookup_df(const LookupResult &result)
@@ -5437,132 +4719,60 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         }
 
         LookupResult result;
+        PMTrackExprScanner scanner;
+        scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_lk = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
+        // R misha splits glookup's scope by chromosome only; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (scanner.kid_can_scan())
+            plan = plan_kids(intervals, 0, iterator_policy);
 
-        if (use_range_split_lk) {
-            int64_t total_range = 0;
-            for (const auto &iv : intervals) total_range += iv.end - iv.start;
-            num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-            if (num_kids > 0) {
-                split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                num_kids = (int)range_kids.size();
-            }
-        } else {
-            num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
-        }
-
-        PyObject *progress_cb = get_progress_cb(py_config);
-        if (num_kids > 0) {
-            progress_cb = NULL;
-        }
-
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            struct LookupHeader {
-                uint64_t nrows;
-            };
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    uint64_t lk_id_offset = 0;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                        lk_id_offset = start;
-                    }
-                    LookupResult kid_result =
-                        compute_lookup(exprs, sub, bins_manager, lookup_table,
-                                       force_binning != 0, iterator_policy, lk_id_offset, progress_cb);
-
-                    LookupHeader header{kid_result.intervals.size()};
-
-                    // Row: chromid(int32) + start(int64) + end(int64) + interval_id(uint64) + value(double)
-                    std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 +
-                                             sizeof(uint64_t) + sizeof(double));
-
-                    PyMisha::lock_multitask_fifo();
-                    try {
-                        PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-                        for (size_t i = 0; i < kid_result.intervals.size(); ++i) {
-                            size_t offset = 0;
-                            int32_t chromid = kid_result.intervals[i].chromid;
-                            memcpy(rowbuf.data() + offset, &chromid, sizeof(chromid));
-                            offset += sizeof(chromid);
-                            memcpy(rowbuf.data() + offset, &kid_result.intervals[i].start, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            memcpy(rowbuf.data() + offset, &kid_result.intervals[i].end, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            memcpy(rowbuf.data() + offset, &kid_result.interval_ids[i], sizeof(uint64_t));
-                            offset += sizeof(uint64_t);
-                            double value = kid_result.values[i];
-                            memcpy(rowbuf.data() + offset, &value, sizeof(double));
-
-                            PyMisha::write_multitask_fifo_unlocked(rowbuf.data(), rowbuf.size());
-                        }
-                    } catch (...) {
-                        PyMisha::unlock_multitask_fifo();
-                        throw;
-                    }
-                    PyMisha::unlock_multitask_fifo();
-                    _exit(0);
+        // a row: start, end, intervalID, value, chromid
+        if (!plan.empty() &&
+            PyMisha::prepare4multitasking(plan.size(), 0, 3 * sizeof(int64_t) + sizeof(double) + sizeof(int32_t))) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
+                LookupResult kid_result = compute_lookup(scanner, exprs.size(), sub, bins_manager, lookup_table,
+                                                         force_binning != 0, &ids);
+                const size_t n = kid_result.intervals.size();
+                char *res = (char *)PyMisha::allocate_res(n);
+                for (size_t i = 0; i < n; ++i) {
+                    const GInterval &iv = kid_result.intervals[i];
+                    int32_t chromid = iv.chromid;
+                    memcpy(res + i * sizeof(int64_t), &iv.start, sizeof(int64_t));
+                    memcpy(res + (n + i) * sizeof(int64_t), &iv.end, sizeof(int64_t));
+                    memcpy(res + (2 * n + i) * sizeof(int64_t), &kid_result.interval_ids[i], sizeof(int64_t));
+                    memcpy(res + (3 * n + i) * sizeof(int64_t), &kid_result.values[i], sizeof(double));
+                    memcpy(res + 4 * n * sizeof(int64_t) + i * sizeof(int32_t), &chromid, sizeof(int32_t));
                 }
-            }
+            });
 
-            // Collect results from children
-            for (int kid = 0; kid < num_kids; ++kid) {
-                LookupHeader header{0};
-                PyMisha::read_multitask_fifo(&header, sizeof(header));
-
-                result.intervals.reserve(result.intervals.size() + header.nrows);
-                result.values.reserve(result.values.size() + header.nrows);
-                result.interval_ids.reserve(result.interval_ids.size() + header.nrows);
-
-                std::vector<char> rowbuf(sizeof(int32_t) + sizeof(int64_t) * 2 +
-                                         sizeof(uint64_t) + sizeof(double));
-
-                for (uint64_t i = 0; i < header.nrows; ++i) {
-                    PyMisha::read_multitask_fifo(rowbuf.data(), rowbuf.size());
-
-                    size_t offset = 0;
-                    int32_t chromid = -1;
-                    int64_t start = 0;
-                    int64_t end = 0;
-                    uint64_t interval_id = 0;
-                    double value = 0.0;
-
-                    memcpy(&chromid, rowbuf.data() + offset, sizeof(chromid));
-                    offset += sizeof(chromid);
-                    memcpy(&start, rowbuf.data() + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    memcpy(&end, rowbuf.data() + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    memcpy(&interval_id, rowbuf.data() + offset, sizeof(uint64_t));
-                    offset += sizeof(uint64_t);
-                    memcpy(&value, rowbuf.data() + offset, sizeof(double));
-
+            // the kids' rows one after another, in the order of one process
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                const size_t n = PyMisha::get_kid_res_size(kid);
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                for (size_t i = 0; i < n; ++i) {
+                    int64_t start, end;
+                    uint64_t id;
+                    double value;
+                    int32_t chromid;
+                    memcpy(&start, res + i * sizeof(int64_t), sizeof(int64_t));
+                    memcpy(&end, res + (n + i) * sizeof(int64_t), sizeof(int64_t));
+                    memcpy(&id, res + (2 * n + i) * sizeof(int64_t), sizeof(int64_t));
+                    memcpy(&value, res + (3 * n + i) * sizeof(int64_t), sizeof(double));
+                    memcpy(&chromid, res + 4 * n * sizeof(int64_t) + i * sizeof(int32_t), sizeof(int32_t));
                     result.intervals.emplace_back(chromid, start, end);
+                    result.interval_ids.push_back(id);
                     result.values.push_back(value);
-                    result.interval_ids.push_back(interval_id);
                 }
             }
-
-            sort_lookup_result(result);
-
-            while (PyMisha::wait_for_kids(1))
-                ;
         } else {
-            result = compute_lookup(exprs, intervals, bins_manager, lookup_table,
-                                    force_binning != 0, iterator_policy, 0, progress_cb);
+            PyObject *progress_cb = get_progress_cb(py_config);
+            if (progress_cb) {
+                scanner.set_progress_callback(progress_cb);
+                scanner.report_progress(false);
+            }
+            result = compute_lookup(scanner, exprs.size(), intervals, bins_manager, lookup_table,
+                                    force_binning != 0, nullptr);
         }
 
         if (result.intervals.empty()) {
@@ -5922,219 +5132,83 @@ static double estimate_rank(double value, const std::vector<double> &sorted_samp
     return pos * scale + 0.5;
 }
 
-static CorSummary compute_cor_pearson(const std::string &expr1, const std::string &expr2,
-                                      const std::vector<GInterval> &intervals,
-                                      long iterator_policy)
-{
-    CorSummary summary;
-    if (intervals.empty())
-        return summary;
+// The scanners of a gcor pair, prepared before any kid is forked: one over both expressions, or,
+// where the two cannot share an iterator (tracks of different formats), one per expression whose
+// values are paired by position
+struct CorPairScanners {
+    std::string expr1, expr2;
+    PMTrackExprScanner both, first, second;
+    bool separate{false};
 
-    // Try combined scanner first (works when both expressions use same track type)
-    try {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1, expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-
-        for (; !scanner.isend(); scanner.next()) {
-            double v1 = scanner.vdouble(0);
-            double v2 = scanner.vdouble(1);
-            summary.update(v1, v2);
-            check_interrupt();
-        }
-
-        return summary;
-    } catch (TGLException &) {
-        // Fall through to separate-scanner approach for mixed track types
-        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
-            throw;
-        summary = CorSummary();  // drop what the combined scan already counted
-    }
-
-    // Separate scanners for mixed track types: extract both then correlate
-    std::vector<double> vals1, vals2;
+    CorPairScanners(const std::string &e1, const std::string &e2, long iterator_policy) : expr1(e1), expr2(e2)
     {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            vals1.push_back(scanner.vdouble(0));
-            check_interrupt();
+        try {
+            both.prepare({expr1, expr2}, PMTrackExprScanner::REAL_T, iterator_policy);
+        } catch (TGLException &) {
+            if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop
+                throw;
+            separate = true;
+            first.prepare({expr1}, PMTrackExprScanner::REAL_T, iterator_policy);
+            second.prepare({expr2}, PMTrackExprScanner::REAL_T, iterator_policy);
         }
     }
+
+    bool kid_can_scan() const { return separate ? first.kid_can_scan() && second.kid_can_scan() : both.kid_can_scan(); }
+
+    // add(x, y) for the values of the two expressions at each iterator interval of intervals
+    template <typename F>
+    void scan(const std::vector<GInterval> &intervals, F &&add)
     {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            vals2.push_back(scanner.vdouble(0));
-            check_interrupt();
+        if (intervals.empty())
+            return;
+        if (!separate) {
+            for (both.start(intervals); !both.isend(); both.next()) {
+                add(both.vdouble(0), both.vdouble(1));
+                check_interrupt();
+            }
+            return;
         }
-    }
 
-    if (vals1.size() != vals2.size()) {
-        verror("Expressions '%s' and '%s' produce different numbers of values (%zu vs %zu). "
-               "This can happen with mixed track types and different iterator alignments.",
-               expr1.c_str(), expr2.c_str(), vals1.size(), vals2.size());
-    }
-
-    for (size_t i = 0; i < vals1.size(); ++i) {
-        summary.update(vals1[i], vals2[i]);
-    }
-
-    return summary;
-}
-
-static SpearmanSummary compute_cor_spearman_exact(const std::string &expr1, const std::string &expr2,
-                                                  const std::vector<GInterval> &intervals,
-                                                  long iterator_policy)
-{
-    auto build_summary = [](const std::vector<ValuePair> &pairs, uint64_t total_bins) {
-        SpearmanSummary s;
-        s.n = total_bins;
-        s.n_na = total_bins - pairs.size();
-        if (pairs.size() < 2) {
-            s.cor = std::numeric_limits<double>::quiet_NaN();
-            return s;
-        }
-        std::vector<double> xvals(pairs.size()), yvals(pairs.size());
-        for (size_t i = 0; i < pairs.size(); ++i) {
-            xvals[i] = pairs[i].x;
-            yvals[i] = pairs[i].y;
-        }
-        std::vector<double> xranks, yranks;
-        compute_ranks(xvals, xranks);
-        compute_ranks(yvals, yranks);
-        s.cor = pearson_from_values(xranks, yranks);
-        return s;
-    };
-
-    SpearmanSummary summary;
-    if (intervals.empty())
-        return summary;
-
-    std::vector<ValuePair> pairs;
-    uint64_t total_bins = 0;
-
-    auto add_pair = [&](double x, double y) {
-        ++total_bins;
-        if (!std::isnan(x) && !std::isnan(y)) {
-            pairs.push_back({x, y});
-            g_pymisha->verify_max_data_size(pairs.size(), "Result");
-        }
-    };
-
-    // Try combined scanner first.
-    try {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1, expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            add_pair(scanner.vdouble(0), scanner.vdouble(1));
-            check_interrupt();
-        }
-    } catch (TGLException &) {
-        // Mixed track types fallback.
-        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
-            throw;
-        pairs.clear();  // drop what the combined scan already counted
-        total_bins = 0;
         std::vector<double> vals1, vals2;
-        {
-            PMTrackExprScanner scanner;
-            std::vector<std::string> exprs = {expr1};
-            scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-            for (; !scanner.isend(); scanner.next()) {
-                vals1.push_back(scanner.vdouble(0));
-                check_interrupt();
-            }
+        for (first.start(intervals); !first.isend(); first.next()) {
+            vals1.push_back(first.vdouble(0));
+            check_interrupt();
         }
-        {
-            PMTrackExprScanner scanner;
-            std::vector<std::string> exprs = {expr2};
-            scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-            for (; !scanner.isend(); scanner.next()) {
-                vals2.push_back(scanner.vdouble(0));
-                check_interrupt();
-            }
+        for (second.start(intervals); !second.isend(); second.next()) {
+            vals2.push_back(second.vdouble(0));
+            check_interrupt();
         }
-
         if (vals1.size() != vals2.size()) {
             verror("Expressions '%s' and '%s' produce different numbers of values (%zu vs %zu). "
                    "This can happen with mixed track types and different iterator alignments.",
                    expr1.c_str(), expr2.c_str(), vals1.size(), vals2.size());
         }
-
         for (size_t i = 0; i < vals1.size(); ++i)
-            add_pair(vals1[i], vals2[i]);
+            add(vals1[i], vals2[i]);
     }
+};
 
-    return build_summary(pairs, total_bins);
+static CorSummary compute_cor_pearson(CorPairScanners &scanners, const std::vector<GInterval> &intervals)
+{
+    CorSummary summary;
+    scanners.scan(intervals, [&](double x, double y) { summary.update(x, y); });
+    return summary;
 }
 
-static void collect_cor_spearman_exact_pairs(const std::string &expr1, const std::string &expr2,
-                                             const std::vector<GInterval> &intervals,
-                                             long iterator_policy,
-                                             std::vector<ValuePair> &pairs,
-                                             uint64_t &total_bins)
+static void collect_cor_spearman_exact_pairs(CorPairScanners &scanners, const std::vector<GInterval> &intervals,
+                                             std::vector<ValuePair> &pairs, uint64_t &total_bins)
 {
     pairs.clear();
     total_bins = 0;
-
-    auto add_pair = [&](double x, double y) {
+    scanners.scan(intervals, [&](double x, double y) {
         ++total_bins;
         if (!std::isnan(x) && !std::isnan(y)) {
             pairs.push_back({x, y});
             g_pymisha->verify_max_data_size(pairs.size(), "Result");
+            if (PyMisha::is_kid())
+                PyMisha::update_res_data_size(pairs.size());
         }
-    };
-
-    // Try combined scanner first.
-    try {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1, expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            add_pair(scanner.vdouble(0), scanner.vdouble(1));
-            check_interrupt();
-        }
-        return;
-    } catch (TGLException &) {
-        // Mixed track types fallback.
-        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
-            throw;
-        pairs.clear();  // drop what the combined scan already counted
-        total_bins = 0;
-    }
-
-    std::vector<double> vals1, vals2;
-    {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            vals1.push_back(scanner.vdouble(0));
-            check_interrupt();
-        }
-    }
-    {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            vals2.push_back(scanner.vdouble(0));
-            check_interrupt();
-        }
-    }
-
-    if (vals1.size() != vals2.size()) {
-        verror("Expressions '%s' and '%s' produce different numbers of values (%zu vs %zu). "
-               "This can happen with mixed track types and different iterator alignments.",
-               expr1.c_str(), expr2.c_str(), vals1.size(), vals2.size());
-    }
-
-    for (size_t i = 0; i < vals1.size(); ++i)
-        add_pair(vals1[i], vals2[i]);
+    });
 }
 
 static SpearmanSummary spearman_summary_from_pairs(const std::vector<ValuePair> &pairs, uint64_t total_bins)
@@ -6160,9 +5234,7 @@ static SpearmanSummary spearman_summary_from_pairs(const std::vector<ValuePair> 
     return summary;
 }
 
-static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, const std::string &expr2,
-                                                   const std::vector<GInterval> &intervals,
-                                                   long iterator_policy,
+static SpearmanSummary compute_cor_spearman_approx(CorPairScanners &scanners, const std::vector<GInterval> &intervals,
                                                    uint64_t sample_size)
 {
     SpearmanSummary summary;
@@ -6179,7 +5251,7 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
 
     uint64_t non_nan = 0;
 
-    auto add_pair = [&](double x, double y) {
+    scanners.scan(intervals, [&](double x, double y) {
         ++summary.n;
         if (std::isnan(x) || std::isnan(y))
             return;
@@ -6187,55 +5259,7 @@ static SpearmanSummary compute_cor_spearman_approx(const std::string &expr1, con
         pair_sampler.add({x, y}, pm::pm_rnd_func);
         x_sampler.add(x, pm::pm_rnd_func);
         y_sampler.add(y, pm::pm_rnd_func);
-    };
-
-    // Try combined scanner first.
-    try {
-        PMTrackExprScanner scanner;
-        std::vector<std::string> exprs = {expr1, expr2};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-        for (; !scanner.isend(); scanner.next()) {
-            add_pair(scanner.vdouble(0), scanner.vdouble(1));
-            check_interrupt();
-        }
-    } catch (TGLException &) {
-        // Mixed track types fallback.
-        if (PyErr_Occurred())  // Ctrl-C (check_interrupt): stop, don't rescan
-            throw;
-        summary.n = 0;  // drop what the combined scan already sampled
-        non_nan = 0;
-        pair_sampler.reset();
-        x_sampler.reset();
-        y_sampler.reset();
-        std::vector<double> vals1, vals2;
-        {
-            PMTrackExprScanner scanner;
-            std::vector<std::string> exprs = {expr1};
-            scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-            for (; !scanner.isend(); scanner.next()) {
-                vals1.push_back(scanner.vdouble(0));
-                check_interrupt();
-            }
-        }
-        {
-            PMTrackExprScanner scanner;
-            std::vector<std::string> exprs = {expr2};
-            scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy);
-            for (; !scanner.isend(); scanner.next()) {
-                vals2.push_back(scanner.vdouble(0));
-                check_interrupt();
-            }
-        }
-
-        if (vals1.size() != vals2.size()) {
-            verror("Expressions '%s' and '%s' produce different numbers of values (%zu vs %zu). "
-                   "This can happen with mixed track types and different iterator alignments.",
-                   expr1.c_str(), expr2.c_str(), vals1.size(), vals2.size());
-        }
-
-        for (size_t i = 0; i < vals1.size(); ++i)
-            add_pair(vals1[i], vals2[i]);
-    }
+    });
 
     summary.n_na = summary.n - non_nan;
     if (non_nan < 2) {
@@ -6324,132 +5348,94 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
         std::vector<CorSummary> summaries(num_pairs);
         std::vector<SpearmanSummary> spearman_summaries(num_pairs);
 
-        // Range-based splitting for fixed-bin iterators
-        bool use_range_split_cor = (iterator_policy > 0);
-        int num_kids;
-        std::vector<std::vector<SplitInterval>> range_kids;
-
-        if (method == CorMethod::PEARSON || method == CorMethod::SPEARMAN_EXACT) {
-            if (use_range_split_cor) {
-                int64_t total_range = 0;
-                for (const auto &iv : intervals) total_range += iv.end - iv.start;
-                num_kids = choose_num_kids_for_range(intervals.size(), total_range, iterator_policy);
-                if (num_kids > 0) {
-                    split_intervals_by_range(intervals, num_kids, iterator_policy, range_kids);
-                    num_kids = (int)range_kids.size();
-                }
-            } else {
-                num_kids = choose_num_kids(intervals.size(), total_intervals_scope(intervals));
+        std::vector<std::unique_ptr<CorPairScanners>> scanners;
+        bool kid_can_scan = true;
+        if (!intervals.empty()) {
+            for (size_t p = 0; p < num_pairs; ++p) {
+                scanners.push_back(std::make_unique<CorPairScanners>(exprs[p * 2], exprs[p * 2 + 1], iterator_policy));
+                kid_can_scan &= scanners.back()->kid_can_scan();
             }
-        } else {
-            num_kids = 0;
         }
+
+        // R misha multitasks the Pearson and the exact Spearman correlations, splitting ranges
+        // with an explicit iterator for Pearson's; a kid does not call into Python
+        std::vector<std::vector<SplitInterval>> plan;
+        if (!intervals.empty() && kid_can_scan && method != CorMethod::SPEARMAN)
+            plan = plan_kids(intervals, method == CorMethod::PEARSON && iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
         uint64_t sample_size = g_pymisha->max_data_size();
         if (sample_size < 1)
             sample_size = 1;
 
-        if (num_kids > 0) {
-            PyMisha::prepare4multitasking(num_kids);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
-                pid_t pid = PyMisha::launch_process();
-                if (pid == 0) {
-                    std::vector<GInterval> sub;
-                    if (!range_kids.empty()) {
-                        extract_sub_intervals(range_kids[kid], sub);
-                    } else {
-                        size_t start = (intervals.size() * kid) / num_kids;
-                        size_t end = (intervals.size() * (kid + 1)) / num_kids;
-                        sub.assign(intervals.begin() + start, intervals.begin() + end);
-                    }
-
-                    for (size_t p = 0; p < num_pairs; ++p) {
-                        if (method == CorMethod::PEARSON) {
-                            CorSummary kid_summary = compute_cor_pearson(exprs[p * 2], exprs[p * 2 + 1],
-                                                                         sub, iterator_policy);
-                            PyMisha::write_multitask_fifo(&kid_summary, sizeof(kid_summary));
-                        } else {
-                            std::vector<ValuePair> kid_pairs;
-                            uint64_t total_bins = 0;
-                            collect_cor_spearman_exact_pairs(exprs[p * 2], exprs[p * 2 + 1],
-                                                             sub, iterator_policy, kid_pairs, total_bins);
-
-                            struct SpearmanHeader {
-                                uint64_t total_bins;
-                                uint64_t pair_count;
-                            } header{total_bins, static_cast<uint64_t>(kid_pairs.size())};
-
-                            PyMisha::lock_multitask_fifo();
-                            try {
-                                PyMisha::write_multitask_fifo_unlocked(&header, sizeof(header));
-                                if (!kid_pairs.empty()) {
-                                    PyMisha::write_multitask_fifo_unlocked(
-                                        kid_pairs.data(),
-                                        kid_pairs.size() * sizeof(ValuePair)
-                                    );
-                                }
-                                PyMisha::unlock_multitask_fifo();
-                            } catch (...) {
-                                PyMisha::unlock_multitask_fifo();
-                                throw;
-                            }
-                        }
-                    }
-                    _exit(0);
+        if (!plan.empty() && method == CorMethod::PEARSON &&
+            PyMisha::prepare4multitasking(plan.size(), num_pairs * sizeof(CorSummary), 0)) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                char *res = (char *)PyMisha::allocate_res(0);
+                for (size_t p = 0; p < num_pairs; ++p) {
+                    CorSummary kid_summary = compute_cor_pearson(*scanners[p], sub);
+                    memcpy(res + p * sizeof(CorSummary), &kid_summary, sizeof(CorSummary));
+                }
+            });
+            // merged in kid order, as R misha merges them
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                for (size_t p = 0; p < num_pairs; ++p) {
+                    CorSummary kid_summary;
+                    memcpy(&kid_summary, res + p * sizeof(CorSummary), sizeof(CorSummary));
+                    summaries[p].merge(kid_summary);
                 }
             }
+        } else if (!plan.empty() && method == CorMethod::SPEARMAN_EXACT &&
+                   // a kid's result: per pair, its number of bins and of value pairs; then the value pairs
+                   PyMisha::prepare4multitasking(plan.size(), num_pairs * 2 * sizeof(uint64_t), sizeof(ValuePair))) {
+            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                std::vector<std::vector<ValuePair>> pairs(num_pairs);
+                std::vector<uint64_t> header(num_pairs * 2);
+                uint64_t num_records = 0;
+                for (size_t p = 0; p < num_pairs; ++p) {
+                    collect_cor_spearman_exact_pairs(*scanners[p], sub, pairs[p], header[p * 2]);
+                    header[p * 2 + 1] = pairs[p].size();
+                    num_records += pairs[p].size();
+                }
+                char *res = (char *)PyMisha::allocate_res(num_records);
+                memcpy(res, header.data(), header.size() * sizeof(uint64_t));
+                res += header.size() * sizeof(uint64_t);
+                for (size_t p = 0; p < num_pairs; ++p) {
+                    if (!pairs[p].empty())
+                        memcpy(res, pairs[p].data(), pairs[p].size() * sizeof(ValuePair));
+                    res += pairs[p].size() * sizeof(ValuePair);
+                }
+            });
 
             std::vector<uint64_t> total_bins_per_pair(num_pairs, 0);
             std::vector<std::vector<ValuePair>> merged_pairs(num_pairs);
-
-            for (int kid = 0; kid < num_kids; ++kid) {
+            for (size_t kid = 0; kid < plan.size(); ++kid) {
+                const char *res = (const char *)PyMisha::get_kid_res(kid);
+                std::vector<uint64_t> header(num_pairs * 2);
+                memcpy(header.data(), res, header.size() * sizeof(uint64_t));
+                res += header.size() * sizeof(uint64_t);
                 for (size_t p = 0; p < num_pairs; ++p) {
-                    if (method == CorMethod::PEARSON) {
-                        CorSummary kid_summary;
-                        PyMisha::read_multitask_fifo(&kid_summary, sizeof(kid_summary));
-                        summaries[p].merge(kid_summary);
-                    } else {
-                        struct SpearmanHeader {
-                            uint64_t total_bins;
-                            uint64_t pair_count;
-                        } header{0, 0};
-
-                        PyMisha::read_multitask_fifo(&header, sizeof(header));
-                        total_bins_per_pair[p] += header.total_bins;
-                        if (header.pair_count > 0) {
-                            size_t old_size = merged_pairs[p].size();
-                            merged_pairs[p].resize(old_size + static_cast<size_t>(header.pair_count));
-                            PyMisha::read_multitask_fifo(
-                                merged_pairs[p].data() + old_size,
-                                static_cast<size_t>(header.pair_count) * sizeof(ValuePair)
-                            );
-                        }
-                    }
+                    total_bins_per_pair[p] += header[p * 2];
+                    size_t old_size = merged_pairs[p].size();
+                    merged_pairs[p].resize(old_size + header[p * 2 + 1]);
+                    if (header[p * 2 + 1])
+                        memcpy(merged_pairs[p].data() + old_size, res, header[p * 2 + 1] * sizeof(ValuePair));
+                    res += header[p * 2 + 1] * sizeof(ValuePair);
                 }
             }
-
-            while (PyMisha::wait_for_kids(1))
-                ;
-
-            if (method == CorMethod::SPEARMAN_EXACT) {
-                for (size_t p = 0; p < num_pairs; ++p) {
-                    spearman_summaries[p] = spearman_summary_from_pairs(
-                        merged_pairs[p], total_bins_per_pair[p]
-                    );
-                }
-            }
-        } else {
+            for (size_t p = 0; p < num_pairs; ++p)
+                spearman_summaries[p] = spearman_summary_from_pairs(merged_pairs[p], total_bins_per_pair[p]);
+        } else if (!intervals.empty()) {
             for (size_t p = 0; p < num_pairs; ++p) {
                 if (method == CorMethod::PEARSON) {
-                    summaries[p] = compute_cor_pearson(exprs[p * 2], exprs[p * 2 + 1],
-                                                       intervals, iterator_policy);
+                    summaries[p] = compute_cor_pearson(*scanners[p], intervals);
                 } else if (method == CorMethod::SPEARMAN_EXACT) {
-                    spearman_summaries[p] = compute_cor_spearman_exact(exprs[p * 2], exprs[p * 2 + 1],
-                                                                        intervals, iterator_policy);
+                    std::vector<ValuePair> pairs;
+                    uint64_t total_bins = 0;
+                    collect_cor_spearman_exact_pairs(*scanners[p], intervals, pairs, total_bins);
+                    spearman_summaries[p] = spearman_summary_from_pairs(pairs, total_bins);
                 } else {
-                    spearman_summaries[p] = compute_cor_spearman_approx(exprs[p * 2], exprs[p * 2 + 1],
-                                                                         intervals, iterator_policy, sample_size);
+                    spearman_summaries[p] = compute_cor_spearman_approx(*scanners[p], intervals, sample_size);
                 }
             }
         }

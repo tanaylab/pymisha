@@ -219,10 +219,8 @@ class TestGcor:
         intervals = pm.gintervals_all()
 
         old_multi = pm.CONFIG["multitasking"]
-        old_min = pm.CONFIG["min_processes"]
         old_max = pm.CONFIG["max_processes"]
         try:
-            pm.CONFIG["min_processes"] = 2
             pm.CONFIG["max_processes"] = 2
 
             pm.CONFIG["multitasking"] = False
@@ -250,7 +248,6 @@ class TestGcor:
             )
         finally:
             pm.CONFIG["multitasking"] = old_multi
-            pm.CONFIG["min_processes"] = old_min
             pm.CONFIG["max_processes"] = old_max
 
     def test_spearman_exact_matches_manual_ranks(self):

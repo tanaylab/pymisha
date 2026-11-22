@@ -129,6 +129,8 @@ void check_dense_num_bins(const std::string &track_name, const std::string &trac
 
 }  // namespace
 
+extern void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &intervals);
+
 // ---- helpers for reading Python spec dicts (same logic as PMVTrack.cpp) ----
 namespace {
 
@@ -233,6 +235,24 @@ bool vt_parse_pssm(PyObject *obj, DnaPSSM &pssm, double prior) {
         pssm.add_dirichlet_prior((float)prior);
     }
     return true;
+}
+
+// The mask of a filtered vtrack, spec["filter"]: intervals as _df2pymisha gives them, canonic
+// (sorted, disjoint, touching intervals unified, as gvtrack_filter keeps them), or None (or no key)
+// for none
+std::unique_ptr<Genome1DFilter> parse_filter(PyObject *spec)
+{
+    PyObject *py_filter = vt_dict_get(spec, "filter");
+    if (!py_filter || py_filter == Py_None)
+        return nullptr;
+
+    std::vector<GInterval> intervs;
+    convert_py_intervals(py_filter, intervs);
+    auto filter = std::make_unique<Genome1DFilter>();
+    filter->per_chrom.resize(g_pmdb->chromkey().get_num_chroms());
+    for (const GInterval &interv : intervs)
+        filter->per_chrom[interv.chromid].emplace_back(interv.chromid, interv.start, interv.end, 0);
+    return filter;
 }
 
 } // anonymous namespace
@@ -621,45 +641,36 @@ void PMTrackExpressionVars::set_vars(const GInterval &interval, unsigned idx)
     // Evaluate virtual track variables
     const GenomeChromKey &chromkey = g_pmdb->chromkey();
     for (auto &vvar : m_vtrack_vars) {
-        if (vvar.scorer) {
-            // Sequence-based vtrack: apply shift, call scorer
-            GInterval eval;
-            if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval)) {
-                vvar.values[idx] = std::nan("");
-            } else {
-                // The pwm/potts sliding caches are keyed by position only; R
-                // clears them in TrackExpressionVars::start_chrom, and frees
-                // the potts scorers' encoded stretch of the previous chromosome.
-                if (eval.chromid != vvar.scorer_chromid) {
-                    if (auto *pwm = dynamic_cast<PWMScorer *>(vvar.scorer.get()))
-                        pwm->invalidate_cache();
-                    else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get())) {
-                        potts->invalidate_cache();
-                        potts->release_chunk();
-                    }
-                    vvar.scorer_chromid = eval.chromid;
-                }
-                vvar.values[idx] = vvar.scorer->score_interval(eval, chromkey);
-            }
-        } else if (!vvar.src_track_name.empty()) {
-            // Value-based vtrack with physical track source
-            GInterval eval;
-            if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval)) {
-                vvar.values[idx] = std::nan("");
-            } else {
-                vvar.values[idx] = eval_value_based_vtrack(vvar, eval);
-            }
-        } else if (vvar.intervals_src) {
-            // A DataFrame source; a window shifted off the chromosome has no answer
-            GInterval eval;
-            if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval))
-                vvar.values[idx] = std::nan("");
-            else
-                vvar.values[idx] = vvar.intervals_src->eval(eval);
-        } else {
-            // Fallback: should not happen if add_vtrack_var was correct
+        // a window shifted off the chromosome has no answer
+        GInterval eval;
+        if (!apply_shift(interval, vvar.sshift, vvar.eshift, chromkey, eval)) {
             vvar.values[idx] = std::nan("");
+            continue;
         }
+
+        // The pwm/potts sliding caches are keyed by position only; R clears them in
+        // TrackExpressionVars::start_chrom, and frees the potts scorers' encoded stretch of the
+        // previous chromosome.
+        if (vvar.scorer && eval.chromid != vvar.scorer_chromid) {
+            if (auto *pwm = dynamic_cast<PWMScorer *>(vvar.scorer.get()))
+                pwm->invalidate_cache();
+            else if (auto *potts = dynamic_cast<PottsScorer *>(vvar.scorer.get())) {
+                potts->invalidate_cache();
+                potts->release_chunk();
+            }
+            vvar.scorer_chromid = eval.chromid;
+        }
+
+        if (vvar.filter)
+            vvar.values[idx] = eval_filtered_vtrack(vvar, eval);
+        else if (vvar.scorer)
+            vvar.values[idx] = vvar.scorer->score_interval(eval, chromkey);
+        else if (!vvar.src_track_name.empty())
+            vvar.values[idx] = eval_value_based_vtrack(vvar, eval);
+        else if (vvar.intervals_src)
+            vvar.values[idx] = vvar.intervals_src->eval(eval);
+        else
+            vvar.values[idx] = std::nan("");
     }
 }
 
@@ -729,6 +740,17 @@ const PMTrackExpressionVars::TrackVar *PMTrackExpressionVars::var(const char *na
     if (it != m_var_map.end()) {
         return &m_track_vars[it->second];
     }
+    return nullptr;
+}
+
+const double *PMTrackExpressionVars::values_of(const std::string &var_name) const
+{
+    for (const TrackVar &v : m_track_vars)
+        if (v.var_name == var_name)
+            return v.values;
+    for (const VTrackVar &v : m_vtrack_vars)
+        if (v.var_name == var_name)
+            return v.values;
     return nullptr;
 }
 
@@ -812,6 +834,7 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
         params_obj = PyList_GetItem(params_obj, 0);
     }
     vvar.param = vt_obj_to_double(params_obj, std::numeric_limits<double>::quiet_NaN());
+    vvar.filter = parse_filter(spec);
 
     // Determine vtrack type from func and src
     PyObject *py_src = vt_dict_get(spec, "src");
@@ -836,7 +859,7 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
         // read path (not mask-gated) and register no func bit, so a reader whose
         // other funcs are all sliding-compatible would take the sliding fast path
         // (which leaves min/max NaN). Such vtracks stay standalone.
-        if (vvar.src_track_type == GenomeTrack::FIXED_BIN &&
+        if (vvar.src_track_type == GenomeTrack::FIXED_BIN && !vvar.filter &&
             vvar.func != "min" && vvar.func != "max") {
             std::string key = vvar.src_track_name + "\x1f" +
                               std::to_string(vvar.sshift) + "\x1f" +
@@ -856,8 +879,11 @@ PMTrackExpressionVars::VTrackVar &PMTrackExpressionVars::add_vtrack_var(
             }
         }
     } else if (py_src && py_src != Py_None) {
-        // A DataFrame source: R misha's Interv_var / Value_var
+        // A DataFrame source: R misha's Interv_var / Value_var. The distance functions do not look
+        // at a filter, as R.
         vvar.intervals_src = std::make_unique<PMIntervalsVtrack>(spec, func);
+        if (func.rfind("distance", 0) == 0)
+            vvar.filter.reset();
     } else {
         TGLError("Virtual track '%s' has unsupported source type for C++ inline evaluation",
                  vtrack_name.c_str());
@@ -1072,7 +1098,9 @@ void PMTrackExpressionVars::setup_value_based_vtrack(VTrackVar &vvar, PyObject *
 
     // Register special functions on 1D tracks
     GenomeTrack1D *track1d = dynamic_cast<GenomeTrack1D *>(vvar.src_track.get());
-    if (track1d)
+    if (track1d && vvar.filter)
+        register_filtered_funcs(track1d, func, vvar.src_track_type);
+    else if (track1d)
         register_value_funcs(track1d, func, vvar.src_track_type);
 
     vvar.src_cur_chromid = -1;
@@ -1212,40 +1240,7 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
 
     const std::string &func = vvar.func;
 
-    // Load chromosome if needed
-    if (vvar.src_cur_chromid != eval.chromid) {
-        std::string chrom_file = g_pmdb->chrom_files(vvar.src_track_path).filename(eval.chromid);
-        std::string full_path = vvar.src_track_path + "/" + chrom_file;
-        // Indexed tracks have no per-chrom file; init_read reads through
-        // track.idx. Gating on the per-chrom file made value-based vtracks over
-        // indexed source tracks always return NaN.
-        const bool indexed =
-            access((vvar.src_track_path + "/track.idx").c_str(), F_OK) == 0;
-        if (!indexed && access(full_path.c_str(), F_OK) != 0) {
-            vvar.src_cur_chromid = eval.chromid;
-            vvar.src_cur_chromid_valid = false;
-        } else {
-            if (vvar.src_track_type == GenomeTrack::FIXED_BIN) {
-                auto *fb = static_cast<GenomeTrackFixedBin *>(vvar.src_track.get());
-                fb->init_read(full_path.c_str(), eval.chromid);
-            } else if (vvar.src_track_type == GenomeTrack::SPARSE) {
-                auto *sp = static_cast<GenomeTrackSparse *>(vvar.src_track.get());
-                sp->init_read(full_path.c_str(), eval.chromid);
-                vvar.sp_intervals_ptr = &sp->get_intervals();
-                vvar.sp_vals_ptr = &sp->get_vals();
-                vvar.sp_scan_idx = 0;
-                vvar.sp_last_start = std::numeric_limits<int64_t>::min();
-                vvar.sp_scan_ready = false;
-            } else if (vvar.src_track_type == GenomeTrack::ARRAYS) {
-                auto *ar = static_cast<GenomeTrackArray *>(vvar.src_track.get());
-                ar->init_read(full_path.c_str(), eval.chromid);
-            }
-            vvar.src_cur_chromid = eval.chromid;
-            vvar.src_cur_chromid_valid = true;
-        }
-    }
-
-    if (!vvar.src_cur_chromid_valid) {
+    if (!load_src_chrom(vvar, eval.chromid)) {
         if (func == "exists" || func == "size") return 0.0;
         return std::numeric_limits<double>::quiet_NaN();
     }
@@ -1370,6 +1365,230 @@ double PMTrackExpressionVars::eval_value_based_vtrack(VTrackVar &vvar, const GIn
     }
 
     return std::numeric_limits<double>::quiet_NaN();
+}
+
+bool PMTrackExpressionVars::load_src_chrom(VTrackVar &vvar, int chromid)
+{
+    if (vvar.src_cur_chromid == chromid)
+        return vvar.src_cur_chromid_valid;
+
+    std::string chrom_file = g_pmdb->chrom_files(vvar.src_track_path).filename(chromid);
+    std::string full_path = vvar.src_track_path + "/" + chrom_file;
+    // Indexed tracks have no per-chrom file; init_read reads through
+    // track.idx. Gating on the per-chrom file made value-based vtracks over
+    // indexed source tracks always return NaN.
+    const bool indexed =
+        access((vvar.src_track_path + "/track.idx").c_str(), F_OK) == 0;
+    vvar.src_cur_chromid = chromid;
+    vvar.src_cur_chromid_valid = indexed || access(full_path.c_str(), F_OK) == 0;
+    if (!vvar.src_cur_chromid_valid)
+        return false;
+
+    if (vvar.src_track_type == GenomeTrack::FIXED_BIN) {
+        auto *fb = static_cast<GenomeTrackFixedBin *>(vvar.src_track.get());
+        fb->init_read(full_path.c_str(), chromid);
+    } else if (vvar.src_track_type == GenomeTrack::SPARSE) {
+        auto *sp = static_cast<GenomeTrackSparse *>(vvar.src_track.get());
+        sp->init_read(full_path.c_str(), chromid);
+        vvar.sp_intervals_ptr = &sp->get_intervals();
+        vvar.sp_vals_ptr = &sp->get_vals();
+        vvar.sp_scan_idx = 0;
+        vvar.sp_last_start = std::numeric_limits<int64_t>::min();
+        vvar.sp_scan_ready = false;
+    } else if (vvar.src_track_type == GenomeTrack::ARRAYS) {
+        auto *ar = static_cast<GenomeTrackArray *>(vvar.src_track.get());
+        ar->init_read(full_path.c_str(), chromid);
+    }
+    return true;
+}
+
+// ---- filtered vtracks (gvtrack_filter): the function over the parts of the interval that the
+// mask leaves, as R misha's TrackVarProcessor, ValueVarProcessor, IntervVarProcessor and
+// SequenceVarProcessor compute it ----
+
+void PMTrackExpressionVars::register_filtered_funcs(GenomeTrack1D *t, const std::string &func,
+                                                    GenomeTrack::Type type)
+{
+    register_value_funcs(t, func, type);
+    // the parts are merged through their value counts
+    if (func != "weighted.sum")
+        t->register_function(GenomeTrack1D::SIZE);
+    // all the unmasked values, while they fit max_data_size
+    if (func == "quantile")
+        t->register_quantile(g_pymisha->max_data_size(), 1000, 1000);
+    // Each part is read afresh, its bins summed in order, not slid from the part before; lse is
+    // slid, as R misha computes it
+    if (type == GenomeTrack::FIXED_BIN && func != "lse")
+        static_cast<GenomeTrackFixedBin *>(t)->disable_sliding();
+}
+
+double PMTrackExpressionVars::eval_filtered_vtrack(VTrackVar &vvar, const GInterval &interval)
+{
+    vvar.filter->subtract(interval, vvar.parts);
+    if (vvar.parts.empty())
+        return std::numeric_limits<double>::quiet_NaN();  // masked entirely
+    if (vvar.scorer)
+        return eval_filtered_seq(vvar, interval);
+    if (!vvar.src_track_name.empty())
+        return eval_filtered_track(vvar, interval);
+    if (vvar.intervals_src)
+        return vvar.intervals_src->eval_filtered(interval, vvar.parts, *vvar.filter);
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+double PMTrackExpressionVars::eval_filtered_track(VTrackVar &vvar, const GInterval &interval)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::string &func = vvar.func;
+    if (!load_src_chrom(vvar, interval.chromid))
+        return func == "exists" || func == "size" ? 0 : nan;
+
+    GenomeTrack1D &track = *static_cast<GenomeTrack1D *>(vvar.src_track.get());
+    if (func != "avg" && func != "mean" && func != "nearest")
+        return value_var_filtered(track, func, vvar.parts, interval.start, vvar.param);
+
+    // The mean of the unmasked values, each value once: the parts' means weighted by their value
+    // counts ("nearest" too, when the parts hold a value)
+    double n = 0, sum = 0;
+    for (const auto &part : track.parts_reading_items_once(vvar.parts)) {
+        track.read_interval(part);
+        const double part_n = track.last_size();
+        if (!(part_n > 0))
+            continue;
+        sum += (double)track.last_avg() * part_n;
+        n += part_n;
+    }
+    if (n > 0)
+        return sum / n;
+    if (func != "nearest")
+        return nan;
+
+    // no value in the parts: the value of the sparse or array track whose unmasked stretch is nearest
+    // to them (a dense track looks inside the interval only, as without a filter)
+    if (vvar.src_track_type == GenomeTrack::SPARSE) {
+        auto &sparse = static_cast<GenomeTrackSparse &>(track);
+        const std::vector<float> &vals = sparse.get_vals();
+        return nearest_unmasked_value(sparse.get_intervals(), 0, vals.size(), [&](size_t i) { return vals[i]; },
+                                      *vvar.filter, vvar.parts);
+    }
+    if (vvar.src_track_type == GenomeTrack::ARRAYS) {
+        auto &array = static_cast<GenomeTrackArray &>(track);
+        const std::vector<GInterval> &items = array.get_intervals();
+        return nearest_unmasked_value(items, 0, items.size(), [&](size_t i) { return array.get_sliced_val(i); },
+                                      *vvar.filter, vvar.parts);
+    }
+    return nan;
+}
+
+double PMTrackExpressionVars::eval_filtered_seq(VTrackVar &vvar, const GInterval &interval)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    const std::string &func = vvar.func;
+    const std::vector<GInterval> &parts = vvar.parts;
+    GenomeSeqScorer &scorer = *vvar.scorer;
+
+    // Each part is scored on its own: a match never spans a masked base
+    if (func == "kmer.count" || func == "kmer.frac" || func == "masked.count" || func == "masked.frac") {
+        if (parts.size() == 1)
+            return scorer.score_interval(parts[0], chromkey);
+        // the counts added; the fractions pooled over the parts' possible positions (kmer.frac, 0 if
+        // none) or bp (masked.frac)
+        double total = 0, weight = 0;
+        bool any = false;
+        for (const auto &part : parts) {
+            const double s = scorer.score_interval(part, chromkey);
+            if (func == "kmer.frac") {
+                const double n = (double)static_cast<KmerCounter &>(scorer).possible_positions(part, chromkey);
+                total += s * n;
+                weight += n;
+            } else if (!std::isnan(s)) {
+                total += func == "masked.frac" ? s * part.range() : s;
+                weight += part.range();
+                any = true;
+            }
+        }
+        if (func == "kmer.frac")
+            return weight > 0 ? total / weight : 0;
+        if (!any)
+            return nan;
+        return func == "masked.frac" ? total / weight : total;
+    }
+
+    const bool edit_distance = func.rfind("pwm.edit_distance", 0) == 0 || func == "pwm.max.edit_distance" ||
+                               func == "pwm.n_mutations";
+    if (edit_distance) {
+        // R misha's aggregate_edit_distance_parts: the fewest edits over the parts; for the .pos
+        // functions the position in the part with the fewest edits, moved to the interval's
+        // coordinates (its sign kept: negative is the reverse strand); for pwm.max.edit_distance the
+        // edits of the part with the best PWM score; the most mutations for pwm.n_mutations
+        auto *ed = dynamic_cast<PWMEditDistanceScorer *>(&scorer);
+        auto *lse_ed = dynamic_cast<PWMLseEditDistanceScorer *>(&scorer);
+        const bool pos = func == "pwm.edit_distance.pos" || func == "pwm.edit_distance.lse.pos";
+        double best = nan, best_key = nan;
+        bool found = false;
+        for (const auto &part : parts) {
+            const double s = scorer.score_interval(part, chromkey);
+            if (pos) {
+                const double edits = ed ? ed->get_last_min_edits() : lse_ed->get_last_min_edits();
+                if (std::isnan(edits) || !(std::isnan(best_key) || edits < best_key))
+                    continue;
+                best_key = edits;
+                const double offset = (double)(part.start - interval.start);
+                best = s > 0 ? s + offset : s < 0 ? s - offset : s;
+            } else if (func == "pwm.max.edit_distance") {
+                const double logp = ed->get_last_pwm_max_logp();
+                if (!found || logp > best_key) {
+                    best_key = logp;
+                    best = s;
+                    found = true;
+                }
+            } else if (func == "pwm.n_mutations") {
+                if (std::isnan(best) || (!std::isnan(s) && s > best))
+                    best = s;
+            } else if (std::isnan(best) || (!std::isnan(s) && s < best))
+                best = s;
+        }
+        return best;
+    }
+
+    // pwm and potts: log-sum-exp over the parts (seeded from the first scorable part, -inf adding
+    // nothing), the maximum, the sum, or the position from the part with the highest max score, moved
+    // to the interval's coordinates and its sign kept; NaN when no part was scorable
+    auto *pwm = dynamic_cast<PWMScorer *>(&scorer);
+    auto *potts = dynamic_cast<PottsScorer *>(&scorer);
+    const bool max_pos = func == "pwm.max.pos" || func == "potts.max.pos";
+    const bool is_max = func == "pwm.max" || func == "potts.max";
+    const bool count = func == "pwm.count" || func == "potts.count";
+    double lse = -std::numeric_limits<double>::infinity();
+    double best = -std::numeric_limits<double>::infinity();
+    double total = 0, best_pos = nan, best_max = -std::numeric_limits<double>::infinity();
+    bool any = false;
+    for (const auto &part : parts) {
+        const double s = scorer.score_interval(part, chromkey);
+        if (std::isnan(s))
+            continue;
+        if (max_pos) {
+            const double part_max = pwm ? pwm->get_last_max_score() : potts->get_last_max_score();
+            if (!any || part_max > best_max) {
+                best_max = part_max;
+                const double offset = (double)(part.start - interval.start);
+                best_pos = s > 0 ? s + offset : s < 0 ? s - offset : s;
+            }
+        } else if (is_max) {
+            if (!any || s > best)
+                best = s;
+        } else if (count)
+            total += s;
+        else if (!any || !std::isfinite(lse))
+            lse = s;
+        else if (std::isfinite(s))
+            log_sum_log(lse, s);
+        any = true;
+    }
+    if (!any)
+        return nan;
+    return max_pos ? best_pos : is_max ? best : count ? total : lse;
 }
 
 void PMTrackExpressionVars::set_substitution(const SeqSubstitution &sub)

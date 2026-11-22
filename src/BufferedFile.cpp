@@ -43,6 +43,7 @@ int BufferedFile::open(const char *path, const char *mode, bool lock)
 		m_eof = false;
 		m_virt_pos = m_phys_pos = 0;
 		m_sbuf_pos = m_ebuf_pos = 0;
+		m_pid = getpid();
 
 		fseeko(m_fp, 0, SEEK_END);
 		m_file_size = ftello(m_fp);
@@ -50,6 +51,20 @@ int BufferedFile::open(const char *path, const char *mode, bool lock)
 		return 0;
 	}
 	return -1;
+}
+
+void BufferedFile::reopen_in_kid()
+{
+	m_pid = getpid();
+	// a file opened for writing cannot be opened again with its mode ("w" truncates)
+	if (m_writable)
+		return;
+	// closes only this process's descriptor; there is nothing to flush in a file opened for reading
+	fclose(m_fp);
+	m_fp = fopen(m_filename.c_str(), "rb");
+	if (!m_fp)
+		TGLError("Failed to reopen file %s: %s", m_filename.c_str(), strerror(errno));
+	m_phys_pos = -1;
 }
 
 int BufferedFile::close()

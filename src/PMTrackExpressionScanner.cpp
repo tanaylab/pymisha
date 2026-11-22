@@ -149,6 +149,235 @@ std::string normalize_logical_precedence(const std::string &expr)
 
 }  // namespace
 
+// An expression Python evaluates with numpy, which a forked kid evaluates in C++ instead (a kid does
+// not call into Python): numbers, the names of track and virtual track variables, parentheses,
+// unary - and +, + - * / and the comparisons of numbers, and & | of comparisons, with Python's
+// precedence (the expression is the one compiled for Python, its & and | operands already in
+// parentheses). The results are numpy's: the same IEEE operations, a comparison false where a
+// value is NaN (!= true), and a comparison or & | result a boolean. Any other expression (a
+// function, CHROM, a chained comparison, arithmetic on booleans, ...) is not taken: parse() fails.
+// A kid does not give numpy's floating point warnings (overflow, division by zero).
+struct PMTrackExprScanner::CppExpr {
+    struct Node {
+        char op;             // 'n' number, 'v' variable, 'm' unary -, 'p' unary +, an operator ('l' <=, 'g' >=, '=' ==, '!' !=)
+        double num;
+        const double *var;
+        int a, b;
+        bool is_bool;
+    };
+    std::vector<Node> nodes;
+    int root{-1};
+
+    // false if expr is not of the form above or names a variable var_values does not know
+    template <typename F>
+    bool parse(const std::string &expr, F &&var_values)
+    {
+        m_s = expr.c_str();
+        m_pos = 0;
+        root = parse_cmp(var_values);
+        skip_ws();
+        return root >= 0 && !m_s[m_pos] && m_has_var;
+    }
+
+    bool is_bool() const { return nodes[root].is_bool; }
+
+    void eval(unsigned n, double *out) const { eval_node(root, n, out); }
+
+private:
+    const char *m_s{nullptr};
+    size_t m_pos{0};
+    bool m_has_var{false};
+
+    void skip_ws() { while (m_s[m_pos] == ' ' || m_s[m_pos] == '\t' || m_s[m_pos] == '\n') ++m_pos; }
+
+    int add(char op, int a, int b, bool is_bool, double num = 0, const double *var = nullptr)
+    {
+        nodes.push_back({op, num, var, a, b, is_bool});
+        return (int)nodes.size() - 1;
+    }
+
+    // a binary operator on operands both of type is_bool, giving a result of type res_bool
+    int binary(char op, int a, int b, bool operands_bool, bool res_bool)
+    {
+        if (a < 0 || b < 0 || nodes[a].is_bool != operands_bool || nodes[b].is_bool != operands_bool)
+            return -1;
+        return add(op, a, b, res_bool);
+    }
+
+    template <typename F>
+    int parse_cmp(F &var_values)
+    {
+        int a = parse_or(var_values);
+        skip_ws();
+        char op = 0;
+        const char *c = m_s + m_pos;
+        if (c[0] == '<' && c[1] == '=') op = 'l';
+        else if (c[0] == '>' && c[1] == '=') op = 'g';
+        else if (c[0] == '=' && c[1] == '=') op = '=';
+        else if (c[0] == '!' && c[1] == '=') op = '!';
+        else if (c[0] == '<') op = '<';
+        else if (c[0] == '>') op = '>';
+        if (!op)
+            return a;
+        m_pos += op == '<' || op == '>' ? 1 : 2;
+        int res = binary(op, a, parse_or(var_values), false, true);
+        skip_ws();
+        // a chained comparison is not taken
+        const char *d = m_s + m_pos;
+        if (*d == '<' || *d == '>' || (*d == '=' && d[1] == '=') || (*d == '!' && d[1] == '='))
+            return -1;
+        return res;
+    }
+
+    template <typename F>
+    int parse_or(F &var_values)
+    {
+        int a = parse_and(var_values);
+        for (skip_ws(); a >= 0 && m_s[m_pos] == '|'; skip_ws()) {
+            ++m_pos;
+            a = binary('|', a, parse_and(var_values), true, true);
+        }
+        return a;
+    }
+
+    template <typename F>
+    int parse_and(F &var_values)
+    {
+        int a = parse_arith(var_values);
+        for (skip_ws(); a >= 0 && m_s[m_pos] == '&'; skip_ws()) {
+            ++m_pos;
+            a = binary('&', a, parse_arith(var_values), true, true);
+        }
+        return a;
+    }
+
+    template <typename F>
+    int parse_arith(F &var_values)
+    {
+        int a = parse_term(var_values);
+        for (skip_ws(); a >= 0 && (m_s[m_pos] == '+' || m_s[m_pos] == '-'); skip_ws()) {
+            char op = m_s[m_pos++];
+            a = binary(op, a, parse_term(var_values), false, false);
+        }
+        return a;
+    }
+
+    template <typename F>
+    int parse_term(F &var_values)
+    {
+        int a = parse_unary(var_values);
+        for (skip_ws(); a >= 0 && (m_s[m_pos] == '*' || m_s[m_pos] == '/'); skip_ws()) {
+            char op = m_s[m_pos++];
+            a = binary(op, a, parse_unary(var_values), false, false);
+        }
+        return a;
+    }
+
+    template <typename F>
+    int parse_unary(F &var_values)
+    {
+        skip_ws();
+        if (m_s[m_pos] == '-' || m_s[m_pos] == '+') {
+            char op = m_s[m_pos++] == '-' ? 'm' : 'p';
+            int a = parse_unary(var_values);
+            return a < 0 || nodes[a].is_bool ? -1 : add(op, a, -1, false);
+        }
+        return parse_primary(var_values);
+    }
+
+    template <typename F>
+    int parse_primary(F &var_values)
+    {
+        skip_ws();
+        const char *c = m_s + m_pos;
+        if (*c == '(') {
+            ++m_pos;
+            int a = parse_cmp(var_values);
+            skip_ws();
+            if (a < 0 || m_s[m_pos] != ')')
+                return -1;
+            ++m_pos;
+            return a;
+        }
+        if (isdigit((unsigned char)*c) || (*c == '.' && isdigit((unsigned char)c[1]))) {
+            // a Python number: digits, a point, an exponent (no 0x, _, j or leading zeros)
+            size_t i = 0;
+            while (isdigit((unsigned char)c[i]))
+                ++i;
+            bool is_float = c[i] == '.';
+            if (is_float)
+                for (++i; isdigit((unsigned char)c[i]); ++i)
+                    ;
+            if (c[i] == 'e' || c[i] == 'E') {
+                size_t j = i + 1 + (c[i + 1] == '+' || c[i + 1] == '-');
+                if (!isdigit((unsigned char)c[j]))
+                    return -1;
+                for (i = j; isdigit((unsigned char)c[i]); ++i)
+                    ;
+                is_float = true;
+            }
+            if (isalnum((unsigned char)c[i]) || c[i] == '_' || c[i] == '.' || (!is_float && c[0] == '0' && i > 1))
+                return -1;
+            double num = strtod(std::string(c, i).c_str(), nullptr);
+            m_pos += i;
+            return add('n', -1, -1, false, num);
+        }
+        if (isalpha((unsigned char)*c) || *c == '_') {
+            size_t i = 0;
+            while (isalnum((unsigned char)c[i]) || c[i] == '_')
+                ++i;
+            const double *values = var_values(std::string(c, i));
+            m_pos += i;
+            skip_ws();
+            // a function call or an attribute (np.log, ...) is not taken
+            if (!values || m_s[m_pos] == '(' || m_s[m_pos] == '.' || m_s[m_pos] == '[')
+                return -1;
+            m_has_var = true;
+            return add('v', -1, -1, false, 0, values);
+        }
+        return -1;
+    }
+
+    void eval_node(int i, unsigned n, double *out) const
+    {
+        const Node &nd = nodes[i];
+        if (nd.op == 'n') {
+            std::fill(out, out + n, nd.num);
+            return;
+        }
+        if (nd.op == 'v') {
+            std::copy(nd.var, nd.var + n, out);
+            return;
+        }
+        eval_node(nd.a, n, out);
+        if (nd.op == 'm') {
+            for (unsigned k = 0; k < n; ++k)
+                out[k] = -out[k];
+            return;
+        }
+        if (nd.op == 'p')
+            return;
+
+        std::vector<double> rhs(n);
+        eval_node(nd.b, n, rhs.data());
+        const double *r = rhs.data();
+        switch (nd.op) {
+        case '+': for (unsigned k = 0; k < n; ++k) out[k] = out[k] + r[k]; break;
+        case '-': for (unsigned k = 0; k < n; ++k) out[k] = out[k] - r[k]; break;
+        case '*': for (unsigned k = 0; k < n; ++k) out[k] = out[k] * r[k]; break;
+        case '/': for (unsigned k = 0; k < n; ++k) out[k] = out[k] / r[k]; break;
+        case '<': for (unsigned k = 0; k < n; ++k) out[k] = out[k] < r[k]; break;
+        case '>': for (unsigned k = 0; k < n; ++k) out[k] = out[k] > r[k]; break;
+        case 'l': for (unsigned k = 0; k < n; ++k) out[k] = out[k] <= r[k]; break;
+        case 'g': for (unsigned k = 0; k < n; ++k) out[k] = out[k] >= r[k]; break;
+        case '=': for (unsigned k = 0; k < n; ++k) out[k] = out[k] == r[k]; break;
+        case '!': for (unsigned k = 0; k < n; ++k) out[k] = out[k] != r[k]; break;
+        case '&': for (unsigned k = 0; k < n; ++k) out[k] = out[k] != 0 && r[k] != 0; break;
+        case '|': for (unsigned k = 0; k < n; ++k) out[k] = out[k] != 0 || r[k] != 0; break;
+        }
+    }
+};
+
 const int PMTrackExprScanner::INIT_REPORT_STEP = 10000;
 const int PMTrackExprScanner::REPORT_INTERVAL = 3000;
 const int PMTrackExprScanner::MIN_REPORT_INTERVAL = 1000;
@@ -239,20 +468,20 @@ std::unique_ptr<PMTrackExpressionIterator> PMTrackExprScanner::create_expr_itera
     }
 }
 
-void PMTrackExprScanner::check(const std::vector<std::string> &exprs,
-                               const std::vector<GInterval> &intervals,
-                               int64_t iterator_policy, ValType valtype,
-                               PyObject *py_vtracks)
+void PMTrackExprScanner::check(const std::vector<std::string> &exprs, ValType valtype, PyObject *py_vtracks)
 {
     m_track_exprs = exprs;
     m_valtype = valtype;
 
     // Parse expressions to find track variables (and vtrack variables if provided)
-    std::vector<std::string> exprs4compile;
+    std::vector<std::string> &exprs4compile = m_exprs4compile;
     m_expr_vars.parse_exprs(m_track_exprs, exprs4compile, py_vtracks);
 
-    // Create the iterator
-    m_itr = create_expr_iterator(intervals, iterator_policy);
+    // The iterator is created over the scope by start(); one over no interval here reports an
+    // iterator that cannot be determined before a kid is forked, and its bin size
+    std::unique_ptr<PMTrackExpressionIterator> probe = create_expr_iterator(std::vector<GInterval>(), m_iterator_policy);
+    const PMFixedBinIterator *fixed = dynamic_cast<const PMFixedBinIterator *>(probe.get());
+    m_fixed_bin_size = fixed ? fixed->get_bin_size() : 0;
 
     // Compile expressions
     m_py_compiled_exprs.resize(m_track_exprs.size());
@@ -264,6 +493,10 @@ void PMTrackExprScanner::check(const std::vector<std::string> &exprs,
         // Check if expression is just a track or vtrack variable name
         const PMTrackExpressionVars::TrackVar *var = m_expr_vars.var(m_track_exprs[iexpr].c_str());
         const PMTrackExpressionVars::VTrackVar *vvar = m_expr_vars.vtrack_var(m_track_exprs[iexpr].c_str());
+        // The values of a track or a virtual track are numbers; read as logical (gscreen) they left
+        // the logical buffer unset, and the scan crashed. R misha's error.
+        if ((var || vvar) && valtype == LOGICAL_T)
+            TGLError("Expression \"%s\" does not produce a logical result", m_track_exprs[iexpr].c_str());
         if (!var && !vvar) {
             // Need to compile: not a simple track name
             m_py_compiled_exprs[iexpr].assign(
@@ -410,11 +643,45 @@ bool PMTrackExprScanner::begin(const std::vector<std::string> &exprs, ValType va
     vdebug("PMTrackExprScanner::begin with %lu expressions, %lu intervals\n",
            exprs.size(), intervals.size());
 
-    check(exprs, intervals, iterator_policy, valtype, py_vtracks);
+    prepare(exprs, valtype, iterator_policy, py_vtracks);
+    return start(intervals);
+}
+
+void PMTrackExprScanner::prepare(const std::vector<std::string> &exprs, ValType valtype, int64_t iterator_policy,
+                                 PyObject *py_vtracks)
+{
+    m_iterator_policy = iterator_policy;
+    check(exprs, valtype, py_vtracks);
 
     // Define Python variables with buffer size from config
     unsigned buf_size = g_pymisha ? g_pymisha->eval_buf_size() : 1000;
     define_py_vars(buf_size);
+
+    // What a kid evaluates in C++ instead (CppExpr); not an expression that reads CHROM, START or
+    // END, whose arrays hold Python objects
+    m_kid_can_scan = !m_use_python || !(m_need_chrom || m_need_start || m_need_end);
+    m_cpp_exprs.clear();
+    m_cpp_exprs.resize(m_track_exprs.size());
+    m_cpp_out.assign(m_track_exprs.size(), std::vector<double>());
+    m_cpp_out_bool.assign(m_track_exprs.size(), std::vector<char>());
+    for (size_t iexpr = 0; iexpr < m_track_exprs.size() && m_kid_can_scan; ++iexpr) {
+        if (!m_py_compiled_exprs[iexpr])
+            continue;
+        m_cpp_exprs[iexpr] = std::make_unique<CppExpr>();
+        if (!m_cpp_exprs[iexpr]->parse(normalize_logical_precedence(m_exprs4compile[iexpr]),
+                                       [this](const std::string &name) { return m_expr_vars.values_of(name); })) {
+            m_kid_can_scan = false;
+            break;
+        }
+        m_cpp_out[iexpr].resize(m_eval_buf_limit);
+        if (m_valtype == LOGICAL_T && m_cpp_exprs[iexpr]->is_bool())
+            m_cpp_out_bool[iexpr].resize(m_eval_buf_limit);
+    }
+}
+
+bool PMTrackExprScanner::start(const std::vector<GInterval> &intervals)
+{
+    m_itr = create_expr_iterator(intervals, m_iterator_policy);
 
     // Pre-populate chrom string cache with all unique chromids from scope
     // to avoid per-element PyUnicode_FromString + hash lookup misses in the hot path
@@ -617,7 +884,7 @@ bool PMTrackExprScanner::eval_next()
         if (m_eval_buf_size < m_eval_buf_limit) {
             // Pad remainder with NaN/sentinel values to prevent stale data
             // from affecting non-elementwise expressions (np.mean, np.sort, etc.)
-            if (m_use_python) {
+            if (m_use_python && !PyMisha::is_kid()) {
                 if (!m_empty_chrom_str)
                     m_empty_chrom_str = PyUnicode_FromString("");
                 for (unsigned i = m_eval_buf_size; i < m_eval_buf_limit; ++i) {
@@ -634,8 +901,22 @@ bool PMTrackExprScanner::eval_next()
 
         check_interrupt();
 
-        // Evaluate compiled expressions
-        if (m_use_python) {
+        // Evaluate compiled expressions: in a kid in C++ (kid_can_scan())
+        if (m_use_python && PyMisha::is_kid()) {
+            for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
+                if (!m_cpp_exprs[iexpr])
+                    continue;
+                double *out = m_cpp_out[iexpr].data();
+                m_cpp_exprs[iexpr]->eval(m_eval_buf_limit, out);
+                if (!m_cpp_out_bool[iexpr].empty()) {
+                    bool *bout = (bool *)m_cpp_out_bool[iexpr].data();
+                    for (unsigned k = 0; k < m_eval_buf_limit; ++k)
+                        bout[k] = out[k] != 0;
+                    m_eval_bools[iexpr] = bout;
+                } else
+                    m_eval_doubles[iexpr] = out;
+            }
+        } else if (m_use_python) {
             for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
                 if (m_py_compiled_exprs[iexpr]) {
                     m_py_eval_bufs[iexpr].assign(

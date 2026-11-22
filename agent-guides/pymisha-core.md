@@ -90,7 +90,7 @@ pm.gsetroot("db")                       # or absolute path; symlink "db" from pr
 pm.gdataset_load("db_extra")            # optional, project-local dataset
 
 pm.CONFIG["max_data_size"] = 10_000_000_000      # raise from default for large gextract returns
-pm.CONFIG["multitasking"] = True                 # parallel across chroms (default; explicit)
+pm.CONFIG["multitasking"] = True                 # parallel across chroms or ranges (default; explicit)
 pm.CONFIG["multitasking_strategy"] = "auto"      # or "tracks" for many-track scans
 ```
 
@@ -98,9 +98,11 @@ Attach the genome you need once at the top and stay on it. Switching `gsetroot` 
 
 **`multitasking` and external parallelism.** pymisha's `CONFIG["multitasking"] = True` forks worker processes internally. When you then wrap pymisha calls in `multiprocessing.Pool` (or `joblib.Parallel` with `prefer="processes"`, or `concurrent.futures.ProcessPoolExecutor`), the nested forks can deadlock or oversubscribe cores. Set `pm.CONFIG["multitasking"] = False` inside the worker body and let the outer layer do the parallelism.
 
-**Memory balance.** `max_data_size` caps the *result size* of any single `gextract`. With `multitasking = True`, several extractions run in parallel and each holds up to that much in memory. A high `max_data_size` combined with `multitasking = True` on a heavy `gextract` can blow past available RAM and surface as `MemoryError` or OOM kill. If you hit it: lower `max_data_size`, drop `multitasking`, or partition by chromosome.
+**Memory balance.** `max_data_size` caps the *result size* (rows) of any single `gextract`, all its processes together. With `multitasking = True` the processes write their rows to shared memory and the parent copies them out, so a result near a high `max_data_size` takes about twice its size at its peak, which can surface as `MemoryError` or an OOM kill. If you hit it: lower `max_data_size`, drop `multitasking`, or partition by chromosome.
 
-**Many-track strategy.** `pm.CONFIG["multitasking_strategy"] = "auto" | "tracks" | "tiles"` controls how the engine parallelizes a multi-track `gextract`. `"tiles"` (the historical default) parallelizes across genome tiles within one expression at a time - good for a few heavy tracks. `"tracks"` parallelizes across the *expressions* in `["...", "..."]` instead - dramatically faster for thousands of motif / feature tracks where each is cheap individually. `"auto"` picks per call. For motif-scan workloads (hundreds of PSSMs over the genome) set `"tracks"` explicitly.
+**Many-track strategy.** `pm.CONFIG["multitasking_strategy"] = "auto" | "tracks" | "tiles"` controls how the engine parallelizes a multi-track `gextract`. `"tiles"` (the historical default) splits the scope among the processes, each extracting every expression over its part - good for a few heavy tracks. `"tracks"` parallelizes across the *expressions* in `["...", "..."]` instead - dramatically faster for thousands of motif / feature tracks where each is cheap individually. `"auto"` picks `"tracks"` for at least 8 expressions over at least 1000 intervals with an iterator of intervals (a DataFrame or an intervals set), as R misha does. For motif-scan workloads (hundreds of PSSMs over the genome) set `"tracks"` explicitly.
+
+**What the processes run.** They evaluate names of tracks and virtual tracks, numbers, `+ - * /`, comparisons and `& |` themselves, without Python. An expression with anything else (`np.log2(...)`, `CHROM`, `START`, `END`) is computed in one process; for a heavy one, extract the tracks with `gextract` and compute in numpy.
 
 **Avoid:**
 - `pm.CONFIG["multitaksing"] = False` - typo of `multitasking`. `pm.CONFIG` is a plain dict and accepts unknown keys silently; this is a no-op.

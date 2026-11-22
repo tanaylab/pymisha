@@ -9,10 +9,10 @@ import pandas as pd
 
 from . import _shared
 from ._shared import (
+    CONFIG,
     _check_breaks,
     _check_flag,
     _checkroot,
-    _config_no_mt,
     _df2pymisha,
     _numpy,
     _pm_dbreload,
@@ -169,27 +169,26 @@ def glookup(
 
     if not use_python:
         # Use C++ streaming implementation
-        with _config_no_mt(_itr_id_map) as _base_cfg:
-            config = dict(_base_cfg)
-            if progress is not None:
-                config["progress"] = progress
-            if progress_desc:
-                config["progress_desc"] = progress_desc
+        config = dict(CONFIG)
+        if progress is not None:
+            config["progress"] = progress
+        if progress_desc:
+            config["progress_desc"] = progress_desc
 
-            # Flatten lookup table in Fortran (column-major) order to match
-            # BinsManager::vals2idx flat index convention
-            flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order="F"))
+        # Flatten lookup table in Fortran (column-major) order to match
+        # BinsManager::vals2idx flat index convention
+        flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order="F"))
 
-            result = _pymisha.pm_lookup(
-                exprs,
-                [b.tolist() for b in breaks_list],
-                flat_table,
-                _df2pymisha(intervals),
-                iterator,
-                include_lowest,
-                force_binning,
-                config,
-            )
+        result = _pymisha.pm_lookup(
+            exprs,
+            [b.tolist() for b in breaks_list],
+            flat_table,
+            _df2pymisha(intervals),
+            iterator,
+            include_lowest,
+            force_binning,
+            config,
+        )
 
         if result is None:
             return None

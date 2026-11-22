@@ -92,6 +92,11 @@ public:
 
         // A DataFrame source (interval or value-based functions), read once
         std::unique_ptr<PMIntervalsVtrack> intervals_src;
+
+        // The mask of gvtrack_filter (nullptr: none), and the unmasked parts of the interval
+        // being evaluated
+        std::unique_ptr<Genome1DFilter> filter;
+        std::vector<GInterval> parts;
     };
 
     PMTrackExpressionVars();
@@ -145,6 +150,10 @@ public:
 
     // Look up a vtrack variable by name
     const VTrackVar *vtrack_var(const char *name) const;
+
+    // The values of the track or virtual track variable named var_name in the expressions compiled
+    // for Python (after define_py_vars()), nullptr if there is none
+    const double *values_of(const std::string &var_name) const;
 
     // Get the bin size used by tracks (0 if not uniform)
     int64_t get_bin_size() const { return m_bin_size; }
@@ -230,6 +239,18 @@ private:
 
     // Evaluate a value-based vtrack for a single interval
     double eval_value_based_vtrack(VTrackVar &vvar, const GInterval &interval);
+
+    // Open chromosome chromid of a value-based vtrack's source; false if the source has no data
+    // for it
+    bool load_src_chrom(VTrackVar &vvar, int chromid);
+
+    // A filtered vtrack over interval (after the shifts), from its unmasked parts vvar.parts
+    double eval_filtered_vtrack(VTrackVar &vvar, const GInterval &interval);
+    double eval_filtered_track(VTrackVar &vvar, const GInterval &interval);
+    double eval_filtered_seq(VTrackVar &vvar, const GInterval &interval);
+
+    // Register the reducers a filtered value-based func reads from each part
+    void register_filtered_funcs(GenomeTrack1D *t, const std::string &func, GenomeTrack::Type type);
 
     // Register the reducer(s) a value-based func needs on a 1D reader.
     static void register_value_funcs(GenomeTrack1D *t, const std::string &func,

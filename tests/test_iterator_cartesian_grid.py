@@ -535,7 +535,6 @@ def test_cartesian_grid_multitask_equals_single_task(_init_db, rects_track):
             "multitasking": True,
             "max_processes": 4,
             "min_scope4process": 1,
-            "min_intervs4process": 1,
         })
         r4 = pm.gextract(rects_track, intervals=scope_2d, iterator=spec)
     finally:

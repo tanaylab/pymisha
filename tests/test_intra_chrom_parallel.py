@@ -42,14 +42,12 @@ class TestIntraChromParallel:
     def _set_serial(self):
         pm.CONFIG.update({
             "multitasking": False,
-            "min_processes": 2,
             "max_processes": 8,
         })
 
     def _set_parallel(self):
         pm.CONFIG.update({
             "multitasking": True,
-            "min_processes": 2,
             "max_processes": 8,
         })
 
@@ -193,7 +191,6 @@ class TestIntraChromParallel:
         # Enable multitasking but cap at 1 process
         pm.CONFIG.update({
             "multitasking": True,
-            "min_processes": 1,
             "max_processes": 1,
         })
         fallback = pm.gextract(

@@ -160,8 +160,7 @@ public:
     // Returns true if multitasking option is switched on
     bool multitasking_avail() const { return m_multitasking_avail; }
 
-    // Returns min / max number of processes
-    int min_processes() const { return m_min_processes; }
+    // Returns the maximal number of processes
     int max_processes() const { return m_max_processes; }
 
     // max_data_size() of no limit (CONFIG['max_data_size'] of None or inf; pymisha._shared._NO_LIMIT)
@@ -170,10 +169,11 @@ public:
     // Returns the upper limit for data size
     uint64_t max_data_size() const { return m_max_data_size; }
 
-    // Multitask gating thresholds. Forking is skipped when the workload is
-    // too small to amortize fork+IPC overhead. Both must be exceeded.
+    // CONFIG['max_mem_usage'] in bytes (it is set in KB, as R's gmax.mem.usage)
+    uint64_t max_mem_usage() const { return m_max_mem_usage; }
+
+    // The floors of a multitasking call's plan (plan_kids() in PMStubs.cpp)
     uint64_t min_scope4process() const { return m_min_scope4process; }
-    uint64_t min_intervs4process() const { return m_min_intervs4process; }
 
     // Returns buffer size of the numpy arrays used within PyEval_EvalCode
     int eval_buf_size() const { return m_eval_buf_size; }
@@ -189,6 +189,32 @@ public:
     // Called by the parent before it forks num_kids processes for a call; warns once per
     // session when the forks will be slow (warn_if_forks_are_slow).
     static void prepare4multitasking(unsigned num_kids);
+
+    // As above, and maps the shared memory the kids hand their results over in, as R misha's
+    // distribute_task(): a kid's result takes res_const_size bytes plus res_record_size bytes per
+    // record, and the records of all the kids together are at most max_records (0 or more than
+    // CONFIG['max_data_size']: max_data_size). Where that much cannot be mapped (no limit, or more
+    // than the RAM and swap), half the RAM is mapped, at most CONFIG['max_mem_usage']. False if not
+    // even that can be mapped: the call then runs in one process. Otherwise the kids must be
+    // forked right after, and all of them waited for before their results are read.
+    static bool prepare4multitasking(unsigned num_kids, uint64_t res_const_size, uint64_t res_record_size,
+                                     uint64_t max_records = 0);
+    // In a kid: the memory for its result of num_records records (an error if it does not fit)
+    static void *allocate_res(uint64_t num_records);
+    // In the parent, once wait_for_kids() returned false: the result of kid i (0-based, in the order
+    // the kids were forked) and its number of records
+    static void *get_kid_res(int kid);
+    static uint64_t get_kid_res_size(int kid);
+    // In a kid: the number of records of its result so far; while it waits for the kids, the parent
+    // checks their sum against CONFIG['max_data_size'], as R misha does
+    static void update_res_data_size(uint64_t num_records) { s_shm->kid_res_num_records[s_kid_index] = num_records; }
+    // Half the RAM, at most CONFIG['max_mem_usage'] (R misha's get_ram_shm_size())
+    static uint64_t ram_shm_size();
+    // The size in records of a fixed-size buffer each of num_kids kids hands over in the shared
+    // memory (a quantiles sample), as R misha's get_kid_buf_size(): max_data_size / num_kids, or
+    // with no limit, a share of ram_shm_size()
+    static uint64_t kid_buf_size(unsigned num_kids, uint64_t record_size);
+
     static pid_t launch_process();
 
     // returns false if all the child processes have ended or true if the timeout has elapsed
@@ -221,7 +247,12 @@ protected:
     struct Shm {
         char          error_msg[10000];
         uint64_t      itr_idx[MAX_KIDS];          // used for progress report
+        unsigned      num_kids;                   // the kids of the step that maps the result arena
+        uint64_t      res_offset;                 // the first free byte of the result arena
+        uint64_t      kid_res_offset[MAX_KIDS];   // where a kid's result starts (NO_RES: not allocated)
+        uint64_t      kid_res_num_records[MAX_KIDS];
     };
+    static const uint64_t NO_RES = ~(uint64_t)0;
 
     struct SigBlocker {
         SigBlocker() {
@@ -252,6 +283,11 @@ protected:
     static vector<pid_t>        s_running_pids;
     static Shm                 *s_shm;
     static int                  s_fifo_fd;
+    static char                *s_res;               // the result arena (MAP_FAILED: none)
+    static uint64_t             s_res_size;
+    static uint64_t             s_res_const_size;
+    static uint64_t             s_res_record_size;
+    static bool                 s_res_size_from_ram;
 
     PMPY                        m_gdict;
     PMPY                        m_c_module_dict;
@@ -261,14 +297,11 @@ protected:
 
     bool                        m_debug{false};
     bool                        m_multitasking_avail{false};
-    int                         m_min_processes{4};
-    int                         m_max_processes{20};
+    int                         m_max_processes{1};
     uint64_t                    m_max_data_size{10000000};
-    // Min total interval scope (bp) and count to enable C++ fork-based
-    // multitasking. Below these floors the fork+FIFO overhead dominates.
-    // Defaults chosen from hg38/Phylo447 bench: 1 Gbp / 250k intervals.
-    uint64_t                    m_min_scope4process{1000000000};
-    uint64_t                    m_min_intervs4process{250000};
+    uint64_t                    m_max_mem_usage{~(uint64_t)0};
+    // CONFIG['min_scope4process'] (see plan_kids())
+    uint64_t                    m_min_scope4process{10000};
     int                         m_eval_buf_size{1000};
     static bool                 s_multitasking_stdout;
 
@@ -304,6 +337,9 @@ extern PyObject *g_module;
 
 inline void check_interrupt()
 {
+    // A kid does not call into Python. On an interrupt the parent stops, and kills its kids.
+    if (PyMisha::is_kid())
+        return;
     if (PyErr_CheckSignals() == -1)
         TGLError("Command interrupted!");
 }

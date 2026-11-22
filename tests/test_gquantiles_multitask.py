@@ -18,7 +18,7 @@ import pymisha as pm
 
 PCTS = [i / 20 for i in range(21)]
 _FORCE_MT = {"multitasking": True, "max_processes": 4,
-             "min_intervs4process": 0, "min_scope4process": 0, "progress": False}
+             "min_scope4process": 0, "progress": False}
 
 # 8 contiguous intervals tiling chrom 1 -> num_intervals (8) >= target (4) -> forks.
 _IV8 = pd.DataFrame({

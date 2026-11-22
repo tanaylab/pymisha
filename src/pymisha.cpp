@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +52,11 @@ int                      PyMisha::s_kid_index;
 vector<pid_t>            PyMisha::s_running_pids;
 PyMisha::Shm            *PyMisha::s_shm = (PyMisha::Shm *)MAP_FAILED;
 int                      PyMisha::s_fifo_fd = -1;
+char                    *PyMisha::s_res = (char *)MAP_FAILED;
+uint64_t                 PyMisha::s_res_size = 0;
+uint64_t                 PyMisha::s_res_const_size = 0;
+uint64_t                 PyMisha::s_res_record_size = 0;
+bool                     PyMisha::s_res_size_from_ram = false;
 bool                     PyMisha::s_multitasking_stdout = false;
 
 PyMisha *g_pymisha = NULL;
@@ -88,6 +94,7 @@ PyMisha::PyMisha(bool check_db)
         // the call continues the stream of the calls before it (pm::g_rng_stream)
         if (!pm::g_rng_stream)
             pm::g_rng_loaded = false;
+        pm::g_rng_peeked = false;
 
         s_sigint_fired = 0;
         s_sigalrm_fired = 0;
@@ -98,6 +105,8 @@ PyMisha::PyMisha(bool check_db)
         s_fifo_sem = SEM_FAILED;
         s_shm = (Shm *)MAP_FAILED;
         s_fifo_fd = -1;
+        s_res = (char *)MAP_FAILED;
+        s_res_size = s_res_const_size = s_res_record_size = 0;
         s_running_pids.clear();
 
         PMPY module(PyImport_AddModule("__main__"));
@@ -198,6 +207,9 @@ PyMisha::~PyMisha()
 
             if (s_shm != (Shm *)MAP_FAILED)
                 munmap(s_shm, sizeof(Shm));
+
+            if (s_res != (char *)MAP_FAILED)
+                munmap(s_res, s_res_size);
 
             unlink(get_fifo_name().c_str());
         }
@@ -361,6 +373,11 @@ static void warn_if_forks_are_slow(unsigned num_kids)
 void PyMisha::prepare4multitasking(unsigned num_kids)
 {
     warn_if_forks_are_slow(num_kids);
+    s_res_record_size = 0;   // no result arena (the overload below maps one)
+
+    // the seed of the kids' random draws, which they do not take from Python themselves
+    if (!pm::g_rng_loaded && !pm::g_rng_peeked)
+        pm::rng_peek();
 
     vdebug("Cleaning old semaphores\n");
     if (s_shm_sem == SEM_FAILED) {
@@ -407,23 +424,191 @@ void PyMisha::prepare4multitasking(unsigned num_kids)
     }
 }
 
-bool pm::g_rng_loaded = false;
-int  pm::g_rng_kid_idx = -1;
-bool pm::g_rng_stream = false;
+// The smallest arena ram_shm_size() gives, whatever CONFIG['max_mem_usage'] is (R misha's
+// MIN_RAM_SHM_SIZE)
+static const uint64_t MIN_RAM_SHM_SIZE = (uint64_t)16 << 20;
 
-void pm::rng_load()
+uint64_t PyMisha::ram_shm_size()
 {
-    // A draw from numpy's global generator. The C++ layer holds the GIL throughout a call (it never
-    // releases it), and draws only in the thread that called it.
+    // Half the RAM: once the kids are done the parent copies their results out of the arena into
+    // arrays of about the same size, so arena and copy together fit in the RAM
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    uint64_t ram = pages > 0 && page_size > 0 ? (uint64_t)pages * (uint64_t)page_size : (uint64_t)8e9;
+    return max(min(ram / 2, g_pymisha->max_mem_usage()), MIN_RAM_SHM_SIZE);
+}
+
+uint64_t PyMisha::kid_buf_size(unsigned num_kids, uint64_t record_size)
+{
+    if (g_pymisha->max_data_size() < MAX_DATA_SIZE_NO_LIMIT)
+        return (uint64_t)ceil(g_pymisha->max_data_size() / (double)num_kids);
+    return max(ram_shm_size() / ((uint64_t)max(num_kids, 1u) * record_size), (uint64_t)1);
+}
+
+bool PyMisha::prepare4multitasking(unsigned num_kids, uint64_t res_const_size, uint64_t res_record_size,
+                                   uint64_t max_records)
+{
+    if (!s_running_pids.empty())
+        verror("Multitasking: the kids of a previous step are still running");
+
+    if (s_res != (char *)MAP_FAILED) {
+        munmap(s_res, s_res_size);
+        s_res = (char *)MAP_FAILED;
+    }
+
+    // Sized for the most the limit allows; the pages are committed only as the kids write.
+    // Saturated, so that a large limit cannot wrap the size around.
+    uint64_t limit = g_pymisha->max_data_size();
+    if (max_records && max_records < limit)
+        limit = max_records;
+    const uint64_t cap = (uint64_t)1 << 62;
+    uint64_t const_size, size;
+    if (__builtin_mul_overflow((uint64_t)num_kids, res_const_size + 8, &const_size))
+        const_size = cap;
+    if (__builtin_mul_overflow(limit, res_record_size, &size) || __builtin_add_overflow(size, const_size, &size) ||
+        size > cap)
+        size = cap;
+    size = max(size, (uint64_t)8);
+
+    s_res_size_from_ram = false;
+    s_res = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s_res == (char *)MAP_FAILED) {
+        // No limit, or a limit larger than can be mapped: map one sized from the RAM instead, if
+        // the kids' fixed-size parts fit in it (as R misha). A result that exceeds it fails in
+        // allocate_res().
+        uint64_t ram_size = ram_shm_size();
+        if (size > ram_size && const_size <= ram_size) {
+            size = ram_size;
+            s_res_size_from_ram = true;
+            s_res = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        }
+        // Not even that: the caller runs in one process. R misha reports an error here, except in
+        // gextract and gscreen, which then run in one process too.
+        if (s_res == (char *)MAP_FAILED) {
+            vdebug("Failed to allocate shared memory for %u kids: %s\n", num_kids, strerror(errno));
+            return false;
+        }
+    }
+    s_res_size = size;
+
+    prepare4multitasking(num_kids);
+
+    // Kid i of this step is s_kid_index i, and its result goes into slot i
+    s_kid_index = 0;
+    s_shm->num_kids = num_kids;
+    s_shm->res_offset = 0;
+    for (int i = 0; i < MAX_KIDS; ++i) {
+        s_shm->kid_res_offset[i] = NO_RES;
+        s_shm->kid_res_num_records[i] = 0;
+    }
+    s_res_const_size = res_const_size;
+    s_res_record_size = res_record_size;
+    return true;
+}
+
+void *PyMisha::allocate_res(uint64_t num_records)
+{
+    if (!s_is_kid)
+        verror("allocate_res() cannot be called by the parent process");
+
+    update_res_data_size(num_records);
+
+    uint64_t res_size;
+    bool overflow = __builtin_mul_overflow(num_records, s_res_record_size, &res_size) ||
+                    __builtin_add_overflow(res_size, s_res_const_size + 7, &res_size);
+    res_size &= ~(uint64_t)7;   // rounded up to 8 bytes, so that every kid's result starts aligned
+
+    uint64_t offset = 0;
+    {
+        SemLocker sl(s_shm_sem);
+        if (!overflow) {
+            offset = s_shm->res_offset;
+            overflow = res_size > s_res_size - min(offset, s_res_size);
+            if (!overflow) {
+                s_shm->kid_res_offset[s_kid_index] = offset;
+                s_shm->res_offset = offset + res_size;
+            }
+        }
+    }
+
+    // reported once the lock is released: a kid's error takes it too
+    if (overflow) {
+        // an arena sized by the limit overflows when the kids' records exceed it: the error the
+        // parent gives for that, whoever comes first
+        if (!s_res_size_from_ram) {
+            uint64_t total = 0;
+            for (unsigned i = 0; i < s_shm->num_kids; ++i)
+                total += s_shm->kid_res_num_records[i];
+            g_pymisha->verify_max_data_size(total, "Result");
+        }
+        if (s_res_size_from_ram)
+            verror("Result size exceeded the maximal allowed.\n"
+                   "Try to bound the scope of the function.\n"
+                   "Note: CONFIG['max_data_size'] sets no limit or more than can be mapped, so the result had to fit\n"
+                   "into half the RAM, at most CONFIG['max_mem_usage'].");
+        verror("Result size exceeded the maximal allowed.\n"
+               "Try to bound the scope of the function.\n"
+               "Note: the maximum data size is controlled via CONFIG['max_data_size'].");
+    }
+    return s_res + offset;
+}
+
+void *PyMisha::get_kid_res(int kid)
+{
+    if (s_shm->kid_res_offset[kid] == NO_RES)
+        verror("Multitasking: process %d ended without a result", kid);
+    return s_res + s_shm->kid_res_offset[kid];
+}
+
+uint64_t PyMisha::get_kid_res_size(int kid)
+{
+    if (s_shm->kid_res_offset[kid] == NO_RES)
+        verror("Multitasking: process %d ended without a result", kid);
+    return s_shm->kid_res_num_records[kid];
+}
+
+bool     pm::g_rng_loaded = false;
+int      pm::g_rng_kid_idx = -1;
+bool     pm::g_rng_stream = false;
+bool     pm::g_rng_peeked = false;
+uint32_t pm::g_rng_peeked_seed = 0;
+
+// A draw from numpy's global generator. The C++ layer holds the GIL throughout a call (it never
+// releases it), and draws only in the thread that called it. With restore, numpy's state is put
+// back after the draw.
+static uint32_t numpy_draw(bool restore)
+{
     PMPY random(PyImport_ImportModule("numpy.random"), true);
-    PMPY draw(random ? PyObject_CallMethod(random, "randint", "K", (unsigned long long)4294967296ULL) : NULL, true);
+    PMPY state(random && restore ? PyObject_CallMethod(random, "get_state", NULL) : NULL, true);
+    PMPY draw(random && (state || !restore) ?
+              PyObject_CallMethod(random, "randint", "K", (unsigned long long)4294967296ULL) : NULL, true);
     PMPY as_long(draw ? PyNumber_Long(draw) : NULL, true);
     unsigned long long seed = as_long ? PyLong_AsUnsignedLongLong(as_long) : 0;
-    if (!as_long || PyErr_Occurred()) {
+    bool ok = as_long && !PyErr_Occurred();
+    if (ok && restore)
+        ok = (bool)PMPY(PyObject_CallMethod(random, "set_state", "(O)", (PyObject *)state), true);
+    if (!ok) {
         PyErr_Clear();
         verror("Failed to draw a seed from numpy's random generator");
     }
-    uint32_t s = (uint32_t)seed;
+    return (uint32_t)seed;
+}
+
+void pm::rng_peek()
+{
+    g_rng_peeked_seed = numpy_draw(true);
+    g_rng_peeked = true;
+}
+
+void pm::rng_load()
+{
+    uint32_t s;
+    if (PyMisha::is_kid()) {
+        if (!g_rng_peeked)
+            verror("A multitasking process needs a random seed its parent did not draw");
+        s = g_rng_peeked_seed;
+    } else
+        s = numpy_draw(false);
     if (g_rng_kid_idx >= 0)
         s = kid_seed(s, g_rng_kid_idx);
     srand48((long)s);
@@ -533,6 +718,8 @@ void PyMisha::check_kids_state(bool ignore_errors)
                 vdebug("pid %d was identified as a child process\n", pid);
                 swap(*ipid, s_running_pids.back());
                 s_running_pids.pop_back();
+                if (!ignore_errors && WIFSIGNALED(status))
+                    verror("Child process %d ended unexpectedly (signal %d)", (int)pid, WTERMSIG(status));
                 if (!ignore_errors && !WIFEXITED(status))
                     verror("Child process %d ended unexpectedly", (int)pid);
                 break;
@@ -571,6 +758,15 @@ bool PyMisha::wait_for_kids(int millisecs)
             SemLocker sl(s_shm_sem);
             if (s_shm->error_msg[0])
                 verror("%s", s_shm->error_msg);
+        }
+
+        // the records of all the kids together, against CONFIG['max_data_size'] (each kid checks
+        // its own)
+        if (s_res_record_size) {
+            uint64_t num_records = 0;
+            for (int i = 0; i < s_kid_index; ++i)
+                num_records += s_shm->kid_res_num_records[i];
+            g_pymisha->verify_max_data_size(num_records, "Result");
         }
 
         if (s_running_pids.empty()) {
@@ -807,23 +1003,23 @@ void PyMisha::load_options()
     m_max_data_size = PyLong_AsUnsignedLongLong(max_data_size);
     if (PyErr_Occurred())
         python_error();
-    if (!PMPY(PyObject_CallMethod(shared, "_config_limit", "s", "max_mem_usage"), true))
+    PMPY max_mem_usage(PyObject_CallMethod(shared, "_config_limit", "s", "max_mem_usage"), true);
+    if (!max_mem_usage)
         python_error();
+    // in KB; R misha counts 1000 bytes to the KB
+    uint64_t max_mem_usage_kb = PyLong_AsUnsignedLongLong(max_mem_usage);
+    if (PyErr_Occurred())
+        python_error();
+    m_max_mem_usage = max_mem_usage_kb >= MAX_DATA_SIZE_NO_LIMIT ? ~(uint64_t)0 : max_mem_usage_kb * 1000;
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("multitasking_stdout"), true)), false) && PyBool_Check(opt))
         s_multitasking_stdout = opt == Py_True;
 
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_processes"), true)), false) && PyLong_Check(opt))
-        m_min_processes = max(as_long("min_processes"), 1L);
-
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_processes"), true)), false) && PyLong_Check(opt))
-        m_max_processes = max((int)as_long("max_processes"), m_min_processes);
+        m_max_processes = max((int)as_long("max_processes"), 1);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_scope4process"), true)), false) && PyLong_Check(opt))
         m_min_scope4process = (uint64_t)max(as_long("min_scope4process"), 0L);
-
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_intervs4process"), true)), false) && PyLong_Check(opt))
-        m_min_intervs4process = (uint64_t)max(as_long("min_intervs4process"), 0L);
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("eval_buf_size"), true)), false) && PyLong_Check(opt))
         m_eval_buf_size = max(as_long("eval_buf_size"), 1L);

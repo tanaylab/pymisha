@@ -107,18 +107,17 @@ CONFIG = {
     'multitasking': True,           # Allow parallel processing
     'multitasking_stdout': False,   # Debug output from children
     'multitasking_strategy': 'auto',  # 'auto' | 'tracks' | 'tiles' (R 5.6.18 parity)
-    'min_processes': 4,             # Min workers for multitasking
-    # Max workers for multitasking. 70% of cores capped at 32, as R misha's
-    # gmax.processes auto-calculates it (5.11.20); the old flat 20 left
+    # Max workers for multitasking. 70% of cores, at least 1 and at most 32, as
+    # R misha's gmax.processes auto-calculates it (5.11.20); the old flat 20 left
     # large-core machines idle (a 56-track extraction ran ~1.5x slower at 20
     # workers than at 40). Past ~32 the per-worker cost - fork, shared memory,
     # result merge - outweighs the extra parallelism: misha measured 89 workers
     # on a 128-core host as slower than 32 on every workload tried, and
     # cold-NFS whole-genome scans saturate at ~32 too. The cap only binds above
-    # 46 cores. Both the C++ scanner and the Python fork paths clamp to the
-    # actual core count, so a small machine is unaffected, and setting
+    # 46 cores. The C++ layer forks at most 2 processes per core (R's
+    # gmax.processes2core), the Python fork paths at most one, and setting
     # CONFIG['max_processes'] by hand still overrides it.
-    'max_processes': max(4, min(32, int((_os.cpu_count() or 1) * 0.7))),
+    'max_processes': max(1, min(32, int((_os.cpu_count() or 1) * 0.7))),
     # Max records (rows of a result, values) a call holds in memory: above it gextract and the
     # like fail and gquantiles samples. R misha's gmax.data.size default, from the RAM and the
     # cores (_optimal_max_data_size), so the same calls fail or sample on the same host.
@@ -147,11 +146,11 @@ CONFIG = {
     # then overwrite from either package. Set to None to leave the process umask
     # alone. Mirrors R misha's gpermissions.umask (5.11.21).
     'permissions_umask': 0o007,
-    # Workload floors for fork-based multitasking. Fork+IPC costs ~150ms on
-    # this stack; below these floors serial is faster (measured 20-200x on
-    # hg38/Phylo447 sparse-track ops). Set to 0 to fork unconditionally.
-    'min_scope4process': 1_000_000_000,   # min total scope (bp) per worker
-    'min_intervs4process': 250_000,       # min total intervals before any fork
+    # The scope (bp) a process of a multitasking call gets at least, as R misha's
+    # gmin.scope4process: a kid takes whole chromosomes until it holds more than
+    # this, and a split of ranges gives each kid at least the larger of this and
+    # 500 kb. 0 drops the floor.
+    'min_scope4process': 10_000,
     'eval_buf_size': 1000,          # Batch size for expression eval
     'debug': False,                 # Debug prints
     'progress': True,              # False, True, 'tqdm', 'rich', 'text', or callable
@@ -781,17 +780,22 @@ def _pymisha2df(arg):
             numrows = col.size
             data[colname] = col
         else:
+            # [categories, codes] is a categorical column; [names, codes, "plain"] a plain one of
+            # the names the codes pick, as from an object array of them, built much faster
             if (
                 not isinstance(col, list)
-                or len(col) != 2
+                or len(col) not in (2, 3)
+                or (len(col) == 3 and col[2] != "plain")
                 or not isinstance(col[0], _numpy.ndarray)
                 or not isinstance(col[1], _numpy.ndarray)
                 or (numrows != -1 and len(col[1]) != numrows)
             ):
                 return arg
             numrows = len(col[1])
-            cats = _pandas.Categorical.from_codes(col[1], col[0])
-            data[colname] = cats
+            if len(col) == 3:
+                data[colname] = _pandas.Series(col[0]).array.take(col[1])
+            else:
+                data[colname] = _pandas.Categorical.from_codes(col[1], col[0])
 
     return _pandas.DataFrame(data)
 
