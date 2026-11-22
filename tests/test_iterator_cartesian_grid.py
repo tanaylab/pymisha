@@ -498,7 +498,7 @@ def test_r_cartesian_grid_min_band_idx_with_physical_band(_init_db):
 # ---------------------------------------------------------------------------
 # T6: Multitask equivalence guard
 #
-# The CartesianGrid scanner currently runs single-process (no fork/FIFO
+# The CartesianGrid scanner currently runs single-process (no fork
 # path).  This test verifies that the result is identical regardless of
 # the CONFIG multitasking settings.  It serves as a regression guard for
 # any future parallelization work.

@@ -72,24 +72,10 @@ public:
         return m_eval_doubles[expr_idx][m_eval_buf_idx];
     }
 
-    // Get the result of last evaluation as boolean
+    // Get the result of last evaluation as boolean (LOGICAL_T, gscreen's, whose expression must
+    // produce booleans: anything else is an error, as in R misha)
     bool vbool(int expr_idx = 0) const {
         return m_eval_bools[expr_idx][m_eval_buf_idx];
-    }
-
-    // Get the result of last evaluation as logical (for gscreen)
-    // Handles both boolean expressions (track1 > 0) and numeric expressions
-    // NaN is treated as false (conservative filtering)
-    bool vlogical(int expr_idx = 0) const {
-        // Check if we have a bool array (from boolean expressions)
-        if (m_eval_bools[expr_idx] != nullptr) {
-            return m_eval_bools[expr_idx][m_eval_buf_idx];
-        }
-        // Otherwise use double array (from numeric expressions)
-        double val = m_eval_doubles[expr_idx][m_eval_buf_idx];
-        // NaN is falsy for filtering purposes (conservative)
-        if (std::isnan(val)) return false;
-        return val != 0.0;
     }
 
     // Get current interval

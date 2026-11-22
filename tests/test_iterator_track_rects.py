@@ -637,7 +637,7 @@ def test_track_rects_multitask_equals_single_task(_init_db, rects_track):
     """Scanner currently single-process; honest regression guard for future.
 
     The TrackRects path in _gextract_2d_via_scanner calls
-    pm_extract_2d_scanner directly, bypassing pymisha's fork+FIFO multitask
+    pm_extract_2d_scanner directly, bypassing pymisha's fork multitask
     infrastructure.  Both CONFIG settings below therefore run single-process.
     The test confirms CONFIG knobs do not corrupt results and will catch any
     future multitask integration that breaks output stability.

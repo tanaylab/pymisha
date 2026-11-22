@@ -274,14 +274,9 @@ def gdist(
     vtracks_dict = _cpp_vtracks(exprs, all_user_vars)
     if vtracks_dict is not None:
         intervals, iterator = _vtrack_scope(exprs, intervals, iterator, vtracks_dict)
-        config = dict(CONFIG)
-        if progress is not None:
-            config["progress"] = progress
-        if progress_desc:
-            config["progress_desc"] = progress_desc
-
-        result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, config,
-                                  vtracks_dict or None)
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_dist(exprs, breaks_list, _df2pymisha(intervals), iterator, include_lowest, CONFIG,
+                                      vtracks_dict or None)
 
         if dataframe:
             return _array_to_dataframe(result, breaks_list, exprs, names, include_lowest)
@@ -1160,7 +1155,11 @@ def gquantiles(
     Calculate quantiles of a track expression.
 
     Computes quantiles for the given percentiles. If data size exceeds the
-    configured limit, data is randomly sampled to fit.
+    configured limit, data is randomly sampled to fit. A multitasked call
+    samples at most ``CONFIG['max_data_size']`` / (number of processes)
+    values in each process, as R misha does: its quantiles are approximate
+    (with a warning) whenever a process has more values than that, also
+    where one process would hold all the values and give exact quantiles.
 
     Parameters
     ----------

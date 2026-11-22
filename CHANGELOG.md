@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.23.0 (2026-11-22)
+
+### Breaking
+
+* `gscreen` of an expression whose result is not logical raises R misha's error, `Expression "..." does not produce a logical result`, in 1D and 2D, multitasked or not. A number, such as `"dense_track * 2"`, `"(dense_track)"` or `"1"`, screened the bins where it was nonzero; only a bare track or virtual track name was an error. A 2D `gextract` of a logical expression over a computed track returns booleans, as over other tracks, not 0 and 1.
+
+### Performance
+
+* `gtrack_smooth` multitasks as R misha's `gtrack.smooth`: each process smooths whole chromosomes into their files, the same bytes one process and R write. hg38 on 128 cores, `tn5bias_mean200bp` in its 20 bp bins with a 5 kb window: 4.3 s -> 0.4 s (R 0.7 s).
+* The processes of a multitasked `gextract` hand over their rows faster: they write their row count to shared memory every 65536 rows instead of every row, and reserve their rows up front. hg38 on 128 cores, 9.57 million 20 bp bins of `tn5bias_mean200bp`: 0.62 s -> 0.51 s with 2 processes, 0.48 s -> 0.44 s with 8, 0.44 s -> 0.43 s with 32 (one process 0.35 s; R 0.24 s in one process, 0.52 s, 0.34 s and 0.38 s with 2, 8 and 32).
+
+### Fixes
+
+* Multitasked calls report their progress, as R misha: every 3 s the mean of the processes' percentages, to the progress callback as `(pct, 100, pct)` or, without one, as text on stderr, and 100% at the end. They reported none, and the default progress bar never completed.
+* `gdist` and `glookup` report their progress. They never called a progress callback, in one process either.
+* The worker processes of a track-parallel `gextract`, of `gsynth` and of `gdb_create` no longer multitask, as R misha's workers: each forked processes of its own (368 from 16 workers).
+* Multitasked `gcor` with `method="spearman.exact"` and several pairs of expressions applies `CONFIG["max_data_size"]` to each pair, as one process does: it applied it to all the pairs together and failed where one process succeeded. R misha's multitasked `gcor` still does.
+* `CONFIG["max_processes"]`, `CONFIG["min_scope4process"]` and `CONFIG["eval_buf_size"]` may be a float or a numpy number, truncated as R misha does (8.7 is 8). Only a Python int was read, and otherwise the default applied: `max_processes = 8.0` ran one process.
+* A multitasked call no longer makes a FIFO in `/tmp`, which nothing read: a killed session left it behind, and the call failed where `/tmp` could not be written to.
+* A call no longer takes the exit status of the session's other child processes: a `subprocess.Popen` that ended before any pymisha call got 0 from `wait()`.
+
+### Docs
+
+* Each process of a multitasked call runs the session's `os.register_at_fork(after_in_child=...)` functions when it starts, though its scan does not call into Python. The notes of v0.22.0 said that the processes do not call into Python.
+* Multitasked `gquantiles` samples at most `max_data_size` / (number of processes) values in each process, as R misha, so its quantiles can be approximate where one process's are exact. The notes of v0.22.0 said that multitasked values are those of one process except the sums of `gsummary` and `gcor`.
+
 ## v0.22.1 (2026-11-22)
 
 ### Tests

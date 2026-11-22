@@ -100,7 +100,7 @@ def test_intervals_via_scanner_multi_scope(_init_db, rects_track, use_scanner_en
 # ---------------------------------------------------------------------------
 # Multitask regression guard
 #
-# The IntervalsPolicy scanner currently runs single-process (no fork/FIFO
+# The IntervalsPolicy scanner currently runs single-process (no fork
 # path).  This test verifies that the result is identical regardless of
 # the CONFIG multitasking settings.  It is a regression guard for any
 # future parallelization work.

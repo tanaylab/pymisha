@@ -8,6 +8,8 @@ and 3 by chromosome, so these tests build a database of 12 chromosomes (2.9 Mb) 
 both formats. Each multitasked call is checked to have forked: its kids' page faults count in
 the parent's RUSAGE_CHILDREN once they are reaped.
 """
+import os
+import re
 import resource
 from pathlib import Path
 
@@ -19,6 +21,7 @@ import pytest
 from _dbpath import TESTDB_ROOT
 
 import pymisha as pm
+from pymisha import _shared
 
 SIZES = [350_000, 320_000, 300_000, 280_000, 260_000, 240_000, 230_000, 220_000, 200_000, 180_000, 160_000, 150_000]
 CHROMS = [f"chr{i + 1}" for i in range(len(SIZES))]
@@ -79,8 +82,8 @@ def _run(call, multitask, **cfg):
     kids' blocks of a sparse track (whose bins cannot be estimated) more than half the RAM of a
     16 GB host, which then runs the call in one process."""
     saved = dict(pm.CONFIG)
-    cfg = {"max_data_size": 10_000_000, **cfg}
-    pm.CONFIG.update(multitasking=multitask, max_processes=8, min_scope4process=0, progress=False, **cfg)
+    cfg = {"max_data_size": 10_000_000, "max_processes": 8, "min_scope4process": 0, **cfg}
+    pm.CONFIG.update(multitasking=multitask, progress=False, **cfg)
     try:
         before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt
         res = call()
@@ -166,7 +169,7 @@ def test_an_expression_a_kid_evaluates(db, expr):
 
 @pytest.mark.parametrize("expr", ["np.log2(dense + 2)", "dense ** 2", "START + dense", "(dense > 0) + 1", "abs(dense)"])
 def test_an_expression_only_python_evaluates_runs_in_one_process(db, expr):
-    # a kid does not call into Python
+    # a kid's scan does not call into Python
     _vtracks(db)
     single, multi = _both(lambda: pm.gextract(expr, pm.gintervals_all(), iterator=10), forks=False)
     pdt.assert_frame_equal(single, multi)
@@ -219,6 +222,17 @@ def test_gscreen(db, expr, iterator):
     _vtracks(db)
     single, multi = _both(lambda: pm.gscreen(expr, pm.gintervals_all(), iterator=iterator))
     pdt.assert_frame_equal(single, multi)
+
+
+@pytest.mark.parametrize("expr", ["dense * 2", "v_kmer + 0"])
+def test_gscreen_of_numbers_is_an_error_in_the_kids_too(db, expr):
+    # a kid read a number as true where nonzero, as one process did; R misha's error in both
+    _vtracks(db)
+    for multitask in (False, True):
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt
+        with pytest.raises(pm.error, match=f'^Expression "{re.escape(expr)}" does not produce a logical result'):
+            _run(lambda: pm.gscreen(expr, pm.gintervals_all(), iterator=10), multitask)
+        assert (resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt > before) == multitask
 
 
 def test_gdist_glookup_gintervals_quantiles_gcor(db):
@@ -281,12 +295,17 @@ def test_dataframe_iterator(db, name, order):
 def _create_both(expr, iterator, forks=True):
     """The data files of the track gtrack_create makes in one process and multitasked (the
     attributes, which hold the date, aside)"""
+    return _track_both(lambda name: pm.gtrack_create(name, "", expr, iterator=iterator), forks)
+
+
+def _track_both(make, forks=True):
+    """The data files of the track make(name) writes in one process and multitasked"""
     files = {}
     for multitask in (False, True):
         name = f"mt_create_{int(multitask)}"
         if pm.gtrack_exists(name):
             pm.gtrack_rm(name, force=True)
-        _, forked = _run(lambda name=name: pm.gtrack_create(name, "", expr, iterator=iterator), multitask)
+        _, forked = _run(lambda name=name: make(name), multitask)
         assert forked == (multitask and forks)
         path = Path(_pymisha.pm_track_path(name))
         files[multitask] = {f.name: f.read_bytes() for f in sorted(path.iterdir()) if f.name != ".attributes"}
@@ -315,6 +334,123 @@ def test_gtrack_create_with_a_dataframe_iterator(db, expr):
 def test_gtrack_create_of_an_expression_only_python_evaluates_runs_in_one_process(db):
     single, multi = _create_both("np.log2(dense + 2)", 10, forks=False)
     assert single == multi
+
+
+# As R misha's gtrack.smooth: the kids take whole chromosomes and smooth them into their files
+@pytest.mark.parametrize(("expr", "iterator", "kw"), [
+    ("dense", None, {}), ("dense", 10, {"alg": "MEAN", "smooth_nans": True}),
+    ("v_filt", 20, {"weight_thr": 0.5}), ("dense * 2 + v_avg", 10, {"alg": "MEAN"}),
+])
+def test_gtrack_smooth_writes_the_files_of_one_process(db, expr, iterator, kw):
+    _vtracks(db)
+    single, multi = _track_both(lambda name: pm.gtrack_smooth(name, "", expr, 500, iterator=iterator, **kw))
+    assert single == multi
+
+
+def test_gtrack_smooth_of_an_expression_only_python_evaluates_runs_in_one_process(db):
+    single, multi = _track_both(lambda name: pm.gtrack_smooth(name, "", "np.log2(dense + 2)", 500, iterator=10),
+                                forks=False)
+    assert single == multi
+
+
+def _create_with_progress(cb):
+    if pm.gtrack_exists("mt_progress"):
+        pm.gtrack_rm("mt_progress", force=True)
+    with _shared._progress_context(cb):
+        pm.gtrack_create("mt_progress", "", "dense * 2", iterator=10)
+    pm.gtrack_rm("mt_progress", force=True)
+
+
+PROGRESS_CALLS = {
+    "gextract": lambda cb: pm.gextract("dense", pm.gintervals_all(), iterator=10, progress=cb),
+    "gscreen": lambda cb: pm.gscreen("dense > 0", pm.gintervals_all(), iterator=10, progress=cb),
+    "gsummary": lambda cb: pm.gsummary("dense", pm.gintervals_all(), iterator=10, progress=cb),
+    "gquantiles": lambda cb: pm.gquantiles("dense", [0.5], pm.gintervals_all(), iterator=10, progress=cb),
+    "gintervals_quantiles": lambda cb: pm.gintervals_quantiles("dense", [0.5], _scope_with_gaps(), iterator=10,
+                                                                progress=cb),
+    "gtrack_create": _create_with_progress,
+    # these two never handed their progress callback to the C++ layer, in one process either
+    "gdist": lambda cb: pm.gdist("dense", [0, 0.5, 1], intervals=pm.gintervals_all(), iterator=10, progress=cb),
+    "glookup": lambda cb: pm.glookup(np.array([1.0, 2.0]), "dense", [0, 0.5, 1], intervals=pm.gintervals_all(),
+                                     iterator=10, progress=cb),
+}
+
+
+@pytest.mark.parametrize("name", PROGRESS_CALLS)
+def test_a_multitasked_call_reports_its_progress(db, name):
+    # A progress callback was called at least once in one process, at the end, and never when the
+    # call multitasked: the default bar never completed
+    for multitask in (False, True):
+        calls = []
+        _, forked = _run(lambda: PROGRESS_CALLS[name](lambda done, total, pct: calls.append((done, total, pct))),
+                         multitask)
+        assert forked == multitask
+        assert calls and calls[-1][2] == 100 and calls[-1][0] == calls[-1][1], calls
+
+
+@pytest.mark.parametrize("value", [8.0, 8.7, np.int64(8), np.float32(8)])
+def test_numeric_settings_of_any_number_type(db, value):
+    # The C++ layer took these from a Python int only: as a float or a numpy number, max_processes
+    # was one process, min_scope4process 10,000 bp and eval_buf_size 1000. R misha reads any number
+    # and truncates it.
+    def call():
+        return pm.gextract("dense", pm.gintervals_all(), iterator=10)
+
+    assert _run(call, True, max_processes=value)[1]
+    # a kid's range is at least min_scope4process bp: one process
+    assert not _run(call, True, min_scope4process=value * 10**9)[1]
+    res, _ = _run(lambda: pm.gextract("np.size(START) + dense * 0", pm.gintervals_all(), iterator=10), False,
+                  eval_buf_size=value)
+    sizes = res.iloc[:, 3].dropna()   # NaN where dense is
+    assert len(sizes) and (sizes == 8).all()
+
+
+def test_a_multitasked_call_makes_no_file_in_tmp(db):
+    # Every multitasked call made a FIFO, /tmp/pymisha-fifo-<pid>, which nothing read: a session that
+    # was killed left it behind, and where /tmp could not be written to, the call failed. A directory
+    # of that name, which the FIFO could not replace, stands for the latter.
+    path = Path(f"/tmp/pymisha-fifo-{os.getpid()}")
+    if os.path.lexists(path):
+        pytest.skip(f"{path} exists")
+    path.mkdir()
+    try:
+        res, forked = _run(lambda: pm.gextract("dense", pm.gintervals_all(), iterator=10), True)
+        assert forked and len(res) > 1000
+    finally:
+        path.rmdir()
+
+
+def test_a_forked_python_worker_does_not_multitask(db):
+    # The workers of _run_forked and _map_forked (track-parallel gextract, gsynth, gdb_create)
+    # ran their C++ calls multitasked, each forking kids of its own
+    from pymisha._shared import _run_forked
+
+    def work(_):
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt
+        pm.gextract("dense", pm.gintervals_all(), iterator=10)
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_minflt > before
+
+    (res, dead), forked = _run(lambda: _run_forked(work, [None, None]), True)
+    assert forked and not dead
+    assert res == [False, False]
+
+
+def test_gcor_spearman_exact_limits_each_pair(db):
+    # As in one process, max_data_size limits the value pairs of each pair of expressions; with
+    # multitasking it limited those of all the pairs together (as R misha does when it multitasks)
+    summary = pm.gsummary("dense", pm.gintervals_all(), iterator=10)
+    n = int(summary["Total intervals"] - summary["NaN intervals"])
+
+    def call():
+        return pm.gcor("dense", "dense * 2", "dense", "dense + 1", intervals=pm.gintervals_all(), iterator=10,
+                       method="spearman.exact")
+
+    single, multi = _both(call, max_data_size=int(1.5 * n))
+    np.testing.assert_allclose(single, [1, 1])
+    np.testing.assert_array_equal(single, multi)
+    for multitask in (False, True):
+        with pytest.raises(pm.error, match=r"Result size \(at least \d+ records\) exceeded the maximum allowed"):
+            _run(call, multitask, max_data_size=n - 1)
 
 
 def test_max_data_size_counts_the_rows_of_all_the_kids(db):

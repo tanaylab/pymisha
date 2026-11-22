@@ -302,6 +302,18 @@ def test_a_killed_kid_fails_the_call():
             parent.wait()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_a_call_leaves_the_other_children_of_the_session_to_their_owner():
+    # Every call waited for any child of the session (waitpid(-1)), and so took the exit status
+    # of a subprocess that had ended: Popen.wait() then gave 0
+    proc = subprocess.Popen(["sh", "-c", "exit 3"])
+    deadline = time.monotonic() + 30
+    while _runs(proc.pid) and time.monotonic() < deadline:   # until it ended, not reaped yet
+        time.sleep(0.01)
+    pm.gintervals_all()
+    assert proc.wait(timeout=30) == 3
+
+
 # A call whose kids' shared memory cannot be mapped runs in one process (R misha reports an error,
 # except in gextract and gscreen). The address space is limited to what the session holds plus
 # 256 MB, which the shared memory of these calls exceeds (it is sized by max_data_size, or half the

@@ -588,7 +588,7 @@ def test_fixed_rect_multitask_equals_single_task():
     the multitask configuration (max_processes, min_scope4process, etc.).
 
     NOTE: pm_extract_2d_scanner does NOT integrate with pymisha's multitask
-    (fork+FIFO) infrastructure.  The FixedRect path in _gextract_2d_via_scanner
+    (fork) infrastructure.  The FixedRect path in _gextract_2d_via_scanner
     calls _pymisha.pm_extract_2d_scanner directly, bypassing _parallel_extract
     entirely.  As a result both the "single-task" and "multi-task" configs below
     run single-process.  The test is still a valuable regression guard: it

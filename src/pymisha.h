@@ -64,6 +64,9 @@ void vwarning(const char *fmt, ...);
 
 void vdebug(const char *fmt, ...);
 
+// Calls progress_cb(done, total, pct), with None for a total of 0; an exception it raises is an error
+void call_progress_cb(PyObject *progress_cb, uint64_t done, uint64_t total, int pct);
+
 #define DBGHERE vemsg("%s, line %d\n", __FILE__, __LINE__);
 
 inline bool is_py_var_char(char c) { return isalnum(c) || c == '_' || c == '.'; }
@@ -197,17 +200,29 @@ public:
     // than the RAM and swap), half the RAM is mapped, at most CONFIG['max_mem_usage']. False if not
     // even that can be mapped: the call then runs in one process. Otherwise the kids must be
     // forked right after, and all of them waited for before their results are read.
+    // num_results: the records are those of this many results (gcor's pairs), each of which
+    // CONFIG['max_data_size'] limits on its own, as in one process; the arena holds num_results
+    // times the limit, and the kids' records together are checked against that. The caller checks
+    // each result once the kids are done.
     static bool prepare4multitasking(unsigned num_kids, uint64_t res_const_size, uint64_t res_record_size,
-                                     uint64_t max_records = 0);
+                                     uint64_t max_records = 0, unsigned num_results = 1);
     // In a kid: the memory for its result of num_records records (an error if it does not fit)
     static void *allocate_res(uint64_t num_records);
     // In the parent, once wait_for_kids() returned false: the result of kid i (0-based, in the order
     // the kids were forked) and its number of records
     static void *get_kid_res(int kid);
     static uint64_t get_kid_res_size(int kid);
-    // In a kid: the number of records of its result so far; while it waits for the kids, the parent
-    // checks their sum against CONFIG['max_data_size'], as R misha does
-    static void update_res_data_size(uint64_t num_records) { s_shm->kid_res_num_records[s_kid_index] = num_records; }
+    // In a kid, called as each record is added: the number of records of its result so far. While it
+    // waits for the kids, the parent checks their sum against CONFIG['max_data_size'], as R misha
+    // does. It is written at every 65536th record only: the kids' counts share cache lines, and a
+    // write per record made a kid's scan slower than one process's. The kid checks its own count
+    // at every record, and allocate_res() writes its final count, which the parent checks before
+    // the results are read.
+    static void update_res_data_size(uint64_t num_records)
+    {
+        if (!(num_records & 0xFFFF))
+            s_shm->kid_res_num_records[s_kid_index] = num_records;
+    }
     // Half the RAM, at most CONFIG['max_mem_usage'] (R misha's get_ram_shm_size())
     static uint64_t ram_shm_size();
     // The size in records of a fixed-size buffer each of num_kids kids hands over in the shared
@@ -220,18 +235,19 @@ public:
     // returns false if all the child processes have ended or true if the timeout has elapsed
     static bool wait_for_kids(int millisecs);
 
-    // returns number of bytes read or 0 for EOF; the parent process that uses fifo does not need to call then wait_for_kids()
-    static int read_multitask_fifo(void *buf, size_t bytes);
-    static void write_multitask_fifo(const void *buf, size_t bytes);
-    static void lock_multitask_fifo();
-    static void unlock_multitask_fifo();
-    static void write_multitask_fifo_unlocked(const void *buf, size_t bytes);
+    // Waits for all the kids and reports their progress as R misha does: every 3 s the mean of the
+    // percentages they reported (update_progress), to progress_cb(pct, 100, pct) or, without one, as
+    // text on stderr, as a scan in one process reports; and 100% once they are done
+    static void wait_for_kids_reporting(PyObject *progress_cb);
+
+    // In a kid: its progress in percent, for its parent to report (R misha's kid_progress)
+    static void update_progress(int progress)
+    {
+        if (s_is_kid)
+            s_shm->kid_progress[s_kid_index] = (unsigned char)progress;
+    }
 
     static bool is_kid() { return s_is_kid; }
-
-    static void itr_idx(uint64_t idx) { s_shm->itr_idx[s_kid_index] = idx; }
-
-    static uint64_t itr_idx_sum();   // sum of itr_idx over all the kids
 
     static int num_kids() { return s_kid_index; }
 
@@ -246,7 +262,7 @@ public:
 protected:
     struct Shm {
         char          error_msg[10000];
-        uint64_t      itr_idx[MAX_KIDS];          // used for progress report
+        unsigned char kid_progress[MAX_KIDS];     // a kid's progress, in percent
         unsigned      num_kids;                   // the kids of the step that maps the result arena
         uint64_t      res_offset;                 // the first free byte of the result arena
         uint64_t      kid_res_offset[MAX_KIDS];   // where a kid's result starts (NO_RES: not allocated)
@@ -278,15 +294,14 @@ protected:
     static bool                 s_is_kid;
     static pid_t                s_parent_pid;
     static sem_t               *s_shm_sem;
-    static sem_t               *s_fifo_sem;
     static int                  s_kid_index;
     static vector<pid_t>        s_running_pids;
     static Shm                 *s_shm;
-    static int                  s_fifo_fd;
     static char                *s_res;               // the result arena (MAP_FAILED: none)
     static uint64_t             s_res_size;
     static uint64_t             s_res_const_size;
     static uint64_t             s_res_record_size;
+    static unsigned             s_res_num_results;
     static bool                 s_res_size_from_ram;
 
     PMPY                        m_gdict;
@@ -312,13 +327,12 @@ protected:
     void load_options();
 
     static string  get_shm_sem_name();
-    static string  get_fifo_sem_name();
-    static string  get_fifo_name();
     static void    sigint_handler(int);
     static void    sigalrm_handler(int);
     static void    sigchld_handler(int);
     static void    check_kids_state(bool ignore_errors);
-    static void    forget_reaped_kids();
+    // The kids' records together, num_records, against CONFIG['max_data_size'] (see num_results)
+    static void    verify_kids_records(uint64_t num_records);
 
     friend void check_interrupt();
     // No [[noreturn]] here: clang rejects an attribute list on a friend
@@ -337,7 +351,7 @@ extern PyObject *g_module;
 
 inline void check_interrupt()
 {
-    // A kid does not call into Python. On an interrupt the parent stops, and kills its kids.
+    // A kid's scan does not call into Python. On an interrupt the parent stops, and kills its kids.
     if (PyMisha::is_kid())
         return;
     if (PyErr_CheckSignals() == -1)
@@ -364,14 +378,6 @@ inline bool is_time_elapsed(int64_t delay_msec, const struct timespec &start_tim
         set_abs_timeout(delay_msec, t1);
         clock_gettime(CLOCK_REALTIME, &t2);
         return t2.tv_sec > t1.tv_sec || (t2.tv_sec == t1.tv_sec && t2.tv_nsec > t1.tv_nsec);
-}
-
-inline uint64_t PyMisha::itr_idx_sum()
-{
-    uint64_t res = 0;
-    for (int i = 0; i < s_kid_index; ++i)
-        res += s_shm->itr_idx[i];
-    return res;
 }
 
 #endif

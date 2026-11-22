@@ -47,16 +47,15 @@ bool                     PyMisha::s_sigalrm_fired = false;
 bool                     PyMisha::s_is_kid = false;
 pid_t                    PyMisha::s_parent_pid = 0;
 sem_t                   *PyMisha::s_shm_sem = SEM_FAILED;
-sem_t                   *PyMisha::s_fifo_sem = SEM_FAILED;
 int                      PyMisha::s_kid_index;
 vector<pid_t>            PyMisha::s_running_pids;
 PyMisha::Shm            *PyMisha::s_shm = (PyMisha::Shm *)MAP_FAILED;
-int                      PyMisha::s_fifo_fd = -1;
-char                    *PyMisha::s_res = (char *)MAP_FAILED;
+char                   *PyMisha::s_res = (char *)MAP_FAILED;
 uint64_t                 PyMisha::s_res_size = 0;
 uint64_t                 PyMisha::s_res_const_size = 0;
 uint64_t                 PyMisha::s_res_record_size = 0;
-bool                     PyMisha::s_res_size_from_ram = false;
+unsigned                 PyMisha::s_res_num_results = 1;
+bool                    PyMisha::s_res_size_from_ram = false;
 bool                     PyMisha::s_multitasking_stdout = false;
 
 PyMisha *g_pymisha = NULL;
@@ -102,9 +101,7 @@ PyMisha::PyMisha(bool check_db)
         s_kid_index = 0;
         s_parent_pid = getpid();
         s_shm_sem = SEM_FAILED;
-        s_fifo_sem = SEM_FAILED;
         s_shm = (Shm *)MAP_FAILED;
-        s_fifo_fd = -1;
         s_res = (char *)MAP_FAILED;
         s_res_size = s_res_const_size = s_res_record_size = 0;
         s_running_pids.clear();
@@ -160,7 +157,7 @@ PyMisha::~PyMisha()
     if (!s_ref_count) {
         // if this is a child, do not detach from shared memory and do not deallocate the semaphore
         if (!s_is_kid) {
-            forget_reaped_kids();
+            check_kids_state(true);
 
             if (s_shm_sem != SEM_FAILED) {
                 SemLocker sl(s_shm_sem);
@@ -174,13 +171,12 @@ PyMisha::~PyMisha()
             }
 
             // After SIGTERM is sent to all the kids, wait till they are reaped. A kid that another
-            // waitpid() reaped is no longer ours and is dropped (waitpid(-1) never returns it, so
-            // the wait would not end). A kid still alive after 10 s gets SIGKILL; after 30 s the
-            // rest are given up on (as R misha 5.17).
+            // waitpid() reaped is no longer ours and is dropped (check_kids_state), or the wait
+            // would not end. A kid still alive after 10 s gets SIGKILL; after 30 s the rest are
+            // given up on (as R misha 5.17).
             struct timespec timeout;
             for (int waited_ms = 0;; waited_ms += 10) {
                 check_kids_state(true);
-                forget_reaped_kids();
                 if (s_running_pids.empty())
                     break;
 
@@ -202,20 +198,12 @@ PyMisha::~PyMisha()
             if (s_shm_sem != SEM_FAILED)
                 sem_close(s_shm_sem);
 
-            if (s_fifo_sem != SEM_FAILED)
-                sem_close(s_fifo_sem);
-
             if (s_shm != (Shm *)MAP_FAILED)
                 munmap(s_shm, sizeof(Shm));
 
             if (s_res != (char *)MAP_FAILED)
                 munmap(s_res, s_res_size);
-
-            unlink(get_fifo_name().c_str());
         }
-
-        if (s_fifo_fd != -1)
-            close(s_fifo_fd);
 
         TGLException::set_error_handler(m_old_error_handler);
 
@@ -233,20 +221,6 @@ string PyMisha::get_shm_sem_name()
 {
     char buf[100];
     snprintf(buf, sizeof(buf), "pymisha-shm-sem-%d", (int)getpid());
-    return buf;
-}
-
-string PyMisha::get_fifo_sem_name()
-{
-    char buf[100];
-    snprintf(buf, sizeof(buf), "pymisha-fifo-sem-%d", (int)getpid());
-    return buf;
-}
-
-string PyMisha::get_fifo_name()
-{
-    char buf[100];
-    snprintf(buf, sizeof(buf), "/tmp/pymisha-fifo-%d", s_is_kid ? (int)getppid() : (int)getpid());
     return buf;
 }
 
@@ -388,29 +362,6 @@ void PyMisha::prepare4multitasking(unsigned num_kids)
         sem_unlink(get_shm_sem_name().c_str());
     }
 
-    if (s_fifo_sem == SEM_FAILED) {
-        sem_unlink(get_fifo_sem_name().c_str());
-        if ((s_fifo_sem = sem_open(get_fifo_sem_name().c_str(), O_CREAT | O_EXCL, 0644, 1)) == SEM_FAILED)
-            verror("sem_open failed: %s", strerror(errno));
-
-        sem_unlink(get_fifo_sem_name().c_str());
-    }
-
-    vdebug("Creating FIFO channel\n");
-    if (s_fifo_fd == -1) {
-        unlink(get_fifo_name().c_str());
-
-        if (mkfifo(get_fifo_name().c_str(), 0666) == -1)
-            verror("mkfifo of file %s failed: %s", get_fifo_name().c_str(), strerror(errno));
-
-        if ((s_fifo_fd = open(get_fifo_name().c_str(), O_RDONLY | O_NONBLOCK)) == -1)
-            verror("open of fifo %s for read failed: %s", get_fifo_name().c_str(), strerror(errno));
-
-#ifdef F_SETPIPE_SZ
-        fcntl(s_fifo_fd, F_SETPIPE_SZ, 1048576);
-#endif
-    }
-
     vdebug("Allocating shared memory for internal communication\n");
     if (s_shm == (Shm *)MAP_FAILED) {
         s_shm = (Shm *)mmap(NULL, sizeof(Shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -420,7 +371,7 @@ void PyMisha::prepare4multitasking(unsigned num_kids)
 
         s_shm->error_msg[0] = '\0';
         for (int i = 0; i < MAX_KIDS; ++i)
-            s_shm->itr_idx[i] = 0;
+            s_shm->kid_progress[i] = 0;
     }
 }
 
@@ -446,7 +397,7 @@ uint64_t PyMisha::kid_buf_size(unsigned num_kids, uint64_t record_size)
 }
 
 bool PyMisha::prepare4multitasking(unsigned num_kids, uint64_t res_const_size, uint64_t res_record_size,
-                                   uint64_t max_records)
+                                   uint64_t max_records, unsigned num_results)
 {
     if (!s_running_pids.empty())
         verror("Multitasking: the kids of a previous step are still running");
@@ -458,10 +409,12 @@ bool PyMisha::prepare4multitasking(unsigned num_kids, uint64_t res_const_size, u
 
     // Sized for the most the limit allows; the pages are committed only as the kids write.
     // Saturated, so that a large limit cannot wrap the size around.
-    uint64_t limit = g_pymisha->max_data_size();
+    const uint64_t cap = (uint64_t)1 << 62;
+    uint64_t limit;
+    if (__builtin_mul_overflow(g_pymisha->max_data_size(), (uint64_t)num_results, &limit))
+        limit = cap;
     if (max_records && max_records < limit)
         limit = max_records;
-    const uint64_t cap = (uint64_t)1 << 62;
     uint64_t const_size, size;
     if (__builtin_mul_overflow((uint64_t)num_kids, res_const_size + 8, &const_size))
         const_size = cap;
@@ -500,10 +453,19 @@ bool PyMisha::prepare4multitasking(unsigned num_kids, uint64_t res_const_size, u
     for (int i = 0; i < MAX_KIDS; ++i) {
         s_shm->kid_res_offset[i] = NO_RES;
         s_shm->kid_res_num_records[i] = 0;
+        s_shm->kid_progress[i] = 0;
     }
     s_res_const_size = res_const_size;
     s_res_record_size = res_record_size;
+    s_res_num_results = num_results;
     return true;
+}
+
+void PyMisha::verify_kids_records(uint64_t num_records)
+{
+    // Over num_results results, the largest holds at least num_records / num_results records, more
+    // than the limit when num_records is more than num_results times it
+    g_pymisha->verify_max_data_size((num_records + s_res_num_results - 1) / s_res_num_results, "Result");
 }
 
 void *PyMisha::allocate_res(uint64_t num_records)
@@ -511,7 +473,7 @@ void *PyMisha::allocate_res(uint64_t num_records)
     if (!s_is_kid)
         verror("allocate_res() cannot be called by the parent process");
 
-    update_res_data_size(num_records);
+    s_shm->kid_res_num_records[s_kid_index] = num_records;
 
     uint64_t res_size;
     bool overflow = __builtin_mul_overflow(num_records, s_res_record_size, &res_size) ||
@@ -539,7 +501,7 @@ void *PyMisha::allocate_res(uint64_t num_records)
             uint64_t total = 0;
             for (unsigned i = 0; i < s_shm->num_kids; ++i)
                 total += s_shm->kid_res_num_records[i];
-            g_pymisha->verify_max_data_size(total, "Result");
+            verify_kids_records(total);
         }
         if (s_res_size_from_ram)
             verror("Result size exceeded the maximal allowed.\n"
@@ -617,7 +579,7 @@ void pm::rng_load()
 
 pid_t PyMisha::launch_process()
 {
-    if (s_shm_sem == SEM_FAILED || s_fifo_sem == SEM_FAILED || s_shm == (Shm *)MAP_FAILED || s_fifo_fd == -1)
+    if (s_shm_sem == SEM_FAILED || s_shm == (Shm *)MAP_FAILED)
         verror("Not ready for multitasking");
 
     if (s_kid_index >= MAX_KIDS)
@@ -661,10 +623,9 @@ pid_t PyMisha::launch_process()
         if (pm::g_rng_stream)
             drand48();
     } else {   // a child process
-        // A kid dies with its parent. A kid whose parent was killed would otherwise run on, and wait
-        // forever for the FIFO lock (lock_multitask_fifo) when the kid that held it died: killed
-        // with the parent, or ended by its write to a FIFO nobody reads (verror() _exit()s it with
-        // the lock held).
+        // A kid dies with its parent. A kid whose parent was killed would otherwise run on to a
+        // result nobody reads, or wait forever for the shared memory lock when the kid that held it
+        // was killed with the parent.
         // ponytail: Linux only; elsewhere such a kid still hangs - a getppid() poll in its waits would cover it
 #ifdef __linux__
         prctl(PR_SET_PDEATHSIG, SIGKILL);
@@ -680,6 +641,8 @@ pid_t PyMisha::launch_process()
         // PyOS_AfterFork_Child() resets threading state, internal locks,
         // and calls registered atfork handlers. This is essential for
         // environments like Jupyter where background threads (ZMQ) exist.
+        // It runs the session's os.register_at_fork(after_in_child=...) functions too: Python
+        // code runs in every kid as it starts, though its scan does not call into Python.
         PyOS_AfterFork_Child();
 
         sigaction(SIGINT, &s_old_sigint_act, NULL);
@@ -696,51 +659,34 @@ pid_t PyMisha::launch_process()
 
         if (!freopen("/dev/null", "r", stdin))
             verror("Failed to open /dev/null");
-
-        close(s_fifo_fd);
-
-        if ((s_fifo_fd = open(get_fifo_name().c_str(), O_WRONLY)) == -1)
-            verror("open of fifo %s for write failed: %s", get_fifo_name().c_str(), strerror(errno));
     }
 
     return pid;
 }
 
-void PyMisha::check_kids_state(bool ignore_errors)
-{
-    int status;
-    pid_t pid;
-
-    while ((pid = waitpid((pid_t)-1, &status, WNOHANG)) > 0) {
-        vdebug("pid %d has ended\n", pid);
-        for (vector<pid_t>::iterator ipid = s_running_pids.begin(); ipid != s_running_pids.end(); ++ipid) {
-            if (*ipid == pid) {
-                vdebug("pid %d was identified as a child process\n", pid);
-                swap(*ipid, s_running_pids.back());
-                s_running_pids.pop_back();
-                if (!ignore_errors && WIFSIGNALED(status))
-                    verror("Child process %d ended unexpectedly (signal %d)", (int)pid, WTERMSIG(status));
-                if (!ignore_errors && !WIFEXITED(status))
-                    verror("Child process %d ended unexpectedly", (int)pid);
-                break;
-            }
-        }
-    }
-}
-
 // Drops from s_running_pids the kids that are already gone: one that ended is reaped here, and one
 // that someone else reaped (waitpid gives ECHILD) is no longer ours - its pid may even belong to
-// another process by now, which must not be signaled.
-void PyMisha::forget_reaped_kids()
+// another process by now, which must not be signaled. Only these pids are waited for: a
+// waitpid(-1) would reap the other children of the Python session too (a subprocess.Popen's), whose
+// exit status their owner then never gets.
+void PyMisha::check_kids_state(bool ignore_errors)
 {
     for (size_t i = 0; i < s_running_pids.size();) {
         int status;
-        pid_t res = waitpid(s_running_pids[i], &status, WNOHANG);
-        if (res == s_running_pids[i] || (res < 0 && errno == ECHILD)) {
-            s_running_pids[i] = s_running_pids.back();
-            s_running_pids.pop_back();
-        } else
+        pid_t pid = s_running_pids[i];
+        pid_t res = waitpid(pid, &status, WNOHANG);
+        if (res != pid && !(res < 0 && errno == ECHILD)) {
             ++i;
+            continue;
+        }
+        s_running_pids[i] = s_running_pids.back();
+        s_running_pids.pop_back();
+        if (res == pid && !ignore_errors) {
+            if (WIFSIGNALED(status))
+                verror("Child process %d ended unexpectedly (signal %d)", (int)pid, WTERMSIG(status));
+            if (!WIFEXITED(status))
+                verror("Child process %d ended unexpectedly", (int)pid);
+        }
     }
 }
 
@@ -766,7 +712,7 @@ bool PyMisha::wait_for_kids(int millisecs)
             uint64_t num_records = 0;
             for (int i = 0; i < s_kid_index; ++i)
                 num_records += s_shm->kid_res_num_records[i];
-            g_pymisha->verify_max_data_size(num_records, "Result");
+            verify_kids_records(num_records);
         }
 
         if (s_running_pids.empty()) {
@@ -784,112 +730,51 @@ bool PyMisha::wait_for_kids(int millisecs)
     return true;
 }
 
-int PyMisha::read_multitask_fifo(void *buf, size_t bytes)
+void PyMisha::wait_for_kids_reporting(PyObject *progress_cb)
 {
-    bool eof_reached = false;
-    int retv;
-    size_t readlen = 0;
-    fd_set rfds;
-    struct timeval tv;
+    const int64_t REPORT_INTERVAL = 3000;   // ms, R misha's REPORT_INTERVAL_DELAY
+    struct timespec last_report;
+    clock_gettime(CLOCK_REALTIME, &last_report);
+    int last_progress = -1;
 
-    while (bytes > readlen) {
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
-        FD_ZERO(&rfds);
-        FD_SET(s_fifo_fd, &rfds);
-
-        retv = select(s_fifo_fd + 1, &rfds, NULL, NULL, &tv);
-
-        if (retv == -1) {
-            if (errno != EINTR)
-                verror("select on fifo failed: %s", strerror(errno));
-        } else if (retv == 1) {
-            retv = read(s_fifo_fd, buf, bytes - readlen);
-
-            if (retv == -1) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    verror("read from fifo failed: %s", strerror(errno));
-            } else {
-                buf = (char *)buf + retv;
-                readlen += retv;
-
-                if (!retv)
-                    eof_reached = true;
-            }
+    while (wait_for_kids(1)) {
+        if (!is_time_elapsed(REPORT_INTERVAL, last_report))
+            continue;
+        // a kid that runs several scans starts each from 0%: what was reported is not taken back
+        int progress = 0;
+        for (int i = 0; i < s_kid_index; ++i)
+            progress += s_shm->kid_progress[i];
+        progress = max(progress / max(s_kid_index, 1), last_progress);
+        if (progress < 100) {
+            if (progress_cb)
+                call_progress_cb(progress_cb, progress, 100, progress);
+            else if (progress != last_progress)
+                vemsg("%d%%...", progress);
+            else
+                vemsg(".");
         }
-
-        check_interrupt();
-
-        if (s_shm->error_msg[0]) {
-            SemLocker sl(s_shm_sem);
-            verror("%s", s_shm->error_msg);
-        }
-
-        check_kids_state(false);
-
-        // Every caller reads a fixed-size message and none checks the length,
-        // so running out of data is an error, not a short read.
-        if (eof_reached && s_running_pids.empty() && readlen < bytes)
-            verror("Multitasking: a child process ended before sending all of its result "
-                   "(%lu of %lu bytes)", (unsigned long)readlen, (unsigned long)bytes);
+        last_progress = progress;
+        clock_gettime(CLOCK_REALTIME, &last_report);
     }
-    return readlen;
+
+    if (progress_cb)
+        call_progress_cb(progress_cb, 100, 100, 100);
+    else if (last_progress >= 0)
+        vemsg("100%%\n");
 }
 
-void PyMisha::write_multitask_fifo(const void *buf, size_t bytes)
+void call_progress_cb(PyObject *progress_cb, uint64_t done, uint64_t total, int pct)
 {
-    SemLocker sl(s_fifo_sem);
-    const char *ptr = (const char *)buf;
-    size_t remaining = bytes;
-    while (remaining > 0) {
-        ssize_t written = write(s_fifo_fd, ptr, remaining);
-        if (written < 0) {
-            if (errno == EINTR)
-                continue;
-            verror("write to fifo failed: %s", strerror(errno));
-        }
-        if (written == 0) {
-            verror("write to fifo failed: wrote 0 bytes");
-        }
-        ptr += written;
-        remaining -= (size_t)written;
-    }
-}
+    PMPY py_done(PyLong_FromUnsignedLongLong(done), true);
+    PMPY py_total(total ? PyLong_FromUnsignedLongLong(total) : Py_NewRef(Py_None), true);
+    PMPY py_pct(PyLong_FromLong(pct), true);
+    if (!py_done || !py_total || !py_pct)
+        TGLError("Failed to allocate arguments for progress callback");
 
-void PyMisha::lock_multitask_fifo()
-{
-    if (s_fifo_sem == SEM_FAILED)
-        verror("Not ready for multitasking");
-    if (sem_wait(s_fifo_sem) == -1)
-        verror("sem_wait failed: %s", strerror(errno));
-}
-
-void PyMisha::unlock_multitask_fifo()
-{
-    if (s_fifo_sem == SEM_FAILED)
-        verror("Not ready for multitasking");
-    if (sem_post(s_fifo_sem) == -1)
-        verror("sem_post failed: %s", strerror(errno));
-}
-
-void PyMisha::write_multitask_fifo_unlocked(const void *buf, size_t bytes)
-{
-    const char *ptr = (const char *)buf;
-    size_t remaining = bytes;
-    while (remaining > 0) {
-        ssize_t written = write(s_fifo_fd, ptr, remaining);
-        if (written < 0) {
-            if (errno == EINTR)
-                continue;
-            verror("write to fifo failed: %s", strerror(errno));
-        }
-        if (written == 0) {
-            verror("write to fifo failed: wrote 0 bytes");
-        }
-        ptr += written;
-        remaining -= (size_t)written;
-    }
+    PMPY res(PyObject_CallFunctionObjArgs(progress_cb, (PyObject *)py_done, (PyObject *)py_total, (PyObject *)py_pct,
+                                          NULL), true);
+    if (!res || PyErr_Occurred())
+        TGLError("Progress callback failed");
 }
 
 void PyMisha::handle_error(const char *msg)
@@ -975,14 +860,25 @@ void PyMisha::load_options()
         PyErr_Clear();
         verror("%s", msg.c_str());
     };
-    auto as_long = [&](const char *name) {
-        long v = PyLong_AsLong(opt);
+    // A number of any type (int, float, a numpy scalar) truncated toward zero, as R misha reads
+    // gmax.processes and the like, and as int() does: 8.0, 8.7 and numpy.int64(8) are all 8. False
+    // for a value of another type, which leaves the default.
+    auto as_long = [&](const char *name, long &v) {
+        if (!PyNumber_Check(opt))
+            return false;
+        PMPY num(PyNumber_Long(opt), true);
+        if (!num) {   // NaN, an infinity
+            PyErr_Clear();
+            verror("CONFIG['%s'] must be a finite number", name);
+        }
+        v = PyLong_AsLong(num);
         if (v == -1 && PyErr_Occurred()) {
             PyErr_Clear();
             verror("CONFIG['%s'] is out of range", name);
         }
-        return v;
+        return true;
     };
+    long v;
 
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("debug"), true)), false) && PyBool_Check(opt))
         m_debug = opt == Py_True;
@@ -1015,14 +911,17 @@ void PyMisha::load_options()
     if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("multitasking_stdout"), true)), false) && PyBool_Check(opt))
         s_multitasking_stdout = opt == Py_True;
 
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_processes"), true)), false) && PyLong_Check(opt))
-        m_max_processes = max((int)as_long("max_processes"), 1);
+    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("max_processes"), true)), false) &&
+        as_long("max_processes", v))
+        m_max_processes = max((int)v, 1);
 
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_scope4process"), true)), false) && PyLong_Check(opt))
-        m_min_scope4process = (uint64_t)max(as_long("min_scope4process"), 0L);
+    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("min_scope4process"), true)), false) &&
+        as_long("min_scope4process", v))
+        m_min_scope4process = (uint64_t)max(v, 0L);
 
-    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("eval_buf_size"), true)), false) && PyLong_Check(opt))
-        m_eval_buf_size = max(as_long("eval_buf_size"), 1L);
+    if (*opt.assign(PyDict_GetItem(opts, PMPY(PyUnicode_FromString("eval_buf_size"), true)), false) &&
+        as_long("eval_buf_size", v))
+        m_eval_buf_size = max(v, 1L);
 }
 
 void PyMisha::sigint_handler(int)

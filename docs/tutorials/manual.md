@@ -992,7 +992,7 @@ Multitasking can be completely switched off:
 pm.CONFIG['multitasking'] = False
 ```
 
-A call divides its scope among at most `min(2 * cores, max_processes)` processes, as R misha does: by whole chromosomes, or, with a bin size as the iterator, into ranges of at least 500 kb and 50,000 bins each (`gextract`, `gscreen`, `gsummary`, `gdist` and Pearson's `gcor`). A process takes whole chromosomes until it holds more than `pm.CONFIG['min_scope4process']` bp (10,000). The rows come back in the order one process gives them. The processes evaluate the expressions without Python: names of tracks and virtual tracks, numbers, `+ - * /`, comparisons and `& |`. An expression with anything else (a numpy function, `CHROM`, `START`, `END`) is computed in one process. So is a call whose processes' shared memory (sized by `max_data_size`, or half the RAM) cannot be mapped, where R misha reports an error.
+A call divides its scope among at most `min(2 * cores, max_processes)` processes, as R misha does: by whole chromosomes, or, with a bin size as the iterator, into ranges of at least 500 kb and 50,000 bins each (`gextract`, `gscreen`, `gsummary`, `gdist` and Pearson's `gcor`). A process takes whole chromosomes until it holds more than `pm.CONFIG['min_scope4process']` bp (10,000). The rows come back in the order one process gives them. Each process is a fork of the Python session, and the functions the session registered with `os.register_at_fork(after_in_child=...)` run in it when it starts; it then evaluates the expressions without Python: names of tracks and virtual tracks, numbers, `+ - * /`, comparisons and `& |`. An expression with anything else (a numpy function, `CHROM`, `START`, `END`) is computed in one process. So is a call whose processes' shared memory (sized by `max_data_size`, or half the RAM) cannot be mapped, where R misha reports an error.
 
 ### Limiting the Memory Consumption
 
@@ -1019,4 +1019,4 @@ Each child process is a fork of the Python session. A fork copies the page table
 
 ### Other Considerations
 
-In multitasking mode, the return value of `pm.gquantiles()` may vary depending on the number of CPU cores. For more details, refer to the API documentation for this function.
+A multitasked call returns the same values as a call in one process, except the sums of `pm.gsummary()` and of Pearson's `pm.gcor()`, merged across the processes in R misha's order (they can differ in the last digits), and `pm.gquantiles()`. Each process of `pm.gquantiles()` samples at most `max_data_size` divided by the number of processes values, as in R misha, so its quantiles are approximate (with a warning) whenever a process has more values than that, also where one process would give them exactly. They then depend on the number of processes, and so on the number of CPU cores.

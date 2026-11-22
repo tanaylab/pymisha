@@ -3,6 +3,7 @@ Tests for interval operations: union, intersect, diff, canonic, and constructors
 
 These tests follow the TDD approach - written before implementation.
 """
+import re
 import shutil
 from pathlib import Path
 
@@ -1258,3 +1259,27 @@ def test_gscreen_of_a_track_name_is_r_misha_error():
                 pm.gscreen(expr, pm.gintervals("1", 0, 10000))
     finally:
         pm.gvtrack_rm("gscreen_name_vt")
+
+
+@pytest.mark.parametrize(("expr", "logical"), [
+    ("dense_track * 2", False), ("(dense_track)", False), ("dense_track + 0", False), ("1", False),
+    ("np.abs(dense_track)", False), ("dense_track * x", False), ("gscreen_vt - x", False),
+    ("dense_track > 0.2", True), ("np.isnan(dense_track)", True), ("(dense_track > 0.2) & (gscreen_vt < 1)", True),
+    ("dense_track > x / 10", True), ("True", True), ("rects_track", False), ("rects_track * 2", False),
+    ("rects_track > 0", True),
+])
+def test_gscreen_of_an_expression_that_is_not_logical_is_r_misha_error(expr, logical):
+    # As R misha: only a logical result screens. A number was read as true where nonzero, in the C++
+    # scan, in the Python one (a variable of the caller's, x) and in 2D; only a bare track name was
+    # an error.
+    pm.gvtrack_create("gscreen_vt", "dense_track", func="avg")
+    kw = {"intervals": pm.gintervals_2d_all()} if "rects" in expr else {
+        "intervals": pm.gintervals(["1", "2"], 0, 200000), "iterator": 50}
+    try:
+        if logical:
+            assert pm.gscreen(expr, vars={"x": 2}, **kw) is not None
+        else:
+            with pytest.raises(pm.error, match=f'^Expression "{re.escape(expr)}" does not produce a logical result'):
+                pm.gscreen(expr, vars={"x": 2}, **kw)
+    finally:
+        pm.gvtrack_rm("gscreen_vt")

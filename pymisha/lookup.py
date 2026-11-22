@@ -17,6 +17,7 @@ from ._shared import (
     _numpy,
     _pm_dbreload,
     _preprocess_intervals_iterator,
+    _progress_context,
     _pymisha,
     _pymisha2df,
     _remap_interval_ids,
@@ -169,26 +170,21 @@ def glookup(
 
     if not use_python:
         # Use C++ streaming implementation
-        config = dict(CONFIG)
-        if progress is not None:
-            config["progress"] = progress
-        if progress_desc:
-            config["progress_desc"] = progress_desc
-
         # Flatten lookup table in Fortran (column-major) order to match
         # BinsManager::vals2idx flat index convention
         flat_table = _numpy.ascontiguousarray(lookup_table.ravel(order="F"))
 
-        result = _pymisha.pm_lookup(
-            exprs,
-            [b.tolist() for b in breaks_list],
-            flat_table,
-            _df2pymisha(intervals),
-            iterator,
-            include_lowest,
-            force_binning,
-            config,
-        )
+        with _progress_context(progress, desc=progress_desc):
+            result = _pymisha.pm_lookup(
+                exprs,
+                [b.tolist() for b in breaks_list],
+                flat_table,
+                _df2pymisha(intervals),
+                iterator,
+                include_lowest,
+                force_binning,
+                CONFIG,
+            )
 
         if result is None:
             return None

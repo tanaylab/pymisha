@@ -1484,15 +1484,27 @@ static void run_extract_kids(PMDirectAccumulator &acc,
                              PMTrackExprScanner &scanner,
                              size_t num_exprs,
                              const std::vector<std::string> &colnames,
-                             const std::vector<std::vector<SplitInterval>> &plan)
+                             const std::vector<std::vector<SplitInterval>> &plan,
+                             PyObject *progress_cb)
 {
     static_assert(sizeof(long) == sizeof(int64_t), "intervalID is a long");
-    fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
+    fork_kids(plan, progress_cb, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
         std::vector<int64_t> starts, ends, row_ids;
         std::vector<int32_t> chromids;
         std::vector<std::vector<double>> values(num_exprs);
 
-        for (scanner.start(sub); !scanner.isend(); scanner.next()) {
+        // as many rows as the iterator's intervals (0 where they are not known), which one process
+        // reserves too; more than max_data_size fail anyway
+        scanner.start(sub);
+        const size_t est_rows = std::min<uint64_t>(scanner.get_iterator()->size(), g_pymisha->max_data_size());
+        starts.reserve(est_rows);
+        ends.reserve(est_rows);
+        row_ids.reserve(est_rows);
+        chromids.reserve(est_rows);
+        for (auto &vals : values)
+            vals.reserve(est_rows);
+
+        for (; !scanner.isend(); scanner.next()) {
             const GInterval &interval = scanner.last_interval();
             starts.push_back(interval.start);
             ends.push_back(interval.end);
@@ -1585,7 +1597,7 @@ static std::vector<GInterval> compute_screen(PMTrackExprScanner &scanner, const 
     bool have_prev = false;
 
     for (; !scanner.isend(); scanner.next()) {
-        bool keep = scanner.vlogical(0);
+        bool keep = scanner.vbool(0);
 
         if (keep) {
             const GInterval &cur_interval = scanner.last_interval();
@@ -1681,13 +1693,13 @@ PyObject *pm_extract(PyObject *self, PyObject *args)
         PMTrackExprScanner scanner;
         scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // A kid does not call into Python, so a scan that evaluates an expression in Python runs here
+        // A kid's scan does not call into Python, so a scan that evaluates an expression in Python runs here
         std::vector<std::vector<SplitInterval>> plan;
         if (scanner.kid_can_scan())
             plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, extract_kid_row_size(exprs.size()))) {
-            run_extract_kids(acc, scanner, exprs.size(), colnames, plan);
+            run_extract_kids(acc, scanner, exprs.size(), colnames, plan, get_progress_cb(py_config));
         } else {
             PyObject *progress_cb = get_progress_cb(py_config);
             if (progress_cb) {
@@ -1839,14 +1851,15 @@ PyObject *pm_screen(PyObject *self, PyObject *args)
         PMTrackExprScanner scanner;
         scanner.prepare({expr}, PMTrackExprScanner::LOGICAL_T, iterator_policy, py_vtracks);
 
-        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        // R misha splits ranges with an explicit iterator; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (scanner.kid_can_scan())
             plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
         // a record: start, end, chromid
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, 2 * sizeof(int64_t) + sizeof(int32_t))) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 std::vector<GInterval> kid_intervals = compute_screen(scanner, sub);
                 const size_t n = kid_intervals.size();
                 char *res = (char *)PyMisha::allocate_res(n);
@@ -2117,13 +2130,14 @@ PyObject *pm_summary(PyObject *self, PyObject *args)
         if (!intervals.empty())
             scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        // R misha splits ranges with an explicit iterator; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (!intervals.empty() && scanner.kid_can_scan())
             plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), sizeof(SummaryStats), 0)) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 SummaryStats kid_summary = compute_summary(scanner, sub);
                 memcpy(PyMisha::allocate_res(0), &kid_summary, sizeof(kid_summary));
             });
@@ -2454,7 +2468,7 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
         if (!intervals.empty())
             scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // R misha splits gquantiles' scope by chromosome only; a kid does not call into Python
+        // R misha splits gquantiles' scope by chromosome only; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (!intervals.empty() && scanner.kid_can_scan())
             plan = plan_kids(intervals, 0, iterator_policy);
@@ -2472,7 +2486,8 @@ PyObject *pm_quantiles(PyObject *self, PyObject *args)
 
         if (num_kids &&
             PyMisha::prepare4multitasking(num_kids, 2 * sizeof(uint64_t) + kid_sampling_buf_size * sizeof(double), 0)) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 StreamPercentiler<double> sp(kid_sampling_buf_size, 0, 0);
                 fill_stream_percentiler(scanner, sub, sp);
                 uint64_t header[2] = {sp.stream_size(), sp.samples().size()};
@@ -2747,14 +2762,15 @@ PyObject *pm_intervals_quantiles(PyObject *self, PyObject *args)
         if (!intervals.empty())
             scanner.prepare({expr}, PMTrackExprScanner::REAL_T, iterator_policy);
 
-        // R misha splits the scope by chromosome; a kid does not call into Python
+        // R misha splits the scope by chromosome; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (!intervals.empty() && scanner.kid_can_scan())
             plan = plan_kids(intervals, 0, iterator_policy);
 
         // a kid's result: whether a quantile is estimated, then the quantiles of its intervals
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), sizeof(uint64_t), n * sizeof(double))) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 std::vector<double> kid_quantiles;
                 uint64_t estimated = compute_interval_quantiles(scanner, sub, percentiles, kid_quantiles);
                 char *res = (char *)PyMisha::allocate_res(sub.size());
@@ -4419,13 +4435,14 @@ PyObject *pm_dist(PyObject *self, PyObject *args)
         if (totalbins)
             scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
 
-        // R misha splits ranges with an explicit iterator; a kid does not call into Python
+        // R misha splits ranges with an explicit iterator; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (totalbins && scanner.kid_can_scan())
             plan = plan_kids(intervals, iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
 
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), totalbins * sizeof(uint64_t), 0)) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 std::vector<uint64_t> kid_dist = compute_dist(scanner, exprs.size(), sub, bins_manager);
                 memcpy(PyMisha::allocate_res(0), kid_dist.data(), totalbins * sizeof(uint64_t));
             });
@@ -4722,7 +4739,7 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         PMTrackExprScanner scanner;
         scanner.prepare(exprs, PMTrackExprScanner::REAL_T, iterator_policy);
 
-        // R misha splits glookup's scope by chromosome only; a kid does not call into Python
+        // R misha splits glookup's scope by chromosome only; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (scanner.kid_can_scan())
             plan = plan_kids(intervals, 0, iterator_policy);
@@ -4730,7 +4747,8 @@ PyObject *pm_lookup(PyObject *self, PyObject *args)
         // a row: start, end, intervalID, value, chromid
         if (!plan.empty() &&
             PyMisha::prepare4multitasking(plan.size(), 0, 3 * sizeof(int64_t) + sizeof(double) + sizeof(int32_t))) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
+            fork_kids(plan, get_progress_cb(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &ids) {
                 LookupResult kid_result = compute_lookup(scanner, exprs.size(), sub, bins_manager, lookup_table,
                                                          force_binning != 0, &ids);
                 const size_t n = kid_result.intervals.size();
@@ -5195,8 +5213,12 @@ static CorSummary compute_cor_pearson(CorPairScanners &scanners, const std::vect
     return summary;
 }
 
+// The value pairs of one pair of expressions, which CONFIG['max_data_size'] limits on its own, as R
+// misha's gcor in one process. A kid reports its records of all the pairs: prev_records of the pairs
+// before this one.
 static void collect_cor_spearman_exact_pairs(CorPairScanners &scanners, const std::vector<GInterval> &intervals,
-                                             std::vector<ValuePair> &pairs, uint64_t &total_bins)
+                                             std::vector<ValuePair> &pairs, uint64_t &total_bins,
+                                             uint64_t prev_records = 0)
 {
     pairs.clear();
     total_bins = 0;
@@ -5206,7 +5228,7 @@ static void collect_cor_spearman_exact_pairs(CorPairScanners &scanners, const st
             pairs.push_back({x, y});
             g_pymisha->verify_max_data_size(pairs.size(), "Result");
             if (PyMisha::is_kid())
-                PyMisha::update_res_data_size(pairs.size());
+                PyMisha::update_res_data_size(prev_records + pairs.size());
         }
     });
 }
@@ -5358,7 +5380,7 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
         }
 
         // R misha multitasks the Pearson and the exact Spearman correlations, splitting ranges
-        // with an explicit iterator for Pearson's; a kid does not call into Python
+        // with an explicit iterator for Pearson's; a kid's scan does not call into Python
         std::vector<std::vector<SplitInterval>> plan;
         if (!intervals.empty() && kid_can_scan && method != CorMethod::SPEARMAN)
             plan = plan_kids(intervals, method == CorMethod::PEARSON && iterator_policy > 0 ? iterator_policy : 0, iterator_policy);
@@ -5369,7 +5391,7 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
 
         if (!plan.empty() && method == CorMethod::PEARSON &&
             PyMisha::prepare4multitasking(plan.size(), num_pairs * sizeof(CorSummary), 0)) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, nullptr, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 char *res = (char *)PyMisha::allocate_res(0);
                 for (size_t p = 0; p < num_pairs; ++p) {
                     CorSummary kid_summary = compute_cor_pearson(*scanners[p], sub);
@@ -5386,14 +5408,17 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
                 }
             }
         } else if (!plan.empty() && method == CorMethod::SPEARMAN_EXACT &&
-                   // a kid's result: per pair, its number of bins and of value pairs; then the value pairs
-                   PyMisha::prepare4multitasking(plan.size(), num_pairs * 2 * sizeof(uint64_t), sizeof(ValuePair))) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                   // a kid's result: per pair, its number of bins and of value pairs; then the value
+                   // pairs, which CONFIG['max_data_size'] limits per pair, as in one process (R misha
+                   // limits the pairs together when it multitasks)
+                   PyMisha::prepare4multitasking(plan.size(), num_pairs * 2 * sizeof(uint64_t), sizeof(ValuePair), 0,
+                                                 num_pairs)) {
+            fork_kids(plan, nullptr, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 std::vector<std::vector<ValuePair>> pairs(num_pairs);
                 std::vector<uint64_t> header(num_pairs * 2);
                 uint64_t num_records = 0;
                 for (size_t p = 0; p < num_pairs; ++p) {
-                    collect_cor_spearman_exact_pairs(*scanners[p], sub, pairs[p], header[p * 2]);
+                    collect_cor_spearman_exact_pairs(*scanners[p], sub, pairs[p], header[p * 2], num_records);
                     header[p * 2 + 1] = pairs[p].size();
                     num_records += pairs[p].size();
                 }
@@ -5423,8 +5448,10 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
                     res += header[p * 2 + 1] * sizeof(ValuePair);
                 }
             }
-            for (size_t p = 0; p < num_pairs; ++p)
+            for (size_t p = 0; p < num_pairs; ++p) {
+                g_pymisha->verify_max_data_size(merged_pairs[p].size(), "Result");
                 spearman_summaries[p] = spearman_summary_from_pairs(merged_pairs[p], total_bins_per_pair[p]);
+            }
         } else if (!intervals.empty()) {
             for (size_t p = 0; p < num_pairs; ++p) {
                 if (method == CorMethod::PEARSON) {

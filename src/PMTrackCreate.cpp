@@ -861,7 +861,8 @@ PyObject *pm_track_create_expr(PyObject *self, PyObject *args)
             plan = plan_kids(intervals, 0, 0);
 
         if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, 0)) {
-            fork_kids(plan, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+            fork_kids(plan, get_progress_cb_local(py_config),
+                      [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
                 write_track_files(scanner, sub, track_dir, binsize);
                 // a file whose last buffer failed to reach the disk when it was closed
                 if (*BufferedFile::write_error())
@@ -1375,6 +1376,42 @@ private:
 
 }  // namespace
 
+// Smooths the expression of scanner (prepared) over intervals into the files of the chromosomes the
+// scan reaches, a smoother per chromosome
+static void smooth_track_files(PMTrackExprScanner &scanner, const vector<GInterval> &intervals,
+                               const string &track_dir, int64_t binsize, unsigned num_samples_aside,
+                               double weight_thr, bool smooth_nans, bool use_linear_ramp)
+{
+    const GenomeChromKey &chromkey = g_pmdb->chromkey();
+    GenomeTrackFixedBin out_track;
+    int cur_chromid = -1;
+    std::unique_ptr<Smoother> smoother;
+
+    for (scanner.start(intervals); !scanner.isend(); scanner.next()) {
+        const GInterval &interv = scanner.last_interval();
+
+        if (interv.chromid != cur_chromid) {
+            // the previous chromosome's last bins, before init_write() moves to the next one
+            if (smoother)
+                smoother->finish();
+
+            cur_chromid = interv.chromid;
+            string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
+            out_track.init_write(path.c_str(), (unsigned)binsize, cur_chromid);
+
+            if (use_linear_ramp)
+                smoother.reset(new LinearRampSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
+            else
+                smoother.reset(new MeanSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
+        }
+
+        smoother->set_next_sample(scanner.vdouble());
+    }
+
+    if (smoother)
+        smoother->finish();
+}
+
 PyObject *pm_smooth(PyObject *self, PyObject *args)
 {
     try {
@@ -1418,14 +1455,11 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
         ensure_track_dir(track_dir);
 
         PMTrackExprScanner scanner;
-        vector<string> exprs = {string(expr)};
-        scanner.begin(exprs, PMTrackExprScanner::REAL_T, intervals, iterator_policy, py_vtracks);
-
-        PMFixedBinIterator *fitr = dynamic_cast<PMFixedBinIterator *>(scanner.get_iterator());
-        if (!fitr)
+        scanner.prepare({string(expr)}, PMTrackExprScanner::REAL_T, iterator_policy, py_vtracks);
+        const int64_t binsize = scanner.fixed_bin_size();
+        if (!binsize)
             verror("gtrack_smooth requires a fixed-bin (dense) iterator");
-        int64_t binsize = fitr->get_bin_size();
-        if (binsize <= 0)
+        if (binsize < 0)
             verror("Failed to infer dense iterator binsize");
 
         // the window size is taken as a whole number, as R does
@@ -1434,45 +1468,35 @@ PyObject *pm_smooth(PyObject *self, PyObject *args)
             verror("Smoothing window is narrow and does not cover any other values around the center");
         g_pymisha->verify_max_data_size(2 * (uint64_t)num_samples_aside + 1, "Smoothing window");
 
+        auto smooth = [&](const vector<GInterval> &scope) {
+            smooth_track_files(scanner, scope, track_dir, binsize, num_samples_aside, weight_thr, smooth_nans,
+                               use_linear_ramp);
+        };
+
+        // As R misha's gtrack.smooth: kids of whole chromosomes, each smoothing its chromosomes into
+        // their files (a chromosome is smoothed from its start to its end in one process)
+        std::vector<std::vector<SplitInterval>> plan;
+        if (scanner.kid_can_scan())
+            plan = plan_kids(intervals, 0, 0);
+
+        if (!plan.empty() && PyMisha::prepare4multitasking(plan.size(), 0, 0)) {
+            fork_kids(plan, nullptr, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {
+                smooth(sub);
+                // a file whose last buffer failed to reach the disk when it was closed
+                if (*BufferedFile::write_error())
+                    verror("%s", BufferedFile::write_error());
+            });
+        } else
+            smooth(intervals);
+
+        // the chromosomes the scan did not reach get a file on a per-chromosome database
         const GenomeChromKey &chromkey = g_pmdb->chromkey();
-        const bool indexed_db = db_is_indexed();
-        vector<bool> created(chromkey.get_num_chroms(), false);
-
-        GenomeTrackFixedBin out_track;
-        int cur_chromid = -1;
-        std::unique_ptr<Smoother> smoother;
-
-        for (; !scanner.isend(); scanner.next()) {
-            const GInterval &interv = scanner.last_interval();
-
-            if (interv.chromid != cur_chromid) {
-                // the previous chromosome's last bins, before init_write() moves to the next one
-                if (smoother)
-                    smoother->finish();
-
-                cur_chromid = interv.chromid;
-                string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, cur_chromid);
-                out_track.init_write(path.c_str(), (unsigned)binsize, cur_chromid);
-                created[cur_chromid] = true;
-
-                if (use_linear_ramp)
-                    smoother.reset(new LinearRampSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
-                else
-                    smoother.reset(new MeanSmoother(out_track, num_samples_aside, weight_thr, smooth_nans));
-            }
-
-            smoother->set_next_sample(scanner.vdouble());
-        }
-
-        if (smoother)
-            smoother->finish();
-
-        if (!indexed_db) {
+        if (!db_is_indexed()) {
+            GenomeTrackFixedBin out_track;
             for (int chromid = 0; chromid < (int)chromkey.get_num_chroms(); ++chromid) {
-                if (created[chromid])
-                    continue;
                 string path = track_dir + "/" + GenomeTrack::get_1d_filename(chromkey, chromid);
-                out_track.init_write(path.c_str(), (unsigned)binsize, chromid);
+                if (!file_exists(path))
+                    out_track.init_write(path.c_str(), (unsigned)binsize, chromid);
             }
         }
 

@@ -1948,10 +1948,11 @@ def _gextract_2d(
         for name in (*expr_tracks, *expr_vtracks):
             local_ns[_expr_safe_name(name)] = values[_expr_safe_name(name)]
 
-        vals = eval(code_obj, {"__builtins__": {}}, local_ns)
-        if _numpy.isscalar(vals):
-            vals = _numpy.full(n, vals, dtype=float)
-        out_df[out_col] = _numpy.asarray(vals, dtype=float)
+        vals = _numpy.asarray(eval(code_obj, {"__builtins__": {}}, local_ns))
+        if vals.ndim == 0:
+            vals = _numpy.full(n, vals)
+        # a logical result stays logical, as the C++ scan gives it: gscreen tells it from a number
+        out_df[out_col] = vals if vals.dtype == bool else vals.astype(float)
 
     out_df["intervalID"] = units["intervalID"].to_numpy(dtype=int)
     return out_df.reset_index(drop=True)
@@ -2727,7 +2728,6 @@ def _parallel_extract_tracks(
 
     worker_config = dict(config)
     worker_config["progress"] = False
-    worker_config["multitasking"] = False  # workers must not fork again
 
     worker_args = [
         (chunk, iterator, worker_config, vtracks_dict) for chunk in expr_chunks
@@ -3445,8 +3445,10 @@ def gscreen(
     """Find intervals where a logical track expression is True.
 
     Evaluates a logical track expression and returns all intervals where
-    the expression value is True (non-zero). Adjacent True intervals on the
-    same chromosome are merged into a single interval.
+    the expression value is True. Adjacent True intervals on the same
+    chromosome are merged into a single interval. An expression whose
+    result is not logical (a number, such as ``"dense_track * 2"``) is an
+    error, as in R misha.
 
     Parameters
     ----------
@@ -3544,8 +3546,9 @@ def gscreen(
         ]
         if not data_cols:
             return None
-        vals = extracted[data_cols[0]].to_numpy(dtype=float, copy=False)
-        mask = (~_numpy.isnan(vals)) & (vals != 0.0)
+        if extracted[data_cols[0]].dtype != bool:
+            raise _pymisha.error(f'Expression "{expr}" does not produce a logical result')
+        mask = extracted[data_cols[0]].to_numpy()
         if not mask.any():
             return None
         return extracted.loc[mask, ["chrom1", "start1", "end1", "chrom2", "start2", "end2"]].reset_index(drop=True)
@@ -3656,8 +3659,10 @@ def gscreen(
 
             local_ns.update(user_vars)
 
-            chunk_mask = eval(code_obj, {"__builtins__": {}}, local_ns)
-            chunk_mask = _numpy.asarray(chunk_mask, dtype=bool)
+            chunk_mask = _numpy.asarray(eval(code_obj, {"__builtins__": {}}, local_ns))
+            # numbers are R misha's error, not read as true where nonzero
+            if chunk_mask.dtype != bool:
+                raise _pymisha.error(f'Expression "{expr}" does not produce a logical result')
 
             for vt in expr_vtracks:
                 chunk_mask = _numpy.where(_numpy.isnan(vtrack_arrays[vt]), False, chunk_mask)

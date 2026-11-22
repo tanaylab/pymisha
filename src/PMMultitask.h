@@ -58,11 +58,13 @@ template <typename F>
     _exit(0);
 }
 
-// Forks a kid per element of plan and waits for them all. Kid k runs
-// kid_work(k, intervals, ids): its intervals and, per interval, its row in the scope (0-based).
-// PyMisha::prepare4multitasking() with the result sizes comes first.
+// Forks a kid per element of plan and waits for them all, reporting their progress to progress_cb
+// as one process reports its own to it (with none, as text on stderr; see
+// PyMisha::wait_for_kids_reporting). Kid k runs kid_work(k, intervals, ids): its intervals and, per
+// interval, its row in the scope (0-based). PyMisha::prepare4multitasking() with the result sizes
+// comes first.
 template <typename F>
-void fork_kids(const std::vector<std::vector<SplitInterval>> &plan, F &&kid_work)
+void fork_kids(const std::vector<std::vector<SplitInterval>> &plan, PyObject *progress_cb, F &&kid_work)
 {
     for (int kid = 0; kid < (int)plan.size(); ++kid) {
         if (!PyMisha::launch_process()) {
@@ -74,8 +76,7 @@ void fork_kids(const std::vector<std::vector<SplitInterval>> &plan, F &&kid_work
             });
         }
     }
-    while (PyMisha::wait_for_kids(1))
-        ;
+    PyMisha::wait_for_kids_reporting(progress_cb);
 }
 
 #endif /* PMMULTITASK_H_ */

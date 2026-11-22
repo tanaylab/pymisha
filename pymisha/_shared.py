@@ -247,6 +247,9 @@ def _forked_worker_main(conn: Any, fn: Any, args: Any, kid_idx: int, parent_pid:
         ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
     if _os.getppid() != parent_pid:  # the parent died before prctl()
         _os._exit(1)
+    # A worker does not multitask, as R misha's workers (options(gmultitasking = FALSE)): its C++
+    # calls would fork up to max_processes kids each, max_processes x max_processes in all
+    CONFIG["multitasking"] = False
     try:
         if _RNG_STREAM_DEPTH:
             # the worker's calls seed from its own numpy state (below), not the parent's stream
@@ -1468,7 +1471,7 @@ def _config_no_mt(id_map, keep=False):
     """Context manager that disables C++ multitasking when id_map is set.
 
     When a DataFrame iterator was preprocessed into a small set of
-    intersected intervals, the C++ fork/FIFO multitasking overhead
+    intersected intervals, the C++ fork multitasking overhead
     dominates the actual work.  The C++ side reads multitasking from
     the module-level ``CONFIG`` global, so we temporarily mutate it.
 

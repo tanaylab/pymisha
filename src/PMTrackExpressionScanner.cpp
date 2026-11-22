@@ -149,8 +149,8 @@ std::string normalize_logical_precedence(const std::string &expr)
 
 }  // namespace
 
-// An expression Python evaluates with numpy, which a forked kid evaluates in C++ instead (a kid does
-// not call into Python): numbers, the names of track and virtual track variables, parentheses,
+// An expression Python evaluates with numpy, which a forked kid evaluates in C++ instead (a kid's
+// scan does not call into Python): numbers, the names of track and virtual track variables, parentheses,
 // unary - and +, + - * / and the comparisons of numbers, and & | of comparisons, with Python's
 // precedence (the expression is the one compiled for Python, its & and | operands already in
 // parentheses). The results are numpy's: the same IEEE operations, a comparison false where a
@@ -604,11 +604,7 @@ void PMTrackExprScanner::define_py_vars(unsigned eval_buf_limit)
         for (size_t iexpr = 0; iexpr < m_track_exprs.size(); ++iexpr) {
             if (m_py_compiled_exprs[iexpr]) {
                 if (m_valtype == LOGICAL_T) {
-                    // For LOGICAL_T, we need both a double buffer (for numeric exprs
-                    // interpreted via vlogical) and a bool buffer (for boolean exprs).
-                    // We allocate both; only one will be used per expression per batch.
-                    m_py_eval_out_double[iexpr].assign(
-                        PyArray_SimpleNew(1, dims, NPY_DOUBLE), true);
+                    // a logical result only (a number is an error, as in R misha)
                     m_py_eval_out_bool[iexpr].assign(
                         PyArray_SimpleNew(1, dims, NPY_BOOL), true);
                 } else {
@@ -739,6 +735,7 @@ bool PMTrackExprScanner::next_batch()
             vemsg("\n");
     }
     call_progress_callback(100, true);
+    PyMisha::update_progress(100);
 
     return false;
 }
@@ -913,7 +910,9 @@ bool PMTrackExprScanner::eval_next()
                     for (unsigned k = 0; k < m_eval_buf_limit; ++k)
                         bout[k] = out[k] != 0;
                     m_eval_bools[iexpr] = bout;
-                } else
+                } else if (m_valtype == LOGICAL_T)
+                    TGLError("Expression \"%s\" does not produce a logical result", m_track_exprs[iexpr].c_str());
+                else
                     m_eval_doubles[iexpr] = out;
             }
         } else if (m_use_python) {
@@ -986,6 +985,11 @@ bool PMTrackExprScanner::eval_next()
 
                     PyArray_Descr *t = PyArray_DTYPE((PyArrayObject *)*m_py_eval_bufs[iexpr]);
 
+                    // gscreen's expression must give booleans: numbers are R misha's error, not
+                    // read as true where nonzero
+                    if (m_valtype == LOGICAL_T && !PyTypeNum_ISBOOL(t->type_num))
+                        TGLError("Expression \"%s\" does not produce a logical result", m_track_exprs[iexpr].c_str());
+
                     if (PyTypeNum_ISBOOL(t->type_num)) {
                         // Boolean result
                         if (m_valtype == LOGICAL_T) {
@@ -1038,10 +1042,12 @@ void PMTrackExprScanner::report_progress_impl()
 {
     m_num_evals += m_eval_buf_size;
 
-    const bool want_text = m_do_report_progress;
-    const bool want_cb = m_progress_cb && !PyMisha::is_kid();
+    // a kid hands its progress to its parent (PyMisha::update_progress), which reports the kids'
+    const bool is_kid = PyMisha::is_kid();
+    const bool want_text = m_do_report_progress && !is_kid;
+    const bool want_cb = m_progress_cb && !is_kid;
 
-    if (!want_text && !want_cb)
+    if (!want_text && !want_cb && !is_kid)
         return;
 
     if (m_num_evals > (size_t)m_report_step) {
@@ -1070,6 +1076,7 @@ void PMTrackExprScanner::report_progress_impl()
                 }
                 if (want_cb)
                     call_progress_callback(progress, false);
+                PyMisha::update_progress(progress);
                 m_last_progress_reported = progress;
             }
             m_num_evals = 0;
@@ -1090,29 +1097,5 @@ void PMTrackExprScanner::call_progress_callback(int progress, bool final)
         total = m_itr->size();
         done = (final && total) ? total : m_itr->idx();
     }
-
-    PyObject *py_done = PyLong_FromUnsignedLongLong(done);
-    PyObject *py_total = total ? PyLong_FromUnsignedLongLong(total) : Py_None;
-    if (!total) {
-        Py_INCREF(Py_None);
-    }
-    PyObject *py_pct = PyLong_FromLong(progress);
-
-    if (!py_done || !py_total || !py_pct) {
-        Py_XDECREF(py_done);
-        Py_XDECREF(py_total);
-        Py_XDECREF(py_pct);
-        TGLError("Failed to allocate arguments for progress callback");
-    }
-
-    PyObject *res = PyObject_CallFunctionObjArgs(m_progress_cb, py_done, py_total, py_pct, NULL);
-    Py_XDECREF(py_done);
-    Py_XDECREF(py_total);
-    Py_XDECREF(py_pct);
-
-    if (!res || PyErr_Occurred()) {
-        Py_XDECREF(res);
-        TGLError("Progress callback failed");
-    }
-    Py_XDECREF(res);
+    call_progress_cb(m_progress_cb, done, total, progress);
 }
