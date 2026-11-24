@@ -9,9 +9,12 @@
 # Checks (the lint and type steps CI runs, so they fail here instead of on the PR):
 #   - ruff check pymisha/
 #   - python -m mypy pymisha/
-# A missing tool is reported and skipped. SKIP_PREPUSH_CHECKS=1 skips both checks.
-# CI installs the latest ruff and runs mypy on Python 3.10–3.12, so keep local
-# tools current (pip install -U ruff mypy) for the checks to match.
+# They run on each commit being pushed, not on the working tree: pymisha/ and
+# pyproject.toml of that commit are exported to a temporary directory, unless the
+# commit is HEAD and pymisha/ and pyproject.toml have no local changes, in which case
+# they run in place. A missing tool is reported and skipped. SKIP_PREPUSH_CHECKS=1
+# skips both checks. CI installs the latest ruff and runs mypy on Python 3.10–3.12,
+# so keep local tools current (pip install -U ruff mypy) for the checks to match.
 #
 set -euo pipefail
 
@@ -34,41 +37,89 @@ if [[ "${SKIP_PREPUSH_CHECKS:-}" == "1" ]]; then
     exit 0
 fi
 
-cd "$(git rev-parse --show-toplevel)"
+TOP="$(git rev-parse --show-toplevel)"
+cd "$TOP"
 
-# Prefer the checkout's own virtualenv, then whatever is on PATH.
+# The commits being pushed: git passes "<local ref> <local sha> <remote ref> <remote sha>"
+# per ref on stdin; a local sha of zeros is a deletion, which has nothing to check.
+SHAS=()
+while read -r _lref lsha _rref _rsha; do
+    [[ -z "${lsha:-}" || "$lsha" =~ ^0+$ ]] && continue
+    commit="$(git rev-parse --verify --quiet "${lsha}^{commit}" || true)"
+    [[ -z "$commit" ]] && continue
+    [[ " ${SHAS[*]-} " == *" $commit "* ]] || SHAS+=("$commit")
+done
+if [[ ${#SHAS[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+# Prefer the checkout's own virtualenv, then whatever is on PATH (absolute, since the
+# checks may run in a temporary directory).
 PY=""
-for cand in .venv/bin/python "${VIRTUAL_ENV:-}/bin/python" python3 python; do
+for cand in "$TOP/.venv/bin/python" "${VIRTUAL_ENV:-}/bin/python" python3 python; do
     if [[ -n "$cand" && "$cand" != "/bin/python" ]] && command -v "$cand" >/dev/null 2>&1; then
-        PY="$cand"
+        PY="$(command -v "$cand")"
         break
     fi
 done
 
-fail=0
-
 RUFF=()
-if [[ -x .venv/bin/ruff ]]; then
-    RUFF=(.venv/bin/ruff)
+if [[ -x "$TOP/.venv/bin/ruff" ]]; then
+    RUFF=("$TOP/.venv/bin/ruff")
 elif command -v ruff >/dev/null 2>&1; then
-    RUFF=(ruff)
+    RUFF=("$(command -v ruff)")
 elif [[ -n "$PY" ]] && "$PY" -m ruff --version >/dev/null 2>&1; then
     RUFF=("$PY" -m ruff)
 fi
+[[ ${#RUFF[@]} -gt 0 ]] || echo "pre-push: ruff not found, skipping (pip install ruff)" >&2
 
-if [[ ${#RUFF[@]} -gt 0 ]]; then
-    echo "pre-push: ruff check pymisha/" >&2
-    "${RUFF[@]}" check pymisha/ || fail=1
-else
-    echo "pre-push: ruff not found, skipping (pip install ruff)" >&2
-fi
-
+HAVE_MYPY=0
 if [[ -n "$PY" ]] && "$PY" -m mypy --version >/dev/null 2>&1; then
-    echo "pre-push: mypy pymisha/" >&2
-    "$PY" -m mypy pymisha/ || fail=1
+    HAVE_MYPY=1
 else
     echo "pre-push: mypy not found, skipping (pip install mypy)" >&2
 fi
+
+# Runs the checks in directory $1 (holding pymisha/ and pyproject.toml); 1 if any fails.
+run_checks() {
+    local dir="$1" status=0
+    if [[ ${#RUFF[@]} -gt 0 ]]; then
+        (cd "$dir" && "${RUFF[@]}" check pymisha/) || status=1
+    fi
+    if [[ $HAVE_MYPY -eq 1 ]]; then
+        (cd "$dir" && "$PY" -m mypy --cache-dir "$TOP/.mypy_cache" pymisha/) || status=1
+    fi
+    return $status
+}
+
+HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+TMPDIRS=()
+cleanup() {
+    local d
+    for d in "${TMPDIRS[@]-}"; do
+        if [[ -n "$d" ]]; then
+            rm -rf "$d"
+        fi
+    done
+    return 0
+}
+trap cleanup EXIT
+
+fail=0
+for sha in "${SHAS[@]}"; do
+    short="$(git rev-parse --short "$sha")"
+    if [[ "$sha" == "$HEAD_SHA" ]] && git diff --quiet HEAD -- pymisha pyproject.toml &&
+        [[ -z "$(git ls-files --others --exclude-standard -- pymisha)" ]]; then
+        echo "pre-push: ruff and mypy on $short (HEAD, clean)" >&2
+        run_checks "$TOP" || fail=1
+    else
+        dir="$(mktemp -d "${TMPDIR:-/tmp}/pymisha-prepush.XXXXXX")"
+        TMPDIRS+=("$dir")
+        git archive "$sha" -- pymisha pyproject.toml | tar -x -C "$dir"
+        echo "pre-push: ruff and mypy on $short (exported)" >&2
+        run_checks "$dir" || fail=1
+    fi
+done
 
 if [[ $fail -ne 0 ]]; then
     echo "" >&2
