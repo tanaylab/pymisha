@@ -169,6 +169,9 @@ PyObject *pm_parquet_writer_open(PyObject *self, PyObject *args);
 PyObject *pm_parquet_writer_add(PyObject *self, PyObject *args);
 PyObject *pm_parquet_writer_close(PyObject *self, PyObject *args);
 PyObject *pm_bedgraph_lines(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_create(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_append(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_finish(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_scanner(PyObject *self, PyObject *args);
@@ -291,6 +294,9 @@ static PyMethodDef module_methods[] = {
     {"pm_parquet_writer_add", gcall<pm_parquet_writer_add>, METH_VARARGS, "Add rows to a Parquet file opened by pm_parquet_writer_open"},
     {"pm_parquet_writer_close", gcall<pm_parquet_writer_close>, METH_VARARGS, "Finish a Parquet file opened by pm_parquet_writer_open"},
     {"pm_bedgraph_lines", gcall<pm_bedgraph_lines>, METH_VARARGS, "bedGraph lines of rows, formatted as R misha writes them"},
+    {"pm_bigwig_create", gcall<pm_bigwig_create>, METH_VARARGS, "Create a bigWig file with its chromosomes; returns the writer's state"},
+    {"pm_bigwig_append", gcall<pm_bigwig_append>, METH_VARARGS, "Append records to a bigWig file being written; returns the writer's state"},
+    {"pm_bigwig_finish", gcall<pm_bigwig_finish>, METH_VARARGS, "Write the index, zoom levels and header of a bigWig file; returns the number of records"},
     {"pm_liftover_aggregate", gcall<pm_liftover_aggregate>, METH_VARARGS, "Aggregate overlapping intervals per chrom (C++ fast path for liftover)"},
     {"pm_parse_chain_file", gcall<pm_parse_chain_file>, METH_VARARGS, "Parse a UCSC chain file into 10 columns (C++ fast path for gintervals_load_chain)"},
     {"pm_read_source_track_1d", gcall<pm_read_source_track_1d>, METH_VARARGS, "Read a 1D source-track directory into a (type, df_dict) tuple (C++ fast path for gtrack_liftover)"},

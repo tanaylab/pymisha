@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* `gtrack_export_bigwig` writes bigWig files directly; UCSC `bedGraphToBigWig` is no longer needed.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking
