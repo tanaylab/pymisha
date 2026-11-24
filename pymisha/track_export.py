@@ -308,9 +308,11 @@ def gtrack_export_bigwig(
         kwargs["iterator"] = iterator
     rank = {c: i for i, c in enumerate(file_chroms)}
 
+    # Created before the try, so a failure before the file is opened (bad chromosome sizes, an
+    # unwritable path) never deletes a file already at the path.
+    state = _pymisha.pm_bigwig_create(file, file_chroms, file_sizes)
     success = False
     try:
-        state = _pymisha.pm_bigwig_create(file, file_chroms, file_sizes)
         for group in groups:
             for intervs in group():
                 data = gextract(track, intervals=intervs, colnames="value", **kwargs)

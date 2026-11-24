@@ -473,6 +473,19 @@ class TestBigWigExport:
             pm.gtrack_export_bigwig("dense_track + bw_no_such_variable", f)
         assert not os.path.exists(f)
 
+    def test_an_export_that_cannot_open_its_file_keeps_the_file_already_there(self, tmp_path):
+        f = tmp_path / "readonly.bw"
+        f.write_text("keep me")
+        f.chmod(0o444)
+        try:
+            if os.access(f, os.W_OK):
+                pytest.skip("file is writable (running as root)")
+            with pytest.raises(Exception):  # noqa: B017
+                pm.gtrack_export_bigwig("dense_track", str(f))
+            assert f.read_text() == "keep me"
+        finally:
+            f.chmod(0o644)
+
     def test_the_writer_refuses_unsorted_and_overlapping_records(self, tmp_path):
         from pymisha._shared import _pymisha
 
