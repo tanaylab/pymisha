@@ -216,7 +216,6 @@ from .tracks import (
     gtrack_var_set,
 )
 from .variants import gextract_variants
-from .windows import ExtractedWindows, gextract_windows, gseq_onehot
 from .vtracks import (
     gvtrack_array_slice,
     gvtrack_clear,
@@ -228,6 +227,7 @@ from .vtracks import (
     gvtrack_ls,
     gvtrack_rm,
 )
+from .windows import ExtractedWindows, gextract_windows, gseq_onehot
 
 # The C extension names this class "pymisha.error", so pickle (and hence
 # multiprocessing error propagation) looks it up here. Without the alias any
