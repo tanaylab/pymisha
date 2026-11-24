@@ -12,6 +12,7 @@ import math
 import re
 import warnings
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as _numpy
 import pandas as _pandas
@@ -88,9 +89,9 @@ def _check_file(file) -> None:
 
 
 def _recycle(x, n: int, what: str) -> list[float]:
-    vals = [x] if _numpy.isscalar(x) else list(x)
+    raw: list[Any] = [x] if _numpy.isscalar(x) else list(x)
     try:
-        vals = [float(v) for v in vals]
+        vals = [float(v) for v in raw]
     except (TypeError, ValueError) as err:
         raise ValueError(f"'{what}' must be a finite number or one per motif") from err
     if len(vals) not in (1, n) or not all(math.isfinite(v) for v in vals):
@@ -164,11 +165,11 @@ def _prepare(motifs) -> list[tuple[str, _numpy.ndarray, dict]]:
         raise TypeError("'motifs' must be a matrix or a non-empty dict or list of matrices")
     if not items:
         raise ValueError("'motifs' must be a matrix or a non-empty dict or list of matrices")
-    ids = [_text(k) for k, _ in items]
-    if any(i is not None and " " in i for i in ids):
+    given = [_text(k) for k, _ in items]
+    if any(i is not None and " " in i for i in given):
         warnings.warn("Motif IDs cannot contain whitespace; replacing it with '_'", stacklevel=3)
-        ids = [None if i is None else i.replace(" ", "_") for i in ids]
-    ids = [f"motif_{n + 1}" if i is None else i for n, i in enumerate(ids)]
+        given = [None if i is None else i.replace(" ", "_") for i in given]
+    ids = [f"motif_{n + 1}" if i is None else i for n, i in enumerate(given)]
     return [(mid, _export_matrix(v, mid), _attrs_of(v)) for mid, (_, v) in zip(ids, items, strict=True)]
 
 
