@@ -108,6 +108,10 @@ trap cleanup EXIT
 fail=0
 for sha in "${SHAS[@]}"; do
     short="$(git rev-parse --short "$sha")"
+    if ! git cat-file -e "$sha:pymisha" 2>/dev/null || ! git cat-file -e "$sha:pyproject.toml" 2>/dev/null; then
+        echo "pre-push: $short has no pymisha/ or pyproject.toml, not checked" >&2
+        continue
+    fi
     if [[ "$sha" == "$HEAD_SHA" ]] && git diff --quiet HEAD -- pymisha pyproject.toml &&
         [[ -z "$(git ls-files --others --exclude-standard -- pymisha)" ]]; then
         echo "pre-push: ruff and mypy on $short (HEAD, clean)" >&2
@@ -115,7 +119,11 @@ for sha in "${SHAS[@]}"; do
     else
         dir="$(mktemp -d "${TMPDIR:-/tmp}/pymisha-prepush.XXXXXX")"
         TMPDIRS+=("$dir")
-        git archive "$sha" -- pymisha pyproject.toml | tar -x -C "$dir"
+        if ! git archive "$sha" -- pymisha pyproject.toml | tar -x -C "$dir"; then
+            echo "pre-push: could not export $short for checking" >&2
+            fail=1
+            continue
+        fi
         echo "pre-push: ruff and mypy on $short (exported)" >&2
         run_checks "$dir" || fail=1
     fi
