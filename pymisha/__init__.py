@@ -171,6 +171,7 @@ from .summary import (
     gsample,
     gsummary,
 )
+from .figwig import gtrack_export_figwig, gtrack_import_figwig
 from .track_export import gtrack_export_bedgraph, gtrack_export_bigwig
 from .tracks import (
     gtrack_2d_convert_to_indexed,
@@ -325,6 +326,7 @@ __all__ = [
     'gtrack_import',
     'gtrack_import_mappedseq',
     'gtrack_import_parquet',
+    'gtrack_import_figwig',
     'gtrack_import_set',
     'gtrack_rm',
     'gtrack_mv',
@@ -355,6 +357,7 @@ __all__ = [
     'gtrack_create_pwm_energy',
     'gtrack_export_bedgraph',
     'gtrack_export_bigwig',
+    'gtrack_export_figwig',
 
     # Interval functions
     'gintervals',

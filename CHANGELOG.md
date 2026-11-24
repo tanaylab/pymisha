@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* New `gtrack_import_figwig` and `gtrack_export_figwig` read and write figwig (`.fw`) multi-track files. Requires `pip install "pymisha[figwig]"`.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking

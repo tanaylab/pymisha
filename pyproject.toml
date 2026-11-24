@@ -45,6 +45,9 @@ dev = [
     "pyreadr",
     "pyarrow",
 ]
+figwig = [
+    "figwig>=0.3.2",
+]
 docs = [
     "mkdocs-material>=9.0",
     "mkdocstrings[python]>=0.24",
