@@ -227,6 +227,16 @@ def test_import_dense_matches_gtrack_import_of_the_same_records(figwig, db1, tmp
                                            rtol=1e-7, equal_nan=True)
 
 
+def test_select_compares_numbers_by_value(figwig, db1, tmp_path):
+    """2, 2.0, "2" and "2.0" select a track whose attribute is 2.0, and 0.1 matches 0.1."""
+    fw = _write_fw(figwig, tmp_path / "num.fw", _values(),
+                   attrs={"f32": {"rep": 2.0, "frac": 0.1}, "big": {"rep": 3, "frac": 0.25}})
+    for i, want in enumerate([2, 2.0, "2", "2.0", np.float32(2)]):
+        assert pm.gtrack_import_figwig(str(fw), select={"rep": want}, track_prefix=f"n{i}_") == [f"n{i}_f32"]
+    assert pm.gtrack_import_figwig(str(fw), select={"rep": 3.0}, track_prefix="t_") == ["t_big"]
+    assert pm.gtrack_import_figwig(str(fw), select={"frac": 0.1}, track_prefix="f_") == ["f_f32"]
+
+
 def test_selection_by_names_indices_and_attributes(figwig, db1, tmp_path):
     fw = _write_fw(figwig, tmp_path / "x.fw", _values(),
                    attrs={"f32": {"assay": "ATAC", "rep": 2}, "big": {"rep": "2"}})

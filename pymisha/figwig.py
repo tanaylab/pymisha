@@ -66,17 +66,31 @@ def _attr_text(value: Any) -> str | None:
     return json.dumps(value)
 
 
-def _filter_text(value: Any) -> str:
-    """A value of *select* as the text it is compared with (see _attr_text)."""
-    if isinstance(value, str):
-        return value
+_JSON_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?\Z")
+
+
+def _number_text(v: float) -> str:
+    """The canonical text of a number: a whole number below 1e15 as an integer, anything else
+    as "%.17g" (C printf), so that 2, 2.0 and "2.0" compare equal. R misha's .figwig_number_text."""
+    if math.isfinite(v) and v.is_integer() and abs(v) < 1e15:
+        return str(int(v))
+    return f"{v:.17g}"
+
+
+def _match_text(value: Any) -> str | None:
+    """The text a value of *select*, or a track's attribute value, is compared with: a number,
+    or a string that is a JSON number, as _number_text; a boolean as "true" / "false"; any other
+    string as it is; anything else as its JSON text; null as None (matches nothing)."""
+    if value is None:
+        return None
     if isinstance(value, (bool, np.bool_)):
         return "true" if value else "false"
-    if isinstance(value, numbers.Integral):
+    if isinstance(value, numbers.Integral) and abs(int(value)) < 10**15:
         return str(int(value))
     if isinstance(value, numbers.Real):
-        v = float(value)
-        return str(int(v)) if v.is_integer() and abs(v) < 1e15 else json.dumps(v)
+        return _number_text(float(value))
+    if isinstance(value, str):
+        return _number_text(float(value)) if _JSON_NUMBER.match(value) else value
     return json.dumps(value)
 
 
@@ -141,11 +155,12 @@ def _select_tracks(records: list[dict], tracks: Any, select: dict | None, file: 
                     f"No track of {file} has the attribute {key!r}; its attributes: {', '.join(sorted(keys))}"
                 )
             wanted = (
-                {_filter_text(w) for w in want}
+                {_match_text(w) for w in want}
                 if isinstance(want, (list, tuple, set, np.ndarray, pd.Series))
-                else {_filter_text(want)}
+                else {_match_text(want)}
             )
-            idx = [i for i in idx if key in records[i] and _attr_text(records[i][key]) in wanted]
+            wanted.discard(None)
+            idx = [i for i in idx if _match_text(records[i].get(key)) in wanted]
         if not idx:
             raise ValueError(f"No track of {file} matches select = {select!r}")
     return idx
@@ -427,8 +442,9 @@ def gtrack_import_figwig(
     in the order given, or all of them in the file's order, and then with
     *select*, a dict of attribute name to value (or list of values, any of
     which matches): a track is imported when every attribute given matches.
-    Values are compared as text, as they become attributes (below), so
-    ``{"rep": 1}`` and ``{"rep": "1"}`` both match a ``"rep": 1`` record.
+    Numbers are compared by value, whether given as numbers or as text, so
+    ``{"rep": 1}``, ``{"rep": "1"}`` and ``{"rep": "1.0"}`` all match a
+    ``"rep": 1`` or ``"rep": 1.0`` record; other values are compared as text.
     ``name``, ``dtype`` and ``group`` can be selected on too.
 
     The track made from figwig track ``n`` is named ``{track_prefix}{n'}``,
