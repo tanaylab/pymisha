@@ -86,8 +86,9 @@ def golden_cases():
         edge, f, background={"T": 0.3, "G": 0.2, "C": 0.2, "A": 0.3}, strands="+"
     )
     cases["edge_args.jaspar"] = lambda f: pm.gseq_write_jaspar(edge, f, nsites=[10, 1000, 3])
-    cases["edge_round.jaspar"] = lambda f: pm.gseq_write_jaspar(edge, f, nsites=[10, 1000, 3], round_counts=True)
-    cases["random_round.jaspar"] = lambda f: pm.gseq_write_jaspar(sets["random"], f, round_counts=True)
+    cases["edge_exact.jaspar"] = lambda f: pm.gseq_write_jaspar(edge, f, nsites=[10, 1000, 3], round_counts=False)
+    cases["random_exact.jaspar"] = lambda f: pm.gseq_write_jaspar(sets["random"], f, round_counts=False)
+    cases["from_meme_exact.jaspar"] = lambda f: pm.gseq_write_jaspar(sets["from_meme"], f, round_counts=False)
     cases["edge_args.motif"] = lambda f: pm.gseq_write_homer(edge, f, threshold_frac=0.8)
     return cases
 
@@ -102,7 +103,7 @@ def max_diff(a: pd.DataFrame, b: pd.DataFrame) -> float:
 
 def test_writers_match_r_golden_files(tmp_path):
     cases = golden_cases()
-    assert len(cases) == 21
+    assert len(cases) == 22
     for nm, write in cases.items():
         f = tmp_path / nm
         with _ignore_renorm():
@@ -142,7 +143,7 @@ suppressWarnings({
     gseq.write_meme(x, file.path(d, "r_bg.meme"), background = c(0.31, 0.19, 0.2, 0.3), strands = "+")
     gseq.write_jaspar(x, file.path(d, "r.jaspar"))
     gseq.write_jaspar(x, file.path(d, "r_ns.jaspar"), nsites = 1)
-    gseq.write_jaspar(x, file.path(d, "r_round.jaspar"), round_counts = TRUE)
+    gseq.write_jaspar(x, file.path(d, "r_exact.jaspar"), round_counts = FALSE)
     gseq.write_jaspar(x, file.path(d, "r.pfm"), format = "simple")
     gseq.write_homer(x, file.path(d, "r.motif"))
     gseq.write_homer(x, file.path(d, "r_frac.motif"), threshold_frac = 0.37)
@@ -212,11 +213,11 @@ def test_random_motifs_match_r_live(tmp_path, seed):
         pm.gseq_write_meme(motifs, str(tmp_path / "p_bg.meme"), background=[0.31, 0.19, 0.2, 0.3], strands="+")
         pm.gseq_write_jaspar(motifs, str(tmp_path / "p.jaspar"))
         pm.gseq_write_jaspar(motifs, str(tmp_path / "p_ns.jaspar"), nsites=1)
-        pm.gseq_write_jaspar(motifs, str(tmp_path / "p_round.jaspar"), round_counts=True)
+        pm.gseq_write_jaspar(motifs, str(tmp_path / "p_exact.jaspar"), round_counts=False)
         pm.gseq_write_jaspar(motifs, str(tmp_path / "p.pfm"), format="simple")
         pm.gseq_write_homer(motifs, str(tmp_path / "p.motif"))
         pm.gseq_write_homer(motifs, str(tmp_path / "p_frac.motif"), threshold_frac=0.37)
-    for stem in ("", "_bg", "_ns", "_round", "_frac"):
+    for stem in ("", "_bg", "_ns", "_exact", "_frac"):
         for ext in (".meme", ".jaspar", ".pfm", ".motif"):
             r = tmp_path / f"r{stem}{ext}"
             if r.exists():
@@ -263,9 +264,11 @@ def test_jaspar_simple_round_trip(tmp_path):
     x = pm.gseq_read_jaspar(str(FIXTURES / "test_motifs_simple.pfm"))
     f = tmp_path / "test_motifs_simple.pfm"
     # without nsites (simple files have none), counts are scaled to 100
-    pm.gseq_write_jaspar(x, str(f), format="simple")
+    pm.gseq_write_jaspar(x, str(f), format="simple", round_counts=False)
     _assert_same(x, pm.gseq_read_jaspar(str(f)), tol=1e-8)
     assert f.read_text().splitlines()[0] == "66.666667        80 26.666667  6.666667"
+    pm.gseq_write_jaspar(x, str(f), format="simple")
+    assert f.read_text().splitlines()[0] == "67 80 27  7"
     pm.gseq_write_jaspar(x, str(f), nsites=15, format="simple")
     _assert_same(x, pm.gseq_read_jaspar(str(f)))
     assert f.read_text().splitlines() == ["10 12  4  1", " 0  0  7  0", " 3  2  1  0", " 2  1  3 14"]
@@ -299,7 +302,7 @@ def test_random_motifs_round_trip(tmp_path):
             assert (y[k].attrs[key] is None) if v is None else y[k].attrs[key] == pytest.approx(v, rel=1e-14)
 
     f = str(tmp_path / "r.jaspar")
-    pm.gseq_write_jaspar(x, f)
+    pm.gseq_write_jaspar(x, f, round_counts=False)
     y = pm.gseq_read_jaspar(f)
     for k in x:
         assert max_diff(x[k], y[k]) <= 1.5e-6 / x[k].attrs.get("nsites", 100.0)
@@ -341,7 +344,7 @@ def test_second_write_gives_same_bytes(tmp_path, fmt):
 def test_meme_to_jaspar_and_homer(tmp_path):
     x = pm.gseq_read_meme(str(FIXTURES / "test_motifs.meme"))
     f = str(tmp_path / "x")
-    pm.gseq_write_jaspar(x, f)
+    pm.gseq_write_jaspar(x, f, round_counts=False)
     y = pm.gseq_read_jaspar(f)
     _assert_same(x, y, tol=1e-9, attrs=False)
     assert [d.attrs["name"] for d in y.values()] == ["AGL3", "RUNX1", "TFAP2A"]
@@ -448,7 +451,8 @@ def test_invalid_matrices_raise(tmp_path):
 def test_edge_motifs_round_trip(tmp_path, fmt):
     x = edge_motifs()
     f = str(tmp_path / "x")
-    getattr(pm, f"gseq_write_{fmt}")(x, f)
+    kwargs = {"round_counts": False} if fmt == "jaspar" else {}
+    getattr(pm, f"gseq_write_{fmt}")(x, f, **kwargs)
     y = list(getattr(pm, f"gseq_read_{fmt}")(f).values())
     assert len(y) == 3
     for a, b in zip(x.values(), y, strict=True):
@@ -556,10 +560,10 @@ def test_jaspar_nsites(tmp_path):
     pm.gseq_write_jaspar({"a": m, "b": m2}, str(f))
     lines = f.read_text().splitlines()
     assert lines[1] == "A  [ 50 ]" and lines[7] == "A  [ 4 ]"
-    pm.gseq_write_jaspar({"a": m, "b": m2}, str(f), nsites=1)
+    pm.gseq_write_jaspar({"a": m, "b": m2}, str(f), nsites=1, round_counts=False)
     assert [f.read_text().splitlines()[i] for i in (1, 2, 4)] == ["A  [  0.5 ]", "C  [ 0.25 ]", "T  [    0 ]"]
     assert [d.attrs["nsites"] for d in pm.gseq_read_jaspar(str(f)).values()] == [1, 1]
-    pm.gseq_write_jaspar({"a": m, "b": m2}, str(f), nsites=[2, 3])
+    pm.gseq_write_jaspar({"a": m, "b": m2}, str(f), nsites=[2, 3], round_counts=False)
     assert [d.attrs["nsites"] for d in pm.gseq_read_jaspar(str(f)).values()] == [2, 3]
     with pytest.raises(ValueError, match="positive"):
         pm.gseq_write_jaspar(m, str(f), nsites=0)
@@ -579,6 +583,9 @@ def test_jaspar_round_counts(tmp_path):
     assert np.max(np.abs(pm.gseq_read_jaspar(str(f))["a"].to_numpy() - m)) <= 1e-3
     with pytest.raises(ValueError, match="round_counts"):
         pm.gseq_write_jaspar(m, str(f), round_counts=None)
+    # the default
+    pm.gseq_write_jaspar({"a": m}, str(f), nsites=3)
+    assert f.read_text().splitlines()[1] == "A  [ 0 1 ]"
 
 
 # ---------------------------------------------------------------------------

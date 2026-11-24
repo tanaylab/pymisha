@@ -368,7 +368,7 @@ def gseq_write_meme(motifs, file, background=None, strands=None) -> None:
     _write_lines(out, file)
 
 
-def gseq_write_jaspar(motifs, file, nsites=None, format="jaspar", round_counts=False) -> None:
+def gseq_write_jaspar(motifs, file, nsites=None, format="jaspar", round_counts=True) -> None:
     """Write motifs to a JASPAR format file.
 
     Writes motifs as count matrices in the JASPAR format that
@@ -379,15 +379,16 @@ def gseq_write_jaspar(motifs, file, nsites=None, format="jaspar", round_counts=F
     JASPAR matrices hold counts, so each motif's probabilities are multiplied by
     its number of sites: the ``nsites`` argument, else the motif's ``nsites``
     attr (as :func:`gseq_read_jaspar` and :func:`gseq_read_meme` return it),
-    else 100. Every position then sums to that number. Counts are written with
-    up to 6 decimals and without trailing zeros, so the integer counts of a
-    JASPAR file are written as integers, and the probabilities read back within
-    1.5e-6 / ``nsites`` of the original. Some tools, such as the MEME Suite's
-    ``jaspar2meme``, read only integer counts: ``round_counts=True`` rounds the
-    counts, at the cost of precision (probabilities then read back within about
-    0.5 / ``nsites``; with an ``nsites`` of a few, whole positions can round to
-    zero, which readers take as uniform). The output is byte-identical to R misha's
-    ``gseq.write_jaspar``.
+    else 100. Every position then sums to that number. Counts are rounded to
+    whole numbers (halves to even), as JASPAR files hold them and as tools such
+    as the MEME Suite's ``jaspar2meme`` and universalmotif require, so
+    probabilities read back within about 0.5 / ``nsites``; the integer counts of
+    a JASPAR file are written back unchanged. With an ``nsites`` of a few, whole
+    positions can round to zero, which readers take as uniform.
+    ``round_counts=False`` writes counts with up to 6 decimals and without
+    trailing zeros instead, so that probabilities read back within
+    1.5e-6 / ``nsites`` of the original. The output is byte-identical to R
+    misha's ``gseq.write_jaspar``.
 
     The header names a motif by its ``name`` attr, or by its ID when it has none
     (JASPAR headers always carry a name). Rows that do not sum to 1 are
@@ -417,7 +418,8 @@ def gseq_write_jaspar(motifs, file, nsites=None, format="jaspar", round_counts=F
         ``"jaspar"`` (headers and labeled rows) or ``"simple"`` (four rows of
         counts per motif).
     round_counts : bool
-        Round counts to integers.
+        Round counts to whole numbers (the default), or write them with up to 6
+        decimals (``False``).
 
     See Also
     --------
