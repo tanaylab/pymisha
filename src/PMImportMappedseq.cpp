@@ -3,7 +3,7 @@
  *
  * Port of R misha GenomeTrackImportMappedseq.cpp (gtrackimport_mappedseq):
  * per-byte FSM SAM/tab parser, SAM flag / MAPQ filters, paired-end fragments,
- * plain / gzip / BAM (samtools) / named-pipe input.
+ * plain / gzip / BAM (BamReader, shared with R misha) / named-pipe input.
  *
  * pymisha additions: "-" and "fd:N" read from a file descriptor, and an indexed
  * database is written through IndexedTrackWriter.
@@ -22,7 +22,7 @@
 #include <vector>
 #include <cstdio>
 #include <sys/stat.h>
-#include <sys/wait.h>
+#include <thread>
 
 #include <zlib.h>
 
@@ -31,6 +31,7 @@
 #include "pymisha.h"
 #include "PMDb.h"
 #include "PMImportMappedseq.h"
+#include "BamReader.h"
 #include "BufferedFile.h"
 #include "GenomeTrack.h"
 #include "GenomeTrackFixedBin.h"
@@ -135,54 +136,32 @@ public:
     bool error() const override { return fp_ ? ferror(fp_) != 0 : true; }
 };
 
-// PipeSource: popen-based source. Used for BAM auto-detect (samtools view).
-// finish() is called explicitly after the FSM has drained the pipe so the
-// caller can inspect the child's exit status; pclose in the destructor is a
-// fallback for the exception path.
-class PipeSource : public ByteSource {
-    FILE *fp_;
-    std::string cmd_;
-    bool finished_;
-    int finish_status_;
-public:
-    explicit PipeSource(const std::string &cmd)
-        : fp_(nullptr), cmd_(cmd), finished_(false), finish_status_(-1)
-    {
-        fp_ = popen(cmd.c_str(), "r");
-        if (!fp_)
-            verror("Failed to popen '%s': %s", cmd.c_str(), strerror(errno));
-    }
-    ~PipeSource() override {
-        if (fp_) pclose(fp_);  // best-effort cleanup on exception paths
-    }
-    int getc() override { return ::getc(fp_); }
-    bool error() const override { return fp_ ? ferror(fp_) != 0 : true; }
-    // Drains the rest of the pipe and waits for the child. Returns the raw
-    // status from pclose (use WEXITSTATUS to extract the exit code).
-    int finish() {
-        if (finished_) return finish_status_;
-        finished_ = true;
-        finish_status_ = pclose(fp_);
-        fp_ = nullptr;
-        return finish_status_;
-    }
-    const std::string &cmd() const { return cmd_; }
-};
+// BamSource reads a BAM file with BamReader and serves each record as the line `samtools view`
+// prints for it, reduced to the columns the SAM parser below reads (see
+// BamReader::append_sam_line), so that a BAM is imported exactly as its SAM text is. BamReader
+// throws on a corrupt or truncated file, so error() has nothing left to report.
+class BamSource : public ByteSource {
+    BamReader reader_;
+    std::string buf_;
+    size_t pos_ = 0;
 
-// Single-quote escape for paths handed to /bin/sh via popen: every ' becomes
-// '\'' and the whole string is wrapped in '...'. Safe against shell
-// metacharacters in filesystem paths.
-static std::string shellquote_single(const std::string &s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    out.push_back('\'');
-    for (char c : s) {
-        if (c == '\'') out.append("'\\''");
-        else out.push_back(c);
+    bool refill() {
+        buf_.clear();
+        pos_ = 0;
+        BamReader::Record rec;
+        while (buf_.size() < 65536 && reader_.next(rec))
+            reader_.append_sam_line(rec, buf_);
+        return !buf_.empty();
     }
-    out.push_back('\'');
-    return out;
-}
+public:
+    BamSource(const std::string &path, unsigned nthreads) { reader_.open(path, nthreads); }
+    int getc() override {
+        if (pos_ >= buf_.size() && !refill())
+            return EOF;
+        return (unsigned char)buf_[pos_++];
+    }
+    bool error() const override { return false; }
+};
 
 // Returns 0 if no magic bytes could be read, otherwise fills buf and returns
 // number of bytes read (up to nbuf).
@@ -194,17 +173,8 @@ static size_t read_magic_bytes(const std::string &path, unsigned char *buf, size
     return n;
 }
 
-// True if the decompressed stream starts with the BAM magic "BAM\1".
-static bool has_bam_payload(const std::string &path) {
-    gzFile gz = gzopen(path.c_str(), "rb");
-    if (!gz) return false;
-    char magic[4];
-    int n = gzread(gz, magic, 4);
-    gzclose(gz);
-    return n == 4 && !memcmp(magic, "BAM\1", 4);
-}
-
-static std::unique_ptr<ByteSource> open_source(const std::string &path) {
+// nthreads: the threads that inflate a BAM file's blocks
+static std::unique_ptr<ByteSource> open_source(const std::string &path, unsigned nthreads) {
     // stdin shorthand
     if (path == "-")
         return std::unique_ptr<ByteSource>(new FdSource(0));
@@ -232,11 +202,8 @@ static std::unique_ptr<ByteSource> open_source(const std::string &path) {
     // 10x fragments.tsv.gz) is read with zlib.
     unsigned char magic[4] = {0, 0, 0, 0};
     size_t n = read_magic_bytes(path, magic, 4);
-    if (n == 4 && magic[0] == 0x1f && magic[1] == 0x8b &&
-                  magic[2] == 0x08 && magic[3] == 0x04 && has_bam_payload(path)) {
-        const std::string cmd = "samtools view " + shellquote_single(path);
-        return std::unique_ptr<ByteSource>(new PipeSource(cmd));
-    }
+    if (BamReader::is_bam(path.c_str()))
+        return std::unique_ptr<ByteSource>(new BamSource(path, nthreads));
     if (n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b)
         return std::unique_ptr<ByteSource>(new GzipSource(path));
     return std::unique_ptr<ByteSource>(new PlainSource(path));
@@ -417,7 +384,8 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
         // lines starting with this char are headers / comments
         const int comment_char = is_sam_format ? '@' : is_frag_format ? '#' : 0;
 
-        auto src = open_source(file_path);
+        const unsigned hw = std::thread::hardware_concurrency();
+        auto src = open_source(file_path, std::min<unsigned>({ hw ? hw : 1, (unsigned)std::max(g_pymisha->max_processes(), 1), 8 }));
         int64_t total_unmapped = 0;
         int64_t total_filtered = 0;
 
@@ -607,27 +575,6 @@ PyObject *pm_import_mappedseq(PyObject *self, PyObject *args)
 
         if (src->error())
             verror("Error while reading %s", file_path.c_str());
-
-        // If we routed through samtools (BAM auto-detect), drain the pipe and
-        // surface a non-zero exit. 127 is "command not found" - tell the user
-        // samtools isn't installed; other codes mean samtools itself failed.
-        if (auto *pipe_src = dynamic_cast<PipeSource *>(src.get())) {
-            int raw_status = pipe_src->finish();
-            if (raw_status != 0) {
-                int code = WIFEXITED(raw_status) ? WEXITSTATUS(raw_status) : -1;
-                if (code == 127) {
-                    verror("BAM input detected at %s but samtools is not on PATH. "
-                           "Install samtools (e.g. `apt-get install samtools` or "
-                           "`conda install -c bioconda samtools`) or pre-convert: "
-                           "`samtools view %s > %s.sam`.",
-                           file_path.c_str(), file_path.c_str(), file_path.c_str());
-                } else {
-                    verror("samtools view %s exited with code %d (raw status %d). "
-                           "Run `samtools view %s | head` to see the underlying error.",
-                           file_path.c_str(), code, raw_status, file_path.c_str());
-                }
-            }
-        }
 
         // Write track files: dense with pileup or paired, sparse otherwise
         ensure_track_dir_pm(track_dir);

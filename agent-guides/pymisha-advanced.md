@@ -382,7 +382,7 @@ pm.gtrack_import_mappedseq("atac.es",
                            remove_dups=True)
 ```
 
-BAM files are auto-detected by bgzip magic bytes and piped through `samtools view` automatically - `samtools` must be on PATH. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). Chromosome names are matched through the alias chain (`chr1` ↔ `1`, `M` ↔ `MT`), as in R misha. SAM / BAM `POS` is 1-based and each read is placed at its 0-based 5' base (a reverse read at its rightmost aligned base, from the CIGAR); unmapped, secondary, QC-failed and supplementary records are skipped, and `min_mapq` drops low-MAPQ records. `paired=True` with a `binsize` imports paired-end fragments: from the proper pairs of a SAM / BAM (`cols_order=None`), or from a fragment file (chrom, start, end in columns 1-3, e.g. a 10x `fragments.tsv.gz`). `file` may also be a named pipe carrying SAM or text.
+BAM files are auto-detected by bgzip magic bytes and read by pymisha itself - `samtools` is not needed, and a truncated or corrupt BAM is an error. For SAM or gzipped SAM inputs, pass `cols_order=None` explicitly. For tab-delimited inputs, pass `cols_order=(seq_col, chrom_col, coord_col, strand_col)` (1-based). Chromosome names are matched through the alias chain (`chr1` ↔ `1`, `M` ↔ `MT`), as in R misha. SAM / BAM `POS` is 1-based and each read is placed at its 0-based 5' base (a reverse read at its rightmost aligned base, from the CIGAR); unmapped, secondary, QC-failed and supplementary records are skipped, and `min_mapq` drops low-MAPQ records. `paired=True` with a `binsize` imports paired-end fragments: from the proper pairs of a SAM / BAM (`cols_order=None`), or from a fragment file (chrom, start, end in columns 1-3, e.g. a 10x `fragments.tsv.gz`). `file` may also be a named pipe carrying SAM or text.
 
 **Per-fragment 2D contacts → 2D track.**
 
@@ -416,7 +416,7 @@ pm.gtrack_export_bedgraph("epi.k27me3.es",
 **Avoid:**
 - `gtrack_import` without `binsize` for a continuous-signal source - resulting bin grid may not align with the rest of your trackdb.
 - `gtrack_import_mappedseq` without `remove_dups=True` for ChIP / ATAC - PCR duplicates inflate per-bin counts.
-- Pre-converting BAM to SAM manually before calling `gtrack_import_mappedseq` - BAM is now auto-detected and piped through `samtools view` internally.
+- Pre-converting BAM to SAM manually before calling `gtrack_import_mappedseq` - BAM is auto-detected and read directly.
 - Per-chromosome `multiprocessing` + `pd.concat` + `gtrack_create_sparse` to build a coverage track from a BAM - `gtrack_create_dense(..., func="coverage")` does it in one call.
 
 ## 6. Side topics (pointers)

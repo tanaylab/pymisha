@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+* `gtrack_import_mappedseq` reads BAM files directly and no longer needs `samtools`. Results are unchanged and the import is over 10x faster.
+
+### Fixes
+
+* `gtrack_import_mappedseq` rejects a truncated BAM (no end-of-file block) instead of importing part of it.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking

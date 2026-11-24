@@ -7,7 +7,6 @@ here the small test DB, also "chr1".
 
 import itertools
 import shutil
-import subprocess
 
 import numpy as np
 import pandas as pd
@@ -17,7 +16,6 @@ import pymisha as pm
 
 from _dbpath import TESTDB_ROOT
 
-_SAMTOOLS = shutil.which("samtools")
 _names = itertools.count()
 
 
@@ -154,19 +152,6 @@ def test_reverse_reads_with_the_same_5_prime_end_are_duplicates_whatever_their_p
     stats = pm.gtrack_import_mappedseq(track, "dups", str(sam), cols_order=None, remove_dups=True)
     assert stats["total"]["total.dups"] == 1
     assert pm.gextract(track, _iv(0, 1000))["start"].tolist() == [107, 109]
-
-
-@pytest.mark.skipif(_SAMTOOLS is None, reason="samtools not on PATH")
-def test_sam_and_bam_place_reads_the_same_way(tmp_path):
-    lines = [
-        "@SQ\tSN:chr1\tLN:500000",
-        sam_line("f1", 0, 100, "10M", 10), sam_line("r1", 16, 200, "3S7M", 10),
-        sam_line("r2", 16, 400, "5M2D5M", 10), sam_line("r3", 16, 600, "5M100N5M", 10),
-    ]
-    sam = write_lines(tmp_path / "same.sam", lines)
-    bam = tmp_path / "same.bam"
-    subprocess.run([_SAMTOOLS, "view", "-b", "-o", str(bam), str(sam)], check=True, capture_output=True)
-    assert import_points(bam) == import_points(sam, cols_order=None)
 
 
 def test_paired_a_first_mate_on_the_last_base_is_imported_and_pos_0_is_unmapped(tmp_path):

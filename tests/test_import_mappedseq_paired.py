@@ -19,7 +19,6 @@ import pymisha as pm
 from _dbpath import TESTDB_ROOT
 
 _BGZIP = shutil.which("bgzip")
-_SAMTOOLS = shutil.which("samtools")
 _names = itertools.count()
 
 
@@ -86,17 +85,8 @@ def write_lines(path, lines):
 
 
 def paired_sam_file(tmp_path, lines=None):
-    # plain SAM, so that the tests do not need samtools
+    # plain SAM (test_import_mappedseq_bam.py checks that BAM gives the same tracks)
     return write_lines(tmp_path / f"paired_{next(_names)}.sam", paired_sam_text() if lines is None else lines)
-
-
-def make_test_bam(tmp_path, lines):
-    if _SAMTOOLS is None:
-        pytest.skip("samtools not on PATH")
-    sam = write_lines(tmp_path / f"bam_src_{next(_names)}.sam", lines)
-    bam = tmp_path / f"in_{next(_names)}.bam"
-    subprocess.run([_SAMTOOLS, "view", "-b", "-o", str(bam), str(sam)], check=True, capture_output=True)
-    return bam
 
 
 def bgzip(path):
@@ -274,16 +264,6 @@ def test_a_reverse_read_past_the_chromosome_end_does_not_overflow_the_dense_trac
         _, stats = import_tmp(sam, cols_order=None, pileup=100, binsize=20)
     assert stats["total"]["total.mapped"] == 0
     assert stats["total"]["total.unmapped"] == 1
-
-
-def test_a_paired_bam_gives_the_same_track_as_the_sam(tmp_path):
-    bam = make_test_bam(tmp_path, paired_sam_text())
-    bam_track, bam_stats = import_tmp(bam, binsize=50, paired=True)
-    sam_track, sam_stats = import_tmp(paired_sam_file(tmp_path), binsize=50, cols_order=None, paired=True)
-    assert bam_stats["total"] == sam_stats["total"]
-    pd.testing.assert_frame_equal(bam_stats["chrom"], sam_stats["chrom"])
-    starts = np.arange(0, 10001, 50)
-    np.testing.assert_array_equal(bins_at(bam_track, starts), bins_at(sam_track, starts))
 
 
 def test_duplicates_are_fragments_with_the_same_start_and_end_not_the_same_start(tmp_path):
