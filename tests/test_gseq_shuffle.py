@@ -1,13 +1,13 @@
 """Tests for gseq_shuffle: exact k-mer preserving shuffles (C++ core shared with R misha)."""
 
 import collections
+import math
 import re
 import time
 
 import numpy as np
 import pandas as pd
 import pytest
-from scipy import stats
 
 import pymisha as pm
 
@@ -90,10 +90,47 @@ def shortcut_shuffle(s, k, n, rng):
     return draws
 
 
+def _chi2_sf(x, df):
+    """P(X >= x) for X ~ chi-square(df): the regularized upper incomplete gamma Q(df/2, x/2), by
+    its series below a + 1 and its continued fraction above (Numerical Recipes gammq). Keeps the
+    test free of scipy, which CI does not install."""
+    a, x = df / 2.0, x / 2.0
+    if x <= 0:
+        return 1.0
+    lg = a * math.log(x) - x - math.lgamma(a)
+    if x < a + 1:
+        term = total = 1.0 / a
+        n = a
+        while abs(term) > abs(total) * 1e-15:
+            n += 1
+            term *= x / n
+            total += term
+        return max(0.0, 1.0 - total * math.exp(lg))
+    tiny = 1e-300
+    b = x + 1 - a
+    c, d = 1 / tiny, 1 / b
+    h = d
+    for i in range(1, 10000):
+        an = -i * (i - a)
+        b += 2
+        d = an * d + b
+        d = tiny if abs(d) < tiny else d
+        c = b + an / c
+        c = tiny if abs(c) < tiny else c
+        d = 1 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1) < 1e-15:
+            break
+    return math.exp(lg) * h
+
+
 def uniformity_p(draws, valid):
     cnt = collections.Counter(draws)
-    obs = np.array([cnt.get(v, 0) for v in valid])
-    return stats.chisquare(obs).pvalue
+    obs = np.array([cnt.get(v, 0) for v in valid], dtype=float)
+    expected = obs.sum() / len(obs)
+    stat = float(((obs - expected) ** 2 / expected).sum())
+    return _chi2_sf(stat, len(obs) - 1)
 
 
 def random_dna(rng, n, alphabet="ACGT"):
