@@ -220,7 +220,7 @@ for W in (50_000, 100_000, 200_000, 500_000):
 
 **Goal.** Extract genome sequence under intervals, score PSSMs on the fly via vtracks, and persist motif energies as tracks when reuse warrants it.
 
-**Before writing string-level sequence code, check `gseq_*`.** pymisha ships a sequence-manipulation family - `gseq_extract`, `gseq_rev`, `gseq_comp`, `gseq_revcomp` (reverse / complement / both), `gseq_kmer` / `gseq_kmer_dist` (kmer counting / distance), `gseq_pwm` / `gseq_pwm_edits` (direct PWM scoring on character strings), and motif file readers (see "Motif file readers" below). Reach for these before hand-rolling reverse complement / kmer scans / PWM scoring in plain Python.
+**Before writing string-level sequence code, check `gseq_*`.** pymisha ships a sequence-manipulation family - `gseq_extract`, `gseq_rev`, `gseq_comp`, `gseq_revcomp` (reverse / complement / both), `gseq_kmer` / `gseq_kmer_dist` (kmer counting / distance), `gseq_shuffle` (shuffles keeping exact k-mer counts), `gseq_pwm` / `gseq_pwm_edits` (direct PWM scoring on character strings), and motif file readers (see "Motif file readers" below). Reach for these before hand-rolling reverse complement / kmer scans / PWM scoring in plain Python.
 
 **Extract sequence.**
 

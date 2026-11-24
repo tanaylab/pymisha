@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* New `gseq_shuffle` shuffles sequences keeping their exact k-mer (default dinucleotide) counts, drawn uniformly; the same seed gives the same sequences as R misha's `gseq.shuffle`.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking

@@ -158,6 +158,7 @@ from .sequence import (
     gseq_pwm_edits,
     gseq_rev,
     gseq_revcomp,
+    gseq_shuffle,
 )
 from .summary import (
     gbins_quantiles,
@@ -442,6 +443,7 @@ __all__ = [
     'gseq_potts',
     'gseq_pwm',
     'gseq_pwm_edits',
+    'gseq_shuffle',
     'gseq_read_meme',
     'gseq_read_jaspar',
     'gseq_read_homer',

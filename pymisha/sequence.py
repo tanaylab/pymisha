@@ -381,6 +381,127 @@ def grevcomp(seq: str | list[str]) -> str | list[str]:
     return gseq_revcomp(seq)
 
 
+def _shuffle_int_arg(x: object, name: str) -> int:
+    if isinstance(x, bool) or not isinstance(x, (int, _numpy.integer)):
+        raise TypeError(f"{name} must be an integer")
+    return int(x)
+
+
+def gseq_shuffle(
+    seqs: str | collections.abc.Iterable[str | None] | _pandas.DataFrame,
+    k: int = 2,
+    n: int = 1,
+    seed: int | _numpy.random.Generator | None = None,
+) -> str | list[str | None] | list[list[str | None]]:
+    """
+    Shuffle sequences keeping their k-mer counts.
+
+    Draws random sequences with exactly the same k-mer counts as the input
+    sequences - the dinucleotide counts with the default ``k=2`` - for use as
+    a composition-matched background, e.g. in motif enrichment. Mirrors R
+    misha's ``gseq.shuffle``.
+
+    Each shuffle is drawn uniformly at random from all the sequences that
+    keep the k-mer counts and the first k-1 bases, by the Eulerian-path
+    construction of Altschul & Erickson (1985) and Kandel et al. (1996), as in
+    uShuffle (Jiang et al. 2008): the (k-1)-mers are the vertices of a graph
+    whose edges are the k-mers of the sequence, a uniformly random spanning
+    tree of "last exits" is drawn with Wilson's algorithm, and the remaining
+    edges out of each vertex are put in a random order. ``k=1`` is a plain
+    random permutation of the bases. Because the k-mers form a path through
+    the (k-1)-mers, the last k-1 bases are kept too.
+
+    Only A, C, G and T (in either case) are shuffled. Any other character -
+    N, an IUPAC code, a gap - stays at its position and splits the sequence
+    into segments, each shuffled on its own; the k-mers that touch such a
+    character are unchanged, so the k-mer counts of the whole sequence,
+    N-containing k-mers included, are kept. Bases are compared ignoring case
+    and every position keeps its case, so a soft-masked stretch stays
+    lowercase at the same coordinates (with new bases in it). A segment of k
+    bases or fewer has only one arrangement and is returned as is.
+
+    The random numbers come from a generator in the C++ core shared with R
+    misha (xoshiro256**), so an integer ``seed`` gives the same sequences as
+    ``gseq.shuffle(..., seed = )`` in R, on every platform. Without a seed one
+    is drawn from numpy's global generator (so ``numpy.random.seed``
+    reproduces the call); from a ``numpy.random.Generator`` one is drawn from
+    it. Those two do not match R, whose generator differs. Each input sequence
+    gets its own stream, derived from the seed and its position in ``seqs``,
+    so its shuffles do not depend on the sequences after it.
+
+    Parameters
+    ----------
+    seqs : str, iterable of str, or DataFrame
+        DNA sequence(s); ``None``/NaN gives ``None``. A DataFrame of intervals
+        is read with :func:`gseq_extract` (strand-aware).
+    k : int, default 2
+        The k-mer length whose counts are kept, 1 to 32.
+    n : int, default 1
+        The number of shuffles of each sequence.
+    seed : int, numpy.random.Generator, or None
+        An integer with ``abs(seed) <= 2**53``, a generator to draw one from,
+        or None to draw one from numpy's global generator.
+
+    Returns
+    -------
+    str, list of str, or list of list of str
+        For a single string, a string (``n=1``) or a list of ``n`` strings.
+        For several sequences, a list with one string per sequence (``n=1``)
+        or with one list of ``n`` strings per sequence (R returns a matrix
+        with a row per sequence).
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> seq = "ACGTTGCAACGTAGCTAGCTTTACG"
+    >>> s = pm.gseq_shuffle(seq, seed=1)
+    >>> sorted(s[i:i + 2] for i in range(24)) == sorted(seq[i:i + 2] for i in range(24))
+    True
+    >>> len(pm.gseq_shuffle(["ACGTACGT", "ccgNNacgtTT"], k=3, n=4, seed=1)[1])
+    4
+
+    See Also
+    --------
+    gseq_kmer, gseq_kmer_dist, gsynth_sample
+    """
+    k = _shuffle_int_arg(k, "k")
+    n = _shuffle_int_arg(n, "n")
+    if not 1 <= k <= 32:
+        raise ValueError("k must be between 1 and 32")
+    if not 1 <= n <= 2**31 - 1:
+        raise ValueError("n must be a positive integer")
+
+    if seed is None:
+        seed_val = int(_numpy.random.randint(0, 2**52, dtype=_numpy.int64))
+    elif isinstance(seed, _numpy.random.Generator):
+        seed_val = int(seed.integers(0, 2**52))
+    else:
+        seed_val = _shuffle_int_arg(seed, "seed")
+        if abs(seed_val) > 2**53:
+            raise ValueError("seed must be None, a numpy Generator, or an integer between -2**53 and 2**53")
+
+    single = isinstance(seqs, str)
+    if single:
+        seq_list: list[str | None] = [seqs]  # type: ignore[list-item]
+    else:
+        if isinstance(seqs, _pandas.DataFrame):
+            seqs = gseq_extract(seqs)
+        seq_list = []
+        for s in seqs:  # type: ignore[union-attr]
+            if isinstance(s, str):
+                seq_list.append(s)
+            elif s is None or _is_na(s):
+                seq_list.append(None)
+            else:
+                raise TypeError("seqs must be a string, an iterable of strings, or an intervals DataFrame")
+
+    flat = _pymisha.pm_gseq_shuffle(seq_list, k, n, seed_val)
+    if n == 1:
+        return flat[0] if single else flat
+    rows = [flat[i * n : (i + 1) * n] for i in range(len(seq_list))]
+    return rows[0] if single else rows
+
+
 def _na_or_seq(x: object) -> bool:
     """R's NA, or more than one value."""
     return _is_na(x) or isinstance(x, (list, tuple, _numpy.ndarray, _pandas.Series))

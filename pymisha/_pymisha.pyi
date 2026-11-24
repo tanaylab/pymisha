@@ -410,6 +410,17 @@ def pm_seq_extract(
     C++ signature: ``PyArg_ParseTuple(args, "O|O", ...)``
     """
 
+def pm_gseq_shuffle(
+    seqs: list[str | None], k: int, n: int, seed: int, /
+) -> list[str | None]:
+    """Shuffle sequences keeping their k-mer counts (the core gseq.shuffle shares).
+
+    Returns a flat list of len(seqs) * n strings, the n shuffles of the first
+    sequence first; None for a None sequence.
+
+    C++ signature: ``PyArg_ParseTuple(args, "OiiL", ...)``
+    """
+
 # -- Analysis / Stats ----------------------------------------------------------
 
 def pm_partition(

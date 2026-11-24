@@ -152,6 +152,7 @@ PyObject *pm_gvariants_reach(PyObject *self, PyObject *args);
 PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args);
 PyObject *pm_gextract_variants(PyObject *self, PyObject *args);
 PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args);
+PyObject *pm_gseq_shuffle(PyObject *self, PyObject *args);
 PyObject *pm_crc64_update(PyObject *self, PyObject *args);
 PyObject *pm_crc64_finalize(PyObject *self, PyObject *args);
 PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args);
@@ -274,6 +275,7 @@ static PyMethodDef module_methods[] = {
     {"pm_gvariants_reach", gcall<pm_gvariants_reach>, METH_VARARGS, "Sequence reach of each sequence vtrack in an expression"},
     {"pm_gextract_variants", gcall<pm_gextract_variants>, METH_VARARGS, "Evaluate an expression with one base substituted per row"},
     {"pm_kmer_count_strings", gcall<pm_kmer_count_strings>, METH_VARARGS, "Count k-mer occurrences in sequences"},
+    {"pm_gseq_shuffle", gcall<pm_gseq_shuffle>, METH_VARARGS, "Shuffle sequences keeping their k-mer counts"},
     {"pm_crc64_update", gcall<pm_crc64_update>, METH_VARARGS, "CRC64-ECMA incremental update"},
     {"pm_crc64_finalize", gcall<pm_crc64_finalize>, METH_VARARGS, "CRC64-ECMA finalize"},
     {"pm_compute_strands_autocorr", gcall<pm_compute_strands_autocorr>, METH_VARARGS, "Compute strand cross-correlation"},
