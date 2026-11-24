@@ -279,8 +279,9 @@ class _DenseWriter:
         lens = ends - starts
         nb = -(-len(x) // b)
         bins = starts // b
-        sums = np.bincount(bins, weights=v * lens, minlength=nb)
-        covered = np.bincount(bins, weights=lens.astype(np.float64), minlength=nb)
+        # bincount with weights is float64; asarray says so to the type checker (no copy)
+        sums = np.asarray(np.bincount(bins, weights=v * lens, minlength=nb), dtype=np.float64)
+        covered = np.asarray(np.bincount(bins, weights=lens.astype(np.float64), minlength=nb), dtype=np.float64)
         self._write_bins(first, sums, covered)
 
     def _fill(self, upto: int) -> None:
