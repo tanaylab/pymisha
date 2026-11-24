@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+* `gseq_write_meme`, `gseq_write_jaspar` and `gseq_write_homer` write motifs in the formats the `gseq_read_*` functions read, so motifs round-trip with their metadata; the files are byte-identical to R misha's `gseq.write_*`.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking

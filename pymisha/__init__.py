@@ -146,6 +146,7 @@ from .liftover import (
     gtrack_liftover,
 )
 from .lookup import glookup, gtrack_lookup
+from .motif_export import gseq_write_homer, gseq_write_jaspar, gseq_write_meme
 from .motif_import import gseq_read_homer, gseq_read_jaspar, gseq_read_meme
 from .sequence import (
     grevcomp,
@@ -445,6 +446,9 @@ __all__ = [
     'gseq_read_meme',
     'gseq_read_jaspar',
     'gseq_read_homer',
+    'gseq_write_meme',
+    'gseq_write_jaspar',
+    'gseq_write_homer',
 
     # Lookup functions
     'glookup',
