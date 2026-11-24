@@ -38,6 +38,12 @@ To install from source (requires a C++17 compiler and numpy):
 pip install -e ".[dev]"
 ```
 
+Contributors: enable the repo's pre-push hook, which runs the `ruff` and `mypy` checks CI runs:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Quick start
 
 PyMisha ships with a built-in examples database so you can start exploring immediately -- no external data needed:

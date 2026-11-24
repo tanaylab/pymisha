@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Pre-push hook: prevent pushing branches to wrong remotes.
+# Pre-push hook. Enable once per clone with:
+#   git config core.hooksPath .githooks
 #
 # Guardrails:
 #   - dev → only private (aviezerl/pymisha)
 #   - main → only origin (tanaylab/pymisha)
+#
+# Checks (the lint and type steps CI runs, so they fail here instead of on the PR):
+#   - ruff check pymisha/
+#   - python -m mypy pymisha/
+# A missing tool is reported and skipped. SKIP_PREPUSH_CHECKS=1 skips both checks.
+# CI installs the latest ruff and runs mypy on Python 3.10–3.12, so keep local
+# tools current (pip install -U ruff mypy) for the checks to match.
 #
 set -euo pipefail
 
@@ -19,6 +27,52 @@ fi
 if [[ "$BRANCH" == "main" && "$REMOTE" == "private" ]]; then
     echo "ERROR: Cannot push 'main' to 'private' (aviezerl/pymisha)." >&2
     echo "       Use: git push origin main" >&2
+    exit 1
+fi
+
+if [[ "${SKIP_PREPUSH_CHECKS:-}" == "1" ]]; then
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Prefer the checkout's own virtualenv, then whatever is on PATH.
+PY=""
+for cand in .venv/bin/python "${VIRTUAL_ENV:-}/bin/python" python3 python; do
+    if [[ -n "$cand" && "$cand" != "/bin/python" ]] && command -v "$cand" >/dev/null 2>&1; then
+        PY="$cand"
+        break
+    fi
+done
+
+fail=0
+
+RUFF=()
+if [[ -x .venv/bin/ruff ]]; then
+    RUFF=(.venv/bin/ruff)
+elif command -v ruff >/dev/null 2>&1; then
+    RUFF=(ruff)
+elif [[ -n "$PY" ]] && "$PY" -m ruff --version >/dev/null 2>&1; then
+    RUFF=("$PY" -m ruff)
+fi
+
+if [[ ${#RUFF[@]} -gt 0 ]]; then
+    echo "pre-push: ruff check pymisha/" >&2
+    "${RUFF[@]}" check pymisha/ || fail=1
+else
+    echo "pre-push: ruff not found, skipping (pip install ruff)" >&2
+fi
+
+if [[ -n "$PY" ]] && "$PY" -m mypy --version >/dev/null 2>&1; then
+    echo "pre-push: mypy pymisha/" >&2
+    "$PY" -m mypy pymisha/ || fail=1
+else
+    echo "pre-push: mypy not found, skipping (pip install mypy)" >&2
+fi
+
+if [[ $fail -ne 0 ]]; then
+    echo "" >&2
+    echo "pre-push: fix the errors above, or push with SKIP_PREPUSH_CHECKS=1 to bypass." >&2
     exit 1
 fi
 
