@@ -54,6 +54,7 @@ from .db import (
 from .db_attrs import gdb_get_readonly_attrs, gdb_set_readonly_attrs
 from .db_create import gdb_convert_to_indexed, gdb_create, gdb_create_genome, gdb_create_linked
 from .extract import gextract, gextract_matrix, giterator_intervals_2d, gscreen
+from .figwig import gtrack_export_figwig, gtrack_import_figwig
 from .gdir import (
     gdir_cd,
     gdir_create,
@@ -171,7 +172,6 @@ from .summary import (
     gsample,
     gsummary,
 )
-from .figwig import gtrack_export_figwig, gtrack_import_figwig
 from .track_export import gtrack_export_bedgraph, gtrack_export_bigwig
 from .tracks import (
     gtrack_2d_convert_to_indexed,
