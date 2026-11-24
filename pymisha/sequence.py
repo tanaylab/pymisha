@@ -495,10 +495,11 @@ def gseq_shuffle(
             else:
                 raise TypeError("seqs must be a string, an iterable of strings, or an intervals DataFrame")
 
-    flat = _pymisha.pm_gseq_shuffle(seq_list, k, n, seed_val)
+    flat: list[str | None] = list(_pymisha.pm_gseq_shuffle(seq_list, k, n, seed_val))
     if n == 1:
-        return flat[0] if single else flat
-    rows = [flat[i * n : (i + 1) * n] for i in range(len(seq_list))]
+        # a single string in gives a string out (it is not NA)
+        return str(flat[0]) if single else flat
+    rows: list[list[str | None]] = [flat[i * n : (i + 1) * n] for i in range(len(seq_list))]
     return rows[0] if single else rows
 
 
