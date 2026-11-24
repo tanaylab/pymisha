@@ -119,6 +119,8 @@ PyObject *pm_read_df(PyObject *self, PyObject *args);
 PyObject *pm_vtrack_compute(PyObject *self, PyObject *args);
 PyObject *pm_find_neighbors(PyObject *self, PyObject *args);
 PyObject *pm_seq_extract(PyObject *self, PyObject *args);
+PyObject *pm_seq_onehot(PyObject *self, PyObject *args);
+PyObject *pm_seq_onehot_strings(PyObject *self, PyObject *args);
 PyObject *pm_partition(PyObject *self, PyObject *args);
 PyObject *pm_dist(PyObject *self, PyObject *args);
 PyObject *pm_intervals_union(PyObject *self, PyObject *args);
@@ -239,6 +241,8 @@ static PyMethodDef module_methods[] = {
     {"pm_vtrack_compute", gcall<pm_vtrack_compute>, METH_VARARGS, "Compute virtual track values"},
     {"pm_find_neighbors", gcall<pm_find_neighbors>, METH_VARARGS, "Find nearest neighbor intervals"},
     {"pm_seq_extract", gcall<pm_seq_extract>, METH_VARARGS, "Extract DNA sequences for intervals"},
+    {"pm_seq_onehot", gcall<pm_seq_onehot>, METH_VARARGS, "One-hot encode genomic windows into an array"},
+    {"pm_seq_onehot_strings", gcall<pm_seq_onehot_strings>, METH_VARARGS, "One-hot encode strings into an array"},
     {"pm_partition", gcall<pm_partition>, METH_VARARGS, "Partition track values into bins"},
     {"pm_dist", gcall<pm_dist>, METH_VARARGS, "Calculate distribution of track values over bins"},
     {"pm_lookup", gcall<pm_lookup>, METH_VARARGS, "Lookup table transform on binned track values"},

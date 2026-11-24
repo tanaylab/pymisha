@@ -7,6 +7,11 @@ Functions for extracting and analyzing DNA sequences, including reverse compleme
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gseq_onehot
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gseq_rev
     options:
       show_root_heading: true

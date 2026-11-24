@@ -410,6 +410,20 @@ def pm_seq_extract(
     C++ signature: ``PyArg_ParseTuple(args, "O|O", ...)``
     """
 
+def pm_seq_onehot(
+    chrom_names: list[str], chrom_codes: Any, starts: Any, revcomp: Any, out: Any, pad: bool, /
+) -> None:
+    """One-hot encode genomic windows into ``out`` (C-contiguous, shape (N, 4, L)).
+
+    C++ signature: ``PyArg_ParseTuple(args, "OOOOOp", ...)``
+    """
+
+def pm_seq_onehot_strings(seqs: list[Any], revcomp: bool, out: Any, /) -> None:
+    """One-hot encode equal-length strings into ``out`` (C-contiguous, shape (N, 4, L)).
+
+    C++ signature: ``PyArg_ParseTuple(args, "OpO", ...)``
+    """
+
 # -- Analysis / Stats ----------------------------------------------------------
 
 def pm_partition(

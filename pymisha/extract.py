@@ -3368,10 +3368,19 @@ def gextract_matrix(
     >>> pm.gextract_matrix("dense_track", unaligned, iterator=32).shape
     (2, 3)
     """
-    from .intervals import gintervals_load, giterator_intervals
-
     _checkroot()
-    caller_ns = _caller_namespace(depth=1)
+    return _gextract_matrix(expr, intervals, iterator, colnames, _caller_namespace(depth=1))
+
+
+def _gextract_matrix(
+    expr: str | list[str],
+    intervals: pd.DataFrame | str,
+    iterator: int,
+    colnames: str | list[str] | None,
+    caller_ns: dict[str, Any],
+) -> Any:
+    """gextract_matrix with the namespace its expressions' variables are looked up in."""
+    from .intervals import gintervals_load, giterator_intervals
 
     exprs = [expr] if isinstance(expr, str) else list(expr)
     if isinstance(colnames, str):

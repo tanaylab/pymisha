@@ -216,6 +216,7 @@ from .tracks import (
     gtrack_var_set,
 )
 from .variants import gextract_variants
+from .windows import ExtractedWindows, gextract_windows, gseq_onehot
 from .vtracks import (
     gvtrack_array_slice,
     gvtrack_clear,
@@ -298,6 +299,8 @@ __all__ = [
     # Track functions
     'gextract',
     'gextract_matrix',
+    'gextract_windows',
+    'ExtractedWindows',
     'gextract_variants',
     'gscreen',
     'gsummary',
@@ -434,6 +437,7 @@ __all__ = [
     # Sequence functions
     'grevcomp',
     'gseq_extract',
+    'gseq_onehot',
     'gseq_rev',
     'gseq_comp',
     'gseq_revcomp',

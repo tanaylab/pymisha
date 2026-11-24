@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+* `gextract_windows` returns fixed-width windows around loci as arrays for sequence models: one-hot DNA `(N, 4, L)` uint8 and track values `(N, T, L')` float32, with jitter margins, strand-aware reverse complement, exclusion intervals and count filters. `gseq_onehot` one-hot encodes intervals (read in C++ straight from the sequence files) or strings.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking

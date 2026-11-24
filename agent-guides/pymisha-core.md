@@ -119,6 +119,7 @@ Pick the verb by *what's returned*, not by alphabetical proximity.
 |---|---|---|
 | `gextract` | DataFrame | Values to look at, plot, or join. |
 | `gextract_matrix` | `(N, L)` / `(N, L, E)` float64 array | Per-bin values over equal-width windows, one row per window in input order. |
+| `gextract_windows` | `ExtractedWindows(x, y, intervals, dropped)` | Model inputs: one-hot DNA `(N, 4, L)` uint8 + signals `(N, T, L')` float32 around loci, with jitter, strand, exclusion and count filters. |
 | `gscreen`  | intervals frame | Filter to a region set (peaks above threshold). |
 | `gquantiles` | quantile cutoffs | Pick a threshold, normalize. Argument is `percentiles=` (0..1), **not** `probs=`. |
 | `gdist`    | N-d count array (or DataFrame with `dataframe=True`) | Binned joint distribution (signal × distance, etc.). |
@@ -466,6 +467,21 @@ arr = pm.gextract_matrix(["atac.es", "k27"], win32, iterator=32)                
 ```
 
 Row `i` is input row `i` (unsorted, duplicated and overlapping rows are fine); columns are in genomic order whatever the strand; the third axis follows the order of `expr` (`colnames` is only checked, a numpy array has no axis names). All windows must have the same width and `iterator` must divide it. Unlike gextract's integer iterator, the bins start at each window's start (as `giterator_intervals(..., interval_relative=True)`), so any start works. Values are what gextract gives for each bin as an iterator interval, NaN included; a dense-track bin that overlaps several track bins gets their plain mean, not weighted by overlap. A window past a chromosome end is an error, as in gextract. Same as R misha's `gextract.matrix`.
+
+**Training arrays in one call (`gextract_windows`, `gseq_onehot`).** For sequence-model inputs use `gextract_windows` rather than `gseq_extract` + your own one-hot + `gextract_matrix`: the one-hot is encoded in C++ straight from the `.seq` files (about 15x faster than the strings route).
+
+```python
+w = pm.gextract_windows({"pos": peaks, "neg": background}, tracks={"atac": "atac.es"},
+                        width=2114, signal_width=1000, jitter=128, binsize=1,
+                        exclude=blacklist, min_counts=10)
+w.x            # (N, 4, 2114 + 256) uint8, channels A C G T, N = all zero
+w.y            # (N, 1, 1000 + 256) float32
+w.intervals    # kept windows (chrom/start/end of the sequence window, index, set, ...)
+w.dropped      # index + reason: off_chrom / excluded / min_counts / max_counts
+x = pm.gseq_onehot(win)   # just the one-hot of equal-width intervals (or of a list of strings)
+```
+
+Windows are centred at `start + (end - start) // 2`; strand -1 rows are reverse complemented (signals reversed) unless `use_strand=False`. `x` takes N x 4 x L bytes. Same arrays as R misha's `gextract.windows`.
 
 **One row per stored position (`iterator=<track>`).** For sparse-aligned data - per-CpG methylation, per-fragment coverage:
 
