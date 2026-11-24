@@ -446,6 +446,13 @@ def gseq_write_jaspar(motifs, file, nsites=None, format="jaspar", round_counts=T
         scaled = mat * ns
         if round_counts:
             scaled = _numpy.round(scaled)  # half to even, as R's round()
+            nzero = int((scaled.sum(axis=1) == 0).sum())
+            if nzero:
+                warnings.warn(
+                    f"Motif '{mid}': {nzero} position(s) round to zero counts; "
+                    "increase 'nsites' or use round_counts=False",
+                    stacklevel=2,
+                )
         counts = [[_fmt_count(v) for v in col] for col in scaled.T]
         width = max(len(c) for col in counts for c in col)
         rows = [" ".join(c.rjust(width) for c in col) for col in counts]

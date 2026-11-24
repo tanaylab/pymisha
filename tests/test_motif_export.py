@@ -101,6 +101,7 @@ def max_diff(a: pd.DataFrame, b: pd.DataFrame) -> float:
 # R parity
 # ---------------------------------------------------------------------------
 
+@pytest.mark.filterwarnings("ignore:Motif 'R22'.*round to zero counts")
 def test_writers_match_r_golden_files(tmp_path):
     cases = golden_cases()
     assert len(cases) == 22
@@ -647,3 +648,12 @@ def test_homer_name_defaults_to_id(tmp_path):
     pm.gseq_write_homer({"MY_ID": np.full((1, 4), 0.25)}, str(f))
     assert next(iter(pm.gseq_read_homer(str(f)).values())).attrs["name"] == "MY_ID"
     assert len(f.read_text().splitlines()[0].split("\t")) == 3
+
+
+def test_jaspar_warns_when_rounding_zeroes_a_position(tmp_path):
+    mat = pd.DataFrame({"A": [0.9, 0.3], "C": [0.1, 0.3], "G": [0.0, 0.2], "T": [0.0, 0.2]})
+    with pytest.warns(UserWarning, match=r"Motif 'm': 1 position\(s\) round to zero counts"):
+        pm.gseq_write_jaspar({"m": mat}, str(tmp_path / "z.jaspar"), nsites=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pm.gseq_write_jaspar({"m": mat}, str(tmp_path / "ok.jaspar"), nsites=1, round_counts=False)
