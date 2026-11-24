@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 import numpy as _numpy
 import pandas as _pandas
 
-from ._shared import _checkroot, _pymisha
+from ._shared import _check_strand_column, _checkroot, _pymisha, _str2strand_values
 from .expr import _caller_namespace
 from .extract import _gextract_matrix, _maybe_load_intervals_set
 
@@ -31,17 +31,17 @@ def _onehot_dtype(dtype: Any) -> _numpy.dtype:
 
 
 def _minus_strand(intervals: _pandas.DataFrame) -> _numpy.ndarray:
-    """True for the rows with strand -1 or "-"."""
+    """True for the rows with strand -1 or "-". The strand column is read and checked as the
+    other interval functions read it: labels "+", "-", ".", "*", "", or numbers -1, 0, 1, in any
+    dtype (categorical and object columns included); anything else is an error."""
     if "strand" not in intervals.columns:
         return _numpy.zeros(len(intervals), dtype=bool)
-    strand = intervals["strand"]
-    if isinstance(strand.dtype, _pandas.CategoricalDtype):
-        strand = strand.astype(object)
-    if _pandas.api.types.is_numeric_dtype(strand):
-        minus = (strand.to_numpy() == -1) & ~_pandas.isna(strand).to_numpy()
-    else:
-        minus = strand.astype(str).to_numpy() == "-"
-    return _numpy.asarray(minus, dtype=bool)
+    col = intervals["strand"]
+    _check_strand_column(col)
+    values = _str2strand_values(col)
+    if values is None:
+        values = col.to_numpy(dtype=_numpy.float64)
+    return _numpy.asarray(values == -1, dtype=bool)
 
 
 def _whole_coords(intervals: _pandas.DataFrame) -> tuple[_numpy.ndarray, _numpy.ndarray]:

@@ -258,3 +258,20 @@ def test_windows_expression_variables():
     np.testing.assert_allclose(w.y, w1.y * 3, rtol=1e-6)
     w2 = pm.gextract_windows(iv, tracks="dense_track * k", width=100, binsize=10, vars={"k": 3})
     np.testing.assert_array_equal(w2.y, w.y)
+
+
+def test_onehot_reads_strand_in_every_dtype():
+    """Categorical and object strand columns holding -1 are reverse complemented too, and a bad
+    strand label is an error, as in gseq_extract."""
+    iv = windows_iv(6, 50)
+    iv["strand"] = np.tile([1, -1], 3)
+    expected = pm.gseq_onehot(iv)
+    for col in (pd.Categorical(iv["strand"]), pd.Series(list(iv["strand"]), dtype=object),
+                pd.Series(["+", "-"] * 3, dtype=object), pd.Categorical(["+", "-"] * 3)):
+        alt = iv.copy()
+        alt["strand"] = col
+        assert np.array_equal(pm.gseq_onehot(alt), expected)
+    bad = iv.copy()
+    bad["strand"] = ["+", "x"] * 3
+    with pytest.raises(Exception, match="strand"):
+        pm.gseq_onehot(bad)
