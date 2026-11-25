@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import gzip
 import os
+import shutil
+import uuid
 import warnings
 from collections.abc import Callable
 from typing import Any
@@ -225,6 +227,10 @@ def gtrack_export_bigwig(
     views. Chromosomes are written in the order of their names (as the bigWig format requires),
     and every chromosome of the genome is listed in the file, also those without values.
 
+    The file is written under a temporary name in the same directory and renamed to *file* once
+    it is complete, so an export that fails or is interrupted leaves a file already at *file*
+    unchanged.
+
     Parameters
     ----------
     track : str
@@ -249,6 +255,8 @@ def gtrack_export_bigwig(
         If the track is a 2D track.
     FileNotFoundError
         If the output directory does not exist.
+    PermissionError
+        If the output directory, or a file already at *file*, is not writable.
 
     Examples
     --------
@@ -308,11 +316,20 @@ def gtrack_export_bigwig(
         kwargs["iterator"] = iterator
     rank = {c: i for i, c in enumerate(file_chroms)}
 
-    # Created before the try, so a failure before the file is opened (bad chromosome sizes, an
-    # unwritable path) never deletes a file already at the path.
-    state = _pymisha.pm_bigwig_create(file, file_chroms, file_sizes)
+    # The file is written under a temporary name in the same directory and renamed over *file*
+    # only once it is complete, so an export that fails (or is interrupted) at any point leaves a
+    # file already at the path as it was, and no partial file behind. A symbolic link is written
+    # through, to the file it points to, as when the file was written in place.
+    dest = os.path.realpath(file) if os.path.islink(file) else file
+    if os.path.isdir(dest):
+        raise IsADirectoryError(f"Cannot write to '{file}': it is a directory")
+    dest_dir, dest_name = os.path.split(dest)
+    if not os.access(dest_dir or ".", os.W_OK) or (os.path.exists(dest) and not os.access(dest, os.W_OK)):
+        raise PermissionError(f"Cannot write to '{file}': permission denied")
+    tmp = os.path.join(dest_dir, f".{dest_name}.{uuid.uuid4().hex[:12]}.tmp")
     success = False
     try:
+        state = _pymisha.pm_bigwig_create(tmp, file_chroms, file_sizes)
         for group in groups:
             for intervs in group():
                 data = gextract(track, intervals=intervs, colnames="value", **kwargs)
@@ -324,14 +341,17 @@ def gtrack_export_bigwig(
                 start = data["start"].to_numpy(dtype=np.int64)
                 rows = np.lexsort((start, ids))
                 state = _pymisha.pm_bigwig_append(
-                    file, state, ids[rows], start[rows], data["end"].to_numpy(dtype=np.int64)[rows],
+                    tmp, state, ids[rows], start[rows], data["end"].to_numpy(dtype=np.int64)[rows],
                     data["value"].to_numpy(dtype=np.float64)[rows],
                 )
-        num_records = _pymisha.pm_bigwig_finish(file, state)
+        num_records = _pymisha.pm_bigwig_finish(tmp, state)
+        if os.path.exists(dest):
+            shutil.copymode(dest, tmp)
+        os.replace(tmp, dest)
         success = True
     finally:
-        if not success and os.path.exists(file):
-            os.unlink(file)
+        if not success and os.path.lexists(tmp):
+            os.unlink(tmp)
 
     if num_records == 0:
         warnings.warn(

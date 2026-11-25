@@ -204,6 +204,7 @@ def _corrupt_cases(tmp_path):
         (_fixture("bad-truncated-record.bam"), "last record is incomplete"),
         (_fixture("bad-cigar-length.bam"), "CIGAR and query sequence lengths differ for bad"),
         (_fixture("bad-refid.bam"), "refers to a reference that its header does not list"),
+        (_fixture("bad-n-ref.bam"), "truncated or corrupt: its header is incomplete"),
     ]
 
 
@@ -213,6 +214,31 @@ def test_a_truncated_or_corrupt_bam_is_an_error_and_leaves_no_track(tmp_path):
         with pytest.raises(Exception, match=msg):
             pm.gtrack_import_mappedseq(track, "corrupt", str(path))
         assert not pm.gtrack_exists(track), str(path)
+
+
+def test_a_bam_header_with_more_references_than_the_file_holds_is_corrupt_not_out_of_memory():
+    # bad-n-ref.bam says it lists 2^31 - 1 references. Reserving room for that many names asks for
+    # some 80 GB, which fails as "Out of memory" on a machine with less, and succeeds through overcommit
+    # on one with more: the address space is capped at 4 GB beyond what this process uses, so the
+    # test sees the small machine's outcome on any machine.
+    import resource
+
+    status = Path("/proc/self/status")
+    if not status.exists():
+        pytest.skip("needs /proc to size the address space")
+    vm_kb = next(int(line.split()[1]) for line in status.read_text().splitlines() if line.startswith("VmSize:"))
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    limit = vm_kb * 1024 + 4 * 2**30
+    if saved[1] != resource.RLIM_INFINITY and saved[1] < limit:
+        pytest.skip("cannot cap the address space")
+    track = _track()
+    resource.setrlimit(resource.RLIMIT_AS, (limit, saved[1]))
+    try:
+        with pytest.raises(Exception, match="truncated or corrupt: its header is incomplete"):
+            pm.gtrack_import_mappedseq(track, "corrupt", _fixture("bad-n-ref.bam"))
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
+    assert not pm.gtrack_exists(track)
 
 
 def test_import_mappedseq_accepts_gzipped_sam(tmp_path):

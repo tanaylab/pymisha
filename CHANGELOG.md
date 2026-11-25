@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.24.1 (2026-11-25)
+
+### Fixes
+
+* `gtrack_export_bigwig` stops on Ctrl-C while it writes and indexes the file; it used to finish the current step first.
+* `gtrack_export_bigwig` writes to a temporary file and renames it into place when done, so an export that fails or is interrupted leaves a file already at the path unchanged.
+* `gtrack_import_mappedseq` reports a BAM header that lists more references than the file holds as corrupt, instead of "Out of memory".
+
 ## v0.24.0 (2026-11-25)
 
 ### Features

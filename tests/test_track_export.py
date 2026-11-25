@@ -486,6 +486,113 @@ class TestBigWigExport:
         finally:
             f.chmod(0o644)
 
+    def test_an_export_that_fails_after_opening_its_file_keeps_the_file_already_there(self, tmp_path):
+        f = tmp_path / "x.bw"
+        f.write_text("keep me")
+
+        # fails in the first gextract, after create() has written the file's header
+        with pytest.raises(Exception):  # noqa: B017
+            pm.gtrack_export_bigwig("dense_track + bw_no_such_variable", str(f))
+        assert f.read_text() == "keep me"
+        assert os.listdir(tmp_path) == ["x.bw"]
+
+        # a write that fails inside create() (as on a full disk): RLIMIT_FSIZE, with SIGXFSZ
+        # ignored, makes a write past 100 bytes fail with EFBIG
+        import resource
+        import signal
+
+        saved_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+        saved_handler = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        try:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (100, saved_limit[1]))
+            with pytest.raises(Exception, match="Failed to write to bigWig file"):
+                pm.gtrack_export_bigwig("dense_track", str(f))
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, saved_limit)
+            signal.signal(signal.SIGXFSZ, saved_handler)
+        assert f.read_text() == "keep me"
+        assert os.listdir(tmp_path) == ["x.bw"]
+
+    def test_an_export_replaces_the_file_already_there_and_writes_through_a_symbolic_link(self, tmp_path):
+        f = tmp_path / "x.bw"
+        f.write_text("old")
+        f.chmod(0o640)
+        pm.gtrack_export_bigwig("dense_track", str(f))
+        assert f.stat().st_mode & 0o777 == 0o640
+        assert len(pm.gintervals_import_bigwig(str(f), pm.gintervals("1", 0, 1000))) > 0
+
+        link = tmp_path / "link.bw"
+        link.symlink_to(f)
+        pm.gtrack_export_bigwig("dense_track", str(link), intervals=pm.gintervals("1", 0, 1000))
+        assert link.is_symlink() and os.readlink(link) == str(f)
+        assert pm.gintervals_import_bigwig(str(f), pm.gintervals_all())["end"].max() == 1000
+        assert sorted(os.listdir(tmp_path)) == ["link.bw", "x.bw"]
+
+        with pytest.raises(IsADirectoryError):
+            pm.gtrack_export_bigwig("dense_track", str(tmp_path))
+
+    def test_ctrl_c_stops_the_writer_s_append_and_finish(self, tmp_path):
+        # Timing-based, as R misha's test: each call takes several seconds on 10 million records,
+        # on one thread, and the signal comes after one. It is sent by another process: a Python
+        # thread could not send it while the call holds the GIL. Python runs signal handlers on
+        # the main thread only, which is where check_interrupt() looks for them.
+        import signal
+        import subprocess
+        import threading
+        import time
+
+        from pymisha import _shared
+        from pymisha._shared import _pymisha
+
+        if threading.current_thread() is not threading.main_thread():
+            pytest.skip("signals are handled on the main thread only")
+        delay = 1.0
+        n = 10_000_000
+        f = str(tmp_path / "big.bw")
+        starts = np.arange(n, dtype=np.int64) * 10 + np.resize(np.array([0, 3], dtype=np.int64), n)
+        ends = starts + 2 + np.resize(np.array([0, 1, 2], dtype=np.int64), n)
+        values = np.random.default_rng(0).random(n)
+        chromids = np.zeros(n, dtype=np.int64)
+
+        def interrupted(call):
+            saved = signal.signal(signal.SIGINT, signal.default_int_handler)
+            sender = subprocess.Popen(["/bin/sh", "-c", f"sleep {delay}; kill -INT {os.getpid()}"])
+            t0 = time.monotonic()
+            res, elapsed = "completed", None
+            try:
+                try:
+                    call()
+                except Exception as e:
+                    res = str(e)
+                elapsed = time.monotonic() - t0
+                sender.wait()
+                time.sleep(max(0.0, delay - elapsed) + 0.5)
+            except KeyboardInterrupt:
+                # the signal reached Python rather than the call: after the call returned
+                pass
+            finally:
+                sender.wait()
+                signal.signal(signal.SIGINT, saved)
+            if elapsed is None:
+                elapsed = time.monotonic() - t0
+            if res == "completed" and elapsed < delay:
+                pytest.skip(f"the call finished in {elapsed:.1f}s, before the {delay}s signal")
+            assert "Command interrupted" in res
+            assert elapsed < delay + 3
+
+        saved_processes = _shared.CONFIG.get("max_processes")
+        _shared.CONFIG["max_processes"] = 1
+        try:
+            state = _pymisha.pm_bigwig_create(f, ["chr1"], np.array([4_000_000_000]))
+            interrupted(lambda: _pymisha.pm_bigwig_append(f, state, chromids, starts, ends, values))
+
+            # the interrupted append left the file behind its state: start it over
+            state = _pymisha.pm_bigwig_create(f, ["chr1"], np.array([4_000_000_000]))
+            state = _pymisha.pm_bigwig_append(f, state, chromids, starts, ends, values)
+            interrupted(lambda: _pymisha.pm_bigwig_finish(f, state))
+        finally:
+            _shared.CONFIG["max_processes"] = saved_processes
+
     def test_the_writer_refuses_unsorted_and_overlapping_records(self, tmp_path):
         from pymisha._shared import _pymisha
 
