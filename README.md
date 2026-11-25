@@ -32,10 +32,22 @@ pip install pymisha
 
 Pre-built wheels are available for Linux (x86_64) and macOS (x86_64 and arm64), Python 3.10-3.12.
 
+Reading and writing figwig (`.fw`) multi-track files (`gtrack_import_figwig`, `gtrack_export_figwig`) needs the optional [figwig](https://github.com/jmschrei/figwig) package:
+
+```bash
+pip install "pymisha[figwig]"
+```
+
 To install from source (requires a C++17 compiler and numpy):
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Contributors: enable the repo's pre-push hook, which runs the `ruff` and `mypy` checks CI runs:
+
+```bash
+git config core.hooksPath .githooks
 ```
 
 ## Quick start

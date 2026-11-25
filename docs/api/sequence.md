@@ -7,6 +7,11 @@ Functions for extracting and analyzing DNA sequences, including reverse compleme
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gseq_onehot
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gseq_rev
     options:
       show_root_heading: true
@@ -32,7 +37,17 @@ Functions for extracting and analyzing DNA sequences, including reverse compleme
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gseq_shuffle
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gseq_pwm
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_pwm_hits
     options:
       show_root_heading: true
       heading_level: 3
@@ -42,9 +57,9 @@ Functions for extracting and analyzing DNA sequences, including reverse compleme
       show_root_heading: true
       heading_level: 3
 
-## Motif Import
+## Motif Import and Export
 
-Functions to import motifs from standard motif format files (MEME, JASPAR, HOMER).
+Functions to read and write motifs in standard motif file formats (MEME, JASPAR, HOMER).
 
 ::: pymisha.gseq_read_meme
     options:
@@ -57,6 +72,21 @@ Functions to import motifs from standard motif format files (MEME, JASPAR, HOMER
       heading_level: 3
 
 ::: pymisha.gseq_read_homer
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_write_meme
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_write_jaspar
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gseq_write_homer
     options:
       show_root_heading: true
       heading_level: 3

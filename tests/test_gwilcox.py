@@ -227,3 +227,22 @@ class TestGwilcoxRParity:
         finally:
             with contextlib.suppress(Exception):
                 pm.gintervals_rm(set_name)
+
+
+@pytest.mark.parametrize(
+    "pval, r_qnorm",
+    [
+        # R: sprintf("%.17g", qnorm(p))
+        (1e-6, -4.7534243088228987),
+        (1e-4, -3.71901648545568),
+        (0.025, -1.9599639845400538),
+        (0.05, -1.6448536269514726),
+        (0.3, -0.52440051270804067),
+        (0.9, 1.2815515655446008),
+    ],
+)
+def test_pval_threshold_is_r_qnorm(pval, r_qnorm):
+    """gwilcox and gsegment turn maxpval into a z threshold exactly as R's qnorm, without scipy."""
+    from pymisha.analysis import _pval_to_zscore
+
+    assert _pval_to_zscore(pval) == pytest.approx(r_qnorm, rel=1e-14)

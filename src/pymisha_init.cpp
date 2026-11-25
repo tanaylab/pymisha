@@ -119,6 +119,8 @@ PyObject *pm_read_df(PyObject *self, PyObject *args);
 PyObject *pm_vtrack_compute(PyObject *self, PyObject *args);
 PyObject *pm_find_neighbors(PyObject *self, PyObject *args);
 PyObject *pm_seq_extract(PyObject *self, PyObject *args);
+PyObject *pm_seq_onehot(PyObject *self, PyObject *args);
+PyObject *pm_seq_onehot_strings(PyObject *self, PyObject *args);
 PyObject *pm_partition(PyObject *self, PyObject *args);
 PyObject *pm_dist(PyObject *self, PyObject *args);
 PyObject *pm_intervals_union(PyObject *self, PyObject *args);
@@ -147,11 +149,14 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
 PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args);
 PyObject *pm_pwm_score_strings(PyObject *self, PyObject *args);
+PyObject *pm_pwm_seq_hits(PyObject *self, PyObject *args);
+PyObject *pm_gintervals_pwm_hits(PyObject *self, PyObject *args);
 PyObject *pm_gseq_potts(PyObject *self, PyObject *args);
 PyObject *pm_gvariants_reach(PyObject *self, PyObject *args);
 PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args);
 PyObject *pm_gextract_variants(PyObject *self, PyObject *args);
 PyObject *pm_kmer_count_strings(PyObject *self, PyObject *args);
+PyObject *pm_gseq_shuffle(PyObject *self, PyObject *args);
 PyObject *pm_crc64_update(PyObject *self, PyObject *args);
 PyObject *pm_crc64_finalize(PyObject *self, PyObject *args);
 PyObject *pm_compute_strands_autocorr(PyObject *self, PyObject *args);
@@ -169,6 +174,9 @@ PyObject *pm_parquet_writer_open(PyObject *self, PyObject *args);
 PyObject *pm_parquet_writer_add(PyObject *self, PyObject *args);
 PyObject *pm_parquet_writer_close(PyObject *self, PyObject *args);
 PyObject *pm_bedgraph_lines(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_create(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_append(PyObject *self, PyObject *args);
+PyObject *pm_bigwig_finish(PyObject *self, PyObject *args);
 PyObject *pm_test_2d_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_iterator(PyObject *self, PyObject *args);
 PyObject *pm_test_fixed_rect_scanner(PyObject *self, PyObject *args);
@@ -239,6 +247,8 @@ static PyMethodDef module_methods[] = {
     {"pm_vtrack_compute", gcall<pm_vtrack_compute>, METH_VARARGS, "Compute virtual track values"},
     {"pm_find_neighbors", gcall<pm_find_neighbors>, METH_VARARGS, "Find nearest neighbor intervals"},
     {"pm_seq_extract", gcall<pm_seq_extract>, METH_VARARGS, "Extract DNA sequences for intervals"},
+    {"pm_seq_onehot", gcall<pm_seq_onehot>, METH_VARARGS, "One-hot encode genomic windows into an array"},
+    {"pm_seq_onehot_strings", gcall<pm_seq_onehot_strings>, METH_VARARGS, "One-hot encode strings into an array"},
     {"pm_partition", gcall<pm_partition>, METH_VARARGS, "Partition track values into bins"},
     {"pm_dist", gcall<pm_dist>, METH_VARARGS, "Calculate distribution of track values over bins"},
     {"pm_lookup", gcall<pm_lookup>, METH_VARARGS, "Lookup table transform on binned track values"},
@@ -269,11 +279,14 @@ static PyMethodDef module_methods[] = {
     {"pm_track2d_index_info", gcall<pm_track2d_index_info>, METH_VARARGS, "Get 2D track index info"},
     {"pm_gseq_pwm_edits", gcall<pm_gseq_pwm_edits>, METH_VARARGS, "Get detailed PWM edit distance information"},
     {"pm_pwm_score_strings", gcall<pm_pwm_score_strings>, METH_VARARGS, "Score sequences with PWM scorer"},
+    {"pm_pwm_seq_hits", gcall<pm_pwm_seq_hits>, METH_VARARGS, "PWM hit positions in sequences"},
+    {"pm_gintervals_pwm_hits", gcall<pm_gintervals_pwm_hits>, METH_VARARGS, "PWM hit positions in genomic intervals"},
     {"pm_gseq_potts", gcall<pm_gseq_potts>, METH_VARARGS, "Score sequences under a Potts (pairwise energy) model"},
     {"pm_potts_score_codes_cmp", gcall<pm_potts_score_codes_cmp>, METH_VARARGS, "Test only: score code windows with both Potts kernels"},
     {"pm_gvariants_reach", gcall<pm_gvariants_reach>, METH_VARARGS, "Sequence reach of each sequence vtrack in an expression"},
     {"pm_gextract_variants", gcall<pm_gextract_variants>, METH_VARARGS, "Evaluate an expression with one base substituted per row"},
     {"pm_kmer_count_strings", gcall<pm_kmer_count_strings>, METH_VARARGS, "Count k-mer occurrences in sequences"},
+    {"pm_gseq_shuffle", gcall<pm_gseq_shuffle>, METH_VARARGS, "Shuffle sequences keeping their k-mer counts"},
     {"pm_crc64_update", gcall<pm_crc64_update>, METH_VARARGS, "CRC64-ECMA incremental update"},
     {"pm_crc64_finalize", gcall<pm_crc64_finalize>, METH_VARARGS, "CRC64-ECMA finalize"},
     {"pm_compute_strands_autocorr", gcall<pm_compute_strands_autocorr>, METH_VARARGS, "Compute strand cross-correlation"},
@@ -291,6 +304,9 @@ static PyMethodDef module_methods[] = {
     {"pm_parquet_writer_add", gcall<pm_parquet_writer_add>, METH_VARARGS, "Add rows to a Parquet file opened by pm_parquet_writer_open"},
     {"pm_parquet_writer_close", gcall<pm_parquet_writer_close>, METH_VARARGS, "Finish a Parquet file opened by pm_parquet_writer_open"},
     {"pm_bedgraph_lines", gcall<pm_bedgraph_lines>, METH_VARARGS, "bedGraph lines of rows, formatted as R misha writes them"},
+    {"pm_bigwig_create", gcall<pm_bigwig_create>, METH_VARARGS, "Create a bigWig file with its chromosomes; returns the writer's state"},
+    {"pm_bigwig_append", gcall<pm_bigwig_append>, METH_VARARGS, "Append records to a bigWig file being written; returns the writer's state"},
+    {"pm_bigwig_finish", gcall<pm_bigwig_finish>, METH_VARARGS, "Write the index, zoom levels and header of a bigWig file; returns the number of records"},
     {"pm_liftover_aggregate", gcall<pm_liftover_aggregate>, METH_VARARGS, "Aggregate overlapping intervals per chrom (C++ fast path for liftover)"},
     {"pm_parse_chain_file", gcall<pm_parse_chain_file>, METH_VARARGS, "Parse a UCSC chain file into 10 columns (C++ fast path for gintervals_load_chain)"},
     {"pm_read_source_track_1d", gcall<pm_read_source_track_1d>, METH_VARARGS, "Read a 1D source-track directory into a (type, df_dict) tuple (C++ fast path for gtrack_liftover)"},

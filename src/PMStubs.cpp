@@ -5409,8 +5409,8 @@ PyObject *pm_cor(PyObject *self, PyObject *args)
             }
         } else if (!plan.empty() && method == CorMethod::SPEARMAN_EXACT &&
                    // a kid's result: per pair, its number of bins and of value pairs; then the value
-                   // pairs, which CONFIG['max_data_size'] limits per pair, as in one process (R misha
-                   // limits the pairs together when it multitasks)
+                   // pairs, which CONFIG['max_data_size'] limits per pair, as in one process and in
+                   // R misha
                    PyMisha::prepare4multitasking(plan.size(), num_pairs * 2 * sizeof(uint64_t), sizeof(ValuePair), 0,
                                                  num_pairs)) {
             fork_kids(plan, nullptr, [&](int, const std::vector<GInterval> &sub, const std::vector<uint64_t> &) {

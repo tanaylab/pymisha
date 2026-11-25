@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-import warnings
+from statistics import NormalDist
 from typing import Any
 
 import numpy as _numpy
@@ -23,54 +23,14 @@ from ._shared import (
 )
 from .extract import _maybe_load_intervals_set
 
-_APPROX_QNORM_WARNED = False
-
 
 def _pval_to_zscore(pval: float) -> float:
-    """Convert a p-value to z-score using the normal distribution PPF.
-
-    Equivalent to R's qnorm(pval). Uses the inverse error function
-    to avoid scipy dependency.
-    """
-    # erfinv approximation: for p in (0,1), qnorm(p) = sqrt(2) * erfinv(2*p - 1)
-    # Use math.erfc and its inverse via a rational approximation
-    # This matches R's qnorm to high precision for typical p-value ranges
+    """R's ``qnorm(pval)``: the standard normal quantile of ``pval``."""
     if pval <= 0:
         return float('-inf')
     if pval >= 1:
         return float('inf')
-    if pval == 0.5:
-        return 0.0
-
-    # Use scipy if available, otherwise fall back to approximation
-    try:
-        from scipy.stats import norm
-        return float(norm.ppf(pval))
-    except ImportError:
-        pass
-
-    # Rational approximation of the inverse normal CDF (Abramowitz & Stegun 26.2.23)
-    # Accurate to ~4.5e-4.
-    global _APPROX_QNORM_WARNED
-    if not _APPROX_QNORM_WARNED:
-        warnings.warn(
-            "scipy is not installed; using an approximate inverse normal CDF "
-            "for p-value to z-score conversion (accuracy ~4.5e-4).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _APPROX_QNORM_WARNED = True
-
-    if pval < 0.5:
-        t = math.sqrt(-2.0 * math.log(pval))
-        # Coefficients for the rational approximation
-        c0, c1, c2 = 2.515517, 0.802853, 0.010328
-        d1, d2, d3 = 1.432788, 0.189269, 0.001308
-        return -(t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t))
-    t = math.sqrt(-2.0 * math.log(1.0 - pval))
-    c0, c1, c2 = 2.515517, 0.802853, 0.010328
-    d1, d2, d3 = 1.432788, 0.189269, 0.001308
-    return t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)
+    return NormalDist().inv_cdf(pval)
 
 
 def gsegment(

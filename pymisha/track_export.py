@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import gzip
 import os
-import shutil
-import subprocess
-import tempfile
 import warnings
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -136,8 +134,8 @@ def _export_bedgraph(
     if name is None:
         name = track
 
-    # Extract the data. Overlapping intervals would extract the same bins twice, and bedGraph (and
-    # bedGraphToBigWig) does not allow overlapping records, so they are merged first.
+    # Extract the data. Overlapping intervals would extract the same bins twice, and bedGraph does
+    # not allow overlapping records, so they are merged first.
     kwargs: dict = {}
     if iterator is not None:
         kwargs["iterator"] = iterator
@@ -182,15 +180,14 @@ def _export_bedgraph(
         if header:
             f.write(f'track type=bedGraph name="{name}"\n'.encode())
         if data is not None:
-            _write_bedgraph_lines(f, data, value_col, chroms)
+            _write_bedgraph_lines(f, data, value_col)
 
 
-def _write_bedgraph_lines(f: Any, data: pd.DataFrame, value_col: str, chroms: list[str] | None) -> None:
+def _write_bedgraph_lines(f: Any, data: pd.DataFrame, value_col: str) -> None:
     """Writes the bedGraph lines of the rows of *data* whose value is not NaN to the binary stream
-    *f*, rows in genome order (chromosome as in the genome database, or as in *chroms*), then
-    start. The lines are R misha's: paste(chrom, sprintf("%.0f", start), sprintf("%.0f", end),
-    value, sep = "\t")."""
-    genome_chroms = [str(c) for c in gintervals_all()["chrom"]] if chroms is None else chroms
+    *f*, rows in genome order (chromosome as in the genome database), then start. The lines are R
+    misha's: paste(chrom, sprintf("%.0f", start), sprintf("%.0f", end), value, sep = "\t")."""
+    genome_chroms = [str(c) for c in gintervals_all()["chrom"]]
     rank = {c: i for i, c in enumerate(genome_chroms)}
     chrom = pd.Categorical(data["chrom"].astype(str))
     # a chromosome the order does not name sorts last, as NA in R's order()
@@ -210,13 +207,23 @@ def _write_bedgraph_lines(f: Any, data: pd.DataFrame, value_col: str, chroms: li
 def gtrack_export_bigwig(
     track: str,
     file: str,
-    intervals: pd.DataFrame | None = None,
+    intervals: pd.DataFrame | str | None = None,
     iterator: int | None = None,
 ) -> None:
     """Export a track or track expression to BigWig format.
 
-    Creates a temporary bedGraph file via :func:`gtrack_export_bedgraph` and
-    then converts it to BigWig using the UCSC ``bedGraphToBigWig`` utility.
+    The track expression is evaluated over the intervals as by :func:`gextract`, one batch of
+    chromosomes at a time, and the values are written to the file as they are extracted, so the
+    whole genome's values are never held in memory. Overlapping intervals are merged first, so
+    each base is written once. NaN values are not written. Values are stored as 32-bit floats, as
+    in every bigWig file.
+
+    The file is written by pymisha itself (the same C++ writer as R misha's); no external tool is
+    needed. Runs of bins of equal size (as from a dense track or a numeric iterator) are stored as
+    fixedStep sections, other values as bedGraph sections. The file has zoom levels (summaries at
+    coarser resolutions), which genome browsers and UCSC's ``bigWigSummary`` use for zoomed-out
+    views. Chromosomes are written in the order of their names (as the bigWig format requires),
+    and every chromosome of the genome is listed in the file, also those without values.
 
     Parameters
     ----------
@@ -224,9 +231,9 @@ def gtrack_export_bigwig(
         Track name or track expression.
     file : str
         Output file path (typically ending in ``.bw`` or ``.bigwig``).
-    intervals : DataFrame or None, optional
-        Genomic intervals to export. If ``None`` (default), the entire
-        genome is used.
+    intervals : DataFrame, str or None, optional
+        Genomic intervals to export, or the name of an interval set. If ``None`` (default), the
+        entire genome is used.
     iterator : int or None, optional
         Iterator bin size. If ``None`` (default), the iterator is
         determined automatically from the track expression.
@@ -238,16 +245,22 @@ def gtrack_export_bigwig(
 
     Raises
     ------
-    RuntimeError
-        If ``bedGraphToBigWig`` is not found on PATH or conversion fails.
     ValueError
         If the track is a 2D track.
+    FileNotFoundError
+        If the output directory does not exist.
 
     Examples
     --------
+    >>> import os, tempfile
     >>> import pymisha as pm
     >>> _ = pm.gdb_init_examples()
-    >>> pm.gtrack_export_bigwig("dense_track", "/tmp/dense.bw")  # doctest: +SKIP
+    >>> f = os.path.join(tempfile.mkdtemp(), "dense.bw")
+    >>> pm.gtrack_export_bigwig("dense_track", f)
+    >>> pm.gintervals_import_bigwig(f, pm.gintervals("1", 0, 100))
+      chrom  start  end     value
+    0  chr1      0   50  0.177778
+    1  chr1     50  100  0.160000
     """
     _checkroot()
 
@@ -264,65 +277,127 @@ def gtrack_export_bigwig(
             f"Cannot write to '{file}': directory does not exist"
         )
 
-    # Locate bedGraphToBigWig converter
-    converter = shutil.which("bedGraphToBigWig")
-    converter_name = "bedGraphToBigWig"
-
-    if converter is None:
-        # Try wigToBigWig as fallback
-        converter = shutil.which("wigToBigWig")
-        converter_name = "wigToBigWig"
-
-    if converter is None:
-        raise RuntimeError(
-            "bedGraphToBigWig or wigToBigWig not found. "
-            "Install from UCSC tools: https://hgdownload.cse.ucsc.edu/admin/exe/"
-        )
-
-    # Create temporary files
-    tmp_bedgraph = None
-    tmp_chromsizes = None
+    # Check for 2D tracks
     try:
-        # Write bedGraph to temp file (no header for bedGraphToBigWig)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".bedgraph", delete=False
-        ) as tmp_bg:
-            tmp_bedgraph = tmp_bg.name
+        from .tracks import gtrack_info
 
-        # bedGraphToBigWig rejects the track header, so never write it. It wants the chromosomes
-        # sorted by name in the C locale ("10" before "9"), which is not the genome order of a
-        # database whose chromosomes are 1, 2, ..., 10.
-        c_order = sorted((str(c) for c in gintervals_all()["chrom"]), key=lambda c: c.encode())
-        _export_bedgraph(track, tmp_bedgraph, intervals, iterator, None, False, chroms=c_order)
+        info = gtrack_info(track)
+        if info.get("dimensions") == 2:
+            raise ValueError("2D tracks are not supported by BigWig export")
+    except ValueError as e:
+        if "2D tracks are not supported" in str(e):
+            raise
+    except _pymisha.error:
+        _logger.debug("no track info for %r; treating it as an expression or virtual track",
+                      track, exc_info=True)
 
-        # Write chrom.sizes
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".chrom.sizes", delete=False
-        ) as tmp_cs:
-            tmp_chromsizes = tmp_cs.name
+    # The chromosomes in the order of the file: by name, byte by byte, as the bigWig format's
+    # chromosome tree is keyed ("1", "10", "2"), which is not the genome order of a database whose
+    # chromosomes are 1, 2, ..., 10. Chromosome id i of the file is file_chroms[i].
+    genome = gintervals_all()
+    genome_chroms = [str(c) for c in genome["chrom"]]
+    order = sorted(range(len(genome_chroms)), key=lambda i: genome_chroms[i].encode())
+    file_chroms = [genome_chroms[i] for i in order]
+    file_sizes = genome["end"].to_numpy(dtype=np.int64)[order]
+    genome = pd.DataFrame({"chrom": file_chroms, "start": 0, "end": file_sizes})
 
-        genome_intervals = gintervals_all()
-        with open(tmp_chromsizes, "w") as f:
-            genome_intervals[["chrom", "end"]].astype({"end": "int64"}).to_csv(
-                f, sep="\t", header=False, index=False
-            )
+    groups = _bigwig_batches(intervals, iterator, genome, file_chroms)
 
-        # Run conversion
-        result = subprocess.run(
-            [converter, tmp_bedgraph, tmp_chromsizes, file],
-            capture_output=True,
-            text=True,
+    kwargs: dict = {}
+    if iterator is not None:
+        kwargs["iterator"] = iterator
+    rank = {c: i for i, c in enumerate(file_chroms)}
+
+    # Created before the try, so a failure before the file is opened (bad chromosome sizes, an
+    # unwritable path) never deletes a file already at the path.
+    state = _pymisha.pm_bigwig_create(file, file_chroms, file_sizes)
+    success = False
+    try:
+        for group in groups:
+            for intervs in group():
+                data = gextract(track, intervals=intervs, colnames="value", **kwargs)
+                if data is None or not len(data):
+                    continue
+                chrom = pd.Categorical(data["chrom"].astype(str))
+                cat_ids = np.array([rank.get(c, -1) for c in chrom.categories], dtype=np.int64)
+                ids = cat_ids[chrom.codes]
+                start = data["start"].to_numpy(dtype=np.int64)
+                rows = np.lexsort((start, ids))
+                state = _pymisha.pm_bigwig_append(
+                    file, state, ids[rows], start[rows], data["end"].to_numpy(dtype=np.int64)[rows],
+                    data["value"].to_numpy(dtype=np.float64)[rows],
+                )
+        num_records = _pymisha.pm_bigwig_finish(file, state)
+        success = True
+    finally:
+        if not success and os.path.exists(file):
+            os.unlink(file)
+
+    if num_records == 0:
+        warnings.warn(
+            "The track has no values in the intervals; the bigWig file holds no data",
+            stacklevel=user_stacklevel(),
         )
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"{converter_name} failed (exit code {result.returncode}): {stderr}"
-            )
 
-    finally:
-        # Clean up temp files
-        if tmp_bedgraph is not None and os.path.exists(tmp_bedgraph):
-            os.unlink(tmp_bedgraph)
-        if tmp_chromsizes is not None and os.path.exists(tmp_chromsizes):
-            os.unlink(tmp_chromsizes)
+def _bigwig_batches(
+    intervals: pd.DataFrame | str | None,
+    iterator: Any,
+    genome: pd.DataFrame,
+    file_chroms: list[str],
+) -> list[Callable[[], list[pd.DataFrame]]]:
+    """The scope of a bigWig export, in the order of the file (by the rank of the chromosome in
+    *file_chroms*, then start), as a list of functions that each return a list of batches of
+    intervals: one function for an intervals set read one chromosome at a time, one in all
+    otherwise. Overlapping intervals are merged. A batch holds whole chromosomes of about 1e8
+    bases in all (an interval is not cut); with a numeric iterator, about 2^22 bins, the intervals
+    being cut at multiples of 2^22 bins (bins do not cross them, so the values are those of the
+    whole interval). R misha's .gbigwig_batches."""
+    batch_bases = int(1e8)
+    cut = (isinstance(iterator, (int, float, np.integer, np.floating)) and not isinstance(iterator, bool)
+           and np.isfinite(iterator) and iterator >= 1 and iterator == int(iterator))
+    if cut:
+        batch_bases = int(iterator) * (1 << 22)
+    rank = {c: i for i, c in enumerate(file_chroms)}
+
+    def split_batches(intervs: pd.DataFrame | None) -> list[pd.DataFrame]:
+        if intervs is None or not len(intervs):
+            return []
+        chrom = intervs["chrom"].astype(str).to_numpy()
+        start = intervs["start"].to_numpy(dtype=np.int64)
+        end = intervs["end"].to_numpy(dtype=np.int64)
+        ids = np.array([rank.get(c, len(rank)) for c in chrom], dtype=np.int64)
+        o = np.lexsort((start, ids))
+        chrom, start, end = chrom[o], start[o], end[o]
+        if cut:
+            first = start // batch_bases
+            n = (end - 1) // batch_bases - first + 1
+            if (n > 1).any():
+                idx = np.repeat(np.arange(len(start)), n)
+                k = np.arange(len(idx)) - np.repeat(np.cumsum(n) - n, n)
+                piece = first[idx] + k
+                chrom = chrom[idx]
+                start = np.maximum(start[idx], piece * batch_bases)
+                end = np.minimum(end[idx], (piece + 1) * batch_bases)
+        widths = end - start
+        batch = (np.cumsum(widths) - widths) // batch_bases
+        bounds = np.flatnonzero(np.diff(batch)) + 1
+        parts = zip(np.split(chrom, bounds), np.split(start, bounds), np.split(end, bounds), strict=True)
+        return [pd.DataFrame({"chrom": c, "start": s, "end": e}) for c, s, e in parts]
+
+    if intervals is None:
+        return [lambda: split_batches(genome)]
+
+    if isinstance(intervals, str) and gintervals_is_bigset(intervals):
+        # a big intervals set is read one chromosome at a time
+        chroms = [str(c) for c in gintervals_chrom_sizes(intervals)["chrom"]]
+        chroms.sort(key=lambda c: rank.get(c, len(rank)))
+
+        def chrom_batches(chrom: str) -> Callable[[], list[pd.DataFrame]]:
+            return lambda: split_batches(gintervals_canonic(gintervals_load(intervals, chrom=chrom),
+                                                            unify_touching_intervals=False))
+
+        return [chrom_batches(chrom) for chrom in chroms]
+
+    canonic = gintervals_canonic(intervals, unify_touching_intervals=False)
+    return [lambda: split_batches(canonic)]

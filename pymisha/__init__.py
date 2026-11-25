@@ -54,6 +54,7 @@ from .db import (
 from .db_attrs import gdb_get_readonly_attrs, gdb_set_readonly_attrs
 from .db_create import gdb_convert_to_indexed, gdb_create, gdb_create_genome, gdb_create_linked
 from .extract import gextract, gextract_matrix, giterator_intervals_2d, gscreen
+from .figwig import gtrack_export_figwig, gtrack_import_figwig
 from .gdir import (
     gdir_cd,
     gdir_create,
@@ -146,8 +147,10 @@ from .liftover import (
     gtrack_liftover,
 )
 from .lookup import glookup, gtrack_lookup
+from .motif_export import gseq_write_homer, gseq_write_jaspar, gseq_write_meme
 from .motif_import import gseq_read_homer, gseq_read_jaspar, gseq_read_meme
 from .sequence import (
+    gintervals_pwm_hits,
     grevcomp,
     gseq_comp,
     gseq_extract,
@@ -156,8 +159,10 @@ from .sequence import (
     gseq_potts,
     gseq_pwm,
     gseq_pwm_edits,
+    gseq_pwm_hits,
     gseq_rev,
     gseq_revcomp,
+    gseq_shuffle,
 )
 from .summary import (
     gbins_quantiles,
@@ -227,6 +232,7 @@ from .vtracks import (
     gvtrack_ls,
     gvtrack_rm,
 )
+from .windows import ExtractedWindows, gextract_windows, gseq_onehot
 
 # The C extension names this class "pymisha.error", so pickle (and hence
 # multiprocessing error propagation) looks it up here. Without the alias any
@@ -298,6 +304,8 @@ __all__ = [
     # Track functions
     'gextract',
     'gextract_matrix',
+    'gextract_windows',
+    'ExtractedWindows',
     'gextract_variants',
     'gscreen',
     'gsummary',
@@ -325,6 +333,7 @@ __all__ = [
     'gtrack_import',
     'gtrack_import_mappedseq',
     'gtrack_import_parquet',
+    'gtrack_import_figwig',
     'gtrack_import_set',
     'gtrack_rm',
     'gtrack_mv',
@@ -355,6 +364,7 @@ __all__ = [
     'gtrack_create_pwm_energy',
     'gtrack_export_bedgraph',
     'gtrack_export_bigwig',
+    'gtrack_export_figwig',
 
     # Interval functions
     'gintervals',
@@ -434,6 +444,7 @@ __all__ = [
     # Sequence functions
     'grevcomp',
     'gseq_extract',
+    'gseq_onehot',
     'gseq_rev',
     'gseq_comp',
     'gseq_revcomp',
@@ -442,9 +453,15 @@ __all__ = [
     'gseq_potts',
     'gseq_pwm',
     'gseq_pwm_edits',
+    'gseq_shuffle',
+    'gseq_pwm_hits',
+    'gintervals_pwm_hits',
     'gseq_read_meme',
     'gseq_read_jaspar',
     'gseq_read_homer',
+    'gseq_write_meme',
+    'gseq_write_jaspar',
+    'gseq_write_homer',
 
     # Lookup functions
     'glookup',

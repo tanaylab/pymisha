@@ -23,8 +23,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install samtools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq samtools
+      # bgzip, for the tests of bgzipped input (BAM import needs no samtools)
+      - name: Install bgzip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tabix
 
       - name: Install package
         run: |
@@ -100,7 +101,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq lcov samtools
+          sudo apt-get install -y -qq lcov tabix
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install numpy pandas pyyaml pytest pyreadr pyarrow
 
@@ -138,8 +139,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install samtools
-        run: brew install samtools
+      - name: Install bgzip
+        run: brew install htslib
 
       - name: Install package
         env:

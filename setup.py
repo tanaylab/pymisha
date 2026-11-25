@@ -19,7 +19,8 @@ compile_args = [
 link_args = []
 
 if os.environ.get('PYMISHA_COVERAGE'):
-    compile_args += ['-O0', '--coverage', '-fprofile-arcs', '-ftest-coverage']
+    # atomic counters: BamReader inflates on threads, and racing counters go negative in lcov
+    compile_args += ['-O0', '--coverage', '-fprofile-arcs', '-ftest-coverage', '-fprofile-update=atomic']
     link_args += ['--coverage']
 elif os.environ.get('PYMISHA_UBSAN'):
     # PYMISHA_UBSAN=1 pip install -e . --no-build-isolation

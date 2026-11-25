@@ -100,7 +100,7 @@ Attach the genome you need once at the top and stay on it. Switching `gsetroot` 
 
 **Multitasked values.** A multitasked call returns the same values as a call in one process, except the sums of `gsummary` and Pearson's `gcor` (merged across the processes, last-digit differences) and `gquantiles`: each of its processes samples at most `max_data_size / processes` values, as in R misha, so past that its quantiles are approximate (with a warning) even where one process would give them exactly. For exact quantiles of a large scope, raise `max_data_size` or set `multitasking = False` for the call.
 
-**Memory balance.** `max_data_size` caps the *result size* (rows) of any single `gextract`, all its processes together. With `multitasking = True` the processes write their rows to shared memory and the parent copies them out, so a result near a high `max_data_size` takes about twice its size at its peak, which can surface as `MemoryError` or an OOM kill. If you hit it: lower `max_data_size`, drop `multitasking`, or partition by chromosome.
+**Memory balance.** `max_data_size` caps the *result size* (rows) of any single `gextract`, all its processes together. It does not change how much memory a result under it takes; lowering it only makes a larger call fail early. With `multitasking = True` (the "tiles" strategy) each process collects its rows in its own memory and then copies them to shared memory, and the parent copies them out of it into the result, so a large result takes about twice its size at its peak, which can surface as `MemoryError` or an OOM kill. If you hit it: drop `multitasking` for the call, or partition by chromosome.
 
 **Many-track strategy.** `pm.CONFIG["multitasking_strategy"] = "auto" | "tracks" | "tiles"` controls how the engine parallelizes a multi-track `gextract`. `"tiles"` (the historical default) splits the scope among the processes, each extracting every expression over its part - good for a few heavy tracks. `"tracks"` parallelizes across the *expressions* in `["...", "..."]` instead - dramatically faster for thousands of motif / feature tracks where each is cheap individually. `"auto"` picks `"tracks"` for at least 8 expressions over at least 1000 intervals with an iterator of intervals (a DataFrame or an intervals set), as R misha does. For motif-scan workloads (hundreds of PSSMs over the genome) set `"tracks"` explicitly.
 
@@ -119,6 +119,7 @@ Pick the verb by *what's returned*, not by alphabetical proximity.
 |---|---|---|
 | `gextract` | DataFrame | Values to look at, plot, or join. |
 | `gextract_matrix` | `(N, L)` / `(N, L, E)` float64 array | Per-bin values over equal-width windows, one row per window in input order. |
+| `gextract_windows` | `ExtractedWindows(x, y, intervals, dropped)` | Model inputs: one-hot DNA `(N, 4, L)` uint8 + signals `(N, T, L')` float32 around loci, with jitter, strand, exclusion and count filters. |
 | `gscreen`  | intervals frame | Filter to a region set (peaks above threshold). |
 | `gquantiles` | quantile cutoffs | Pick a threshold, normalize. Argument is `percentiles=` (0..1), **not** `probs=`. |
 | `gdist`    | N-d count array (or DataFrame with `dataframe=True`) | Binned joint distribution (signal × distance, etc.). |
@@ -466,6 +467,21 @@ arr = pm.gextract_matrix(["atac.es", "k27"], win32, iterator=32)                
 ```
 
 Row `i` is input row `i` (unsorted, duplicated and overlapping rows are fine); columns are in genomic order whatever the strand; the third axis follows the order of `expr` (`colnames` is only checked, a numpy array has no axis names). All windows must have the same width and `iterator` must divide it. Unlike gextract's integer iterator, the bins start at each window's start (as `giterator_intervals(..., interval_relative=True)`), so any start works. Values are what gextract gives for each bin as an iterator interval, NaN included; a dense-track bin that overlaps several track bins gets their plain mean, not weighted by overlap. A window past a chromosome end is an error, as in gextract. Same as R misha's `gextract.matrix`.
+
+**Training arrays in one call (`gextract_windows`, `gseq_onehot`).** For sequence-model inputs use `gextract_windows` rather than `gseq_extract` + your own one-hot + `gextract_matrix`: the one-hot is encoded in C++ straight from the `.seq` files (about 15x faster than the strings route).
+
+```python
+w = pm.gextract_windows({"pos": peaks, "neg": background}, tracks={"atac": "atac.es"},
+                        width=2114, signal_width=1000, jitter=128, binsize=1,
+                        exclude=blacklist, min_counts=10)
+w.x            # (N, 4, 2114 + 256) uint8, channels A C G T, N = all zero
+w.y            # (N, 1, 1000 + 256) float32
+w.intervals    # kept windows (chrom/start/end of the sequence window, index, set, ...)
+w.dropped      # index + reason: off_chrom / excluded / min_counts / max_counts
+x = pm.gseq_onehot(win)   # just the one-hot of equal-width intervals (or of a list of strings)
+```
+
+Windows are centred at `start + (end - start) // 2`; strand -1 rows are reverse complemented (signals reversed) unless `use_strand=False`. `x` takes N x 4 x L bytes. Same arrays as R misha's `gextract.windows`.
 
 **One row per stored position (`iterator=<track>`).** For sparse-aligned data - per-CpG methylation, per-fragment coverage:
 

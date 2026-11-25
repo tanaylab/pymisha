@@ -4309,7 +4309,10 @@ def gtrack_import_mappedseq(
     Dense (pileup or paired-end fragment coverage) track. The file can be in
     SAM format, in a tab-delimited format where each line describes a single
     read, in gzipped variants of either (``.sam.gz``, ``.tsv.gz``), or in BAM
-    format (detected from its content; requires ``samtools`` on ``PATH``).
+    format (detected from its content and read by pymisha itself; ``samtools``
+    is not needed). A BAM import gives the track that importing the output of
+    ``samtools view`` gives; a truncated or corrupt BAM, including one that
+    does not end with the BGZF end-of-file block, is an error.
     Without *paired*, any bgzipped file is read as SAM. *file* may also be a
     named pipe (FIFO) carrying SAM or text, plain or gzipped, but not BAM. A
     pipe is not inspected, so the BAM and bgzip rules above do not apply to
@@ -4475,8 +4478,8 @@ def gtrack_import_mappedseq(
             "Pass cols_order=None for a SAM file."
         )
 
-    # BAM: samtools view emits SAM, so the default cols_order is switched to None and any
-    # other one is an error.
+    # BAM: its records are read as SAM records, so the default cols_order is switched to None
+    # and any other one is an error.
     if sam_input:
         if cols_given:
             raise ValueError(

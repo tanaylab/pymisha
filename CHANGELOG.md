@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.24.0 (2026-11-25)
+
+### Features
+
+* New `gextract_windows` returns fixed-width windows around loci as arrays for sequence models: one-hot DNA `(N, 4, L)` uint8 and track values `(N, T, L')` float32, with jitter margins, strand-aware reverse complement, exclusion intervals and count filters. `gseq_onehot` one-hot encodes intervals (read in C++ straight from the sequence files) or strings.
+* New `gseq_pwm_hits` and `gintervals_pwm_hits` return the position, strand and score of every motif window that passes a threshold, as R misha's `gseq.pwm_hits` and `gintervals.pwm_hits`.
+* New `gseq_write_meme`, `gseq_write_jaspar` and `gseq_write_homer` write motifs in the formats the `gseq_read_*` functions read, so motifs round-trip with their metadata (JASPAR counts are rounded to whole numbers unless `round_counts=False`); the files are byte-identical to R misha's `gseq.write_*`.
+* New `gseq_shuffle` shuffles sequences keeping their exact k-mer (default dinucleotide) counts, drawn uniformly; the same seed gives the same sequences as R misha's `gseq.shuffle`.
+* New `gtrack_import_figwig` and `gtrack_export_figwig` read and write figwig (`.fw`) multi-track files. Requires `pip install "pymisha[figwig]"`.
+* `gtrack_export_bigwig` writes bigWig files directly; UCSC `bedGraphToBigWig` is no longer needed.
+
+### Performance
+
+* `gtrack_import_mappedseq` reads BAM files directly and no longer needs `samtools`. Results are unchanged and the import is over 10x faster.
+* `pwm.count`, `pwm.max` and `pwm.max.pos` virtual tracks and `gseq_pwm`'s C++ path (`"count"`, `"max"`) skip windows that cannot reach the threshold or the best score so far: several times faster, with identical results.
+
+### Fixes
+
+* `gtrack_import_mappedseq` rejects a truncated BAM (no end-of-file block) instead of importing part of it.
+* `gsegment` and `gwilcox` without scipy installed find the same segments and windows as R misha: the p-value threshold is now R's `qnorm` exactly, not an approximation off by about 1e-4.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking
