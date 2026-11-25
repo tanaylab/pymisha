@@ -192,3 +192,211 @@ PyObject *pm_pwm_score_strings(PyObject *self, PyObject *args)
         return nullptr;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Hit positions (gseq_pwm_hits, gintervals_pwm_hits)
+// ---------------------------------------------------------------------------
+
+#include "PwmFastScan.h"
+#include "PMDb.h"
+#include "GenomeSeqFetch.h"
+#include <cstdlib>
+
+void convert_py_intervals(PyObject *py_intervals, std::vector<GInterval> &intervals);
+
+namespace {
+
+// A window-skipping scanner over the float weights the PSSM adds, or none
+// under MISHA_DISABLE_PWM_SKIP=1 (for differential testing).
+void pwm_logp_table(const DnaPSSM &pssm, std::vector<float> &logp)
+{
+    const int w = pssm.size();
+    logp.assign((size_t)w * 4, 0.f);
+    for (int c = 0; c < w; ++c)
+        for (int b = 0; b < 4; ++b)
+            logp[(size_t)c * 4 + b] = pssm[c].get_log_prob_from_code(b);
+}
+
+bool pwm_skip_disabled()
+{
+    const char *env = std::getenv("MISHA_DISABLE_PWM_SKIP");
+    return env && std::string(env) == "1";
+}
+
+PyObject *hits_dict(const std::vector<std::pair<const char *, std::vector<int64_t>>> &icols,
+                    const std::vector<int> &strands, const std::vector<double> &scores)
+{
+    PMPY dict(PyDict_New(), true);
+    const npy_intp n = (npy_intp)strands.size();
+    for (const auto &col : icols) {
+        PMPY arr(PyArray_SimpleNew(1, (npy_intp *)&n, NPY_INT64), true);
+        if (!arr) verror("Failed to allocate result array");
+        if (n) std::memcpy(PyArray_DATA((PyArrayObject *)*arr), col.second.data(), n * sizeof(int64_t));
+        PyDict_SetItemString(dict, col.first, arr);
+    }
+    PMPY rstrand(PyArray_SimpleNew(1, (npy_intp *)&n, NPY_INT32), true);
+    PMPY rscore(PyArray_SimpleNew(1, (npy_intp *)&n, NPY_DOUBLE), true);
+    if (!rstrand || !rscore) verror("Failed to allocate result array");
+    if (n) {
+        std::memcpy(PyArray_DATA((PyArrayObject *)*rstrand), strands.data(), n * sizeof(int));
+        std::memcpy(PyArray_DATA((PyArrayObject *)*rscore), scores.data(), n * sizeof(double));
+    }
+    PyDict_SetItemString(dict, "strand", rstrand);
+    PyDict_SetItemString(dict, "score", rscore);
+    dict.to_be_stolen();
+    return (PyObject *)dict;
+}
+
+} // anonymous namespace
+
+/*
+ * pm_pwm_seq_hits(seqs, pssm, prior, bidirect, strand, score_thresh, lo, hi)
+ *
+ * seqs:   list of str
+ * lo, hi: lists of int, per sequence: the 0-based first and last window start
+ *         (hi < lo for none)
+ *
+ * The windows R misha's gseq.pwm(mode = "count") counts (pwm_fast_scan::seq_hits()).
+ * Returns a dict of numpy arrays: seq_idx (0-based), start (0-based), strand, score.
+ */
+PyObject *pm_pwm_seq_hits(PyObject *self, PyObject *args)
+{
+    PyObject *py_seqs = nullptr, *py_pssm = nullptr, *py_lo = nullptr, *py_hi = nullptr;
+    double prior = 0.01, score_thresh = 0.0;
+    int bidirect = 1, strand = 1;
+
+    if (!PyArg_ParseTuple(args, "OOdiidOO", &py_seqs, &py_pssm, &prior, &bidirect, &strand,
+                          &score_thresh, &py_lo, &py_hi))
+        return nullptr;
+
+    try {
+        if (!PyList_Check(py_seqs) || !PyList_Check(py_lo) || !PyList_Check(py_hi) ||
+            PyList_Size(py_lo) != PyList_Size(py_seqs) || PyList_Size(py_hi) != PyList_Size(py_seqs)) {
+            PyErr_SetString(PyExc_TypeError, "seqs, lo and hi must be lists of the same length");
+            return nullptr;
+        }
+        DnaPSSM pssm;
+        if (!parse_pssm_strings(py_pssm, pssm, prior)) {
+            PyErr_SetString(PyExc_ValueError, "pssm must be a numeric array with shape Lx4 or 4xL");
+            return nullptr;
+        }
+        const int w = pssm.size();
+        std::vector<float> logp;
+        pwm_logp_table(pssm, logp);
+        pwm_fast_scan::BoundScanner bound;
+        if (!pwm_skip_disabled())
+            bound.init(logp.data(), w);
+
+        std::vector<int64_t> idx, starts;
+        std::vector<int> strands;
+        std::vector<double> scores;
+        std::vector<pwm_fast_scan::SeqHit> hits;
+        const Py_ssize_t n_seqs = PyList_Size(py_seqs);
+        for (Py_ssize_t i = 0; i < n_seqs; ++i) {
+            PyObject *py_seq = PyList_GetItem(py_seqs, i);
+            if (!py_seq || !PyUnicode_Check(py_seq))
+                continue;
+            Py_ssize_t len = 0;
+            const char *seq = py_seq_bytes(py_seq, &len);
+            if (!seq)
+                return nullptr;
+            const long long lo = PyLong_AsLongLong(PyList_GetItem(py_lo, i));
+            const long long hi = PyLong_AsLongLong(PyList_GetItem(py_hi, i));
+            if (PyErr_Occurred())
+                return nullptr;
+            hits.clear();
+            pwm_fast_scan::seq_hits(&bound, logp.data(), w, seq, (size_t)len, lo, hi,
+                                    bidirect != 0, strand, score_thresh, hits);
+            for (const pwm_fast_scan::SeqHit &h : hits) {
+                idx.push_back(i);
+                starts.push_back(h.start);
+                strands.push_back(h.strand);
+                scores.push_back(h.score);
+            }
+        }
+        return hits_dict({{"seq_idx", idx}, {"start", starts}}, strands, scores);
+    } catch (const TGLException &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.msg());
+        return nullptr;
+    } catch (const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
+}
+
+/*
+ * pm_gintervals_pwm_hits(intervals, pssm, prior, bidirect, strand, score_thresh, extend)
+ *
+ * intervals: as _df2pymisha gives them
+ *
+ * The windows a pwm.count virtual track with the same parameters counts over
+ * each interval (PWMScorer::collect_hits()). Returns a dict of numpy arrays:
+ * interval_idx (0-based row), start, end (genomic), strand, score.
+ */
+PyObject *pm_gintervals_pwm_hits(PyObject *self, PyObject *args)
+{
+    PyObject *py_intervals = nullptr, *py_pssm = nullptr;
+    double prior = 0.01, score_thresh = 0.0;
+    int bidirect = 1, strand = 1, extend = 1;
+
+    if (!PyArg_ParseTuple(args, "OOdiidi", &py_intervals, &py_pssm, &prior, &bidirect, &strand,
+                          &score_thresh, &extend))
+        return nullptr;
+
+    try {
+        PyMisha pymisha(true);
+
+        DnaPSSM pssm;
+        if (!parse_pssm_strings(py_pssm, pssm, prior))
+            verror("pssm must be a numeric array with shape Lx4 or 4xL");
+        // as the pwm virtual tracks build their scorer (PMTrackExpressionVars)
+        pssm.set_bidirect(bidirect != 0);
+        const char scorer_strand = bidirect ? 0 : (char)strand;
+
+        std::vector<GInterval> intervals;
+        convert_py_intervals(py_intervals, intervals);
+
+        GenomeSeqFetch seqfetch;
+        seqfetch.set_seqdir(g_pmdb->groot() + "/seq");
+        const GenomeChromKey &chromkey = g_pmdb->chromkey();
+
+        PWMScorer scorer(pssm, &seqfetch, extend != 0, PWMScorer::MOTIF_COUNT, scorer_strand,
+                         std::vector<float>(), 1, (float)score_thresh);
+
+        // in genomic order, so the sequence is read sequentially
+        std::vector<size_t> order(intervals.size());
+        for (size_t i = 0; i < order.size(); ++i)
+            order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            const GInterval &x = intervals[a], &y = intervals[b];
+            return x.chromid != y.chromid ? x.chromid < y.chromid : x.start < y.start;
+        });
+
+        std::vector<int64_t> ids, starts, ends;
+        std::vector<int> strands;
+        std::vector<double> scores;
+        std::vector<PWMScorer::Hit> hits;
+        for (size_t k : order) {
+            check_interrupt();
+            GInterval interval = intervals[k];
+            interval.strand = 0;   // a strand column is ignored, as by the virtual tracks
+            hits.clear();
+            scorer.collect_hits(interval, chromkey, hits);
+            for (const PWMScorer::Hit &h : hits) {
+                ids.push_back((int64_t)k);
+                starts.push_back(h.start);
+                ends.push_back(h.end);
+                strands.push_back(h.strand);
+                scores.push_back(h.score);
+            }
+        }
+        return hits_dict({{"interval_idx", ids}, {"start", starts}, {"end", ends}}, strands, scores);
+    } catch (TGLException &e) {
+        PyMisha::handle_error(e.msg());
+        return nullptr;
+    } catch (const std::bad_alloc &e) {
+        PyMisha::handle_error("Out of memory");
+        return nullptr;
+    }
+}

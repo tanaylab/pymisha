@@ -1745,6 +1745,267 @@ def gseq_pwm(
     return _numpy.array(results, dtype=float)
 
 
+def _pssm_wx4(pssm: _numpy.ndarray | _pandas.DataFrame) -> _numpy.ndarray:
+    """The PSSM as a contiguous (w, 4) float array, columns A, C, G, T, for the
+    C++ parser (which applies the prior itself)."""
+    pssm = _coerce_pssm_matrix(pssm)
+    if isinstance(pssm, _pandas.DataFrame):
+        for col in ("A", "C", "G", "T"):
+            if col not in pssm.columns:
+                raise KeyError(f"PSSM DataFrame missing column '{col}'")
+        return _numpy.ascontiguousarray(pssm[["A", "C", "G", "T"]].values, dtype=float)
+    if isinstance(pssm, _numpy.ndarray):
+        if pssm.ndim != 2 or pssm.shape[1] != 4:
+            raise ValueError("PSSM array must have shape (w, 4)")
+        return _numpy.ascontiguousarray(pssm, dtype=float)
+    raise ValueError("PSSM must be a numpy array or pandas DataFrame")
+
+
+def _pwm_hits_common_args(score_thresh, bidirect, strand, prior, what):
+    if score_thresh is None:
+        raise ValueError(
+            f"{what}() requires a 'score_thresh' argument. PWM scores are "
+            "log-likelihoods, so there is no default that suits every PSSM - pick a "
+            "threshold from the score distribution of your own matrix, e.g. with "
+            "gseq_pwm(mode='max')."
+        )
+    score_thresh = _coerce_score_thresh(score_thresh)
+    if _na_or_seq(bidirect) or not isinstance(bidirect, (bool, _numpy.bool_, int, _numpy.integer)):
+        raise ValueError("bidirect must be True or False")
+    bidirect = bool(bidirect)
+    if bidirect:
+        strand = 1
+    else:
+        if (_na_or_seq(strand) or isinstance(strand, (str, bool, _numpy.bool_))
+                or strand not in (-1, 1)):
+            raise ValueError(
+                f"{what}(bidirect=False) needs an explicit strand: 1 for the "
+                "forward strand, -1 for the reverse."
+            )
+        strand = int(strand)
+    if (isinstance(prior, (bool, _numpy.bool_)) or not isinstance(prior, (int, float, _numpy.number))
+            or not 0 <= prior <= 1):
+        raise ValueError("prior must be a number between 0 and 1")
+    return score_thresh, bidirect, strand, float(prior)
+
+
+def gseq_pwm_hits(
+    seqs: str | list[str],
+    pssm: _numpy.ndarray | _pandas.DataFrame,
+    score_thresh: float | None = None,
+    bidirect: bool = True,
+    strand: int = 1,
+    start_pos: int | list[int] | None = None,
+    end_pos: int | list[int] | None = None,
+    extend: bool | int = False,
+    prior: float = 0.01,
+) -> _pandas.DataFrame:
+    """
+    Find PWM motif hits in DNA sequences.
+
+    Returns every window of each sequence whose PWM score reaches
+    *score_thresh*, with its position, strand and score. Windows are scored as
+    R misha's ``gseq.pwm(mode = "count")`` scores them with its default
+    ``neutral_chars`` and no spatial weights - a natural-log likelihood
+    including the prior, summed in double precision over the PSSM's single
+    precision log-probabilities - and the same C++ code finds them in both
+    packages, so ``gseq_pwm_hits`` here and ``gseq.pwm_hits`` in R return the
+    same rows. A window holding ``N`` or any other non-ACGT character is not
+    scored; gap characters are not skipped. Windows that cannot reach the
+    threshold are skipped without being scored, which makes a strict threshold
+    fast; the hits are the same as scoring every window.
+
+    Strand: with ``bidirect=True`` a window is one hit, whose ``score`` is the
+    log-sum-exp of its forward and reverse-complement scores (the value
+    thresholded, as in :func:`gseq_pwm` and ``pwm.count``), and whose
+    ``strand`` is the strand that scores higher on its own (``1`` on a tie).
+    With ``bidirect=False`` only the strand named by *strand* is read and
+    ``strand`` is that strand. ``start`` and ``end`` are positions on the input
+    sequence whatever the strand.
+
+    Parameters
+    ----------
+    seqs : str or list of str
+        DNA sequence(s) to scan (case-insensitive).
+    pssm : numpy.ndarray or pandas.DataFrame
+        Position-specific scoring matrix, shape ``(w, 4)`` with columns
+        [A, C, G, T], or a DataFrame with columns ``A``, ``C``, ``G``, ``T``.
+    score_thresh : float
+        Required. Windows scoring at or above it are hits.
+    bidirect : bool, default True
+        Scan both strands.
+    strand : int, default 1
+        With ``bidirect=False``: ``1`` for the forward strand, ``-1`` for the
+        reverse complement.
+    start_pos, end_pos : int, list of int or None
+        1-based inclusive region of interest per sequence (recycled), as in
+        :func:`gseq_pwm`; windows start inside it.
+    extend : bool or int, default False
+        How many bases a window may run past ``end_pos``, as in
+        :func:`gseq_pwm`.
+    prior : float, default 0.01
+        Pseudocount added to the PSSM frequencies.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per hit with columns ``seq_idx`` (1-based index into *seqs*),
+        ``start`` and ``end`` (1-based, inclusive window positions),
+        ``strand`` (1 or -1) and ``score``, ordered by ``seq_idx`` and
+        ``start``. Empty when nothing passes.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import pymisha as pm
+    >>> pssm = np.array([[0.7, 0.1, 0.1, 0.1], [0.1, 0.7, 0.1, 0.1],
+    ...                  [0.1, 0.1, 0.7, 0.1], [0.1, 0.1, 0.1, 0.7]])
+    >>> pm.gseq_pwm_hits(["TTACGTAAACGTTT", "GGGGGGGG"], pssm, score_thresh=-3)  # doctest: +SKIP
+
+    See Also
+    --------
+    gseq_pwm, gintervals_pwm_hits
+    """
+    score_thresh, bidirect, strand, prior = _pwm_hits_common_args(
+        score_thresh, bidirect, strand, prior, "gseq_pwm_hits")
+    extend = _seq_extend_arg(extend)
+    cpp_pssm = _pssm_wx4(pssm)
+    w = cpp_pssm.shape[0]
+
+    if isinstance(seqs, str):
+        seqs = [seqs]
+    seqs = [_seq_bytes(x) if isinstance(x, str) else ("" if x is None or _is_na(x) else x) for x in seqs]
+    n = len(seqs)
+    starts = None if start_pos is None else _numpy.resize(_numpy.asarray(start_pos, dtype=_numpy.int64), n)
+    ends = None if end_pos is None else _numpy.resize(_numpy.asarray(end_pos, dtype=_numpy.int64), n)
+    E = (w - 1 if extend else 0) if isinstance(extend, bool) else int(extend)
+
+    # 0-based first and last window start, as R's compute_bounds() without gaps
+    lo: list[int] = []
+    hi: list[int] = []
+    for i, seq in enumerate(seqs):
+        L = len(seq) if isinstance(seq, str) else 0
+        roi_start = max(1, int(starts[i])) if starts is not None else 1
+        roi_end = min(L, int(ends[i])) if ends is not None else L
+        if roi_start > roi_end:
+            lo.append(0)
+            hi.append(-1)
+            continue
+        end_lim = min(L - 1, roi_end - 1 + E)
+        lo.append(roi_start - 1)
+        hi.append(end_lim - w + 1)
+
+    res = _pymisha.pm_pwm_seq_hits(
+        [s if isinstance(s, str) else "" for s in seqs], cpp_pssm, prior,
+        int(bidirect), int(strand), float(score_thresh), lo, hi,
+    )
+    start = res["start"] + 1
+    return _pandas.DataFrame({
+        "seq_idx": res["seq_idx"] + 1,
+        "start": start,
+        "end": start + w - 1,
+        "strand": res["strand"].astype(_numpy.int64),
+        "score": res["score"],
+    })
+
+
+def gintervals_pwm_hits(
+    intervals,
+    pssm: _numpy.ndarray | _pandas.DataFrame,
+    score_thresh: float | None = None,
+    bidirect: bool = True,
+    strand: int = 1,
+    prior: float = 0.01,
+    extend: bool = True,
+) -> _pandas.DataFrame | None:
+    """
+    Find PWM motif hits in genomic intervals.
+
+    Returns, for each interval, the motif windows that reach *score_thresh*:
+    exactly the windows a ``pwm.count`` virtual track with the same parameters
+    counts over that interval, as intervals with their strand and score. It
+    replaces running :func:`gscreen` over a 1 bp iterator.
+
+    A window is anchored at its first (leftmost) base, which must lie in the
+    interval; with ``extend=True`` it may run up to ``w - 1`` bases past the
+    interval's end, as the PWM virtual tracks do. Scores are natural-log
+    likelihoods including the prior, computed as the ``pwm`` virtual tracks
+    compute them (single precision), and a window holding ``N`` or any other
+    non-ACGT base is not scored. Windows that cannot reach the threshold are
+    skipped without being scored; the hits are the same as scoring every
+    window.
+
+    Strand: with ``bidirect=True`` a window is one hit, whose ``score`` is the
+    log-sum-exp of its forward and reverse-complement scores (the value
+    ``pwm.count`` thresholds), and whose ``strand`` is the strand that scores
+    higher on its own (``1`` on a tie), as ``pwm.max.pos`` names it. With
+    ``bidirect=False`` only the strand named by *strand* is read and
+    ``strand`` is that strand. A ``strand`` column of *intervals* is ignored,
+    as by the virtual tracks. ``start`` and ``end`` are genomic coordinates of
+    the window whatever the strand.
+
+    Parameters
+    ----------
+    intervals : pandas.DataFrame or str
+        Genomic intervals (``chrom``, ``start``, ``end``) or the name of an
+        interval set.
+    pssm : numpy.ndarray or pandas.DataFrame
+        Position-specific scoring matrix, shape ``(w, 4)`` with columns
+        [A, C, G, T].
+    score_thresh : float
+        Required. Windows scoring at or above it are hits.
+    bidirect : bool, default True
+        Scan both strands.
+    strand : int, default 1
+        With ``bidirect=False``: ``1`` or ``-1``, the strand scanned.
+    prior : float, default 0.01
+        Pseudocount added to the PSSM frequencies.
+    extend : bool, default True
+        Let a window anchored near an interval's end read bases past it.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        Columns ``chrom``, ``start``, ``end`` (the window), ``strand``,
+        ``score`` and ``intervalID`` (the 1-based row of *intervals* the
+        window is anchored in, as R and :func:`gextract` number it), sorted
+        by ``intervalID`` and ``start``; None when nothing passes.
+
+    See Also
+    --------
+    gseq_pwm_hits, gvtrack_create
+    """
+    if intervals is None:
+        raise ValueError("Usage: gintervals_pwm_hits(intervals, pssm, score_thresh, ...)")
+    score_thresh, bidirect, strand, prior = _pwm_hits_common_args(
+        score_thresh, bidirect, strand, prior, "gintervals_pwm_hits")
+    if not isinstance(extend, (bool, _numpy.bool_)):
+        raise ValueError("extend must be True or False")
+    _checkroot()
+    cpp_pssm = _pssm_wx4(pssm)
+    intervals = _maybe_load_intervals_set(intervals)
+    if intervals is None or len(intervals) == 0:
+        return None
+    intervals = intervals.reset_index(drop=True)
+
+    res = _pymisha.pm_gintervals_pwm_hits(
+        _df2pymisha(intervals), cpp_pssm, prior, int(bidirect), int(strand),
+        float(score_thresh), int(bool(extend)),
+    )
+    if len(res["start"]) == 0:
+        return None
+    idx = res["interval_idx"]
+    out = _pandas.DataFrame({
+        "chrom": intervals["chrom"].to_numpy()[idx],
+        "start": res["start"],
+        "end": res["end"],
+        "strand": res["strand"].astype(_numpy.int64),
+        "score": res["score"],
+        "intervalID": idx + 1,
+    })
+    return out.sort_values(["intervalID", "start"], kind="stable").reset_index(drop=True)
+
+
 def gseq_potts(
     seqs: str | list[str],
     model: dict,

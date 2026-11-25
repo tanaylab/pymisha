@@ -147,6 +147,8 @@ PyObject *pm_track2d_convert_to_indexed(PyObject *self, PyObject *args);
 PyObject *pm_track2d_index_info(PyObject *self, PyObject *args);
 PyObject *pm_gseq_pwm_edits(PyObject *self, PyObject *args);
 PyObject *pm_pwm_score_strings(PyObject *self, PyObject *args);
+PyObject *pm_pwm_seq_hits(PyObject *self, PyObject *args);
+PyObject *pm_gintervals_pwm_hits(PyObject *self, PyObject *args);
 PyObject *pm_gseq_potts(PyObject *self, PyObject *args);
 PyObject *pm_gvariants_reach(PyObject *self, PyObject *args);
 PyObject *pm_potts_score_codes_cmp(PyObject *self, PyObject *args);
@@ -269,6 +271,8 @@ static PyMethodDef module_methods[] = {
     {"pm_track2d_index_info", gcall<pm_track2d_index_info>, METH_VARARGS, "Get 2D track index info"},
     {"pm_gseq_pwm_edits", gcall<pm_gseq_pwm_edits>, METH_VARARGS, "Get detailed PWM edit distance information"},
     {"pm_pwm_score_strings", gcall<pm_pwm_score_strings>, METH_VARARGS, "Score sequences with PWM scorer"},
+    {"pm_pwm_seq_hits", gcall<pm_pwm_seq_hits>, METH_VARARGS, "PWM hit positions in sequences"},
+    {"pm_gintervals_pwm_hits", gcall<pm_gintervals_pwm_hits>, METH_VARARGS, "PWM hit positions in genomic intervals"},
     {"pm_gseq_potts", gcall<pm_gseq_potts>, METH_VARARGS, "Score sequences under a Potts (pairwise energy) model"},
     {"pm_potts_score_codes_cmp", gcall<pm_potts_score_codes_cmp>, METH_VARARGS, "Test only: score code windows with both Potts kernels"},
     {"pm_gvariants_reach", gcall<pm_gvariants_reach>, METH_VARARGS, "Sequence reach of each sequence vtrack in an expression"},

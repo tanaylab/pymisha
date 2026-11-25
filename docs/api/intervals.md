@@ -32,6 +32,11 @@ Functions for creating, manipulating, and querying genomic intervals, including 
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gintervals_pwm_hits
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gintervals_intersect
     options:
       show_root_heading: true

@@ -148,6 +148,7 @@ from .liftover import (
 from .lookup import glookup, gtrack_lookup
 from .motif_import import gseq_read_homer, gseq_read_jaspar, gseq_read_meme
 from .sequence import (
+    gintervals_pwm_hits,
     grevcomp,
     gseq_comp,
     gseq_extract,
@@ -156,6 +157,7 @@ from .sequence import (
     gseq_potts,
     gseq_pwm,
     gseq_pwm_edits,
+    gseq_pwm_hits,
     gseq_rev,
     gseq_revcomp,
 )
@@ -442,6 +444,8 @@ __all__ = [
     'gseq_potts',
     'gseq_pwm',
     'gseq_pwm_edits',
+    'gseq_pwm_hits',
+    'gintervals_pwm_hits',
     'gseq_read_meme',
     'gseq_read_jaspar',
     'gseq_read_homer',

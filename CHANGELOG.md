@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* `pwm.count`, `pwm.max` and `pwm.max.pos` virtual tracks and `gseq_pwm`'s C++ path (`"count"`, `"max"`) skip windows that cannot reach the threshold or the best score so far: several times faster, with identical results.
+* New `gseq_pwm_hits` and `gintervals_pwm_hits` return the position, strand and score of every motif window that passes a threshold, as R misha's `gseq.pwm_hits` and `gintervals.pwm_hits`.
+
 ## v0.23.0 (2026-11-22)
 
 ### Breaking
