@@ -72,12 +72,27 @@ Functions for creating, manipulating, and querying genomic intervals, including 
       show_root_heading: true
       heading_level: 3
 
+::: pymisha.gintervals_remove_overlaps
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: pymisha.gintervals_annotate
     options:
       show_root_heading: true
       heading_level: 3
 
 ::: pymisha.gintervals_normalize
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gintervals_expand
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: pymisha.gintervals_promoters
     options:
       show_root_heading: true
       heading_level: 3

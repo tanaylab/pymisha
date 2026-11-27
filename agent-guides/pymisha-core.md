@@ -251,12 +251,7 @@ peaks = pm.gintervals_canonic(peaks)
 
 **Clip to genome bounds.** `pm.gintervals_force_range(intervs)` clamps `start >= 0` and `end <= chrom_len`. Use after any expansion that may push past chromosome ends. It shortens windows silently, so for fixed-width windows (model inputs, `gextract_matrix`) drop the rows whose width changed: `win = pm.gintervals_force_range(win); win = win[win["end"] - win["start"] == width]`.
 
-**Symmetric expansion.** No one-call helper - the manual form is short:
-
-```python
-expanded = peaks.assign(start=peaks["start"] - 100, end=peaks["end"] + 100)
-expanded = pm.gintervals_force_range(expanded)
-```
+**Symmetric expansion.** `pm.gintervals_expand(peaks, 100)` adds N bp to each side and clamps with `gintervals_force_range` in one call (pymisha >= 0.25.0).
 
 **Persist.**
 
@@ -315,21 +310,13 @@ Sign of `dist` (the same for `gintervals_annotate`'s distance column). It is nev
 - **Target without a `strand` column:** `dist` is unsigned (never negative), so a negative `mindist` or `dist < 0` matches nothing.
 - **`use_intervals1_strand=True`** (and `gintervals_neighbors_upstream/downstream/directional`): it follows the query's strand: positive when the target lies downstream of the query, negative upstream, on either strand. A query without a `strand` column counts as +, which gives the sign in genome coordinates (positive = target to the right).
 
-**Promoters from TSS.** Manual one-step recipe:
+**Promoters from TSS in one call** (pymisha >= 0.25.0):
 
 ```python
-import numpy as np
-
-tss = pm.gintervals_load("intervs.global.tss")
-# upstream=500, downstream=50, strand-aware:
-upstream, downstream = 500, 50
-fwd = tss["strand"].fillna(1) >= 0
-prom = tss.assign(
-    start=lambda d: np.where(fwd, d["start"] - upstream, d["end"] - downstream),
-    end  =lambda d: np.where(fwd, d["start"] + downstream, d["end"] + upstream),
-)
-prom = pm.gintervals_force_range(prom)
+prom = pm.gintervals_promoters("intervs.global.tss", upstream=500, downstream=50)
 ```
+
+One window per TSS, `upstream` bp before the TSS and `downstream` bp from it on, oriented by the `strand` column (a set built by `gdb_install_intervals` names it `"tss"`). Strand 0, a TSS shared by genes on both strands, gets a window covering both directions. A set without a `strand` column is an error, not silently treated as `+`.
 
 Reuse this as the source for `intervs.global.tss` derived analyses (overlap with peaks, distance-banded screens, etc.).
 

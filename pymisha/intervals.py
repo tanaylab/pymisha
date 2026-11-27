@@ -6265,6 +6265,73 @@ def gintervals_mark_overlaps(
     return result
 
 
+def gintervals_remove_overlaps(
+    intervals: pd.DataFrame | str,
+    select: str = "first",
+    unify_touching_intervals: bool = True,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """
+    Keep one interval of each group of overlapping intervals.
+
+    Groups overlapping intervals as :func:`gintervals_mark_overlaps` does and
+    keeps one interval of each group, as R misha's
+    ``gintervals.remove_overlaps``.
+
+    Parameters
+    ----------
+    intervals : DataFrame or str
+        1D intervals, or the name of an intervals set.
+    select : {"first", "last", "random"}, default "first"
+        Which interval of each group to keep: the first or last in row
+        order, or a random one.
+    unify_touching_intervals : bool, default True
+        Whether touching intervals (``end == start``) count as overlapping.
+    seed : int, optional
+        Random seed for ``select="random"``.
+
+    Returns
+    -------
+    DataFrame
+        The kept rows, in their original order and with their original index.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> import pandas as pd
+    >>> intervs = pd.DataFrame({
+    ...     "chrom": ["1", "1", "1", "1"],
+    ...     "start": [11000, 100, 10000, 10500],
+    ...     "end":   [12000, 200, 13000, 10600],
+    ...     "data":  [10, 20, 30, 40],
+    ... })
+    >>> pm.gintervals_remove_overlaps(intervs)["data"].tolist()
+    [10, 20]
+
+    See Also
+    --------
+    gintervals_mark_overlaps : Mark groups of overlapping intervals.
+    gintervals_canonic : Merge overlapping intervals.
+    """
+    if select not in ("first", "last", "random"):
+        raise ValueError("select must be 'first', 'last' or 'random'")
+    intervals = _resolve_intervals(intervals)
+    if intervals is None or len(intervals) == 0:
+        raise ValueError("intervals cannot be None or empty")
+    assert isinstance(intervals, pd.DataFrame)
+
+    group = pd.Series(
+        gintervals_mark_overlaps(intervals, "group", unify_touching_intervals)["group"].to_numpy()
+    )
+    if select == "random":
+        # shuffle, keep the first row of each group, back to row order
+        kept = group.sample(frac=1, random_state=seed).drop_duplicates().sort_index().index
+    else:
+        kept = group[~group.duplicated(keep=select)].index
+    return intervals.iloc[kept.to_numpy()]
+
+
 def gintervals_annotate(
     intervals: pd.DataFrame | str,
     annotation_intervals: pd.DataFrame | str,
@@ -6499,6 +6566,136 @@ def gintervals_annotate(
     if keep_order:
         output = output.sort_values("_orig_order", kind="stable").reset_index(drop=True)
     return output.drop(columns=["_orig_order"])
+
+
+def gintervals_expand(
+    intervals: pd.DataFrame | str,
+    expansion: float | list[float] | Any,
+) -> pd.DataFrame | None:
+    """
+    Expand intervals on both sides.
+
+    Adds *expansion* bp to each side of every 1D interval, then clips the
+    result to the chromosome boundaries (:func:`gintervals_force_range`), as
+    R misha's ``gintervals.expand``.
+
+    Parameters
+    ----------
+    intervals : DataFrame or str
+        1D intervals, or the name of an intervals set.
+    expansion : number or array-like
+        bp added to each side: one value, or one per interval.
+
+    Returns
+    -------
+    DataFrame or None
+        The expanded intervals with their other columns, or ``None`` if none
+        is left inside the genome.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> _ = pm.gdb_init_examples()
+    >>> pm.gintervals_expand(pm.gintervals("1", [1000, 5000], [2000, 6000]), 100)  # doctest: +SKIP
+
+    See Also
+    --------
+    gintervals_normalize : Resize intervals around their centers.
+    gintervals_promoters : Strand-aware windows around the 5' end.
+    gintervals_force_range : Clip intervals to the chromosomes.
+    """
+    intervals = _resolve_intervals(intervals)
+    _checkroot()
+    if intervals is None:
+        raise ValueError("intervals cannot be None")
+    assert isinstance(intervals, pd.DataFrame)
+    out = intervals.copy()
+    expansion = _numpy.asarray(expansion)
+    out["start"] = out["start"] - expansion
+    out["end"] = out["end"] + expansion
+    return gintervals_force_range(out)
+
+
+def gintervals_promoters(
+    intervals: pd.DataFrame | str,
+    upstream: int = 500,
+    downstream: int = 50,
+) -> pd.DataFrame | None:
+    """
+    Promoter windows around the 5' end of stranded intervals.
+
+    Returns, for each interval, *upstream* bp before its 5' end and
+    *downstream* bp from the 5' base on, following the interval's strand, as
+    R misha's ``gintervals.promoters``. The 5' base is ``start`` for strand 1
+    and ``end - 1`` for strand -1, so a window is ``upstream + downstream`` bp
+    wide before clipping at the chromosome ends. On a 1 bp TSS set, such as
+    the ``tss`` set that :func:`gdb_install_intervals` writes, this gives
+    promoters; on transcripts it uses their first base.
+
+    Strand 0 marks features on opposite strands merged into one interval, as
+    :func:`gintervals_import_genes` does for a TSS that two genes share. For
+    such an interval the window covers both the strand 1 and the strand -1
+    window.
+
+    Parameters
+    ----------
+    intervals : DataFrame or str
+        Intervals with a ``strand`` column (1, -1 or 0), or the name of such
+        an intervals set.
+    upstream : int, default 500
+        bp upstream of the 5' end.
+    downstream : int, default 50
+        bp downstream of the 5' end, the 5' base included.
+
+    Returns
+    -------
+    DataFrame or None
+        The windows with the other columns kept, clipped to the chromosome
+        boundaries, or ``None`` if none is left inside the genome.
+
+    Raises
+    ------
+    ValueError
+        If there is no ``strand`` column or a strand is not 1, -1 or 0.
+
+    Examples
+    --------
+    >>> import pymisha as pm
+    >>> import pandas as pd
+    >>> _ = pm.gdb_init_examples()
+    >>> tss = pd.DataFrame({"chrom": "1", "start": [10000, 20000],
+    ...                     "end": [10001, 20001], "strand": [1, -1]})
+    >>> pm.gintervals_promoters(tss)[["start", "end"]].values.tolist()
+    [[9500, 10050], [19951, 20501]]
+
+    See Also
+    --------
+    gintervals_expand : Expand intervals on both sides.
+    gintervals_import_genes : Import TSS, exon and UTR sets.
+    """
+    intervals = _resolve_intervals(intervals)
+    _checkroot()
+    if intervals is None:
+        raise ValueError("intervals cannot be None")
+    assert isinstance(intervals, pd.DataFrame)
+    if "strand" not in intervals.columns:
+        raise ValueError("intervals must have a strand column (1, -1 or 0)")
+    strand = intervals["strand"].to_numpy()
+    if not _numpy.isin(strand, (-1, 0, 1)).all():
+        raise ValueError("strand must be 1, -1 or 0")
+    start = intervals["start"].to_numpy()
+    end = intervals["end"].to_numpy()
+    plus_start, plus_end = start - upstream, start + downstream
+    minus_start, minus_end = end - downstream, end + upstream
+    is_plus, is_minus = strand == 1, strand == -1
+    out = intervals.copy()
+    out["start"] = _numpy.select(
+        [is_plus, is_minus], [plus_start, minus_start], _numpy.minimum(plus_start, minus_start)
+    )
+    out["end"] = _numpy.select(
+        [is_plus, is_minus], [plus_end, minus_end], _numpy.maximum(plus_end, minus_end)
+    )
+    return gintervals_force_range(out)
 
 
 def gintervals_normalize(

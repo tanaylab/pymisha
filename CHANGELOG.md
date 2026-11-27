@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.25.0 (2026-11-27)
+
+### Features
+
+* New `gintervals_promoters`: strand-aware promoter windows around the 5' end of intervals, such as a TSS set. Strand 0 covers both directions.
+* New `gintervals_expand` widens intervals on both sides; new `gintervals_remove_overlaps` keeps one interval per overlap group. Both follow the R misha functions of the same names.
+
+### Documentation
+
+* The documentation site now links the guides for LLM coding agents, which were only in the README.
+
 ## v0.24.2 (2026-11-27)
 
 ### Fixes
