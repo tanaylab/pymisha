@@ -59,6 +59,7 @@ def _install_genes(
     pre-deleting set names if overwrite is desired.
     """
     import pymisha as pm
+    from pymisha.intervals import _unify_intervals
 
     gene_sets = gene_sets if gene_sets is not None else dict(_DEFAULT_GENE_SETS)
 
@@ -85,11 +86,10 @@ def _install_genes(
         lambda a: a.get("gene_name") or a.get("gene_id") or ""
     )
 
-    installed: dict[str, int] = {}
+    # misha strand: 1 / -1; a GTF "." (unknown) becomes 0.
+    df["strand"] = df["strand"].map({"+": 1, "-": -1}).fillna(0).astype(int)
 
-    def _join_distinct(series: pd.Series) -> str:
-        vals = sorted({str(v) for v in series if str(v) != ""})
-        return ";".join(vals)
+    installed: dict[str, int] = {}
 
     def _save(sub: pd.DataFrame, key: str) -> None:
         if key not in gene_sets:
@@ -97,21 +97,24 @@ def _install_genes(
         if sub.empty:
             return
         name = f"{prefix}{gene_sets[key]}"
-        # Keep misha-required columns plus the gene-name annotations. Overlapping
-        # features that unify to one interval (e.g. two transcripts sharing a
-        # TSS) concatenate their distinct accessions / symbols with ";", matching
-        # R's gintervals.import_genes annots merge.
-        out = sub[["chrom", "start", "end", "name", "geneName"]].copy()
-        out = out.groupby(
-            ["chrom", "start", "end"], as_index=False, sort=False
-        ).agg({"name": _join_distinct, "geneName": _join_distinct})
+        # Same unification as R's gintervals.import_genes: overlapping
+        # intervals merge into one, strand becomes 0 where they disagree, and
+        # distinct accessions / symbols are concatenated with ";".
+        cols = ["chrom", "start", "end", "strand", "name", "geneName"]
+        records = [
+            (c, s, e, st, [n, g])
+            for c, s, e, st, n, g in sub[cols].itertuples(index=False, name=None)
+        ]
+        out = _unify_intervals(records, ["name", "geneName"])
+        assert out is not None  # sub is non-empty
         pm.gintervals_save(out, name)
         installed[name] = len(out)
 
-    # TSS: 1bp interval at transcript start (strand-aware)
-    transcripts = df[df["feature"] == "transcript"].copy()
+    # TSS: 1bp interval at transcript start (strand-aware). A transcript with
+    # unknown strand has no defined start, so it gets no TSS.
+    transcripts = df[(df["feature"] == "transcript") & (df["strand"] != 0)].copy()
     if not transcripts.empty:
-        pos_mask = transcripts["strand"] == "+"
+        pos_mask = transcripts["strand"] == 1
         # Plus strand: start..start+1; minus: end-1..end (half-open)
         tss = transcripts.copy()
         tss.loc[pos_mask, "end"] = tss.loc[pos_mask, "start"] + 1

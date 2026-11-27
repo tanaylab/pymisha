@@ -248,8 +248,9 @@ UCSC data URLs:
     instead with **`pm.gdb_install_intervals()`** (into an existing genome), or
     build a genome together with its gene sets in one step via
     **`pm.gdb_build_genome()`**. Both populate the `tss` / `exons` / `utr3` /
-    `utr5` interval sets, each carrying `name` (transcript accession) and
-    `geneName` (gene symbol) columns.
+    `utr5` interval sets, each carrying `strand` (`1` / `-1`, `0` where
+    overlapping features on opposite strands were merged), `name` (transcript
+    accession) and `geneName` (gene symbol) columns.
 
 ## Linked Databases
 

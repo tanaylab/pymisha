@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.24.2 (2026-11-27)
+
+### Fixes
+
+* `gdb_install_intervals` gene sets (`tss`, `exons`, `utr3`, `utr5`) now have a `strand` column, and overlapping features merge as in R misha, with strand `0` where their strands differ. A transcript with strand `.` gets no TSS. Rebuild existing gene sets with `overwrite=True`. Thanks to Vova Mindel (@vmindel) for the report.
+
 ## v0.24.1 (2026-11-25)
 
 ### Fixes

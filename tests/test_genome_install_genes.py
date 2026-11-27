@@ -103,6 +103,40 @@ def test_install_genes_tss_strand_aware(monkeypatch):
     assert list(tss["end"]) == [100, 400]
 
 
+def test_install_genes_strand_and_overlap_merge_match_r(monkeypatch):
+    """Sets carry strand 1/-1; overlaps merge with strand 0 on mismatch, as in
+    R's gintervals.import_genes (expected values are R misha 5.20.0 output on
+    the equivalent genePred). A "." transcript gets no TSS."""
+    calls = _capture(monkeypatch)
+    rows = [
+        ("T1", "+", (1000, 3000), [(1000, 1500), (2000, 3000)]),
+        ("T3", "-", (0, 1001), [(0, 1001)]),
+        ("T2", "-", (4000, 6000), [(4000, 4500), (5500, 6000)]),
+        ("T5", "+", (4200, 4800), [(4200, 4800)]),
+        ("T6", ".", (7000, 7500), [(7000, 7500)]),
+    ]
+    gtf = ""
+    for t, st, (ts, te), exons in rows:
+        attrs = f'gene_id "G{t}"; transcript_id "{t}";'
+        gtf += f"1\tt\ttranscript\t{ts + 1}\t{te}\t.\t{st}\t.\t{attrs}\n"
+        for s, e in exons:
+            gtf += f"1\tt\texon\t{s + 1}\t{e}\t.\t{st}\t.\t{attrs}\n"
+    _install_genes(gtf.encode(), _identity)
+    by_name = {name: df for df, name in calls}
+
+    tss = by_name["tss"]
+    assert tss[["start", "end", "strand"]].values.tolist() == [
+        [1000, 1001, 0], [4200, 4201, 1], [5999, 6000, -1],
+    ]
+    assert list(tss["name"]) == ["T1;T3", "T5", "T2"]
+
+    exons = by_name["exons"]
+    assert exons[["start", "end", "strand"]].values.tolist() == [
+        [0, 1500, 0], [2000, 3000, 1], [4000, 4800, 0], [5500, 6000, -1],
+        [7000, 7500, 0],
+    ]
+
+
 def test_install_genes_empty_after_filter(monkeypatch):
     calls = _capture(monkeypatch)
     # Only a CDS feature - not in the filter list.
